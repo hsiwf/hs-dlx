@@ -10,6 +10,7 @@ use super::Shell;
 use super::row::Row;
 use crate::links;
 use crate::new_task::{NewTask, NewTaskEvent};
+use crate::sniff::{SniffEvent, SniffView};
 
 impl Shell {
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -23,9 +24,28 @@ impl Shell {
         if self.clipboard.as_ref() == Some(&url) {
             self.clipboard = None;
         }
+        // 不是 m3u8 的网页地址：在嗅探页里打开，找页面里的视频流
+        if links::stream_url(url.as_str()).is_none() {
+            self.open_sniff(url, window, cx);
+            return;
+        }
+        self.open_new_task(url, Vec::new(), window, cx);
+    }
+
+    /// 打开新建页探测 `url`，带着请求头 `headers`；嗅探页开着时先把它的网页藏起来。
+    pub(super) fn open_new_task(
+        &mut self,
+        url: Url,
+        headers: Vec<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((sniff, _)) = &self.sniff {
+            sniff.update(cx, |sniff, cx| sniff.hide(cx));
+        }
         let (service, folder, home) =
             (self.service.clone(), self.folder.clone(), self.home.clone());
-        let view = cx.new(|cx| NewTask::new(service, url, folder, home, window, cx));
+        let view = cx.new(|cx| NewTask::new(service, url, headers, folder, home, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -160,5 +180,26 @@ impl Shell {
         self.new_task
             .as_ref()
             .is_some_and(|(shown, _)| shown == view)
+    }
+
+    /// 在嗅探页里打开网页 `url`（已开着的换成这个）。
+    fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| SniffView::new(url, window, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this: &mut Self, _, event: &SniffEvent, window, cx| {
+                match event {
+                    SniffEvent::Probe { url, headers } => {
+                        this.open_new_task(url.clone(), headers.clone(), window, cx)
+                    }
+                    SniffEvent::Dismissed => this.sniff = None,
+                }
+                cx.notify();
+            },
+        );
+        self.new_task = None;
+        self.sniff = Some((view, subscription));
+        cx.notify();
     }
 }

@@ -30,6 +30,7 @@ use crate::links;
 use crate::new_task;
 use crate::new_task::NewTask;
 use crate::signals::Level;
+use crate::sniff::SniffView;
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 
@@ -68,6 +69,8 @@ pub struct Shell {
     selected: Option<TaskId>,
     /// 新建视图与对它的订阅：视图关掉时订阅一起释放
     new_task: Option<(Entity<NewTask>, Subscription)>,
+    /// 嗅探页与对它的订阅；新建页开着时在它下面（网页藏起来）
+    sniff: Option<(Entity<SniffView>, Subscription)>,
     paste: Entity<InputState>,
     /// 新建任务默认保存到的目录；新建时换过就记住，到应用退出
     folder: PathBuf,
@@ -200,6 +203,7 @@ impl Shell {
             rows,
             selected,
             new_task: None,
+            sniff: None,
             paste,
             folder,
             home: dirs::home_dir(),
@@ -424,18 +428,20 @@ fn ended_signal(
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        let show_list = !self.rows.is_empty() || self.new_task.is_some();
         let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
-        if show_list {
+        // 嗅探页占满主体，不显示任务列表
+        let sniffing = self.new_task.is_none() && self.sniff.is_some();
+        if !sniffing && (!self.rows.is_empty() || self.new_task.is_some()) {
             body = body.child(self.render_list(now, cx));
         }
-        body = match (&self.new_task, self.selected_row()) {
-            (Some((view, _)), _) => body.child(view.clone()),
-            (None, Some(row)) => {
+        body = match (&self.new_task, &self.sniff, self.selected_row()) {
+            (Some((view, _)), _, _) => body.child(view.clone()),
+            (None, Some((sniff, _)), _) => body.child(sniff.clone()),
+            (None, None, Some(row)) => {
                 let (main, aside) = self.render_task(row, now, cx);
                 body.child(main).child(aside)
             }
-            (None, None) => body.child(self.render_standby(cx)),
+            (None, None, None) => body.child(self.render_standby(cx)),
         };
         div()
             .relative()

@@ -128,12 +128,13 @@ impl NewTask {
     pub fn new(
         service: Rc<Service>,
         url: Url,
+        headers: Vec<(String, String)>,
         folder: PathBuf,
         home: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let headers = cx.new(|cx| HeadersEditor::new(Vec::new(), window, cx));
+        let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
         // 读系统代理要调操作系统的接口，在后台读
         let target = url.clone();
         let reading = cx
@@ -160,13 +161,13 @@ impl NewTask {
             rings_bounds: Rc::new(Cell::new(Bounds::default())),
             error: None,
             creating: false,
-            headers,
+            headers: editor,
             focus: cx.focus_handle(),
             route: None,
             _route: route,
             _probe: Task::ready(()),
         };
-        view.probe(Vec::new(), window, cx);
+        view.probe(headers, window, cx);
         view
     }
 
