@@ -1,0 +1,19 @@
+[package]
+name = "hs-m3u8-desktop"
+version.workspace = true
+description = "Desktop application for hs-m3u8, built with GPUI"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+chrono.workspace = true
+dirs.workspace = true
+gpui-kit.workspace = true
+hs-m3u8-app = { path = "../../crates/app" }
+hs-m3u8-core = { path = "../../crates/core" }
+
+[lints]
+workspace = true
