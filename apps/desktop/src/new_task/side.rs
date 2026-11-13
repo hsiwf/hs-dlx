@@ -8,8 +8,11 @@ use gpui_kit::{
 use hs_m3u8_app::{OutputKind, title_of};
 use hs_m3u8_core::Probe;
 
-use super::{NewTask, NewTaskEvent, Probing, duration_of};
-use crate::ui::{self, OPTION_MIN_WIDTH, OPTION_WIDTH, Tone};
+use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, duration_of};
+
+/// 选项栏的宽度。
+const OPTION_WIDTH: f32 = 320.;
+use crate::ui::{self, Tone};
 use crate::{format, theme};
 
 impl NewTask {

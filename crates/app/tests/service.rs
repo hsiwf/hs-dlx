@@ -353,7 +353,6 @@ fn an_ending_that_cannot_be_saved_is_saved_later() {
         let (status, unsaved) = rt.block_on(stopped(&mut events, id, |_| {}));
         assert_eq!(status, Status::Done);
         assert!(matches!(unsaved, Some(Error::Store(_))), "{unsaved:?}");
-        assert!(service.has_unsaved());
         drop(holding);
         let task = service.tasks().unwrap().remove(0);
         assert_eq!(task.status, Status::Done);
@@ -364,7 +363,59 @@ fn an_ending_that_cannot_be_saved_is_saved_later() {
     let task = service.tasks().unwrap().remove(0);
     assert_eq!((task.id, task.status), (id, Status::Done));
     assert!(task.result.is_some());
-    assert!(!service.has_unsaved());
+}
+
+/// 关闭服务：运行中的任务取消、停下、按暂停写进存储；之后不再开始任务。
+#[test]
+fn closing_pauses_running_tasks() {
+    let dir = test_dir("close");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let url = server.base.join("index.m3u8").unwrap();
+    let id = create(&rt, &service, draft(url.clone(), folder.clone())).id;
+    rt.block_on(first_segment(&mut events, id));
+
+    service.close().unwrap();
+
+    let task = service.tasks().unwrap().remove(0);
+    assert_eq!(task.status, Status::Paused);
+    assert!(folder.join("index.hsdl").is_dir());
+    assert!(matches!(service.resume(id), Err(Error::Closed)));
+    let refused = rt.block_on(service.create(draft(url, folder), 1)).unwrap();
+    assert!(matches!(refused, Err(Error::Closed)), "{refused:?}");
+}
+
+/// 新建时提交被别的连接挡住（它持着读事务）：报存储错误，已开始的任务取消、它建出的任务目录删掉，存储里没有它。
+#[test]
+fn a_create_that_cannot_commit_leaves_nothing() {
+    let dir = test_dir("create-uncommitted");
+    let folder = dir.join("out");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, _events) = service(&store);
+    let mut other = rusqlite::Connection::open(&store).unwrap();
+    let reading = other.transaction().unwrap();
+    let count: i64 = reading
+        .query_row("SELECT count(*) FROM task", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let created = rt
+        .block_on(service.create(
+            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+            1,
+        ))
+        .unwrap();
+    assert!(matches!(created, Err(Error::Store(_))), "{created:?}");
+    drop(reading);
+    // 关闭时等不要了的任务收尾（取消、删任务目录）
+    service.close().unwrap();
+
+    assert!(service.tasks().unwrap().is_empty());
+    assert!(!folder.join("index.hsdl").exists());
 }
 
 /// 任务目录里有不是本库写的文件时放弃删不干净：任务留在列表里、报出留下的东西；拿走那个文件后再放弃即删掉。

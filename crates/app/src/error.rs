@@ -36,12 +36,23 @@ pub enum Error {
         id: TaskId,
         leftovers: Vec<hs_m3u8_core::Leftover>,
     },
-    /// 读任务目录超时（如网络盘没有响应）；可重试
-    #[error("读{id}的任务目录超过 {} 秒没有结果", .after.as_secs())]
+    /// 磁盘操作超时（如网络盘没有响应）：`action` 为在做什么；可重试
+    #[error("{action}超过 {} 秒没有结果", .after.as_secs())]
     TimedOut {
-        id: TaskId,
+        action: String,
         after: std::time::Duration,
     },
+    /// 放弃时任务目录删了、存储里的记录没删掉：`leftovers` 为核心报出的残留（之后不再报），`cause` 为删记录时的错误；
+    /// 再放弃一次即删掉记录
+    #[error("{id}的任务目录已删，存储里的记录没删掉（{cause}），再放弃一次即可{}", left(.leftovers))]
+    RecordNotDeleted {
+        id: TaskId,
+        leftovers: Vec<hs_m3u8_core::Leftover>,
+        cause: Box<Error>,
+    },
+    /// 服务已关闭（[`crate::Service::close`]），不再开始任务
+    #[error("正在退出，不再开始任务")]
+    Closed,
     /// 新任务的任务目录与存储里已有的任务相同
     #[error("任务目录已被另一个任务使用：{}", .0.display())]
     WorkDirTaken(std::path::PathBuf),
@@ -67,4 +78,13 @@ fn join(leftovers: &[hs_m3u8_core::Leftover]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("；")
+}
+
+/// 残留的说明接在句末；没有时为空。
+fn left(leftovers: &[hs_m3u8_core::Leftover]) -> String {
+    if leftovers.is_empty() {
+        String::new()
+    } else {
+        format!("；没删掉的：{}", join(leftovers))
+    }
 }

@@ -40,8 +40,8 @@ fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
 /// 第 2 版，重建表：
 /// - 编号不再重用（AUTOINCREMENT）：界面按编号认领异步回来的结果，删掉的任务的编号给了新任务就会认错。
 /// - 任务目录单列（绝对路径；NULL 时任务没有自己的任务目录）。第 1 版的行按第 1 版的规则补算：没完成的取与输出同级的
-///   `<主名>.hsdl`，已完成的为 NULL（任务目录已在完成时删掉）。补算出的任务目录相同（按迁移时的 [`naming::path_key`]
-///   比较）的一组里，编号最小的留着它，其余的改为失败、任务目录为 NULL：放弃它们会删掉留着的那个已下的内容。
+///   `<主名>.hsdl`，已完成的为 NULL（任务目录已在完成时删掉）。补算出的任务目录相同（按 [`v2_path_key`] 比较）的一组
+///   里，编号最小的留着它，其余的改为失败、任务目录为 NULL：放弃它们会删掉留着的那个已下的内容。
 /// - 点播的总片数，与完成时写出的结果（时长、字节数、视频的宽高）。
 fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
@@ -107,7 +107,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
         if row.status == "done" {
             continue;
         }
-        match owners.entry(naming::path_key(&work_dir)) {
+        match owners.entry(v2_path_key(&work_dir)) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(row.title);
                 tx.execute(
@@ -130,6 +130,14 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
+/// 迁移的结果。
+fn v2_path_key(path: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(&path.to_lowercase())
+        .into_owned()
 }
 
 /// 第 1 版任务目录的位置：输出 `path`（绝对路径）同级的 `<主名>.hsdl`，MP4 的主名去掉扩展名、本地 HLS 的为目录名；

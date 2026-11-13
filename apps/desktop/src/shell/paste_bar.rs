@@ -10,7 +10,17 @@ use hs_m3u8_core::bare_url;
 use super::Shell;
 use crate::links::http_url;
 use crate::theme;
-use crate::ui::{self, CAPTION_LINE, FOOTER_BOTTOM, FOOTER_GAP, PILL_HEIGHT, Tone};
+use crate::ui::{self, CAPTION_LINE, TEXT_LINE, Tone};
+
+/// 胶囊的高度。
+const PILL_HEIGHT: f32 = 56.;
+/// 下边距。
+const BOTTOM: f32 = 24.;
+/// 各行（剪贴板提示、胶囊、输入错误）之间的间距。
+const LINE_GAP: f32 = 10.;
+/// 粘贴栏的高：胶囊、下边距，上面一行剪贴板提示（小标题）、下面一行输入错误（正文），各带间距。
+pub(super) const HEIGHT: f32 =
+    PILL_HEIGHT + BOTTOM + (CAPTION_LINE + LINE_GAP) + (TEXT_LINE + LINE_GAP);
 
 /// 粘贴栏胶囊的最大宽度。
 const PILL_MAX_WIDTH: f32 = 880.;
@@ -77,9 +87,9 @@ impl Shell {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(FOOTER_GAP))
+            .gap(px(LINE_GAP))
             .px(px(28.))
-            .pb(px(FOOTER_BOTTOM))
+            .pb(px(BOTTOM))
             .children(hint)
             .child(
                 div()

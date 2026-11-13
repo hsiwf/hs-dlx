@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -32,6 +33,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 关闭服务时，等取消了的任务停下并写进结束状态、等运行时的阻塞线程，各最多等多久。
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 新建时检查保存目录里的名字最多等多久：网络盘没有响应时不让新建一直挂着。
+const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
+/// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
+const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 交给界面的事件。
 #[derive(Debug)]
@@ -87,20 +92,20 @@ impl Ending {
     }
 }
 
-/// 服务的状态，运行时里的任务与界面共用。锁的顺序：`creating` → `store` → 其余各把。
+/// 服务的状态，运行时里的任务与界面共用。锁的顺序：先 `store`，再其余各把（其余各把之间不嵌套）。
 struct Shared {
     engine: Engine,
     store: Mutex<Store>,
-    /// 新建任务逐个进行：取名先读存储、再查磁盘（锁外，网络盘上可能慢）、最后插入，两次新建交错会取到同一个名字
-    creating: Mutex<()>,
+    /// 关闭了（[`Service::close`]）：不再开始任务。在 `store` 锁内置上与查看，关闭之后开始的任务不会漏取消
+    closed: AtomicBool,
     /// 运行中的任务；登记与查询放弃中都在 `store` 锁内，继续与放弃不会交错
     running: Mutex<HashMap<TaskId, Running>>,
     /// 正在放弃的任务：放弃做完（成功或失败）之前不能继续或移除
     discarding: Mutex<HashSet<TaskId>>,
     /// 停下了、但状态没能写进存储的任务：下一次写存储时补写
     unsaved: Mutex<HashMap<TaskId, Ending>>,
-    /// 服务在运行时里起的收尾任务（运行中任务的收尾、存储写不进时不要了的任务的收尾）；关闭时等它们
-    tasks: TaskTracker,
+    /// 服务在运行时里起的、会改状态的任务（运行中任务的收尾、放弃、存储写不进时不要了的任务的收尾）；关闭时等它们
+    tracker: TaskTracker,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -135,11 +140,11 @@ impl Service {
         let shared = Arc::new(Shared {
             engine,
             store: Mutex::new(store),
-            creating: Mutex::new(()),
+            closed: AtomicBool::new(false),
             running: Mutex::new(HashMap::new()),
             discarding: Mutex::new(HashSet::new()),
             unsaved: Mutex::new(HashMap::new()),
-            tasks: TaskTracker::new(),
+            tracker: TaskTracker::new(),
             events,
         });
         let service = Service {
@@ -167,29 +172,27 @@ impl Service {
         Ok(tasks)
     }
 
-    /// 有停下了而状态还没写进存储的任务。
-    pub fn has_unsaved(&self) -> bool {
-        !lock(&self.shared.unsaved).is_empty()
-    }
-
     /// 把停下了而状态还没写进存储的补写进去。
     pub fn flush(&self) -> Result<(), Error> {
         self.shared.write(|_| Ok(()))
     }
 
-    /// 退出前停下所有任务：取消运行中的任务，最多等 2 秒让它们与别的收尾任务停下、写进结束状态，
-    /// 再补写没写进去的，返回补写的结果。没来得及停下的与补写不进的，存储里还是运行中，下次打开时按暂停处理。之后服务
-    /// 照常可用。不能在 tokio 运行时里调用。
+    /// 退出前停下所有任务：不再开始任务（新建与继续报 [`Error::Closed`]），取消运行中的，最多等 2 秒让它们与放弃等
+    /// 收尾任务做完、写进结束状态，再补写没写进去的，返回补写的结果。没来得及停下的与补写不进的，存储里还是运行中，
+    /// 下次打开时按暂停处理。不能在 tokio 运行时里调用。
     pub fn close(&self) -> Result<(), Error> {
-        for running in lock(&self.shared.running).values() {
-            running.control.cancel();
+        {
+            let _store = lock(&self.shared.store);
+            self.shared.closed.store(true, Ordering::Relaxed);
+            for running in lock(&self.shared.running).values() {
+                running.control.cancel();
+            }
         }
-        let tasks = &self.shared.tasks;
-        tasks.close();
+        let tracker = &self.shared.tracker;
+        tracker.close();
         let _timed_out = self
             .runtime()
-            .block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tasks.wait()).await });
-        tasks.reopen();
+            .block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tracker.wait()).await });
         self.flush()
     }
 
@@ -204,12 +207,12 @@ impl Service {
     /// 主名由地址得出（见 [`crate::title_of`]），避开磁盘上已有的与存储里各任务占用的输出与任务目录（不分大小写与
     /// Unicode 写法），被占用时加编号；任务的标题即这个主名，任务目录为核心的默认位置。`draft.folder` 不是绝对路径、
     /// 选轨偏好存不了时报 [`Error::InvalidInput`]。取名要查磁盘（网络盘上可能慢），在运行时的阻塞线程上、存储锁外做，
-    /// 几次新建逐个进行；返回的句柄在任何执行器上都可等待。存储写不进时什么也不留：已开始的任务取消，它建出的任务目录
-    /// 删掉，磁盘上还留下东西时发 [`Event::Orphaned`]。
+    /// 10 秒内查不完报 [`Error::TimedOut`]；返回的句柄在任何执行器上都可等待。存储写不进时什么也不留：已开始的任务
+    /// 取消，它建出的任务目录删掉，磁盘上还留下东西时发 [`Event::Orphaned`]。
     pub fn create(&self, draft: Draft, created_at: i64) -> JoinHandle<Result<Task, Error>> {
         let shared = self.shared.clone();
         self.runtime()
-            .spawn_blocking(move || shared.create(draft, created_at))
+            .spawn(async move { shared.create(draft, created_at).await })
     }
 
     /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下。已完成的报 [`Error::AlreadyDone`]，
@@ -231,7 +234,7 @@ impl Service {
             tokio::time::timeout(INSPECT_TIMEOUT, shared.engine.inspect(&work_dir))
                 .await
                 .map_err(|_| Error::TimedOut {
-                    id,
+                    action: format!("读{id}的任务目录"),
                     after: INSPECT_TIMEOUT,
                 })?
                 .map_err(Error::from)
@@ -268,8 +271,9 @@ impl Service {
     }
 
     /// 放弃任务：在运行就先取消并等它停下，再删掉任务目录（见 [`Engine::discard`]）与存储里的记录；返回留下的东西。
-    /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]，处理后可再放弃。做完之前任务记为正在放弃，继续与移除
-    /// 都报 [`Error::Discarding`]，再放弃一次同样报这个错误。返回的句柄在任何执行器上都可等待。
+    /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
+    /// 30 秒内做不完报 [`Error::TimedOut`]（之后再放弃从做到的地方接着做）。做完之前任务记为正在放弃，继续与移除都报
+    /// [`Error::Discarding`]，再放弃一次同样报这个错误。返回的句柄在任何执行器上都可等待。
     pub fn discard(&self, id: TaskId) -> JoinHandle<Result<Vec<Leftover>, Error>> {
         let stopped = {
             let _store = lock(&self.shared.store);
@@ -287,8 +291,17 @@ impl Service {
             id,
             shared: self.shared.clone(),
         };
-        self.runtime().spawn(async move {
-            let result = run_discard(id, &guard.shared, stopped).await;
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let discarding = run_discard(id, &guard.shared, stopped);
+            let result = tokio::time::timeout(DISCARD_TIMEOUT, discarding)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::TimedOut {
+                        action: format!("放弃{id}"),
+                        after: DISCARD_TIMEOUT,
+                    })
+                });
             drop(guard);
             result
         })
@@ -296,16 +309,18 @@ impl Service {
 }
 
 impl Drop for Service {
-    /// 先 [`Service::close`]，再关掉运行时（阻塞线程最多等 2 秒）；没停下的任务随运行时丢弃。
+    /// 还没 [`Service::close`] 时先关闭，再关掉运行时（阻塞线程最多等 2 秒）；没停下的任务随运行时丢弃。
     fn drop(&mut self) {
-        // 释放时没有调用方能处理补写的错误，结果见 close 的说明；要知道结果的调用方先调 close
-        let _unsaved = self.close();
+        if !self.shared.closed.load(Ordering::Relaxed) {
+            // 释放时没有调用方能处理补写的错误，结果见 close 的说明；要知道结果的调用方先调 close
+            let _unsaved = self.close();
+        }
         let runtime = self.runtime.take().expect("运行时只在这里取走");
         runtime.shutdown_timeout(CLOSE_TIMEOUT);
     }
 }
 
-/// 放弃中的登记：放弃做完或中途 panic 时都从放弃中集合里去掉。
+/// 放弃中的登记：放弃做完、超时，或运行时关闭时随任务一起丢弃，都从放弃中集合里去掉。
 struct DiscardGuard {
     id: TaskId,
     shared: Arc<Shared>,
@@ -328,6 +343,7 @@ async fn run_discard(
         let _stopped = stopped.wait_for(|done| *done).await;
     }
     let leftovers = match shared.get(id)?.work_dir {
+        // 放弃超时时这个 future 被丢弃，核心在步与步之间停下，再放弃时从做到的地方接着做
         Some(work_dir) => {
             shared
                 .engine
@@ -342,11 +358,18 @@ async fn run_discard(
     {
         return Err(Error::WorkDirLeft { id, leftovers });
     }
-    shared.write(|tx| store::delete(tx, id))?;
+    // 核心报出的残留已没有记录，只在这里报一次，删不掉记录时也要带着
+    if let Err(cause) = shared.write(|tx| store::delete(tx, id)) {
+        return Err(Error::RecordNotDeleted {
+            id,
+            leftovers,
+            cause: Box::new(cause),
+        });
+    }
     Ok(leftovers)
 }
 
-/// 运行中任务的登记：任务停下（或收尾的任务 panic）时从运行表里去掉，并告诉等它停下的放弃。
+/// 运行中任务的登记：任务停下（或运行时关闭时收尾的任务被丢弃）时从运行表里去掉，并告诉等它停下的放弃。
 struct RunningGuard {
     id: TaskId,
     shared: Arc<Shared>,
@@ -361,15 +384,27 @@ impl Drop for RunningGuard {
 }
 
 impl Shared {
-    /// 在一个事务里先补写没写进去的结束状态，再做 `f`，然后提交；补写进去的从待补写里去掉。
+    /// 在一个事务里先补写没写进去的结束状态，再做 `f`，然后提交（见 [`Shared::commit`]）。
     fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T, Error>) -> Result<T, Error> {
         let mut store = lock(&self.store);
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
         let value = f(&tx)?;
-        tx.commit()?;
-        self.clear_unsaved(applied);
+        self.commit(tx, applied)?;
         Ok(value)
+    }
+
+    /// 提交补写了 `applied`（[`Shared::apply_unsaved`] 的返回）的事务 `tx`；提交了的补写从待补写里去掉，其间同一任务
+    /// 又记了新的结束状态时留着新的。调用方持着 `store` 锁直到返回，提交与清理之间没有别的写入。
+    fn commit(&self, tx: Transaction<'_>, applied: Vec<(TaskId, Ending)>) -> Result<(), Error> {
+        tx.commit()?;
+        let mut unsaved = lock(&self.unsaved);
+        for (id, ending) in applied {
+            if unsaved.get(&id) == Some(&ending) {
+                unsaved.remove(&id);
+            }
+        }
+        Ok(())
     }
 
     /// 存储里的任务 `id`；没有时报 [`Error::NotFound`]。
@@ -394,18 +429,7 @@ impl Shared {
         Ok(unsaved)
     }
 
-    /// 已提交的补写从待补写里去掉；其间同一任务又记了新的结束状态时留着新的。调用方须持着 `store` 锁，与提交之间
-    /// 没有别的写入。
-    fn clear_unsaved(&self, applied: Vec<(TaskId, Ending)>) {
-        let mut unsaved = lock(&self.unsaved);
-        for (id, ending) in applied {
-            if unsaved.get(&id) == Some(&ending) {
-                unsaved.remove(&id);
-            }
-        }
-    }
-
-    fn create(self: &Arc<Self>, draft: Draft, created_at: i64) -> Result<Task, Error> {
+    async fn create(self: &Arc<Self>, draft: Draft, created_at: i64) -> Result<Task, Error> {
         if !draft.folder.is_absolute() {
             return Err(Error::InvalidInput(format!(
                 "保存目录不是绝对路径：{}",
@@ -413,45 +437,72 @@ impl Shared {
             )));
         }
         let preference = StoredPreference::try_from(&draft.preference)?;
-        let _creating = lock(&self.creating);
-        let taken = {
-            let mut store = lock(&self.store);
-            let tx = store.transaction()?;
-            store::taken_paths(&tx)?
-        };
-        let (title, output) = naming::output_for(
-            &draft.folder,
-            &naming::title_of(&draft.url),
-            draft.output,
-            &taken,
-        )?;
-        let work_dir = output.options().resolved_work_dir()?;
-        let spec = TaskSpec {
-            title,
-            url: draft.url,
-            preference,
-            headers: draft.headers,
-            output,
-            live: draft.live,
-        };
+        let title = naming::title_of(&draft.url);
+        // 取名与插入之间别的新建可能插入了同一个主名的任务，插入时报 WorkDirTaken，就重新取名；每重来一次存储里就多了
+        // 一个别的任务，不会一直重来
+        loop {
+            let taken = {
+                let mut store = lock(&self.store);
+                let tx = store.transaction()?;
+                store::taken_paths(&tx)?
+            };
+            let (folder, title, kind) = (draft.folder.clone(), title.clone(), draft.output);
+            let naming = tokio::task::spawn_blocking(move || {
+                naming::output_for(&folder, &title, kind, &taken)
+            });
+            let (title, output) = tokio::time::timeout(NAMING_TIMEOUT, naming)
+                .await
+                .map_err(|_| Error::TimedOut {
+                    action: format!("检查保存目录 {}", draft.folder.display()),
+                    after: NAMING_TIMEOUT,
+                })?
+                .expect("取名不会 panic，运行时关闭时本任务也一起丢弃")?;
+            let work_dir = output.options().resolved_work_dir()?;
+            let spec = TaskSpec {
+                title,
+                url: draft.url.clone(),
+                preference: preference.clone(),
+                headers: draft.headers.clone(),
+                output,
+                live: draft.live,
+            };
+            match self.insert_and_start(&spec, work_dir, created_at) {
+                Err(Error::WorkDirTaken(_)) => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// 把任务存进存储并开始；调用方须在运行时里（[`Engine::start`] 的要求）。
+    fn insert_and_start(
+        self: &Arc<Self>,
+        spec: &TaskSpec,
+        work_dir: PathBuf,
+        created_at: i64,
+    ) -> Result<Task, Error> {
         let mut store = lock(&self.store);
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
-        let id = store::insert(&tx, &spec, &work_dir, created_at)?;
+        let id = store::insert(&tx, spec, &work_dir, created_at)?;
         let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
         let job = self.engine.start(request(&task)?)?;
-        if let Err(error) = tx.commit() {
+        if let Err(error) = self.commit(tx, applied) {
             drop(store);
             self.abandon(job, work_dir);
-            return Err(Error::Store(error));
+            return Err(error);
         }
-        self.clear_unsaved(applied);
-        self.track(id, job, None);
+        self.track(&task, job);
         Ok(task)
     }
 
     fn resume(self: &Arc<Self>, id: TaskId) -> Result<(), Error> {
         let mut store = lock(&self.store);
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
         if lock(&self.running).contains_key(&id) {
             return Err(Error::Running(id));
         }
@@ -467,15 +518,14 @@ impl Shared {
         let request = request(&task)?;
         store::set_status(&tx, id, &Status::Running)?;
         let job = self.engine.start(request)?;
-        let committed = tx.commit();
-        match &committed {
-            Ok(()) => self.clear_unsaved(applied),
+        let committed = self.commit(tx, applied);
+        if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
-            Err(_) => job.control().cancel(),
+            job.control().cancel();
         }
-        self.track(id, job, task.total);
+        self.track(&task, job);
         drop(store);
-        committed.map_err(Error::Store)
+        committed
     }
 
     /// 新建时存储写不进而不要的任务：取消，等它停下，再删掉它建出的任务目录；磁盘上还留下东西时发
@@ -483,7 +533,7 @@ impl Shared {
     fn abandon(self: &Arc<Self>, job: Job, work_dir: PathBuf) {
         job.control().cancel();
         let shared = self.clone();
-        self.tasks.spawn(async move {
+        self.tracker.spawn(async move {
             let (paths, reason) = match job.wait().await {
                 Ok(output) => (
                     written(&output),
@@ -512,9 +562,10 @@ impl Shared {
         });
     }
 
-    /// 登记运行中的任务，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。`total` 为存储里记着的点播
-    /// 总片数；下载开始后的总片数与它不同时记下。调用方须在运行时里。
-    fn track(self: &Arc<Self>, id: TaskId, job: Job, total: Option<usize>) {
+    /// 登记运行中的任务 `task`，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。下载开始后的点播
+    /// 总片数与存储里记着的不同时记下。调用方须在运行时里。
+    fn track(self: &Arc<Self>, task: &Task, job: Job) {
+        let (id, total, live) = (task.id, task.total, task.spec.live);
         let control = job.control();
         let (stopped_tx, stopped) = watch::channel(false);
         lock(&self.running).insert(
@@ -530,7 +581,7 @@ impl Shared {
             stopped: stopped_tx,
         };
         let shared = self.clone();
-        self.tasks.spawn(async move {
+        self.tracker.spawn(async move {
             let done = CancellationToken::new();
             let forwarding = tokio::spawn(forward(
                 shared.clone(),
@@ -544,16 +595,20 @@ impl Shared {
             let forwarded = forwarding
                 .await
                 .expect("转发进度的任务不会 panic，运行时关闭时本任务也一起丢弃");
-            // 转发按节流取样，下得快时可能没见过下载阶段；按最后的进度再定一次点播的总片数
+            // 转发按节流取样，下得快时可能没见过下载阶段；按最后的进度再定一次点播的总片数。停在下载或写出阶段的，
+            // 请求不开录制的必是点播，开了录制的要没见过录制阶段才是
             let last = control.progress().borrow().clone();
             let vod = match &result {
                 Ok(output) => output.live.is_none(),
-                Err(_) => last.stage == Stage::Downloading,
+                Err(_) => {
+                    matches!(last.stage, Stage::Downloading | Stage::Writing)
+                        && !(live && forwarded.recorded)
+                }
             };
             let total = if vod && last.segments.total > 0 {
                 Some(last.segments.total)
             } else {
-                forwarded
+                forwarded.total
             };
             let (status, result, leftovers) = match result {
                 Ok(output) => {
@@ -591,26 +646,38 @@ impl Shared {
     }
 }
 
-/// 转发任务 `id` 的进度，同时记下点播的总片数，直到 `done` 取消或进度不再更新；返回最后知道的总片数（开始时为
-/// `total`）。
+/// 转发进度时看到的。
+struct Forwarded {
+    /// 最后知道的点播总片数
+    total: Option<usize>,
+    /// 见过录制阶段
+    recorded: bool,
+}
+
+/// 转发任务 `id` 的进度，同时记下点播的总片数，直到 `done` 取消或进度不再更新；`total` 为开始时知道的总片数。
 async fn forward(
     shared: Arc<Shared>,
     id: TaskId,
     control: JobControl,
-    mut total: Option<usize>,
+    total: Option<usize>,
     done: CancellationToken,
-) -> Option<usize> {
+) -> Forwarded {
+    let mut seen = Forwarded {
+        total,
+        recorded: false,
+    };
     let mut progress = control.progress();
     loop {
         match done.run_until_cancelled(progress.changed()).await {
             Some(Ok(())) => {}
-            None | Some(Err(_)) => return total,
+            None | Some(Err(_)) => return seen,
         }
         let snapshot = progress.borrow_and_update().clone();
+        seen.recorded |= snapshot.stage == Stage::Recording;
         // 点播的总片数在下载开始时就定了；直播与准备阶段不记
         let count = snapshot.segments.total;
-        if snapshot.stage == Stage::Downloading && count > 0 && total != Some(count) {
-            total = Some(count);
+        if snapshot.stage == Stage::Downloading && count > 0 && seen.total != Some(count) {
+            seen.total = Some(count);
             if let Err(error) = shared.write(|tx| store::set_total(tx, id, count)) {
                 // 接收端随界面关闭而丢弃时没有谁能处理；停下时随结束状态再写一次
                 let _closed = shared.events.send(Event::TotalUnsaved { id, error });
@@ -625,7 +692,7 @@ async fn forward(
             .await
             .is_none()
         {
-            return total;
+            return seen;
         }
     }
 }

@@ -4,7 +4,7 @@
 mod rings;
 mod side;
 
-pub use self::rings::{FIGURE_HEIGHT, FIGURE_WIDTH};
+use self::rings::{FIGURE_HEIGHT, FIGURE_WIDTH};
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -20,6 +20,13 @@ use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, Source, Url};
 
 use crate::ui::{BOTTOM, GAP};
+
+/// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
+const OPTION_MIN_WIDTH: f32 = 260.;
+/// 新建页的最小宽：整个同心环区域与收到最窄的选项栏。
+pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + OPTION_MIN_WIDTH;
+/// 新建页的最小高：同心环区域与下边距。
+pub const MIN_HEIGHT: f32 = FIGURE_HEIGHT + BOTTOM;
 
 /// 新建任务视图发给外面的事件。
 pub enum NewTaskEvent {
@@ -237,6 +244,7 @@ impl Render for NewTask {
         // 中间一栏至少放得下整个同心环区域：窗口窄时先收两侧的栏
         div()
             .flex_1()
+            .min_w(px(MIN_WIDTH))
             .flex()
             .gap(px(GAP))
             .child(

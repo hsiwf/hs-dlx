@@ -31,9 +31,9 @@ const LABEL_X: f32 = 496.;
 /// 标签一列的宽：圆点加一行 12 号字的清晰度与码率（如「1080p · 4.2 Mbps」，不换行）。
 const LABEL_WIDTH: f32 = 184.;
 /// 同心环区域（连同右侧的标签）的宽。
-pub const FIGURE_WIDTH: f32 = LABEL_X + LABEL_WIDTH;
+pub(super) const FIGURE_WIDTH: f32 = LABEL_X + LABEL_WIDTH;
 /// 同心环区域的高。
-pub const FIGURE_HEIGHT: f32 = BOX_TOP + BOX + BOX_TOP;
+pub(super) const FIGURE_HEIGHT: f32 = BOX_TOP + BOX + BOX_TOP;
 /// 点在环宽之外多远以内仍算点中这一环。
 const HIT_SLOP: f32 = 8.;
 

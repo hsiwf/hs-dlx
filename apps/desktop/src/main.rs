@@ -21,8 +21,8 @@ use gpui_kit::{
 };
 use hs_m3u8_app::{Service, Store};
 
-use crate::shell::Shell;
-use crate::ui::{MIN_HEIGHT, MIN_WIDTH, PAD, TITLE_HEIGHT};
+use crate::shell::{MIN_HEIGHT, MIN_WIDTH, Shell};
+use crate::ui::{PAD, TITLE_HEIGHT};
 
 /// 全部任务合计同时最多多少个请求（见 `Engine::new`）。
 const MAX_REQUESTS: NonZeroUsize = NonZeroUsize::new(32).unwrap();

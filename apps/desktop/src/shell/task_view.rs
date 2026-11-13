@@ -15,14 +15,37 @@ use super::row::{Row, look};
 use crate::ring;
 use crate::signals::{Level, Signal};
 use crate::theme;
-use crate::ui::{
-    self, ACTIONS_GAP, BOTTOM, SIGNAL_MIN_WIDTH, SIGNAL_WIDTH, SUGGESTION_GAP, SUGGESTION_PADDING,
-    TEXT_LINE, Tone,
-};
+use crate::ui::{self, BOTTOM, BUTTON_HEIGHT, CAPTION_LINE, GAP, TEXT_LINE, Tone, max};
 
-/// 中央刻度环里的深色圆盘离绘制区域边缘多远、里面的字离圆盘边多远。
+/// 中央刻度环里的深色圆盘离绘制区域边缘多远。
 const DISC_INSET: f32 = 70.;
+/// 圆盘里的字离圆盘边多远。
 const DISC_PADDING: f32 = 24.;
+/// 右边信号栏的宽度。
+const SIGNAL_WIDTH: f32 = 300.;
+/// 窗口窄时信号栏最多收到的宽度。
+const SIGNAL_MIN_WIDTH: f32 = 240.;
+/// 中央刻度环到下面一行按钮的间距。
+const ACTIONS_GAP: f32 = 24.;
+/// 待机页里中央刻度环到剪贴板卡片的间距。
+const SUGGESTION_GAP: f32 = 28.;
+/// 剪贴板卡片的上下内边距。
+const SUGGESTION_PADDING: f32 = 10.;
+/// 剪贴板卡片里两行字的间距。
+const SUGGESTION_LINE_GAP: f32 = 2.;
+/// 任务视图的最小宽：中央刻度环与收到最窄的信号栏。
+pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + SIGNAL_MIN_WIDTH;
+/// 任务视图中间一栏的最小高：中央刻度环、间距、一行按钮、下边距。
+pub(super) const MIN_HEIGHT: f32 = ring::AREA + ACTIONS_GAP + BUTTON_HEIGHT + BOTTOM;
+/// 待机页的最小高：中央刻度环、间距、剪贴板卡片（内边距、1 像素描边，与按钮和两行字中高的一个）、下边距。
+pub(super) const STANDBY_MIN_HEIGHT: f32 = ring::AREA
+    + SUGGESTION_GAP
+    + 2. * (SUGGESTION_PADDING + 1.)
+    + max(
+        BUTTON_HEIGHT,
+        CAPTION_LINE + SUGGESTION_LINE_GAP + TEXT_LINE,
+    )
+    + BOTTOM;
 
 impl Shell {
     /// 中间一栏与右边的信号栏。
@@ -286,7 +309,7 @@ impl Shell {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(2.))
+                        .gap(px(SUGGESTION_LINE_GAP))
                         .child(ui::caption("剪贴板里的链接"))
                         .child(
                             div()

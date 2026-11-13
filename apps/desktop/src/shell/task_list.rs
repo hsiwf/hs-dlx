@@ -11,7 +11,12 @@ use gpui_kit::{
 use super::Shell;
 use super::row::{Row, look};
 use crate::new_task::Phase;
-use crate::ui::{self, LIST_MIN_WIDTH, LIST_WIDTH};
+use crate::ui;
+
+/// 任务列表的宽度。
+const WIDTH: f32 = 300.;
+/// 窗口窄时任务列表最多收到的宽度。
+pub(super) const MIN_WIDTH: f32 = 240.;
 use crate::{ring, theme};
 
 /// 列表小环的边长与环宽。
@@ -33,9 +38,9 @@ impl Shell {
             .collect();
         div()
             .id("tasks")
-            .flex_basis(px(LIST_WIDTH))
+            .flex_basis(px(WIDTH))
             .flex_shrink(1.)
-            .min_w(px(LIST_MIN_WIDTH))
+            .min_w(px(MIN_WIDTH))
             .flex()
             .flex_col()
             .gap(px(4.))

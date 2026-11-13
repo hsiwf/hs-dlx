@@ -8,9 +8,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled, Window, div, point, px,
 };
 
-use crate::{new_task, ring, theme};
+use crate::theme;
 
-/// 顶栏高度；macOS 的红绿灯按它垂直居中。
+/// 顶栏高度；macOS 的红绿灯按它垂直居中，右上角的提示从它下面开始。
 pub const TITLE_HEIGHT: f32 = 56.;
 /// 主体左右的内边距。
 pub const PAD: f32 = 20.;
@@ -24,51 +24,8 @@ pub const BUTTON_HEIGHT: f32 = 38.;
 pub const CAPTION_LINE: f32 = 18.;
 /// 正文（13 号字）的行高。
 pub const TEXT_LINE: f32 = 20.;
-/// 左边任务列表的宽度。
-pub const LIST_WIDTH: f32 = 300.;
-/// 窗口窄时任务列表最多收到的宽度。
-pub const LIST_MIN_WIDTH: f32 = 240.;
-/// 任务视图右边信号栏的宽度。
-pub const SIGNAL_WIDTH: f32 = 300.;
-/// 窗口窄时信号栏最多收到的宽度。
-pub const SIGNAL_MIN_WIDTH: f32 = 240.;
-/// 新建页右边选项栏的宽度。
-pub const OPTION_WIDTH: f32 = 320.;
-/// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
-pub const OPTION_MIN_WIDTH: f32 = 260.;
-/// 任务视图里中央刻度环到下面一行按钮的间距。
-pub const ACTIONS_GAP: f32 = 24.;
-/// 任务视图中间一栏的高：中央刻度环、间距、一行按钮、下边距。
-pub const TASK_VIEW_HEIGHT: f32 = ring::AREA + ACTIONS_GAP + BUTTON_HEIGHT + BOTTOM;
-/// 待机页里中央刻度环到剪贴板卡片的间距。
-pub const SUGGESTION_GAP: f32 = 28.;
-/// 剪贴板卡片的上下内边距。
-pub const SUGGESTION_PADDING: f32 = 10.;
-/// 待机页中间一栏的高：中央刻度环、间距、剪贴板卡片（内边距加按钮与两行字中高的一个）、下边距。
-pub const STANDBY_HEIGHT: f32 = ring::AREA
-    + SUGGESTION_GAP
-    + 2. * SUGGESTION_PADDING
-    + max(BUTTON_HEIGHT, CAPTION_LINE + 2. + TEXT_LINE)
-    + BOTTOM;
-/// 新建页中间一栏的高：同心环区域与下边距。
-pub const NEW_TASK_HEIGHT: f32 = new_task::FIGURE_HEIGHT + BOTTOM;
-/// 粘贴栏胶囊的高度。
-pub const PILL_HEIGHT: f32 = 56.;
-/// 粘贴栏的下边距。
-pub const FOOTER_BOTTOM: f32 = 24.;
-/// 粘贴栏里各行（剪贴板提示、胶囊、输入错误）之间的间距。
-pub const FOOTER_GAP: f32 = 10.;
-/// 粘贴栏的高：胶囊、下边距，上面一行剪贴板提示（小标题）、下面一行输入错误（正文），各带间距。
-pub const FOOTER_HEIGHT: f32 =
-    PILL_HEIGHT + FOOTER_BOTTOM + (CAPTION_LINE + FOOTER_GAP) + (TEXT_LINE + FOOTER_GAP);
-/// 窗口的最小宽：放得下新建页的三栏（列表与选项栏收到最窄，中间是整个同心环区域）。
-pub const MIN_WIDTH: f32 =
-    2. * PAD + LIST_MIN_WIDTH + GAP + new_task::FIGURE_WIDTH + GAP + OPTION_MIN_WIDTH;
-/// 窗口的最小高：放得下顶栏、最高的中间一栏与粘贴栏。
-pub const MIN_HEIGHT: f32 =
-    TITLE_HEIGHT + max(max(TASK_VIEW_HEIGHT, STANDBY_HEIGHT), NEW_TASK_HEIGHT) + FOOTER_HEIGHT;
-
-const fn max(a: f32, b: f32) -> f32 {
+/// 两个尺寸里大的一个（常量表达式里用）。
+pub const fn max(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
 }
 
