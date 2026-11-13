@@ -1,0 +1,349 @@
+//! 选中任务的视图：中间的刻度环与下面的操作，右边的信号；没有任务时的待机页。
+
+use std::time::Instant;
+
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, px,
+};
+use hs_m3u8_app::Status;
+use hs_m3u8_core::bare_url;
+
+use super::Shell;
+use super::row::{Row, look};
+use crate::ring;
+use crate::signals::{Level, Signal};
+use crate::theme;
+use crate::ui::{
+    self, ACTIONS_GAP, BOTTOM, SIDE_MIN_WIDTH, SIGNAL_WIDTH, SUGGESTION_GAP, SUGGESTION_PADDING,
+    Tone,
+};
+
+/// 中央刻度环里的深色圆盘离绘制区域边缘多远、里面的字离圆盘边多远。
+const DISC_INSET: f32 = 70.;
+const DISC_PADDING: f32 = 24.;
+
+impl Shell {
+    /// 中间一栏与右边的信号栏。
+    pub(super) fn render_task(
+        &self,
+        row: &Row,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> (Div, Div) {
+        let look = look(row, now);
+        let ticks = look.ticks;
+        let ring = ring_with_disc(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| ring::paint_ticks(bounds, ring::RADIUS, &ticks, window),
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(look.color)
+                        .child(look.state),
+                )
+                .child(ui::num(
+                    div()
+                        .text_size(px(64.))
+                        .line_height(px(64.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(look.big),
+                ))
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_center()
+                        .line_clamp(2)
+                        .child(row.task.spec.title.clone()),
+                )
+                .child(ui::num(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::muted())
+                        .text_center()
+                        .line_clamp(3)
+                        .child(SharedString::from(look.line)),
+                )),
+        );
+        let main = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(ACTIONS_GAP))
+            .pb(px(BOTTOM))
+            .child(ring)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap(px(10.))
+                    .children(self.actions(row, cx)),
+            );
+        // 最新的在最上面，多了可以滚动
+        let aside = div()
+            .flex_basis(px(SIGNAL_WIDTH))
+            .flex_shrink(1.)
+            .min_w(px(SIDE_MIN_WIDTH))
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .py(px(8.))
+            .pr(px(8.))
+            .child(ui::caption("信号"))
+            .child(
+                div()
+                    .id("signals")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .pb(px(16.))
+                    .children(row.signals.iter().rev().map(signal_card)),
+            );
+        (main, aside)
+    }
+
+    fn actions(&self, row: &Row, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if !row.idle() {
+            return Vec::new();
+        }
+        let id = row.task.id;
+        let confirming = self.confirm_discard == Some(id);
+        let discard = |cx: &mut Context<Self>| {
+            ui::button(
+                "discard",
+                if confirming {
+                    "再点一次：删除已下的内容"
+                } else {
+                    "放弃任务"
+                },
+                Tone::Plain,
+                cx.listener(move |this, _, _, cx| this.discard(id, confirming, cx)),
+            )
+            .when(confirming, |b| {
+                b.border_color(theme::orange()).text_color(theme::orange())
+            })
+            .into_any_element()
+        };
+        let pause = |cx: &mut Context<Self>| {
+            ui::button(
+                "pause",
+                "暂停",
+                Tone::Plain,
+                cx.listener(move |this, _, _, _| this.service.pause(id)),
+            )
+            .into_any_element()
+        };
+        match &row.task.status {
+            Status::Running if row.recording() => vec![
+                ui::button(
+                    "stop",
+                    "停止并写出",
+                    Tone::Rec,
+                    cx.listener(move |this, _, _, cx| {
+                        this.service.stop(id);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                pause(cx),
+                discard(cx),
+            ],
+            Status::Running => vec![pause(cx), discard(cx)],
+            Status::Paused | Status::Failed(_) => vec![
+                ui::button(
+                    "resume",
+                    "继续",
+                    Tone::Glow,
+                    cx.listener(move |this, _, _, cx| this.resume(id, cx)),
+                )
+                .into_any_element(),
+                discard(cx),
+            ],
+            Status::Done => {
+                // 输出在不在是完成时与打开应用时在后台查的；还没查完时先不给这两个按钮
+                let (mp4, shown) = row
+                    .present
+                    .as_ref()
+                    .map_or((None, None), |p| (p.mp4.clone(), p.shown.clone()));
+                let mut actions = Vec::new();
+                if let Some(mp4) = mp4 {
+                    actions.push(
+                        ui::button("play", "▶ 播放", Tone::Glow, move |_, _, cx| {
+                            cx.open_with_system(&mp4)
+                        })
+                        .into_any_element(),
+                    );
+                }
+                if let Some(shown) = shown {
+                    actions.push(
+                        ui::button(
+                            "reveal",
+                            "在访达中显示",
+                            Tone::Plain,
+                            move |_, _, cx| cx.reveal_path(&shown),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                actions.push(
+                    ui::button(
+                        "forget",
+                        "从列表移除",
+                        Tone::Ghost,
+                        cx.listener(move |this, _, _, cx| this.forget(id, cx)),
+                    )
+                    .into_any_element(),
+                );
+                actions
+            }
+        }
+    }
+
+    /// 没有任务也没在新建时：待机的刻度环；剪贴板里有链接时放在环下面，一键探测。
+    pub(super) fn render_standby(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ring = ring_with_disc(
+            canvas(
+                |_, _, _| {},
+                |bounds, _, window, _| ring::paint_standby(bounds, ring::RADIUS, window),
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::cyan())
+                        .child("就绪"),
+                )
+                .child(
+                    div()
+                        .text_size(px(30.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("粘贴链接"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme::muted())
+                        .child("m3u8 · 回车探测"),
+                ),
+        );
+        let suggestion = self.clipboard.clone().map(|url| {
+            let shown = bare_url(&url).to_string();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .w(px(560.))
+                .pl(px(20.))
+                .pr(px(10.))
+                .py(px(SUGGESTION_PADDING))
+                .rounded(px(18.))
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::edge())
+                .child(ui::dot(theme::cyan(), 8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(ui::caption("剪贴板里的链接"))
+                        .child(div().text_size(px(13.)).truncate().child(shown)),
+                )
+                .child(ui::button(
+                    "probe-clipboard",
+                    "探测",
+                    Tone::Glow,
+                    cx.listener(move |this, _, window, cx| this.probe_url(&url, window, cx)),
+                ))
+        });
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(SUGGESTION_GAP))
+            .pb(px(BOTTOM))
+            .child(ring)
+            .children(suggestion)
+    }
+}
+
+/// 中央刻度环：`ring` 是撑满整块区域的画布，中间压一个深色圆盘，`center` 放在圆盘里。
+fn ring_with_disc(ring: AnyElement, center: Div) -> Div {
+    let disc = ring::AREA - 2. * DISC_INSET;
+    let place = || {
+        div()
+            .absolute()
+            .top(px(DISC_INSET))
+            .left(px(DISC_INSET))
+            .size(px(disc))
+    };
+    div()
+        .relative()
+        .size(px(ring::AREA))
+        .flex_none()
+        .child(ring)
+        .child(place().rounded_full().bg(theme::disc()))
+        .child(
+            place()
+                .px(px(DISC_PADDING))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(center),
+        )
+}
+
+fn signal_card(signal: &Signal) -> impl IntoElement {
+    ui::card(match signal.level {
+        Level::Info => theme::line(),
+        Level::Warn => theme::warn_edge(),
+        Level::Error => theme::error_edge(),
+    })
+    .flex()
+    .flex_col()
+    .gap(px(4.))
+    .child(ui::num(
+        div()
+            .flex()
+            .justify_between()
+            .text_size(px(11.))
+            .text_color(theme::muted())
+            .child(signal.at.clone())
+            .when(signal.repeat > 1, |s| {
+                s.child(format!("×{}", signal.repeat))
+            }),
+    ))
+    .child(SharedString::from(signal.text.clone()))
+}

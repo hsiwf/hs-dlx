@@ -1,5 +1,4 @@
-//! 环的画法：主角任务的刻度环、待机时的刻度环、列表里的小进度环、新任务的虚线环。都以绘制区域的中心为圆心，从
-//! 12 点方向顺时针。
+//! 环的画法：中央的刻度环（任务的分片、待机）与列表里的小进度环。都以绘制区域的中心为圆心，从 12 点方向顺时针。
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -7,7 +6,11 @@ use gpui_kit::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
 
 use crate::theme;
 
-/// 刻度环最多画几个刻度：半径 206 时周长约 1294，每格 2 宽、至少留 1.6 的缝。分片更多时一个刻度管几片。
+/// 中央刻度环的绘制区域边长与刻度环的半径。
+pub const AREA: f32 = 460.;
+pub const RADIUS: f32 = 206.;
+
+/// 刻度环最多画几个刻度：在 [`RADIUS`] 的环上每格 2 宽、至少留 1.6 的缝。分片更多时一个刻度管几片。
 pub const MAX_TICKS: usize = 360;
 
 /// 刻度的半长：刻度是以环为中线、沿半径方向的短线。
@@ -84,8 +87,8 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
     let mut halo_wide = Stroke::new(9., theme::alpha(ticks.color, 0.07), HALF + 2.);
     let mut halo_near = Stroke::new(5., theme::alpha(ticks.color, 0.18), HALF + 1.);
     let mut lit = Stroke::new(2., ticks.color, HALF);
-    let mut written_halo = Stroke::new(5., theme::alpha(theme::white(), 0.16), HALF + 1.);
-    let mut written = Stroke::new(2., theme::white(), HALF);
+    let mut written_halo = Stroke::new(5., theme::alpha(theme::written(), 0.16), HALF + 1.);
+    let mut written = Stroke::new(2., theme::written(), HALF);
     let mut active = Stroke::new(2., theme::cyan_dim(), HALF);
     let mut retry_halo = Stroke::new(10., theme::alpha(theme::orange(), 0.3), RETRY_HALF + 2.);
     let mut retry = Stroke::new(3., theme::orange(), RETRY_HALF);
@@ -150,11 +153,10 @@ pub fn paint_standby(bounds: Bounds<Pixels>, radius: f32, window: &mut Window) {
     }
 }
 
-/// 在 `bounds` 中心画半径 `radius`、宽 `width` 的环：底色 `track` 一整圈，上面从 12 点起顺时针画 `fraction`
-/// （0 到 1）的 `color`。
+/// 在 `bounds` 里画一个贴着边、宽 `width` 的环：底色 `track` 一整圈，上面从 12 点起顺时针画 `fraction`（0 到 1）
+/// 的 `color`。
 pub fn paint_arc(
     bounds: Bounds<Pixels>,
-    radius: f32,
     width: f32,
     fraction: f32,
     color: Hsla,
@@ -162,27 +164,12 @@ pub fn paint_arc(
     window: &mut Window,
 ) {
     let center = bounds.center();
+    let side = f32::from(bounds.size.width.min(bounds.size.height));
+    let radius = side / 2. - width / 2.;
     for (span, paint) in [(1.0, track), (fraction.clamp(0.0, 1.0), color)] {
         if span > 0.0 {
             window.paint_path(arc(center, radius, width, 0.0, span), paint);
         }
-    }
-}
-
-/// 虚线圆：`dashes` 段，每段占一格的 60%。
-pub fn paint_dashed(
-    bounds: Bounds<Pixels>,
-    radius: f32,
-    width: f32,
-    dashes: usize,
-    color: Hsla,
-    window: &mut Window,
-) {
-    let center = bounds.center();
-    let step = 1.0 / dashes as f32;
-    for i in 0..dashes {
-        let from = i as f32 * step;
-        window.paint_path(arc(center, radius, width, from, step * 0.6), color);
     }
 }
 

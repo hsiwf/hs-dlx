@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
-use hs_m3u8_app::{Event, OutputSpec, Service, Status, Store, StoredPreference, TaskId, TaskSpec};
+use hs_m3u8_app::{Draft, Error, Event, OutputKind, OutputSpec, Service, Status, Store, TaskId};
 use hs_m3u8_core::Url;
 use hs_m3u8_core::hls::Preference;
 use tokio::runtime::Runtime;
@@ -103,15 +103,20 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn spec(url: Url, mp4: PathBuf) -> TaskSpec {
-    TaskSpec {
-        title: "测试".into(),
+fn draft(url: Url, folder: PathBuf) -> Draft {
+    Draft {
         url,
-        preference: StoredPreference::try_from(&Preference::default()).unwrap(),
+        preference: Preference::default(),
         headers: Vec::new(),
-        output: OutputSpec::Mp4(mp4),
+        output: OutputKind::Mp4,
+        folder,
         live: false,
     }
+}
+
+/// 新建任务并等它存进存储。
+fn create(rt: &Runtime, service: &Service, draft: Draft) -> hs_m3u8_app::Task {
+    rt.block_on(service.create(draft, 1)).unwrap().unwrap()
 }
 
 fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
@@ -128,8 +133,20 @@ async fn ended(
         match events.recv().await.expect("服务还在，事件通道不会关闭") {
             Event::Progress { id: at, progress } if at == id => on_progress(&progress),
             Event::Ended { id: at, status, .. } if at == id => return status,
-            Event::StoreFailed { error, .. } => panic!("状态没写进存储：{error}"),
+            Event::StoreFailed { error, .. } => panic!("没写进存储：{error}"),
             _ => {}
+        }
+    }
+}
+
+/// 等到任务 `id` 下完第一个分片。
+async fn first_segment(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) {
+    loop {
+        if let Some(Event::Progress { id: at, progress }) = events.recv().await
+            && at == id
+            && progress.segments.done == 1
+        {
+            return;
         }
     }
 }
@@ -141,47 +158,53 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
-/// 新建即开始，下完写出 MP4、删掉任务目录，存储里记为已完成。
+/// 新建即开始，下完写出 MP4（标题与主名取自地址）、删掉任务目录，存储里记为已完成；从列表移除只删记录，输出留着。
 #[test]
 fn a_task_downloads_and_is_recorded_as_done() {
     let dir = test_dir("done");
+    let folder = dir.join("out");
     let rt = runtime();
     let server = rt.block_on(Server::start(true));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let mp4 = dir.join("out.mp4");
 
-    let id = service
-        .create(
-            spec(server.base.join("index.m3u8").unwrap(), mp4.clone()),
-            1,
-        )
-        .unwrap()
-        .id;
-    let status = rt.block_on(ended(&mut events, id, |_| {}));
+    let task = create(
+        &rt,
+        &service,
+        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+    );
+    assert_eq!(task.spec.title, "index");
+    assert_eq!(task.spec.output, OutputSpec::Mp4(folder.join("index.mp4")));
+    let status = rt.block_on(ended(&mut events, task.id, |_| {}));
 
     assert_eq!(status, Status::Done);
-    assert!(mp4.is_file());
-    assert!(!dir.join("out.hsdl").exists());
-    assert_eq!(service.tasks().unwrap()[0].status, Status::Done);
+    assert!(folder.join("index.mp4").is_file());
+    assert!(!folder.join("index.hsdl").exists());
+    let done = service.tasks().unwrap().remove(0);
+    assert_eq!(done.status, Status::Done);
+    let result = done.result.expect("完成时记下写出的结果");
+    assert!(result.bytes > 0 && result.duration.is_some(), "{result:?}");
+    service.forget(task.id).unwrap();
+    assert!(service.tasks().unwrap().is_empty());
+    assert!(folder.join("index.mp4").is_file());
 }
 
-/// 第一个分片下完后暂停：停下为暂停、任务目录保留；关掉应用重开后继续，只补下没完成的分片。
+/// 第一个分片下完后暂停：停下为暂停、任务目录保留、总片数记下，查看任务目录得到已下的 1 片；关掉应用重开后继续，只
+/// 补下没完成的分片。
 #[test]
 fn a_paused_task_resumes_after_reopening() {
     let dir = test_dir("pause");
+    let folder = dir.join("out");
     let store = dir.join("tasks.sqlite");
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
-    let mp4 = dir.join("out.mp4");
     let id = {
         let (service, mut events) = service(&store);
-        let id = service
-            .create(
-                spec(server.base.join("index.m3u8").unwrap(), mp4.clone()),
-                1,
-            )
-            .unwrap()
-            .id;
+        let id = create(
+            &rt,
+            &service,
+            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        )
+        .id;
         let mut paused = false;
         let status = rt.block_on(ended(&mut events, id, |progress| {
             if progress.segments.done == 1 && !paused {
@@ -190,47 +213,95 @@ fn a_paused_task_resumes_after_reopening() {
             }
         }));
         assert_eq!(status, Status::Paused);
-        assert!(dir.join("out.hsdl").is_dir());
+        assert!(folder.join("index.hsdl").is_dir());
         id
     };
 
     server.gate.open();
     let (service, mut events) = service(&store);
-    assert_eq!(service.tasks().unwrap()[0].status, Status::Paused);
+    let task = service.tasks().unwrap().remove(0);
+    assert_eq!((task.status, task.total), (Status::Paused, Some(2)));
+    // 没完成的任务不能只从列表移除，任务目录要一起放弃
+    assert!(matches!(service.forget(id), Err(Error::NotFinished(_))));
+    let saved = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap();
+    assert_eq!((saved.segments, saved.live), (1, false));
     service.resume(id).unwrap();
     let status = rt.block_on(ended(&mut events, id, |_| {}));
 
     assert_eq!(status, Status::Done);
-    assert!(mp4.is_file());
+    assert!(folder.join("index.mp4").is_file());
 }
 
-/// 运行中放弃：先停下，再删掉任务目录与存储里的记录。
+/// 同一地址新建两次：第二个任务的主名避开第一个任务占用的（第一个还没在磁盘上留下输出）。
+#[test]
+fn the_same_link_twice_gets_separate_outputs() {
+    let dir = test_dir("twice");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, _events) = service(&dir.join("tasks.sqlite"));
+    let url = server.base.join("index.m3u8").unwrap();
+
+    let first = create(&rt, &service, draft(url.clone(), folder.clone()));
+    let second = create(&rt, &service, draft(url, folder.clone()));
+
+    assert_eq!(first.spec.output, OutputSpec::Mp4(folder.join("index.mp4")));
+    assert_eq!(
+        second.spec.output,
+        OutputSpec::Mp4(folder.join("index 2.mp4"))
+    );
+    assert_eq!(second.spec.title, "index 2");
+    for id in [first.id, second.id] {
+        rt.block_on(service.discard(id)).unwrap().unwrap();
+    }
+}
+
+/// 运行中放弃：先停下，再删掉任务目录与存储里的记录；放弃做完之前不能继续、再放弃或移除。
 #[test]
 fn discarding_a_running_task_removes_it() {
     let dir = test_dir("discard");
+    let folder = dir.join("out");
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let id = service
-        .create(
-            spec(server.base.join("index.m3u8").unwrap(), dir.join("out.mp4")),
-            1,
-        )
-        .unwrap()
-        .id;
-    rt.block_on(async {
-        loop {
-            if let Some(Event::Progress { progress, .. }) = events.recv().await
-                && progress.segments.done == 1
-            {
-                break;
-            }
-        }
-    });
+    let id = create(
+        &rt,
+        &service,
+        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+    )
+    .id;
+    rt.block_on(first_segment(&mut events, id));
 
-    let leftovers = rt.block_on(service.discard(id)).unwrap().unwrap();
+    let discarding = service.discard(id);
+    assert!(matches!(
+        service.resume(id),
+        Err(Error::Discarding(_) | Error::Running(_))
+    ));
+    assert!(matches!(
+        service.forget(id),
+        Err(Error::Discarding(_) | Error::Running(_))
+    ));
+    assert!(matches!(
+        rt.block_on(service.discard(id)).unwrap(),
+        Err(Error::Discarding(_))
+    ));
+    let leftovers = rt.block_on(discarding).unwrap().unwrap();
 
     assert_eq!(leftovers, []);
-    assert!(!dir.join("out.hsdl").exists());
+    assert!(!folder.join("index.hsdl").exists());
+    assert!(service.tasks().unwrap().is_empty());
+}
+
+/// 保存目录不是绝对路径的拒收，什么也不存。
+#[test]
+fn a_relative_folder_is_refused() {
+    let dir = test_dir("relative");
+    let rt = runtime();
+    let (service, _events) = service(&dir.join("tasks.sqlite"));
+    let url = Url::parse("http://127.0.0.1:9/index.m3u8").unwrap();
+    let refused = rt
+        .block_on(service.create(draft(url, PathBuf::from("out")), 1))
+        .unwrap();
+    assert!(matches!(refused, Err(Error::InvalidInput(_))));
     assert!(service.tasks().unwrap().is_empty());
 }
