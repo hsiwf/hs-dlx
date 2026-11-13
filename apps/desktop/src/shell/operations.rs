@@ -1,13 +1,14 @@
-//! 对一个任务的操作：读任务目录、继续、放弃、从列表移除，与任务停下后的查看。
+//! 对一个任务的操作：读任务目录、继续、改请求头、放弃、从列表移除，与任务停下后的查看。
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use gpui_kit::Context;
+use gpui_kit::{AppContext as _, Context, Window};
 use hs_m3u8_app::{Status, TaskId};
 
 use super::Shell;
 use super::row::{Disk, Present};
+use crate::headers::HeadersEditor;
 use crate::rate::Rate;
 use crate::signals::Level;
 
@@ -185,6 +186,41 @@ impl Shell {
             Err(error) => {
                 let title = self.title(id);
                 self.notify(format!("移除「{title}」失败：{error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开失败任务 `id` 的请求头编辑框，填上它现在的请求头。
+    pub(super) fn edit_headers(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(headers) = self.row(id).map(|row| row.task.spec.headers.clone()) else {
+            return;
+        };
+        let editor = cx.new(|cx| HeadersEditor::new(headers, window, cx));
+        editor.update(cx, |editor, cx| editor.focus(window, cx));
+        self.editing_headers = Some((id, editor));
+        cx.notify();
+    }
+
+    /// 存下编辑框里的请求头并重试；编辑框里还没按回车的一条加不进去时什么也不做（原因显示在编辑框里）。
+    pub(super) fn save_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, editor)) = self.editing_headers.clone() else {
+            return;
+        };
+        let Some(headers) = editor.update(cx, |editor, cx| editor.take(window, cx)) else {
+            return;
+        };
+        match self.service.set_headers(id, headers.clone()) {
+            Ok(()) => {
+                self.editing_headers = None;
+                if let Some(row) = self.row_mut(id) {
+                    row.task.spec.headers = headers;
+                }
+                self.resume(id, cx);
+            }
+            Err(error) => {
+                let title = self.title(id);
+                self.notify(format!("改「{title}」的请求头失败：{error}"));
             }
         }
         cx.notify();

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::{OutputOptions, Target, Url};
 
+use crate::Failure;
 use crate::preference::StoredPreference;
 
 /// 输出要哪几种。
@@ -40,7 +41,7 @@ pub struct Draft {
     pub live: bool,
 }
 
-/// 新建任务时给定、之后不变的内容：续传与续录照它重建请求。
+/// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Service::set_headers`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     /// 列表里显示的名字
@@ -81,8 +82,8 @@ pub enum Status {
     Running,
     /// 用户暂停；任务目录保留，继续时续传。应用异常退出时还在运行的，重开后也是这个状态
     Paused,
-    /// 以错误结束，值为错误的说明；任务目录保留
-    Failed(String),
+    /// 以错误结束；任务目录保留
+    Failed(Failure),
     /// 已写出输出
     Done,
 }

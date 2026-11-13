@@ -1,6 +1,7 @@
 //! 桌面应用的入口：打开任务存储、启动任务服务、开主窗口。
 
 mod format;
+mod headers;
 mod links;
 mod live;
 mod new_task;

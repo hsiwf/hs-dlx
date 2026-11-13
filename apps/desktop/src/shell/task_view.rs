@@ -7,7 +7,7 @@ use gpui_kit::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
-use hs_m3u8_app::Status;
+use hs_m3u8_app::{FailureKind, Status};
 use hs_m3u8_core::bare_url;
 
 use super::row::{Row, look};
@@ -144,6 +144,7 @@ impl Shell {
             .py(px(8.))
             .pr(px(8.))
             .children(live.then(|| live_view::summary(row)))
+            .children(self.headers_card(row, cx))
             .child(ui::caption("信号"))
             .child(
                 div()
@@ -158,6 +159,47 @@ impl Shell {
                     .children(row.signals.iter().rev().map(signal_card)),
             );
         (main, aside)
+    }
+
+    /// 正在改这个任务的请求头时，信号栏上方的编辑卡片。
+    fn headers_card(&self, row: &Row, cx: &mut Context<Self>) -> Option<Div> {
+        let (_, editor) = self
+            .editing_headers
+            .as_ref()
+            .filter(|(id, _)| *id == row.task.id)?;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .p(px(14.))
+                .rounded(px(14.))
+                .bg(theme::panel())
+                .border_1()
+                .border_color(theme::edge())
+                .child(ui::caption("请求头：保存后重试"))
+                .child(editor.clone())
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(ui::button(
+                            "save-headers",
+                            "保存并重试",
+                            Tone::Glow,
+                            cx.listener(|this, _, window, cx| this.save_headers(window, cx)),
+                        ))
+                        .child(ui::button(
+                            "cancel-headers",
+                            "取消",
+                            Tone::Ghost,
+                            cx.listener(|this, _, _, cx| {
+                                this.editing_headers = None;
+                                cx.notify();
+                            }),
+                        )),
+                ),
+        )
     }
 
     fn actions(&self, row: &Row, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -217,7 +259,7 @@ impl Shell {
                 )
                 .into_any_element(),
             ],
-            Status::Paused | Status::Failed(_) => vec![
+            Status::Paused => vec![
                 ui::button(
                     "resume",
                     "继续",
@@ -227,6 +269,64 @@ impl Shell {
                 .into_any_element(),
                 discard(cx),
             ],
+            Status::Failed(failure) => {
+                let mut actions = Vec::new();
+                // 被服务器拒绝的多半缺请求头：改请求头是这一屏最该按的
+                let rejected = matches!(failure.kind, FailureKind::Status(401 | 403));
+                if rejected
+                    && self
+                        .editing_headers
+                        .as_ref()
+                        .is_none_or(|(at, _)| *at != id)
+                {
+                    actions.push(
+                        ui::button(
+                            "edit-headers",
+                            "改请求头",
+                            Tone::Glow,
+                            cx.listener(move |this, _, window, cx| {
+                                this.edit_headers(id, window, cx)
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                // 来源变了、不支持的，再试一次结果一样，只给放弃
+                if !matches!(
+                    failure.kind,
+                    FailureKind::SourceChanged | FailureKind::Unsupported
+                ) {
+                    actions.push(
+                        ui::button(
+                            "retry",
+                            "重试",
+                            if rejected { Tone::Plain } else { Tone::Glow },
+                            cx.listener(move |this, _, _, cx| this.resume(id, cx)),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                // 输出路径上已有东西：给出它在哪，挪走后再试
+                if failure.kind == FailureKind::OutputTaken {
+                    let target = row.task.spec.output.options().target;
+                    let output = target
+                        .mp4()
+                        .or(target.hls())
+                        .expect("输出至少有 MP4 与本地 HLS 之一")
+                        .to_path_buf();
+                    actions.push(
+                        ui::button(
+                            "reveal",
+                            "在访达中显示",
+                            Tone::Plain,
+                            move |_, _, cx| cx.reveal_path(&output),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                actions.push(discard(cx));
+                actions
+            }
             Status::Done => {
                 // 输出在不在是完成时与打开应用时在后台查的；还没查完时先不给这两个按钮
                 let (mp4, shown) = row

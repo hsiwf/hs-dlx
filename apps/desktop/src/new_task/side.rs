@@ -184,6 +184,14 @@ impl NewTask {
                         )),
                 ),
         );
+        options = options.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(ui::caption("请求头"))
+                .child(self.headers.clone()),
+        );
 
         let picked = master.map(|m| &m.variants[self.variant]);
         let verb = if probe.live {
@@ -231,7 +239,7 @@ impl NewTask {
                     .when(!creating, |s| {
                         s.cursor_pointer()
                             .hover(|s| s.bg(theme::cyan_pale()))
-                            .on_click(cx.listener(|this, _, _, cx| this.start(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
                     })
                     .child(
                         div()

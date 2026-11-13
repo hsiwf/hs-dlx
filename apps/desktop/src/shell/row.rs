@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
 use gpui_kit::Hsla;
-use hs_m3u8_app::{Finished, OutputSpec, Status, Task};
+use hs_m3u8_app::{Failure, FailureKind, Finished, OutputSpec, Status, Task};
 use hs_m3u8_core::{Progress, Saved, Stage};
 
 use crate::live::Timeline;
@@ -201,8 +201,35 @@ fn percent(fraction: f32) -> String {
 /// 任务为什么停着。
 enum Stopped<'a> {
     Paused,
-    /// 值为错误的说明
-    Failed(&'a str),
+    Failed(&'a Failure),
+}
+
+/// 失败时圆盘里的大字与说明：大字为状态码或种类，说明写这类失败多半是怎么回事；完整的错误在信号里。
+pub fn failure_text(failure: &Failure) -> (String, &'static str) {
+    match failure.kind {
+        FailureKind::Status(code @ (401 | 403)) => (
+            code.to_string(),
+            "服务器拒绝了请求，多要带上来源页的 Referer 或 Cookie",
+        ),
+        FailureKind::Status(code @ (404 | 410)) => {
+            (code.to_string(), "服务器上已没有这个地址，多为链接过期")
+        }
+        FailureKind::Status(code) => (code.to_string(), "服务器没有正常回应"),
+        FailureKind::Network => (
+            "网络".into(),
+            "连不上服务器或传输中断，检查网络或代理后重试",
+        ),
+        FailureKind::Certificate => ("证书".into(), "服务器的证书不受信任"),
+        FailureKind::Disk => ("磁盘".into(), "读写本机的文件出错，或读不到所在的盘"),
+        FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
+        FailureKind::SourceChanged => (
+            "不符".into(),
+            "来源与已下载的不是同一份内容，已下的不能接着用",
+        ),
+        FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
+        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性"),
+        FailureKind::Other => ("!".into(), "出错停下了"),
+    }
 }
 
 pub fn look(row: &Row, now: Instant) -> Look {
@@ -212,7 +239,7 @@ pub fn look(row: &Row, now: Instant) -> Look {
     match &row.task.status {
         Status::Running => running(row, Amount::of(row).unwrap_or_default(), now),
         Status::Paused => stopped(row, Stopped::Paused),
-        Status::Failed(message) => stopped(row, Stopped::Failed(message)),
+        Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
         Status::Done => done_look(row),
     }
 }
@@ -268,16 +295,19 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 orb: theme::cyan_dim(),
             }
         }
-        Stopped::Failed(message) => Look {
-            state: state("需要处理"),
-            color: theme::orange(),
-            ticks: ticks(theme::finished()),
-            big: "!".to_owned(),
-            line: message.to_owned(),
-            fraction,
-            orb: theme::orange(),
-            short: "!".to_owned(),
-        },
+        Stopped::Failed(failure) => {
+            let (big, hint) = failure_text(failure);
+            Look {
+                state: state("需要处理"),
+                color: theme::orange(),
+                ticks: ticks(theme::finished()),
+                big,
+                line: hint.to_owned(),
+                fraction,
+                orb: theme::orange(),
+                short: "!".to_owned(),
+            }
+        }
     }
 }
 
@@ -517,12 +547,17 @@ mod tests {
     /// 继续后在准备阶段就失败：这次运行的进度是 0/0，读到任务目录后按目录里已有的显示。
     #[test]
     fn a_resume_that_fails_early_still_shows_the_work_dir() {
-        let mut failed = row(Status::Failed("HTTP 状态 403".into()), false, Some(420));
+        let forbidden = Failure {
+            kind: FailureKind::Status(403),
+            message: "HTTP 状态 403".into(),
+        };
+        let mut failed = row(Status::Failed(forbidden), false, Some(420));
         failed.progress = Some(Progress::default());
         failed.disk = Disk::Read(Some(saved(143, false)));
         let seen = look(&failed, Instant::now());
         assert_eq!((seen.ticks.count, seen.ticks.lit), (360, 122));
-        assert_eq!(seen.big, "!");
+        assert_eq!(seen.big, "403");
+        assert!(seen.line.contains("Referer"), "{}", seen.line);
     }
 
     /// 暂停的直播录制写已录的时长，不写片数与百分比。

@@ -9,7 +9,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
 use crate::preference::StoredPreference;
-use crate::{Error, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming};
+use crate::{
+    Error, Failure, FailureKind, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming,
+};
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
@@ -42,6 +44,7 @@ fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
 /// - 任务目录单列（绝对路径；NULL 时任务没有自己的任务目录）。第 1 版的行按第 1 版的规则补算：没完成的取与输出同级的
 ///   `<主名>.hsdl`，已完成的为 NULL（任务目录已在完成时删掉）。补算出的任务目录相同（按 [`v2_path_key`] 比较）的一组
 ///   里，编号最小的留着它，其余的改为失败、任务目录为 NULL：放弃它们会删掉留着的那个已下的内容。
+/// - 失败的种类（[`crate::FailureKind`] 在存储里的写法），只在失败时有；第 1 版失败的行记为其余。
 /// - 点播的总片数，与完成时写出的结果（时长、字节数、视频的宽高）。
 fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
@@ -58,6 +61,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             live INTEGER NOT NULL CHECK (live IN (0, 1)),
             status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done')),
             error TEXT,
+            failure TEXT CHECK ((status = 'failed') = (failure IS NOT NULL)),
             created_at INTEGER NOT NULL,
             total INTEGER CHECK (total >= 0),
             duration_ms INTEGER CHECK (duration_ms >= 0),
@@ -66,9 +70,9 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             height INTEGER CHECK (height > 0)
         ) STRICT;
         INSERT INTO task_v2 (id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status,
-                             error, created_at)
+                             error, failure, created_at)
             SELECT id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status, error,
-                   created_at
+                   CASE WHEN status = 'failed' THEN 'other' END, created_at
             FROM task;
         DROP TABLE task;
         ALTER TABLE task_v2 RENAME TO task;",
@@ -117,7 +121,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             }
             std::collections::hash_map::Entry::Occupied(owner) => {
                 tx.execute(
-                    "UPDATE task SET status = 'failed', error = ?2 WHERE id = ?1",
+                    "UPDATE task SET status = 'failed', error = ?2, failure = 'other' WHERE id = ?1",
                     params![
                         row.id,
                         format!(
@@ -230,7 +234,7 @@ impl Store {
 
 /// 读出一个任务的各列，顺序与 [`Row::read`] 一致。
 const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status, \
-                       error, created_at, total, duration_ms, bytes, width, height";
+                       error, failure, created_at, total, duration_ms, bytes, width, height";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。任务目录与已有任务的输出或任务目录相同
 /// （按 [`naming::path_key`] 比较）时报 [`Error::WorkDirTaken`]：两个任务共用任务目录时，放弃其中一个会删掉另一个已下
@@ -312,6 +316,22 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
     Ok(taken)
 }
 
+/// 换掉任务的请求头；没有这个任务时报 [`Error::NotFound`]。
+pub fn set_headers(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    headers: &[(String, String)],
+) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET headers = ?2 WHERE id = ?1",
+        params![id.0, to_json(&headers)],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
 /// 记下点播的总片数；没有这个任务时报 [`Error::NotFound`]。
 pub fn set_total(tx: &Transaction<'_>, id: TaskId, total: usize) -> Result<(), Error> {
     let total = i64::try_from(total).expect("分片数远小于 i64 的上限");
@@ -344,15 +364,19 @@ pub fn set_result(tx: &Transaction<'_>, id: TaskId, result: &Finished) -> Result
 
 /// 改状态；没有这个任务时报 [`Error::NotFound`]。
 pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(), Error> {
-    let (name, error) = match status {
-        Status::Running => ("running", None),
-        Status::Paused => ("paused", None),
-        Status::Failed(message) => ("failed", Some(message.as_str())),
-        Status::Done => ("done", None),
+    let (name, error, failure) = match status {
+        Status::Running => ("running", None, None),
+        Status::Paused => ("paused", None, None),
+        Status::Failed(failure) => (
+            "failed",
+            Some(failure.message.as_str()),
+            Some(failure.kind.code()),
+        ),
+        Status::Done => ("done", None, None),
     };
     let changed = tx.execute(
-        "UPDATE task SET status = ?2, error = ?3 WHERE id = ?1",
-        params![id.0, name, error],
+        "UPDATE task SET status = ?2, error = ?3, failure = ?4 WHERE id = ?1",
+        params![id.0, name, error, failure],
     )?;
     if changed == 0 {
         return Err(Error::NotFound(id));
@@ -390,6 +414,7 @@ struct Row {
     live: bool,
     status: String,
     error: Option<String>,
+    failure: Option<String>,
     created_at: i64,
     total: Option<i64>,
     duration_ms: Option<i64>,
@@ -413,12 +438,13 @@ impl Row {
             live: row.get(9)?,
             status: row.get(10)?,
             error: row.get(11)?,
-            created_at: row.get(12)?,
-            total: row.get(13)?,
-            duration_ms: row.get(14)?,
-            bytes: row.get(15)?,
-            width: row.get(16)?,
-            height: row.get(17)?,
+            failure: row.get(12)?,
+            created_at: row.get(13)?,
+            total: row.get(14)?,
+            duration_ms: row.get(15)?,
+            bytes: row.get(16)?,
+            width: row.get(17)?,
+            height: row.get(18)?,
         })
     }
 
@@ -454,11 +480,14 @@ impl Row {
             }),
             _ => return Err(corrupt("写出的结果")),
         };
-        let status = match (self.status.as_str(), self.error) {
-            ("running", None) => Status::Running,
-            ("paused", None) => Status::Paused,
-            ("failed", Some(message)) => Status::Failed(message),
-            ("done", None) => Status::Done,
+        let status = match (self.status.as_str(), self.error, self.failure) {
+            ("running", None, None) => Status::Running,
+            ("paused", None, None) => Status::Paused,
+            ("failed", Some(message), Some(code)) => Status::Failed(Failure {
+                kind: FailureKind::parse(&code).ok_or_else(|| corrupt("失败的种类"))?,
+                message,
+            }),
+            ("done", None, None) => Status::Done,
             _ => return Err(corrupt("状态")),
         };
         Ok(Task {
@@ -587,7 +616,11 @@ mod tests {
             hls: "/m/b".into(),
         };
         let b = add(&tx, both, 200).unwrap();
-        set_status(&tx, a, &Status::Failed("403".into())).unwrap();
+        let forbidden = Failure {
+            kind: FailureKind::Status(403),
+            message: "HTTP 状态 403".into(),
+        };
+        set_status(&tx, a, &Status::Failed(forbidden.clone())).unwrap();
         set_status(&tx, b, &Status::Done).unwrap();
         tx.commit().unwrap();
 
@@ -596,7 +629,7 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].spec, spec(OutputSpec::Mp4("/m/a.mp4".into())));
         assert_eq!(tasks[0].work_dir.as_deref(), Some(Path::new("/m/a.hsdl")));
-        assert_eq!(tasks[0].status, Status::Failed("403".into()));
+        assert_eq!(tasks[0].status, Status::Failed(forbidden));
         assert_eq!(tasks[1].status, Status::Done);
         assert_eq!(get(&tx, b).unwrap().unwrap().created_at, 200);
         delete(&tx, a).unwrap();
@@ -737,7 +770,7 @@ mod tests {
         );
         assert_eq!(tasks[1].status, Status::Done);
         assert!(
-            matches!(&tasks[2].status, Status::Failed(message) if message.contains("「甲」")),
+            matches!(&tasks[2].status, Status::Failed(f) if f.message.contains("「甲」")),
             "{:?}",
             tasks[2].status
         );

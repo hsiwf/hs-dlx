@@ -25,6 +25,7 @@ use hs_m3u8_app::{Event, Events, Finished, Service, Status, TaskId};
 use hs_m3u8_core::Url;
 
 use self::row::Row;
+use crate::headers::HeadersEditor;
 use crate::links;
 use crate::new_task;
 use crate::new_task::NewTask;
@@ -67,6 +68,8 @@ pub struct Shell {
     clipboard: Option<Url>,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
     confirm_discard: Option<TaskId>,
+    /// 正在改请求头的失败任务与编辑框
+    editing_headers: Option<(TaskId, Entity<HeadersEditor>)>,
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行
     quitting: bool,
     /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
@@ -170,6 +173,7 @@ impl Shell {
             notices,
             clipboard: None,
             confirm_discard: None,
+            editing_headers: None,
             quitting: false,
             creating: 0,
             early: Vec::new(),
@@ -350,6 +354,7 @@ impl Shell {
         self.selected = Some(id);
         self.new_task = None;
         self.confirm_discard = None;
+        self.editing_headers = None;
         cx.notify();
     }
 }
@@ -369,7 +374,7 @@ fn ended_signal(
             ),
         ),
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
-        Status::Failed(message) => (Level::Error, message.clone()),
+        Status::Failed(failure) => (Level::Error, failure.message.clone()),
         Status::Running => unreachable!("任务服务只在任务停下后发结束事件"),
     }
 }

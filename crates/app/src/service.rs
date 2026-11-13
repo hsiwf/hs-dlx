@@ -15,7 +15,7 @@ use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output, Probe,
-    Progress, Saved, Source, Stage, Unsettled,
+    Progress, Saved, Source, Stage, Unsettled, check_header,
 };
 use rusqlite::Transaction;
 use tokio::runtime::Runtime;
@@ -25,7 +25,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
-use crate::{Draft, Error, Finished, Status, Task, TaskId, TaskSpec, naming};
+use crate::{Draft, Error, Failure, Finished, Status, Task, TaskId, TaskSpec, naming};
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -253,6 +253,23 @@ impl Service {
                 return Err(Error::NotFinished(id));
             }
             store::delete(tx, id)
+        })
+    }
+
+    /// 换掉停着的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_header`]）的报 [`Error::InvalidInput`]；
+    /// 任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]。
+    pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
+        for (name, value) in &headers {
+            check_header(name, value).map_err(Error::InvalidInput)?;
+        }
+        self.shared.write(|tx| {
+            if lock(&self.shared.running).contains_key(&id) {
+                return Err(Error::Running(id));
+            }
+            if lock(&self.shared.discarding).contains(&id) {
+                return Err(Error::Discarding(id));
+            }
+            store::set_headers(tx, id, &headers)
         })
     }
 
@@ -616,7 +633,7 @@ impl Shared {
                     (Status::Done, Some(result), output.leftovers)
                 }
                 Err(hs_m3u8_core::Error::Cancelled) => (Status::Paused, None, Vec::new()),
-                Err(error) => (Status::Failed(error.to_string()), None, Vec::new()),
+                Err(error) => (Status::Failed(Failure::of(&error)), None, Vec::new()),
             };
             let ending = Ending {
                 status,

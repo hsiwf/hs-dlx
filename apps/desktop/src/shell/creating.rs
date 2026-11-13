@@ -25,7 +25,7 @@ impl Shell {
         }
         let (service, folder, home) =
             (self.service.clone(), self.folder.clone(), self.home.clone());
-        let view = cx.new(|cx| NewTask::new(service, url, folder, home, cx));
+        let view = cx.new(|cx| NewTask::new(service, url, folder, home, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,

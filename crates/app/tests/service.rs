@@ -209,8 +209,8 @@ fn a_task_downloads_and_is_recorded_as_done() {
     assert!(folder.join("index.mp4").is_file());
 }
 
-/// 第一个分片下完后暂停：停下为暂停、任务目录保留、总片数记下，查看任务目录得到已下的 1 片；关掉应用重开后继续，只
-/// 补下没完成的分片。
+/// 第一个分片下完后暂停：停下为暂停、任务目录保留、总片数记下，查看任务目录得到已下的 1 片；关掉应用重开后改请求头、
+/// 继续，只补下没完成的分片。
 #[test]
 fn a_paused_task_resumes_after_reopening() {
     let dir = test_dir("pause");
@@ -246,7 +246,20 @@ fn a_paused_task_resumes_after_reopening() {
     assert!(matches!(service.forget(id), Err(Error::NotFinished(_))));
     let saved = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap();
     assert_eq!((saved.segments, saved.live), (1, false));
+    // 停着时可以改请求头，不合要求的拒收
+    let bad = vec![("Bad Name".to_owned(), "x".to_owned())];
+    assert!(matches!(
+        service.set_headers(id, bad),
+        Err(Error::InvalidInput(_))
+    ));
+    let referer = vec![("Referer".to_owned(), "https://example.com/".to_owned())];
+    service.set_headers(id, referer.clone()).unwrap();
+    assert_eq!(service.tasks().unwrap()[0].spec.headers, referer);
     service.resume(id).unwrap();
+    assert!(matches!(
+        service.set_headers(id, Vec::new()),
+        Err(Error::Running(_))
+    ));
     let status = rt.block_on(ended(&mut events, id, |_| {}));
 
     assert_eq!(status, Status::Done);

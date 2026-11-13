@@ -12,13 +12,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{
-    Bounds, Context, EventEmitter, IntoElement, ParentElement as _, PathPromptOptions, Pixels,
-    Render, Styled as _, Task, Window, div, px,
+    AppContext as _, Bounds, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
+    PathPromptOptions, Pixels, Render, Styled as _, Task, Window, div, px,
 };
 use hs_m3u8_app::{Draft, OutputKind, Service};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, Source, Url};
 
+use crate::headers::HeadersEditor;
 use crate::ui::{BOTTOM, GAP};
 
 /// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
@@ -88,6 +89,8 @@ pub struct NewTask {
     error: Option<String>,
     /// 点了开始、服务还在新建：开始按钮不可用
     creating: bool,
+    /// 额外的请求头
+    headers: Entity<HeadersEditor>,
     _probe: Task<()>,
 }
 
@@ -99,9 +102,11 @@ impl NewTask {
         url: Url,
         folder: PathBuf,
         home: Option<PathBuf>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let handle = service.probe(Source::new(url.clone()));
+        let headers = cx.new(|cx| HeadersEditor::new(Vec::new(), window, cx));
         let probe = cx.spawn(async move |this, cx| {
             let probing = match handle.await {
                 Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
@@ -132,6 +137,7 @@ impl NewTask {
             rings_bounds: Rc::new(Cell::new(Bounds::default())),
             error: None,
             creating: false,
+            headers,
             _probe: probe,
         }
     }
@@ -191,14 +197,20 @@ impl NewTask {
         .detach();
     }
 
-    /// 交出选择，由主窗口新建任务。
-    fn start(&mut self, cx: &mut Context<Self>) {
+    /// 交出选择，由主窗口新建任务；请求头输入框里还没按回车的一条加不进去时不交，原因显示在输入框下面。
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating || !matches!(self.probing, Probing::Ready(_)) {
+            return;
+        }
+        let Some(headers) = self
+            .headers
+            .update(cx, |editor, cx| editor.take(window, cx))
+        else {
+            return;
+        };
         let Probing::Ready(probe) = &self.probing else {
             return;
         };
-        if self.creating {
-            return;
-        }
         let preference = match &probe.master {
             Some(master) => Preference {
                 variant: master.variants[self.variant].choice(),
@@ -214,7 +226,7 @@ impl NewTask {
         let draft = Draft {
             url: self.url.clone(),
             preference,
-            headers: Vec::new(),
+            headers,
             output: self.output,
             folder: self.folder.clone(),
             live: probe.live,
