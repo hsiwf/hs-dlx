@@ -1,11 +1,12 @@
-//! 新建页右边的选项栏：标题与摘要、清晰度之外的选择（音轨、输出、保存位置）与开始按钮。
+//! 新建页右边的选项栏：标题与摘要、清晰度之外的选择（音轨、输出、保存位置、请求头）、请求经哪里走与开始按钮；
+//! 探测失败时为失败原因与能做的事（改请求头重新探测、重新探测）。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::{FailureKind, OutputKind, title_of};
+use hs_m3u8_app::{OutputKind, title_of};
 use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, Route, duration_of};
@@ -52,13 +53,15 @@ impl NewTask {
                 cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
             )),
             Probing::Failed(failure) => {
-                // 被服务器拒绝的多半缺请求头：给出编辑框，带上再探测
-                let rejected = matches!(failure.kind, FailureKind::Status(401 | 403));
+                // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测
+                let headers = failure.kind.headers_may_help();
+                let again = headers || failure.kind.retry_helps();
                 side.child(
                     ui::card(theme::error_edge())
                         .child(SharedString::from(failure.message.clone())),
                 )
-                .when(rejected, |side| {
+                .children(self.route_line())
+                .when(headers, |side| {
                     side.child(
                         div()
                             .flex()
@@ -73,16 +76,18 @@ impl NewTask {
                     div()
                         .flex()
                         .gap(px(10.))
-                        .child(ui::button(
-                            "reprobe",
-                            if rejected {
-                                "带上请求头重新探测"
-                            } else {
-                                "重新探测"
-                            },
-                            Tone::Glow,
-                            cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
-                        ))
+                        .when(again, |row| {
+                            row.child(ui::button(
+                                "reprobe",
+                                if headers {
+                                    "带上请求头重新探测"
+                                } else {
+                                    "重新探测"
+                                },
+                                Tone::Glow,
+                                cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
+                            ))
+                        })
                         .child(ui::button(
                             "dismiss",
                             "返回",
@@ -93,6 +98,28 @@ impl NewTask {
             }
             Probing::Ready(probe) => self.ready_side(side, probe, cx),
         }
+    }
+
+    /// 「网络」一行：这个地址的请求经哪个代理或为什么直连；还没读到系统代理时为 None。
+    fn route_line(&self) -> Option<Div> {
+        let line = match self.route.as_ref()? {
+            Route::Proxy(proxy, source) => ui::num(
+                div()
+                    .text_size(px(13.))
+                    .truncate()
+                    .child(format!("经代理 {proxy}（{source}）")),
+            ),
+            Route::Direct(why) => div().text_size(px(13.)).child(format!("直连 · {why}")),
+            Route::Broken(why) => ui::error_text(why.clone()),
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(ui::caption("网络"))
+                .child(line),
+        )
     }
 
     /// 标题下的一行：主机 · 时长 · 几档清晰度 · 几条音轨 · 直播。直播的时长是当前窗口的，不写。
@@ -223,25 +250,8 @@ impl NewTask {
                 .child(ui::caption("请求头"))
                 .child(self.headers.clone()),
         );
-        if let Some(route) = &self.route {
-            let line = match route {
-                Route::Proxy(proxy, source) => ui::num(
-                    div()
-                        .text_size(px(13.))
-                        .truncate()
-                        .child(format!("经代理 {proxy}（{source}）")),
-                ),
-                Route::Direct(why) => div().text_size(px(13.)).child(format!("直连 · {why}")),
-                Route::Broken(why) => ui::error_text(why.clone()),
-            };
-            options = options.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(ui::caption("网络"))
-                    .child(line),
-            );
+        if let Some(line) = self.route_line() {
+            options = options.child(line);
         }
 
         let picked = master.map(|m| &m.variants[self.variant]);

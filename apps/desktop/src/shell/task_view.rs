@@ -7,9 +7,10 @@ use gpui_kit::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
-use hs_m3u8_app::{FailureKind, Status};
+use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
+use super::plan::{Action, stopped_plan};
 use super::row::{Row, look};
 use super::{Shell, live_view};
 use crate::ring;
@@ -162,6 +163,16 @@ impl Shell {
             .editing_headers
             .as_ref()
             .filter(|(id, _)| *id == row.task.id)?;
+        // 存完接着跑：暂停的继续；失败的在重试或改请求头可能有用时重试，其余（再试也一样的）只保存
+        let (label, run_after) = match &row.task.status {
+            Status::Paused => ("保存并继续", true),
+            Status::Failed(failure)
+                if failure.kind.retry_helps() || failure.kind.headers_may_help() =>
+            {
+                ("保存并重试", true)
+            }
+            _ => ("保存", false),
+        };
         Some(
             div()
                 .flex()
@@ -180,9 +191,11 @@ impl Shell {
                         .gap(px(10.))
                         .child(ui::button(
                             "save-headers",
-                            "保存并重试",
+                            label,
                             Tone::Glow,
-                            cx.listener(|this, _, window, cx| this.save_headers(window, cx)),
+                            cx.listener(move |this, _, window, cx| {
+                                this.save_headers(run_after, window, cx)
+                            }),
                         ))
                         .child(ui::button(
                             "cancel-headers",
@@ -197,8 +210,7 @@ impl Shell {
         )
     }
 
-    /// 暂停或失败的任务的操作，最该按的那一个发光：被拒或取到错误页的先改请求头；直播接不上之前录的先写出已录的；
-    /// 其余先继续（重试）。再试也一样的失败不给重试；直播停着时都能只写出已录的；任何停着的任务都能改请求头。
+    /// 暂停或失败的任务的操作（见 [`stopped_plan`]），第一个发光，改请求头不在第一个时只是文字。
     fn stopped_actions(
         &self,
         row: &Row,
@@ -214,81 +226,69 @@ impl Shell {
             .editing_headers
             .as_ref()
             .is_some_and(|(at, _)| *at == id);
-        let headers_first = failure.is_some_and(FailureKind::headers_may_help);
-        let recorded_first = row.recording() && failure == Some(FailureKind::SourceChanged);
-        let mut glow = true;
-        let mut tone = move || {
-            if std::mem::replace(&mut glow, false) {
-                Tone::Glow
-            } else {
-                Tone::Plain
-            }
-        };
-        let mut actions = Vec::new();
-        let edit_headers = |tone, cx: &mut Context<Self>| {
-            ui::button(
-                "edit-headers",
-                "改请求头",
-                tone,
-                cx.listener(move |this, _, window, cx| this.edit_headers(id, window, cx)),
-            )
-            .into_any_element()
-        };
-        let write_recorded = |tone, cx: &mut Context<Self>| {
-            ui::button(
-                "write-recorded",
-                "写出已录的",
-                tone,
-                cx.listener(move |this, _, _, cx| this.write_recorded(id, cx)),
-            )
-            .into_any_element()
-        };
-        if headers_first && !editing {
-            actions.push(edit_headers(tone(), cx));
-        }
-        if recorded_first {
-            actions.push(write_recorded(tone(), cx));
-        }
-        if failure.is_none_or(FailureKind::retry_helps) {
-            actions.push(
-                ui::button(
-                    "resume",
-                    if failure.is_some() {
-                        "重试"
-                    } else {
-                        "继续"
-                    },
-                    tone(),
-                    cx.listener(move |this, _, _, cx| this.resume(id, cx)),
-                )
-                .into_any_element(),
-            );
-        }
-        if row.recording() && !recorded_first {
-            actions.push(write_recorded(Tone::Plain, cx));
-        }
-        if !headers_first && !editing {
-            actions.push(edit_headers(Tone::Ghost, cx));
-        }
-        // 输出路径上已有东西：打开保存目录，被占的那个就在里面，挪走后再试
-        if failure == Some(FailureKind::OutputTaken) {
-            let target = row.task.spec.output.options().target;
-            let folder = target
-                .mp4()
-                .or(target.hls())
-                .and_then(|path| path.parent())
-                .expect("输出是以文件名结尾的绝对路径")
-                .to_path_buf();
-            actions.push(
-                ui::button(
-                    "reveal",
-                    "打开保存目录",
-                    Tone::Plain,
-                    move |_, _, cx| cx.open_with_system(&folder),
-                )
-                .into_any_element(),
-            );
-        }
+        let plan = stopped_plan(
+            failure,
+            row.recording(),
+            row.writing_recorded.is_some(),
+            editing,
+        );
+        let mut actions: Vec<AnyElement> = plan
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let tone = match (index, action) {
+                    (0, _) => Tone::Glow,
+                    (_, Action::EditHeaders) => Tone::Ghost,
+                    _ => Tone::Plain,
+                };
+                match action {
+                    Action::EditHeaders => ui::button(
+                        "edit-headers",
+                        "改请求头",
+                        tone,
+                        cx.listener(move |this, _, window, cx| this.edit_headers(id, window, cx)),
+                    ),
+                    Action::WriteRecorded => ui::button(
+                        "write-recorded",
+                        "写出已录的",
+                        tone,
+                        cx.listener(move |this, _, _, cx| this.write_recorded(id, cx)),
+                    ),
+                    Action::SwitchToHls => ui::button(
+                        "switch-hls",
+                        "改存本地 HLS",
+                        tone,
+                        cx.listener(move |this, _, _, cx| this.switch_to_hls(id, cx)),
+                    ),
+                    Action::Resume => ui::button(
+                        "resume",
+                        if failure.is_some() {
+                            "重试"
+                        } else {
+                            "继续"
+                        },
+                        tone,
+                        cx.listener(move |this, _, _, cx| this.resume(id, cx)),
+                    ),
+                    Action::OpenFolder => {
+                        let target = row.task.spec.output.options().target;
+                        let folder = target
+                            .mp4()
+                            .or(target.hls())
+                            .and_then(|path| path.parent())
+                            .expect("输出是以文件名结尾的绝对路径")
+                            .to_path_buf();
+                        ui::button(
+                            "open-folder",
+                            "打开保存目录",
+                            tone,
+                            move |_, _, cx| cx.open_with_system(&folder),
+                        )
+                    }
+                }
+                .into_any_element()
+            })
+            .collect();
         actions.push(discard);
         actions
     }

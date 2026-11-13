@@ -15,7 +15,7 @@ use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output,
-    OutputOptions, Probe, Progress, Saved, Source, Stage, Unsettled, check_header,
+    OutputOptions, Probe, Progress, Saved, Source, Stage, Unsettled, check_option_header,
 };
 use rusqlite::Transaction;
 use tokio::runtime::Runtime;
@@ -25,7 +25,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
-use crate::{Draft, Error, Failure, Finished, Status, Task, TaskId, TaskSpec, naming};
+use crate::{Draft, Error, Failure, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming};
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -231,6 +231,31 @@ impl Service {
         self.shared.resume(id, Run::WriteRecorded)
     }
 
+    /// 把停着的任务的输出改为只要本地 HLS（目录与 MP4 同名、去掉扩展名），任务目录不变，已下的分片照样用：用于内容
+    /// 放不进 MP4（[`crate::FailureKind::Mp4Unsupported`]）之后，再继续或只写出已录的。只输出本地 HLS 的不变；新路径已被
+    /// 别的任务占着时报 [`Error::PathTaken`]；拒绝的情形同 [`Service::set_headers`]。
+    pub fn switch_to_hls(&self, id: TaskId) -> Result<(), Error> {
+        self.shared.write(|tx| {
+            if lock(&self.shared.running).contains_key(&id) {
+                return Err(Error::Running(id));
+            }
+            if lock(&self.shared.discarding).contains(&id) {
+                return Err(Error::Discarding(id));
+            }
+            let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
+            match task.status {
+                Status::Done => return Err(Error::AlreadyDone(id)),
+                Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
+                Status::Running | Status::Paused | Status::Failed(_) => {}
+            }
+            let hls = match task.spec.output {
+                OutputSpec::Hls(_) => return Ok(()),
+                OutputSpec::Mp4(mp4) | OutputSpec::Both { mp4, .. } => mp4.with_extension(""),
+            };
+            store::set_output(tx, id, &OutputSpec::Hls(hls))
+        })
+    }
+
     /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
     pub fn task(&self, id: TaskId) -> Result<Task, Error> {
         let mut store = lock(&self.shared.store);
@@ -276,12 +301,12 @@ impl Service {
         })
     }
 
-    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_header`]）的报
+    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）的报
     /// [`Error::InvalidInput`]；任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、放弃没做完
     /// 的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
     pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
         for (name, value) in &headers {
-            check_header(name, value).map_err(Error::InvalidInput)?;
+            check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
         self.shared.write(|tx| {
             if lock(&self.shared.running).contains_key(&id) {
@@ -548,7 +573,7 @@ impl Shared {
             self.abandon(job, work_dir);
             return Err(error);
         }
-        self.track(&task, job);
+        self.track(&task, job, Run::Resume);
         Ok(task)
     }
 
@@ -583,7 +608,7 @@ impl Shared {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
             job.control().cancel();
         }
-        self.track(&task, job);
+        self.track(&task, job, run);
         drop(store);
         committed
     }
@@ -624,7 +649,7 @@ impl Shared {
 
     /// 登记运行中的任务 `task`，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。下载开始后的点播
     /// 总片数与存储里记着的不同时记下。调用方须在运行时里。
-    fn track(self: &Arc<Self>, task: &Task, job: Job) {
+    fn track(self: &Arc<Self>, task: &Task, job: Job, run: Run) {
         let (id, total, live) = (task.id, task.total, task.spec.live);
         let control = job.control();
         let (stopped_tx, stopped) = watch::channel(false);
@@ -660,8 +685,10 @@ impl Shared {
             let last = control.progress().borrow().clone();
             let vod = match &result {
                 Ok(output) => output.live.is_none(),
+                // 只写出已录的必是直播
                 Err(_) => {
-                    matches!(last.stage, Stage::Downloading | Stage::Writing)
+                    run == Run::Resume
+                        && matches!(last.stage, Stage::Downloading | Stage::Writing)
                         && !(live && (forwarded.recorded || last.session.is_some()))
                 }
             };

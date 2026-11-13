@@ -117,9 +117,10 @@ impl Shell {
         match self.service.write_recorded(id) {
             Ok(()) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
+                // 核心报出进度之前，已录时长先按停下时知道的显示
+                row.writing_recorded = Some(row.recorded());
                 row.task.status = Status::Running;
                 row.progress = None;
-                row.writing_recorded = true;
                 row.forget_disk();
                 // 写出不联网，没有下载速度与剩余时间可估
                 row.rate = Rate::new(Instant::now(), None);
@@ -128,6 +129,32 @@ impl Shell {
             Err(error) => self.notify(format!("写出「{title}」已录的失败：{error}")),
         }
         cx.notify();
+    }
+
+    /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下。
+    pub(super) fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        let title = self.title(id);
+        let Some(live) = self.row(id).map(Row::recording) else {
+            return;
+        };
+        if let Err(error) = self.service.switch_to_hls(id) {
+            self.notify(format!("「{title}」没能改存本地 HLS：{error}"));
+            cx.notify();
+            return;
+        }
+        match self.service.task(id) {
+            Ok(task) => {
+                if let Some(row) = self.row_mut(id) {
+                    row.task.spec.output = task.spec.output;
+                }
+            }
+            Err(error) => self.notify(format!("读不出「{title}」改后的输出：{error}")),
+        }
+        if live {
+            self.write_recorded(id, cx);
+        } else {
+            self.resume(id, cx);
+        }
     }
 
     pub(super) fn resume_now(&mut self, id: TaskId) {
@@ -156,7 +183,7 @@ impl Shell {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 row.task.status = Status::Running;
                 row.progress = None;
-                row.writing_recorded = false;
+                row.writing_recorded = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
@@ -199,13 +226,20 @@ impl Shell {
                     Ok(Err(error)) => vec![format!("放弃「{title}」失败：{error}")],
                     Err(join) => vec![format!("放弃「{title}」中途出错：{join}")],
                 };
-                // 没删干净的、超时的，服务里已记为放弃没做完：照服务里的状态改这一行
-                let status = this.service.task(id).map(|task| task.status);
+                // 没删干净的、超时的，服务里已记为放弃没做完：照服务里的状态改这一行（行还在时）
+                if this.row(id).is_some() {
+                    match this.service.task(id) {
+                        Ok(task) => {
+                            let row = this.row_mut(id).expect("上面刚找到这一行");
+                            row.task.status = task.status;
+                        }
+                        Err(error) => this.notify(format!(
+                            "读不出「{title}」放弃后的状态（{error}），界面上的状态可能不对"
+                        )),
+                    }
+                }
                 if let Some(row) = this.row_mut(id) {
                     row.discarding = false;
-                    if let Ok(status) = status {
-                        row.task.status = status;
-                    }
                 }
                 if !problems.is_empty() && this.quitting {
                     this.cancel_quit("放弃没做干净，没有退出".to_owned());
@@ -233,7 +267,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// 打开失败任务 `id` 的请求头编辑框，填上它现在的请求头。
+    /// 打开停着的任务 `id` 的请求头编辑框，填上它现在的请求头。
     pub(super) fn edit_headers(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(headers) = self.row(id).map(|row| row.task.spec.headers.clone()) else {
             return;
@@ -244,8 +278,14 @@ impl Shell {
         cx.notify();
     }
 
-    /// 存下编辑框里的请求头并重试；编辑框里还没按回车的一条加不进去时什么也不做（原因显示在编辑框里）。
-    pub(super) fn save_headers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 存下编辑框里的请求头，`run_after` 时接着继续；编辑框里还没按回车的一条加不进去时什么也不做（原因显示在编辑
+    /// 框里）。
+    pub(super) fn save_headers(
+        &mut self,
+        run_after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((id, editor)) = self.editing_headers.clone() else {
             return;
         };
@@ -258,7 +298,9 @@ impl Shell {
                 if let Some(row) = self.row_mut(id) {
                     row.task.spec.headers = headers;
                 }
-                self.resume(id, cx);
+                if run_after {
+                    self.resume(id, cx);
+                }
             }
             Err(error) => {
                 let title = self.title(id);

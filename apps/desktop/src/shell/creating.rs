@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpui_kit::{AppContext as _, Context, Entity, Window};
+use gpui_kit::{AppContext as _, Context, Entity, Focusable as _, Window};
 use hs_m3u8_app::{Draft, Event};
 use hs_m3u8_core::Url;
 
@@ -55,7 +55,19 @@ impl Shell {
                         this.create(view.clone(), (**draft).clone(), window, cx)
                     }
                     NewTaskEvent::Dismissed => this.new_task = None,
-                    NewTaskEvent::FolderChanged(folder) => this.folder = folder.clone(),
+                    // 用户还在粘贴栏里打别的链接时不抢焦点：只在粘贴栏里还是这个链接、或焦点不在粘贴栏时给
+                    NewTaskEvent::Ready => {
+                        let typing = this.paste.read(cx).focus_handle(cx).is_focused(window);
+                        let same = links::http_url(&this.paste.read(cx).value())
+                            .is_some_and(|url| &url == view.read(cx).url());
+                        if !typing || same {
+                            view.update(cx, |view, cx| view.focus(window, cx));
+                        }
+                    }
+                    NewTaskEvent::FolderChanged(folder) => {
+                        this.folder = folder.clone();
+                        this.watch_free_space(cx);
+                    }
                 }
                 cx.notify();
             },

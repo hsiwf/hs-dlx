@@ -2,7 +2,8 @@
 
 use hs_m3u8_core::remux::Error as RemuxError;
 use hs_m3u8_core::{
-    Error as CoreError, FetchFailure, HttpErrorKind, RefreshReason, StallReason, WorkDirProblem,
+    Error as CoreError, FetchFailure, HttpErrorKind, RefreshReason, StallReason, Unsupported,
+    WorkDirProblem,
 };
 
 /// 任务以失败结束：种类与说明。
@@ -23,7 +24,7 @@ impl Failure {
     }
 }
 
-/// 失败的种类：调用方据此决定怎么提示、能不能重试、该不该先改请求头。
+/// 失败的种类：调用方据此决定怎么提示、能不能重试、该不该先改请求头或换输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// 服务器回了这个 HTTP 状态码（如 403：多要带上 Referer、Cookie 之类的请求头）
@@ -42,9 +43,13 @@ pub enum FailureKind {
     Malformed,
     /// 直播长时间录不到新分片
     Stalled,
-    /// 来源用了不支持的特性，或内容放不进 MP4
+    /// 内容放不进 MP4：改存本地 HLS 可以，已下的分片照样用
+    Mp4Unsupported,
+    /// 来源用了不支持的特性（DRM 等加密、只有关键帧的轨、增量更新的播放列表等），或不是 HLS
     Unsupported,
-    /// 其余
+    /// 再试也一样的其余失败：任务目录认不出、参数不对、重定向过多、服务器不照范围请求回应、合并时内容不对等
+    Unrecoverable,
+    /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端）
     Other,
 }
 
@@ -70,12 +75,7 @@ impl FailureKind {
             },
             CoreError::Incomplete { .. } | CoreError::SystemProxy(_) => FailureKind::Network,
             CoreError::Io { .. } | CoreError::VolumeUnavailable { .. } => FailureKind::Disk,
-            CoreError::Remux(error) => match error.as_ref() {
-                RemuxError::Io { .. } | RemuxError::OpenOutput { .. } => FailureKind::Disk,
-                RemuxError::Unsupported(_) => FailureKind::Unsupported,
-                // 其余是合并本身出的错
-                _ => FailureKind::Other,
-            },
+            CoreError::Remux(error) => FailureKind::of_remux(error),
             CoreError::OutputExists(_) | CoreError::OutputOccupied { .. } => {
                 FailureKind::OutputTaken
             }
@@ -88,25 +88,39 @@ impl FailureKind {
                 | WorkDirProblem::SelectionGone
                 | WorkDirProblem::SourceUnverified
                 | WorkDirProblem::Unaligned { .. } => FailureKind::SourceChanged,
-                WorkDirProblem::Locked
-                | WorkDirProblem::Corrupt(_)
+                WorkDirProblem::Locked => FailureKind::Other,
+                WorkDirProblem::Corrupt(_)
                 | WorkDirProblem::UnsupportedVersion { .. }
-                | WorkDirProblem::NotLiveRecording => FailureKind::Other,
+                | WorkDirProblem::NotLiveRecording => FailureKind::Unrecoverable,
             },
             CoreError::Select(_) => FailureKind::SourceChanged,
             CoreError::Playlist { .. }
             | CoreError::KeyLength { .. }
-            | CoreError::ResponseTooLarge { .. }
             | CoreError::Integrity { .. } => FailureKind::Malformed,
-            CoreError::Unsupported(_) | CoreError::NotMediaPlaylist { .. } => {
+            CoreError::Unsupported(unsupported) => match unsupported {
+                Unsupported::Mp4(_) => FailureKind::Mp4Unsupported,
+                Unsupported::EmptyPlaylist(_)
+                | Unsupported::NoTargetDuration(_)
+                | Unsupported::Encryption { .. }
+                | Unsupported::KeyWithoutUri(_)
+                | Unsupported::IFramesOnly { .. }
+                | Unsupported::DeltaUpdate { .. }
+                | Unsupported::Hls(_)
+                | Unsupported::InitChangesWithinGroup { .. }
+                | Unsupported::DiscontinuityMismatch { .. }
+                | Unsupported::NoMergeableGroup(_)
+                | Unsupported::Fmp4BaseDataOffset { .. }
+                | Unsupported::TsInit(_) => FailureKind::Unsupported,
+            },
+            // 地址多半指向视频文件或直播流，不是 HLS
+            CoreError::NotMediaPlaylist { .. } | CoreError::ResponseTooLarge { .. } => {
                 FailureKind::Unsupported
             }
             CoreError::InvalidInput(_)
             | CoreError::LiveNotEnabled
             | CoreError::NothingRecorded
-            | CoreError::Hook { .. }
-            | CoreError::HttpClientInit(_)
-            | CoreError::Cancelled => FailureKind::Other,
+            | CoreError::Hook { .. } => FailureKind::Unrecoverable,
+            CoreError::HttpClientInit(_) | CoreError::Cancelled => FailureKind::Other,
         }
     }
 
@@ -121,12 +135,42 @@ impl FailureKind {
             HttpErrorKind::RangeIgnored(_)
             | HttpErrorKind::RangeMismatch(_)
             | HttpErrorKind::Redirect(_)
-            | HttpErrorKind::InvalidRequest(_) => FailureKind::Other,
+            | HttpErrorKind::InvalidRequest(_) => FailureKind::Unrecoverable,
         }
     }
 
-    /// 什么都不改、再试一次有没有可能成功：状态码只有 408、429 与 5xx 是暂时的；证书、内容不对、来源变了、不支持的
-    /// 再试也一样；磁盘、输出已存在、网络与停滞的，外面的情况会变（腾出空间、挪走文件、网络恢复）。
+    /// 合并（写 MP4、核对能否合并）时的错误。
+    fn of_remux(error: &RemuxError) -> FailureKind {
+        match error {
+            RemuxError::Io { .. } | RemuxError::OpenOutput { .. } => FailureKind::Disk,
+            RemuxError::Unsupported(_) => FailureKind::Mp4Unsupported,
+            RemuxError::Cancelled => FailureKind::Other,
+            RemuxError::Init(_)
+            | RemuxError::NoGroups
+            | RemuxError::StreamsCount { .. }
+            | RemuxError::TrackCount { .. }
+            | RemuxError::EmptyTrack { .. }
+            | RemuxError::InvalidGaps { .. }
+            | RemuxError::EmptyGroup { .. }
+            | RemuxError::NonUtf8Path(_)
+            | RemuxError::Unrecognized(_)
+            | RemuxError::Fmp4 { .. }
+            | RemuxError::Fmp4OpenEnded { .. }
+            | RemuxError::OpenInput { .. }
+            | RemuxError::DuplicateKind { .. }
+            | RemuxError::UnplacedPacket { .. }
+            | RemuxError::RejectedOptions(_)
+            | RemuxError::Read { .. }
+            | RemuxError::Mux(_)
+            | RemuxError::Reread { .. }
+            | RemuxError::VerifyStreams { .. }
+            | RemuxError::VerifyPackets { .. } => FailureKind::Unrecoverable,
+        }
+    }
+
+    /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件）后再试，有没有可能成功；不需要处理什么的暂时性故障
+    /// （408、429、5xx、超时、停滞）同样算。证书、内容不对、来源变了、放不进 MP4、不支持与其余再试也一样的不算：
+    /// 它们要改请求头、换输出，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
     pub fn retry_helps(self) -> bool {
         match self {
             FailureKind::Status(code) => matches!(code, 408 | 429 | 500..=599),
@@ -138,7 +182,9 @@ impl FailureKind {
             FailureKind::Certificate
             | FailureKind::SourceChanged
             | FailureKind::Malformed
-            | FailureKind::Unsupported => false,
+            | FailureKind::Mp4Unsupported
+            | FailureKind::Unsupported
+            | FailureKind::Unrecoverable => false,
         }
     }
 
@@ -160,6 +206,8 @@ impl FailureKind {
             FailureKind::Disk => "disk".into(),
             FailureKind::OutputTaken => "output-taken".into(),
             FailureKind::SourceChanged => "source-changed".into(),
+            FailureKind::Mp4Unsupported => "mp4-unsupported".into(),
+            FailureKind::Unrecoverable => "unrecoverable".into(),
             FailureKind::Malformed => "malformed".into(),
             FailureKind::Stalled => "stalled".into(),
             FailureKind::Unsupported => "unsupported".into(),
@@ -175,6 +223,8 @@ impl FailureKind {
             "disk" => FailureKind::Disk,
             "output-taken" => FailureKind::OutputTaken,
             "source-changed" => FailureKind::SourceChanged,
+            "mp4-unsupported" => FailureKind::Mp4Unsupported,
+            "unrecoverable" => FailureKind::Unrecoverable,
             "malformed" => FailureKind::Malformed,
             "stalled" => FailureKind::Stalled,
             "unsupported" => FailureKind::Unsupported,
@@ -182,6 +232,42 @@ impl FailureKind {
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
         })
     }
+}
+
+/// 每一种失败（状态码取一个）。下面的 match 列出全部种类：加种类时编译器逼着补进来，存储与写法的测试才覆盖得到。
+#[cfg(test)]
+pub(crate) fn every() -> Vec<FailureKind> {
+    let all = vec![
+        FailureKind::Status(403),
+        FailureKind::Network,
+        FailureKind::Certificate,
+        FailureKind::Disk,
+        FailureKind::OutputTaken,
+        FailureKind::SourceChanged,
+        FailureKind::Malformed,
+        FailureKind::Stalled,
+        FailureKind::Mp4Unsupported,
+        FailureKind::Unsupported,
+        FailureKind::Unrecoverable,
+        FailureKind::Other,
+    ];
+    for kind in &all {
+        match kind {
+            FailureKind::Status(_)
+            | FailureKind::Network
+            | FailureKind::Certificate
+            | FailureKind::Disk
+            | FailureKind::OutputTaken
+            | FailureKind::SourceChanged
+            | FailureKind::Malformed
+            | FailureKind::Stalled
+            | FailureKind::Mp4Unsupported
+            | FailureKind::Unsupported
+            | FailureKind::Unrecoverable
+            | FailureKind::Other => {}
+        }
+    }
+    all
 }
 
 #[cfg(test)]
@@ -246,18 +332,7 @@ mod tests {
 
     #[test]
     fn codes_round_trip() {
-        for kind in [
-            FailureKind::Status(403),
-            FailureKind::Network,
-            FailureKind::Certificate,
-            FailureKind::Disk,
-            FailureKind::OutputTaken,
-            FailureKind::SourceChanged,
-            FailureKind::Malformed,
-            FailureKind::Stalled,
-            FailureKind::Unsupported,
-            FailureKind::Other,
-        ] {
+        for kind in every() {
             assert_eq!(FailureKind::parse(&kind.code()), Some(kind));
         }
         assert_eq!(FailureKind::parse("status:x"), None);

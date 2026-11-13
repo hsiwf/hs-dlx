@@ -52,8 +52,8 @@ pub struct Row {
     pub discarding: bool,
     /// 直播录制这次打开应用以来的时间线（钟面用）
     pub timeline: Timeline,
-    /// 这次运行只写出已录的（不联网）：不算录制，不给停止
-    pub writing_recorded: bool,
+    /// 最近一次运行是只写出已录的（不联网）时为开始时的已录时长：运行中不算录制、不给停止；失败后重试也只写出
+    pub writing_recorded: Option<Duration>,
 }
 
 impl Row {
@@ -100,7 +100,7 @@ impl Row {
             resuming: false,
             discarding: false,
             timeline: Timeline::default(),
-            writing_recorded: false,
+            writing_recorded: None,
         }
     }
 
@@ -138,7 +138,7 @@ impl Row {
     /// 是直播的录制：运行中过了准备阶段的按阶段；其余（停下的、还在准备的）按任务目录里的记录（继续前读到的），
     /// 没读到时按新建时的选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
     pub fn recording(&self) -> bool {
-        if self.task.status == Status::Running && self.writing_recorded {
+        if self.task.status == Status::Running && self.writing_recorded.is_some() {
             return false;
         }
         if let Some(p) = &self.progress
@@ -251,10 +251,9 @@ fn failure_text(failure: &Failure) -> (String, &'static str) {
             "取到的不是视频该有的内容，多为错误页或登录页，常要补 Cookie",
         ),
         FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
-        FailureKind::Unsupported => (
-            "不支持".into(),
-            "来源用了不支持的特性，或内容放不进 MP4（可改存本地 HLS 重新下载）",
-        ),
+        FailureKind::Mp4Unsupported => ("MP4".into(), "内容放不进 MP4：改存本地 HLS，已下的照样用"),
+        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
+        FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见右边的信号"),
         FailureKind::Other => ("!".into(), "原因见右边的信号"),
     }
 }
@@ -432,20 +431,20 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             },
             big: percent.clone(),
             line: count.map_or_else(
-                || "不经网络".to_owned(),
-                |c| format!("已写 {} / {} 个文件 · 不经网络", c.done, c.total),
+                || "不联网".to_owned(),
+                |c| format!("已写 {} / {} 个文件 · 不联网", c.done, c.total),
             ),
             fraction: written,
             orb: theme::cyan_pale(),
             short: percent,
         };
     }
-    if row.writing_recorded {
+    if let Some(recorded) = row.writing_recorded {
         return Look {
             state: "准备写出".to_owned(),
             color: theme::cyan(),
             ticks: Ticks::of(0, 0, true),
-            big: format::clock(amount.duration),
+            big: format::clock(amount.duration.max(recorded)),
             line: "不联网，只写出已录的".to_owned(),
             fraction: 0.0,
             orb: theme::cyan(),

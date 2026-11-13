@@ -529,3 +529,34 @@ fn writing_recorded_content_of_a_download_fails_visibly() {
     assert_eq!(service.task(id).unwrap().status, status);
     assert!(folder.join("index.hsdl").is_dir());
 }
+
+/// 下到一半改存本地 HLS：任务目录不变，继续后写出同名的本地 HLS 目录，不再写 MP4。
+#[test]
+fn a_paused_task_can_switch_to_local_hls() {
+    let dir = test_dir("switch-hls");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let id = create(
+        &rt,
+        &service,
+        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+    )
+    .id;
+    rt.block_on(first_segment(&mut events, id));
+    service.pause(id);
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Paused);
+
+    service.switch_to_hls(id).unwrap();
+    assert_eq!(
+        service.task(id).unwrap().spec.output,
+        OutputSpec::Hls(folder.join("index"))
+    );
+    server.gate.open();
+    service.resume(id).unwrap();
+
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Done);
+    assert!(folder.join("index").join("index.m3u8").is_file());
+    assert!(!folder.join("index.mp4").exists());
+}

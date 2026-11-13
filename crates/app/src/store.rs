@@ -66,7 +66,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
                 (status = 'failed') = (failure IS NOT NULL)
                 AND (failure IS NULL
                      OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'malformed',
-                                    'stalled', 'unsupported', 'other')
+                                    'stalled', 'mp4-unsupported', 'unsupported', 'unrecoverable', 'other')
                      OR failure GLOB 'status:[0-9][0-9][0-9]')
             ),
             created_at INTEGER NOT NULL,
@@ -312,8 +312,14 @@ pub fn get(tx: &Transaction<'_>, id: TaskId) -> Result<Option<Task>, Error> {
 /// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录与任务目录。新建任务选主名时避开
 /// 它们。
 pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
-    let mut statement = tx.prepare("SELECT mp4_path, hls_path, work_dir FROM task")?;
-    let rows = statement.query_map([], |row| {
+    taken_except(tx, None)
+}
+
+/// 除任务 `except` 之外的任务占用的路径的比较键；`except` 为 None 时为全部任务的。
+fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<String>, Error> {
+    let mut statement =
+        tx.prepare("SELECT mp4_path, hls_path, work_dir FROM task WHERE ?1 IS NULL OR id != ?1")?;
+    let rows = statement.query_map([except.map(|id| id.0)], |row| {
         Ok([
             row.get::<_, Option<String>>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -329,6 +335,26 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
         );
     }
     Ok(taken)
+}
+
+/// 换掉任务的输出；新的输出路径与别的任务的输出或任务目录相同时报 [`Error::PathTaken`]，没有这个任务时报
+/// [`Error::NotFound`]。任务目录不变。
+pub fn set_output(tx: &Transaction<'_>, id: TaskId, output: &OutputSpec) -> Result<(), Error> {
+    let (kind, mp4, hls) = output_columns(output)?;
+    let others = taken_except(tx, Some(id))?;
+    for path in [mp4.as_deref(), hls.as_deref()].into_iter().flatten() {
+        if others.contains(&naming::path_key(path)) {
+            return Err(Error::PathTaken(path.into()));
+        }
+    }
+    if tx.execute(
+        "UPDATE task SET output_kind = ?2, mp4_path = ?3, hls_path = ?4 WHERE id = ?1",
+        params![id.0, kind, mp4, hls],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
 }
 
 /// 换掉任务的请求头；没有这个任务时报 [`Error::NotFound`]。
@@ -656,6 +682,22 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert_eq!(get(&tx, a).unwrap(), None);
+    }
+
+    /// 每一种失败都写得进存储、读得回来（存储里的 CHECK 列着全部写法）。
+    #[test]
+    fn every_failure_kind_is_stored() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let id = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
+        for kind in crate::failure::every() {
+            let failed = Status::Failed(Failure {
+                kind,
+                message: "x".into(),
+            });
+            set_status(&tx, id, &failed).unwrap();
+            assert_eq!(get(&tx, id).unwrap().unwrap().status, failed);
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod live_view;
 mod notices;
 mod operations;
 mod paste_bar;
+mod plan;
 mod quit;
 mod row;
 mod task_list;
@@ -48,13 +49,16 @@ pub const MIN_HEIGHT: f32 = TITLE_HEIGHT
 /// 多久读一次保存目录所在盘的可用空间。
 const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// `folder`（还不存在时取最近的已存在的上级）所在盘对本用户可用的字节数；读不出时为原因。
+/// 读一次可用空间最多等多久：网络盘掉线时读会卡住。
+const FREE_SPACE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 保存目录 `folder` 所在盘对本用户可用的字节数；目录不在（被删、所在的盘没接上）或读不出时为原因。
 fn free_space(folder: &std::path::Path) -> Result<u64, String> {
-    let existing = folder
-        .ancestors()
-        .find(|path| path.exists())
-        .ok_or_else(|| format!("{} 及其上级都不存在", folder.display()))?;
-    fs4::available_space(existing).map_err(|error| error.to_string())
+    match folder.try_exists() {
+        Ok(true) => fs4::available_space(folder).map_err(|error| format!("读不出：{error}")),
+        Ok(false) => Err("保存目录不在".to_owned()),
+        Err(error) => Err(format!("读不出：{error}")),
+    }
 }
 
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
@@ -83,7 +87,7 @@ pub struct Shell {
     clipboard: Option<Url>,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
     confirm_discard: Option<TaskId>,
-    /// 正在改请求头的失败任务与编辑框
+    /// 正在改请求头的停着的任务与编辑框
     editing_headers: Option<(TaskId, Entity<HeadersEditor>)>,
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行
     quitting: bool,
@@ -92,7 +96,7 @@ pub struct Shell {
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
     early: Vec<Event>,
     _events: Task<()>,
-    /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出时为原因
+    /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
     _ticker: Task<()>,
     _free_space: Task<()>,
@@ -164,26 +168,6 @@ impl Shell {
             }
         });
         // 速度按时间窗算，没有新进度时也要随时间降下来：有任务在运行时每秒重画一次
-        // 盘余随下载变化，读一次很快，但网络盘上可能卡住：在后台读，每 10 秒一次
-        let free_space = cx.spawn(async move |this, cx| {
-            loop {
-                let Ok(folder) = this.read_with(cx, |this, _| this.folder.clone()) else {
-                    break;
-                };
-                let read = cx
-                    .background_executor()
-                    .spawn(async move { free_space(&folder) })
-                    .await;
-                let alive = this.update(cx, |this, cx| {
-                    this.free_space = Some(read);
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    break;
-                }
-                cx.background_executor().timer(FREE_SPACE_INTERVAL).await;
-            }
-        });
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -219,13 +203,14 @@ impl Shell {
             _events: receiving,
             free_space: None,
             _ticker: ticker,
-            _free_space: free_space,
+            _free_space: Task::ready(()),
             _subscriptions: vec![typed, activated, quitting],
         };
         let ids: Vec<TaskId> = shell.rows.iter().map(|r| r.task.id).collect();
         for id in ids {
             shell.after_stop(id, cx);
         }
+        shell.watch_free_space(cx);
         shell.refresh_clipboard(cx);
         if let Some(link) = link {
             shell
@@ -337,6 +322,51 @@ impl Shell {
         }
         self.after_stop(id, cx);
         self.quit_if_idle(cx);
+    }
+
+    /// （重新）开始读保存目录所在盘的可用空间：在后台读，每 10 秒一次。一次读超过 3 秒就先报超时，等它读完再接着
+    /// 按间隔读，不叠着发起新的；换了保存目录时调一次，立即按新目录读。
+    fn watch_free_space(&mut self, cx: &mut Context<Self>) {
+        let folder = self.folder.clone();
+        self._free_space = cx.spawn(async move |this, cx| {
+            loop {
+                let target = folder.clone();
+                let mut read = std::pin::pin!(
+                    cx.background_executor()
+                        .spawn(async move { free_space(&target) })
+                );
+                let mut timer = std::pin::pin!(cx.background_executor().timer(FREE_SPACE_TIMEOUT));
+                let early = std::future::poll_fn(|context| {
+                    if let std::task::Poll::Ready(value) = read.as_mut().poll(context) {
+                        return std::task::Poll::Ready(Some(value));
+                    }
+                    timer.as_mut().poll(context).map(|()| None)
+                })
+                .await;
+                let value = match early {
+                    Some(value) => value,
+                    None => {
+                        let late = Err(format!("读了 {} 秒没有结果", FREE_SPACE_TIMEOUT.as_secs()));
+                        let alive = this.update(cx, |this, cx| {
+                            this.free_space = Some(late);
+                            cx.notify();
+                        });
+                        if alive.is_err() {
+                            break;
+                        }
+                        read.await
+                    }
+                };
+                let alive = this.update(cx, |this, cx| {
+                    this.free_space = Some(value);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(FREE_SPACE_INTERVAL).await;
+            }
+        });
     }
 
     fn row(&self, id: TaskId) -> Option<&Row> {

@@ -1,5 +1,5 @@
-//! 新建任务：探测地址，每档清晰度画成一个同心环（越粗码率越高，引线连到右侧的标签），点环选中，再选音轨、输出与
-//! 保存位置。
+//! 新建任务：带着请求头探测地址，每档清晰度画成一个同心环（越粗码率越高，引线连到右侧的标签），点环或用方向键
+//! 选中，再选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新探测；请求经哪个代理写在选项栏里。
 
 mod rings;
 mod side;
@@ -37,6 +37,8 @@ pub enum NewTaskEvent {
     Dismissed,
     /// 换了保存位置：之后新建的任务默认也存到这里
     FolderChanged(PathBuf),
+    /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
+    Ready,
 }
 
 /// 探测进行到哪一步，粘贴栏与任务列表据此显示状态。
@@ -58,8 +60,8 @@ impl Phase {
     }
 }
 
-/// 请求经哪里走（任务用系统代理设置，见 [`hs_m3u8_core::Proxy::System`]）。
-pub(super) enum Route {
+/// 请求经哪里走。任务都用系统代理设置（核心的默认 [`hs_m3u8_core::Proxy::System`]，应用不改它），这里照同一份设置读。
+enum Route {
     /// 经这个代理（已去掉凭据的写法）与读到它的地方
     Proxy(String, &'static str),
     /// 直连，值为原因
@@ -167,22 +169,17 @@ impl NewTask {
             _route: route,
             _probe: Task::ready(()),
         };
-        view.probe(headers, window, cx);
+        view.probe(headers, cx);
         view
     }
 
     /// 带着请求头 `headers` 探测（之前的探测结果作废）。
-    fn probe(
-        &mut self,
-        headers: Vec<(String, String)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn probe(&mut self, headers: Vec<(String, String)>, cx: &mut Context<Self>) {
         let mut source = Source::new(self.url.clone());
         source.http.headers = headers;
         let handle = self.service.probe(source);
         self.probing = Probing::Running;
-        self._probe = cx.spawn_in(window, async move |this, cx| {
+        self._probe = cx.spawn(async move |this, cx| {
             let probing = match handle.await {
                 Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
                 Ok(Err(error)) => Probing::Failed(Failure::of(&error)),
@@ -192,7 +189,7 @@ impl NewTask {
                 }),
             };
             // 视图在探测期间被关掉时不再需要结果
-            let _closed = this.update_in(cx, |this, window, cx| {
+            let _closed = this.update(cx, |this, cx| {
                 if let Probing::Ready(probe) = &probing
                     && let Some(master) = &probe.master
                 {
@@ -200,7 +197,7 @@ impl NewTask {
                     this.audio = master.selected.audio.as_ref().map(|a| a.index);
                 }
                 if matches!(probing, Probing::Ready(_)) {
-                    this.focus.focus(window, cx);
+                    cx.emit(NewTaskEvent::Ready);
                 }
                 this.probing = probing;
                 cx.notify();
@@ -215,7 +212,7 @@ impl NewTask {
             .headers
             .update(cx, |editor, cx| editor.confirm(window, cx))
         {
-            self.probe(headers, window, cx);
+            self.probe(headers, cx);
         }
     }
 
@@ -231,9 +228,15 @@ impl NewTask {
         }
     }
 
+    /// 让新建页获得键盘焦点：方向键换档、回车开始、Esc 关闭。
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+    }
+
     /// 新建页自己有焦点时的按键：↑ ← 换到码率高一档（外一环），↓ → 换到低一档，回车开始，Esc 关闭。
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus.is_focused(window) {
+        // 开始了就不能取消，也不再换档
+        if !self.focus.is_focused(window) || self.creating {
             return;
         }
         match event.keystroke.key.as_str() {

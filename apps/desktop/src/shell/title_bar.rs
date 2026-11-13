@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use gpui_kit::component::TitleBar;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{FontWeight, IntoElement, ParentElement as _, Styled as _, canvas, div, px};
 use hs_m3u8_app::Status;
 
@@ -18,7 +19,7 @@ const LOGO_ARC: f32 = 0.72;
 const LOGO_MARGIN: f32 = 14.;
 const LOGO_GAP: f32 = 10.;
 const STATUS_MARGIN: f32 = 28.;
-/// 可用空间少于这么多时顶栏的状态标成橙色：多数视频放不下了。
+/// 可用空间少于这么多时标成橙色：约 10 Mbps 的视频再下十几分钟就满。
 const LOW_SPACE: u64 = 1 << 30;
 
 impl Shell {
@@ -28,22 +29,22 @@ impl Shell {
             .iter()
             .filter(|r| r.task.status == Status::Running)
             .collect();
-        let mut parts = Vec::new();
-        if !running.is_empty() {
+        let activity = (!running.is_empty()).then(|| {
             let speed: f64 = running.iter().map(|r| r.rate.bytes_per_second(now)).sum();
-            parts.push(format!(
+            format!(
                 "{} 个进行中 · ↓ {}/s",
                 running.len(),
                 format::bytes(speed as u64)
-            ));
-        }
-        let low = matches!(self.free_space, Some(Ok(free)) if free < LOW_SPACE);
-        match &self.free_space {
-            Some(Ok(free)) => parts.push(format!("盘余 {}", format::bytes(*free))),
-            Some(Err(reason)) => parts.push(format!("盘余读不出（{reason}）")),
-            None => {}
-        }
-        let status = parts.join(" · ");
+            )
+        });
+        // 可用空间：不足或读不出时标橙色，只标这一段
+        let space = self.free_space.as_ref().map(|free| match free {
+            Ok(bytes) => (
+                format!("可用 {}", format::bytes(*bytes)),
+                *bytes < LOW_SPACE,
+            ),
+            Err(reason) => (format!("可用空间：{reason}"), true),
+        });
         TitleBar::new()
             .h(px(TITLE_HEIGHT))
             .bg(theme::ground())
@@ -80,9 +81,16 @@ impl Shell {
             .child(ui::num(
                 div()
                     .pr(px(STATUS_MARGIN))
+                    .flex()
+                    .gap(px(6.))
                     .text_size(px(13.))
-                    .text_color(if low { theme::orange() } else { theme::muted() })
-                    .child(status),
+                    .text_color(theme::muted())
+                    .children(activity)
+                    .children(space.map(|(text, warn)| {
+                        div()
+                            .when(warn, |s| s.text_color(theme::orange()))
+                            .child(text)
+                    })),
             ))
     }
 }

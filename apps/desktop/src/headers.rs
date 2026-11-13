@@ -1,5 +1,5 @@
 //! 请求头的编辑：已有的一条一条列出、可以删，输入框里写「名称: 值」回车添加。添加时按核心的规则校验
-//! （[`check_header`]），同名的（不分大小写）替换原有的一条。
+//! （[`check_option_header`]），同名的（不分大小写）替换原有的一条。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -7,7 +7,7 @@ use gpui_kit::{
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
     div, px,
 };
-use hs_m3u8_core::check_header;
+use hs_m3u8_core::check_option_header;
 
 use crate::theme;
 use crate::ui::{self, TEXT_LINE};
@@ -98,15 +98,13 @@ fn merge(headers: &mut Vec<(String, String)>, header: (String, String)) {
     headers.push(header);
 }
 
-/// 值是凭据、列出时遮住的请求头（不分大小写）：共享屏幕或截图时不露出来。
-const SECRET: [&str; 3] = ["cookie", "authorization", "proxy-authorization"];
+/// 名字里带这些词（不分大小写）的请求头当作凭据，列出时遮住：共享屏幕或截图时不露出来。
+const SECRET: [&str; 6] = ["cookie", "auth", "token", "key", "secret", "session"];
 
 /// 列出时的值：凭据只露出长度。
 fn shown(name: &str, value: &str) -> String {
-    if SECRET
-        .iter()
-        .any(|secret| name.eq_ignore_ascii_case(secret))
-    {
+    let name = name.to_ascii_lowercase();
+    if SECRET.iter().any(|word| name.contains(word)) {
         format!("已填 {} 个字符", value.chars().count())
     } else {
         value.to_owned()
@@ -119,7 +117,7 @@ fn parse(text: &str) -> Result<(String, String), String> {
         .split_once(':')
         .ok_or_else(|| "要写成「名称: 值」".to_owned())?;
     let (name, value) = (name.trim(), value.trim());
-    check_header(name, value)?;
+    check_option_header(name, value)?;
     Ok((name.to_owned(), value.to_owned()))
 }
 
@@ -215,6 +213,7 @@ mod tests {
             ]
         );
         assert_eq!(shown("COOKIE", "sid=12345"), "已填 9 个字符");
+        assert_eq!(shown("X-Api-Key", "abc"), "已填 3 个字符");
         assert_eq!(shown("Referer", "https://a/"), "https://a/");
     }
 }

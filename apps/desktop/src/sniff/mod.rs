@@ -12,7 +12,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use hs_m3u8_app::title_of;
-use hs_m3u8_core::{Url, check_header};
+use hs_m3u8_core::{Url, check_option_header};
 
 use self::script::Report;
 use crate::links::http_url;
@@ -197,7 +197,7 @@ impl SniffView {
             }
         }
         for (name, value) in &headers {
-            check_header(name, value)?;
+            check_option_header(name, value)?;
         }
         Ok(headers)
     }
