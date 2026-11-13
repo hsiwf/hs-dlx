@@ -1,9 +1,14 @@
-//! 嗅探页：左边是网页（后退、前进、刷新、地址栏），右边列出这个页面里找到的视频流。点某条流的「探测」时带上它所在
-//! 页面的地址（Referer）、网页的 User-Agent 与网页里这个流地址的 Cookie，交给新建页。
+//! 嗅探页：左边是网页（后退、前进、刷新、地址栏），右边列出这个页面里找到的视频流。点某条流的「探测」时带上网页里的
+//! 播放器请求它时浏览器会带的请求头（见 [`request::headers_for`]），交给新建页。页面的地址与标题由网页引擎报；脚本
+//! 发回的只有找到的流与请求数，按不可信数据校验、限量。
 
+mod request;
 mod script;
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::Duration;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -12,14 +17,16 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use hs_m3u8_app::title_of;
-use hs_m3u8_core::{Url, check_option_header};
+use hs_m3u8_core::Url;
+use hs_m3u8_webview::WebView;
+use tokio::sync::mpsc;
 
 use self::script::Report;
-use crate::links::http_url;
+use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::theme;
 use crate::ui::{self, CAPTION_LINE, GAP, TEXT_LINE, Tone};
-use crate::webview::WebView;
+use crate::wait::within;
 
 /// 右边一栏的宽度。
 const ASIDE_WIDTH: f32 = 380.;
@@ -28,6 +35,17 @@ pub const ASIDE_MIN_WIDTH: f32 = 300.;
 /// 网页一栏最窄多宽：常见网页的移动版布局从这里起。
 pub const PAGE_MIN_WIDTH: f32 = 480.;
 
+/// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
+const MAX_FOUND: usize = 200;
+/// 最多记多少个框架的请求数：网页能造任意多个框架编号，再多的不记。
+const MAX_FRAMES: usize = 64;
+/// 网页发来、还没处理的消息最多积多少条：网页发得比处理得快时，再来的丢掉并计数。
+const QUEUE: usize = 256;
+/// 等网页引擎回出 Cookie 最多多久：引擎卡住时不让探测一直挂着。
+const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 网页标题最多显示与用作任务标题的字符数。
+const MAX_TITLE: usize = 300;
+
 /// 嗅探页发给外面的事件。
 pub enum SniffEvent {
     /// 探测这个流
@@ -35,11 +53,28 @@ pub enum SniffEvent {
     Dismissed,
 }
 
+/// 网页引擎报的页面变化，按发生的先后处理，不丢。
+enum Engine {
+    /// 开始加载这个地址：之前找到的都属于上一个页面
+    Loading(String),
+    /// 加载完了这个地址
+    Loaded(String),
+    /// 网页要在新窗口里打开这个地址（链接的 target=_blank、window.open）：在这里打开
+    Open(String),
+}
+
+/// 网页能任意多发的：脚本的消息与标题的变化，积多了丢。
+enum Incoming {
+    Message(String),
+    Title(String),
+}
+
 /// 找到的一条流。
+#[derive(Clone)]
 struct Found {
     url: Url,
-    /// 它所在框架的地址
-    page: Url,
+    /// 它所在框架的 origin；不是 http(s) 的为 None
+    origin: Option<Url>,
     /// 网页的 User-Agent
     agent: String,
 }
@@ -50,39 +85,87 @@ pub struct SniffView {
     address: Entity<InputState>,
     title: String,
     found: Vec<Found>,
-    /// 各层框架（按地址区分）发出的请求数
+    /// 列表满了之后又找到的条数
+    overflow: usize,
+    /// 各个框架（脚本取的编号）发出的请求数
     requests: HashMap<String, u32>,
-    /// 最近一次操作没成的原因（地址不是链接、取不到 Cookie 等）
+    /// 网页发来、积压满了丢掉的消息数，从打开嗅探页起算
+    dropped: Rc<Cell<u64>>,
+    /// 最近一次操作没成的原因（地址不是链接、读不出 Cookie 等）
     error: Option<String>,
+    /// 最近一次探测没带上的、没有名字的 Cookie 个数
+    nameless: usize,
+    /// 正在读 Cookie、准备探测的那条流
+    reading: Option<Url>,
     /// 网页换了地址、还没写进地址栏的（写地址栏要窗口，下一次画时写）
     navigated: Option<String>,
-    _reports: Task<()>,
+    _engine: Task<()>,
+    _incoming: Task<()>,
+    _reading: Task<()>,
     _typed: Subscription,
 }
 
 impl EventEmitter<SniffEvent> for SniffView {}
 
+/// 把网页发来的交给处理它的任务；积压满了时丢掉并计数，嗅探页关了时什么也不做。
+fn offer(sender: &mpsc::Sender<Incoming>, dropped: &Cell<u64>, incoming: Incoming) {
+    match sender.try_send(incoming) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => dropped.set(dropped.get() + 1),
+    }
+}
+
 impl SniffView {
     pub fn new(url: Url, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (engine, mut engine_events) = mpsc::unbounded_channel::<Engine>();
+        let (incoming, mut incomings) = mpsc::channel::<Incoming>(QUEUE);
+        let dropped = Rc::new(Cell::new(0));
         let builder = wry::WebViewBuilder::new()
             // 播放器常在嵌入的框架里：每一层框架都注入
             .with_initialization_script_for_main_only(script::SCRIPT, false)
-            .with_ipc_handler(move |request| {
-                // 嗅探页关掉后网页还会发消息，没有人收
-                let _closed = sender.send(request.into_body());
+            .with_ipc_handler({
+                let (incoming, dropped) = (incoming.clone(), dropped.clone());
+                move |request| offer(&incoming, &dropped, Incoming::Message(request.into_body()))
+            })
+            .with_document_title_changed_handler({
+                let dropped = dropped.clone();
+                move |title| offer(&incoming, &dropped, Incoming::Title(title))
+            })
+            .with_on_page_load_handler({
+                let engine = engine.clone();
+                move |event, url| {
+                    // 嗅探页关了时没有人收
+                    let _closed = engine.send(match event {
+                        wry::PageLoadEvent::Started => Engine::Loading(url),
+                        wry::PageLoadEvent::Finished => Engine::Loaded(url),
+                    });
+                }
+            })
+            .with_new_window_req_handler(move |url, _| {
+                // 嗅探页关了时没有人收
+                let _closed = engine.send(Engine::Open(url));
+                wry::NewWindowResponse::Deny
             })
             .with_url(url.as_str());
         let webview = WebView::build(builder, window, cx)
             .map(|webview| cx.new(|_| webview))
             .map_err(|error| format!("建不出网页：{error}"));
-        let reports = cx.spawn(async move |this, cx| {
-            while let Some(message) = receiver.recv().await {
-                // 页面发来的按不可信数据校验，认不出的丢掉
-                let Some(report) = script::parse(&message) else {
-                    continue;
-                };
-                if this.update(cx, |this, cx| this.apply(report, cx)).is_err() {
+        let engine_task = cx.spawn(async move |this, cx| {
+            while let Some(event) = engine_events.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_engine(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let incoming_task = cx.spawn(async move |this, cx| {
+            while let Some(incoming) = incomings.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_incoming(incoming, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -105,27 +188,73 @@ impl SniffView {
             address,
             title: String::new(),
             found: Vec::new(),
+            overflow: 0,
             requests: HashMap::new(),
+            dropped,
             error: None,
+            nameless: 0,
+            reading: None,
             navigated: None,
-            _reports: reports,
+            _engine: engine_task,
+            _incoming: incoming_task,
+            _reading: Task::ready(()),
             _typed: typed,
         }
     }
 
-    fn apply(&mut self, report: Report, cx: &mut Context<Self>) {
-        match report {
-            Report::Stream { url, page, agent } => {
-                if !self.found.iter().any(|found| found.url == url) {
-                    self.found.push(Found { url, page, agent });
+    fn on_engine(&mut self, event: Engine, cx: &mut Context<Self>) {
+        match event {
+            Engine::Loading(url) => {
+                self.found.clear();
+                self.overflow = 0;
+                self.requests.clear();
+                self.title.clear();
+                self.error = None;
+                self.nameless = 0;
+                self.reading = None;
+                self._reading = Task::ready(());
+                self.navigated = Some(url);
+            }
+            Engine::Loaded(url) => self.navigated = Some(url),
+            Engine::Open(url) => self.open(&url, cx),
+        }
+        cx.notify();
+    }
+
+    fn on_incoming(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
+        match incoming {
+            // 页面发来的按不可信数据校验，认不出的丢掉
+            Incoming::Message(text) => match script::parse(&text) {
+                Some(Report::Stream { url, origin, agent }) => {
+                    if self.found.iter().any(|found| found.url == url) {
+                        return;
+                    }
+                    if self.found.len() < MAX_FOUND {
+                        self.found.push(Found { url, origin, agent });
+                    } else {
+                        self.overflow += 1;
+                    }
                 }
-            }
-            Report::Requests { frame, count } => {
-                self.requests.insert(frame, count);
-            }
-            Report::Page { url, title } => {
-                self.title = title;
-                self.navigated = Some(url.to_string());
+                Some(Report::Requests { frame, count }) => {
+                    if self.requests.len() < MAX_FRAMES || self.requests.contains_key(&frame) {
+                        self.requests.insert(frame, count);
+                    }
+                }
+                None => return,
+            },
+            // 单页应用换页时地址变了而不重新加载，常伴着改标题：顺带读一次地址
+            Incoming::Title(title) => {
+                self.title = title
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(MAX_TITLE)
+                    .collect();
+                if let Some(webview) = self.webview() {
+                    match webview.read(cx).raw().url() {
+                        Ok(url) => self.navigated = Some(url),
+                        Err(error) => self.error = Some(format!("读不出网页的地址：{error}")),
+                    }
+                }
             }
         }
         cx.notify();
@@ -140,10 +269,10 @@ impl SniffView {
         self.webview.as_ref().ok()
     }
 
-    /// 在网页里打开地址栏里的 `text`。
+    /// 在网页里打开 `text`（地址栏里输入的，或网页要在新窗口里开的）。
     fn open(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(url) = http_url(text) else {
-            self.error = Some("要 http 或 https 开头的链接".to_owned());
+            self.error = Some(NOT_HTTP.to_owned());
             cx.notify();
             return;
         };
@@ -158,74 +287,93 @@ impl SniffView {
         cx.notify();
     }
 
-    /// 在网页里执行后退、前进或刷新。
-    fn navigate(&mut self, script: &str, cx: &mut Context<Self>) {
+    /// 后退、前进或刷新：`act` 调网页的那个操作，`what` 为没做成时的说法。
+    fn navigate(
+        &mut self,
+        act: fn(&wry::WebView) -> wry::Result<()>,
+        what: &str,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(webview) = self.webview() {
-            self.error = webview
-                .read(cx)
-                .raw()
-                .evaluate_script(script)
+            self.error = act(webview.read(cx).raw())
                 .err()
-                .map(|error| format!("网页没响应：{error}"));
+                .map(|error| format!("{what}：{error}"));
         }
         cx.notify();
     }
 
-    /// 探测第 `index` 条流要带的请求头：它所在页面（去掉 `#` 之后的部分）作 Referer、网页的 User-Agent，与网页里
-    /// 这个流地址的 Cookie；都按核心的规则校验过。
-    fn headers_for(
-        &self,
-        index: usize,
-        cx: &Context<Self>,
-    ) -> Result<Vec<(String, String)>, String> {
-        let found = &self.found[index];
-        let mut page = found.page.clone();
-        page.set_fragment(None);
-        let mut headers = vec![("Referer".to_owned(), page.to_string())];
-        if !found.agent.is_empty() {
-            headers.push(("User-Agent".to_owned(), found.agent.clone()));
-        }
-        if let Some(webview) = self.webview() {
-            let cookies = webview
-                .read(cx)
-                .raw()
-                .cookies_for_url(found.url.as_str())
-                .map_err(|error| format!("读不出网页的 Cookie：{error}"))?;
-            if !cookies.is_empty() {
-                let pairs: Vec<String> = cookies
-                    .iter()
-                    .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-                    .collect();
-                headers.push(("Cookie".to_owned(), pairs.join("; ")));
-            }
-        }
-        for (name, value) in &headers {
-            check_option_header(name, value)?;
-        }
-        Ok(headers)
-    }
-
+    /// 读出网页引擎里发往这条流的 Cookie，配好请求头后交给新建页；读的期间不能再点探测。
     fn probe(&mut self, index: usize, cx: &mut Context<Self>) {
-        match self.headers_for(index, cx) {
-            Ok(headers) => {
-                self.error = None;
-                cx.emit(SniffEvent::Probe(Link {
-                    url: self.found[index].url.clone(),
-                    title: (!self.title.is_empty()).then(|| self.title.clone()),
-                    headers,
-                }));
-            }
-            Err(error) => self.error = Some(error),
+        if self.reading.is_some() {
+            return;
         }
+        let Some(webview) = self.webview() else {
+            return;
+        };
+        let found = self.found[index].clone();
+        let raw = webview.read(cx).raw();
+        let top = match raw.url() {
+            Ok(top) => http_url(&top),
+            Err(error) => {
+                self.error = Some(format!("读不出网页的地址：{error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let asking = hs_m3u8_webview::cookies::cookies_for(raw, &found.url);
+        let title = (!self.title.is_empty()).then(|| self.title.clone());
+        self.reading = Some(found.url.clone());
+        self.error = None;
+        self._reading = cx.spawn(async move |this, cx| {
+            let asking = std::pin::pin!(asking);
+            let answer = within(asking, cx.background_executor().timer(COOKIE_TIMEOUT))
+                .await
+                .unwrap_or_else(|| {
+                    Err(format!(
+                        "网页引擎 {} 秒没有回出 Cookie",
+                        COOKIE_TIMEOUT.as_secs()
+                    ))
+                });
+            // 读的期间嗅探页关了时不再探测
+            let _closed = this.update(cx, |this, cx| {
+                this.reading = None;
+                let made = answer.and_then(|cookies| {
+                    request::headers_for(
+                        &found.url,
+                        found.origin.as_ref(),
+                        &found.agent,
+                        top.as_ref(),
+                        cookies,
+                    )
+                });
+                match made {
+                    Ok(made) => {
+                        this.nameless = made.nameless;
+                        cx.emit(SniffEvent::Probe(Link {
+                            url: found.url,
+                            title,
+                            headers: made.headers,
+                        }));
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        });
         cx.notify();
     }
 
-    /// 把原生网页藏起来：嗅探页不显示时（换成新建页）它不会自己藏，再画时重新摆出来。
+    /// 藏起网页并暂停里面的视频与音频：嗅探页不显示时调（原生网页不随 GPUI 的画面消失），再显示时网页重新摆出来。
     pub fn hide(&mut self, cx: &mut Context<Self>) {
-        if let Some(webview) = self.webview()
-            && let Err(error) = webview.read(cx).raw().set_visible(false)
-        {
-            self.error = Some(format!("网页没能藏起来：{error}"));
+        let Some(webview) = self.webview() else {
+            return;
+        };
+        let webview = webview.read(cx);
+        let hidden = webview
+            .hide()
+            .and_then(|()| webview.raw().evaluate_script(script::PAUSE));
+        if let Err(error) = hidden {
+            self.error = Some(format!("网页没能藏起来或停下播放：{error}"));
             cx.notify();
         }
     }
@@ -255,13 +403,14 @@ impl SniffView {
     fn render_page(&self, cx: &mut Context<Self>) -> Div {
         let nav = |id: &'static str,
                    label: &'static str,
-                   script: &'static str,
+                   act: fn(&wry::WebView) -> wry::Result<()>,
+                   what: &'static str,
                    cx: &mut Context<Self>| {
             ui::button(
                 id,
                 label,
                 Tone::Ghost,
-                cx.listener(move |this, _, _, cx| this.navigate(script, cx)),
+                cx.listener(move |this, _, _, cx| this.navigate(act, what, cx)),
             )
         };
         let toolbar = div()
@@ -272,9 +421,15 @@ impl SniffView {
             .py(px(10.))
             .border_b_1()
             .border_color(theme::line())
-            .child(nav("back", "‹", "history.back();", cx))
-            .child(nav("forward", "›", "history.forward();", cx))
-            .child(nav("reload", "↻", "location.reload();", cx))
+            .child(nav("back", "‹", wry::WebView::go_back, "没能后退", cx))
+            .child(nav(
+                "forward",
+                "›",
+                wry::WebView::go_forward,
+                "没能前进",
+                cx,
+            ))
+            .child(nav("reload", "↻", wry::WebView::reload, "没能刷新", cx))
             .child(
                 div()
                     .flex_1()
@@ -325,8 +480,9 @@ impl SniffView {
 
     /// 右边：找到的流、监听的请求数与说明。
     fn render_found(&self, cx: &mut Context<Self>) -> Div {
-        let requests: u32 = self.requests.values().sum();
+        let requests: u64 = self.requests.values().map(|&count| u64::from(count)).sum();
         let rows = self.found.iter().enumerate().map(|(index, found)| {
+            let reading = self.reading.as_ref() == Some(&found.url);
             div()
                 .flex()
                 .items_center()
@@ -359,20 +515,44 @@ impl SniffView {
                                 .child(SharedString::from(meta(&found.url))),
                         )),
                 )
-                .child(ui::button(
-                    ("probe-found", index),
-                    "探测",
-                    if index == 0 { Tone::Glow } else { Tone::Plain },
-                    cx.listener(move |this, _, _, cx| this.probe(index, cx)),
-                ))
+                .child(if reading {
+                    ui::caption("读 Cookie…").into_any_element()
+                } else {
+                    ui::button(
+                        ("probe-found", index),
+                        "探测",
+                        if index == 0 { Tone::Glow } else { Tone::Plain },
+                        cx.listener(move |this, _, _, cx| this.probe(index, cx)),
+                    )
+                    .into_any_element()
+                })
         });
         let empty = self.found.is_empty().then(|| {
             div()
                 .text_size(px(13.))
                 .line_height(px(TEXT_LINE))
                 .text_color(theme::muted())
-                .child("还没找到。在网页里点播放，播放器拉取的 m3u8 会出现在这里。")
+                .child("还没找到。在网页里点播放，播放器拉取的 HLS 播放列表会出现在这里。")
         });
+        let mut notes = Vec::new();
+        if self.overflow > 0 {
+            notes.push(format!(
+                "只列出前 {MAX_FOUND} 条，另有 {} 条没列出",
+                self.overflow
+            ));
+        }
+        let dropped = self.dropped.get();
+        if dropped > 0 {
+            notes.push(format!(
+                "网页发来的消息太多，丢了 {dropped} 条，可能有流没列出"
+            ));
+        }
+        if self.nameless > 0 {
+            notes.push(format!(
+                "上次探测没带 {} 个没有名字的 Cookie：请求头只能写「名=值」",
+                self.nameless
+            ));
+        }
         div()
             .flex_basis(px(ASIDE_WIDTH))
             .flex_shrink(1.)
@@ -415,9 +595,10 @@ impl SniffView {
                     .children(rows)
                     .children(empty),
             )
+            .children(notes.into_iter().map(ui::caption))
             .children(self.error.clone().map(ui::error_text))
             .child(ui::caption(
-                "探测时带上这个页面的地址、User-Agent 与 Cookie；Cookie 只发给流地址所在的网站。",
+                "探测时带上流所在页面的网站作 Referer、网页的 User-Agent，与网页里的播放器请求它时也会带的 Cookie。",
             ))
     }
 }
@@ -442,7 +623,7 @@ fn rings() -> Div {
         .child(ring(RINGS - 18., 2., theme::cyan_dim()))
 }
 
-/// 流的说明：主机与路径；只差查询参数的几条（常见：同一个地址带不同的令牌）标出带参数的。
+/// 流的说明：主机与路径；带查询参数的标出（同一个地址常带不同的令牌，只看主机与路径分不出来）。
 fn meta(url: &Url) -> String {
     let mut text = format!("{}{}", url.host_str().unwrap_or_default(), url.path());
     if url.query().is_some() {

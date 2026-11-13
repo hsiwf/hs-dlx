@@ -1,10 +1,12 @@
-//! 把 wry 的原生网页视图放进 GPUI 窗口：随布局摆位置、在被裁掉时藏起来，挡住的区域不让下面的 GPUI 内容收到点击。
-//! 源自 gpui-webview 0.9.1（© Longbridge，Apache-2.0，全文见同目录 LICENSE-APACHE），改为依赖官方 wry，只留不用窗口
-//! 合成时用到的部分。
+//! 把 wry 的原生网页视图放进 GPUI 窗口：随布局摆位置、在被裁掉时藏起来，挡住的区域不让下面的 GPUI 内容收到点击；
+//! 另取网页引擎的 Cookie 存储（[`cookies`]）。嵌入的部分源自 gpui-webview 0.9.1（© Longbridge，Apache-2.0，全文见本
+//! crate 的 LICENSE-APACHE），改为依赖官方 wry，只留不用窗口合成时用到的部分。
 //!
 //! 原生视图直接挂在窗口上：它盖住所在区域里的 GPUI 内容（弹层、提示也盖住），也不能被部分裁剪（容器只裁掉一部分时它
-//! 照样占满原来的区域），整个移出可见区域时才藏起来。
+//! 照样占满原来的区域），整个移出可见区域时才藏起来。不画它的那一帧它不会自己消失：换掉所在的视图时由使用方调
+//! [`WebView::hide`]。
 
+pub mod cookies;
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -20,17 +22,32 @@ use gpui_kit::{
 };
 use wry::Rect;
 
+/// 摆放网页时可能没做成的几件事，各记各的：一件做成了不清掉另一件的原因。
+#[derive(Clone, Copy)]
+enum Trouble {
+    /// 摆到布局给的位置、显示出来
+    Place,
+    /// 点在网页外时把键盘焦点交还窗口
+    Focus,
+    /// 页面缩放对齐窗口的缩放：只有 Linux 要对齐
+    #[cfg(target_os = "linux")]
+    Scale,
+}
+
 /// 放在 GPUI 窗口里的网页。
 pub struct WebView {
     webview: Rc<wry::WebView>,
-    /// 摆位置或交还焦点最近一次失败的原因；成功后清掉。放在这里由使用方显示：画的过程中报不出错误
-    trouble: RefCell<Option<String>>,
+    /// 各件事最近一次没做成的原因（下标为 [`Trouble`] 的值），做成后清掉。画的过程中报不出错误，放在这里由使用方显示
+    troubles: RefCell<[Option<String>; 3]>,
     /// GPUI 的缩放倍数，页面的缩放按它对齐（GDK 只支持整数倍）
     #[cfg(target_os = "linux")]
     scale_factor: Cell<f32>,
     /// 页面所在区域的左上角（窗口坐标），把页面上的点击转给 GPUI 时用
     #[cfg(target_os = "linux")]
     origin: Rc<Cell<gpui_kit::Point<Pixels>>>,
+    /// 持有期间 GPUI 驱动 GTK 的主循环
+    #[cfg(target_os = "linux")]
+    _gtk: linux::GtkUser,
 }
 
 impl Drop for WebView {
@@ -42,18 +59,18 @@ impl Drop for WebView {
 }
 
 impl WebView {
-    /// 按 `builder` 在 `window` 里建网页，做好各平台 wry 要的准备。Linux 上窗口要跑在 X11 或 XWayland 上（Wayland
-    /// 窗口报错），并在这里初始化 GTK、由 GPUI 驱动它的主循环。
+    /// 按 `builder` 在 `window` 里建网页，做好各平台 wry 要的准备。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland
+    /// 窗口报错；GTK 在这里初始化，有网页期间由 GPUI 驱动它的主循环。
     pub fn build(
         builder: wry::WebViewBuilder,
         window: &mut Window,
         cx: &mut App,
     ) -> wry::Result<Self> {
         #[cfg(target_os = "linux")]
-        let webview = {
+        let (webview, gtk) = {
             let parent = linux::X11Parent::new(window)?;
-            linux::ensure_gtk(cx)?;
-            builder.build_as_child(&parent)?
+            let gtk = linux::GtkUser::new(cx)?;
+            (builder.build_as_child(&parent)?, gtk)
         };
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build_as_child(&*window)?;
@@ -70,11 +87,13 @@ impl WebView {
         let _ = cx;
         Ok(WebView {
             webview: Rc::new(webview),
-            trouble: RefCell::new(None),
+            troubles: RefCell::new([None, None, None]),
             #[cfg(target_os = "linux")]
             scale_factor: Cell::new(window.scale_factor()),
             #[cfg(target_os = "linux")]
             origin,
+            #[cfg(target_os = "linux")]
+            _gtk: gtk,
         })
     }
 
@@ -83,9 +102,16 @@ impl WebView {
         &self.webview
     }
 
-    /// 摆位置或交还焦点最近一次失败的原因。
+    /// 摆放与交还焦点最近没做成的原因，几件都没做成时用「；」连起来；都做成了为 None。
     pub fn trouble(&self) -> Option<String> {
-        self.trouble.borrow().clone()
+        let troubles = self.troubles.borrow();
+        let reasons: Vec<&str> = troubles.iter().flatten().map(String::as_str).collect();
+        (!reasons.is_empty()).then(|| reasons.join("；"))
+    }
+
+    /// 藏起网页（页面照旧留着）：所在的视图不再显示时调，下次画出来时重新摆出来。
+    pub fn hide(&self) -> wry::Result<()> {
+        self.webview.set_visible(false)
     }
 
     /// 按页面区域 `document` 与继承下来的裁剪区 `clip` 摆放：完全在裁剪区外时藏起来（页面照旧留着）。
@@ -114,8 +140,14 @@ impl WebView {
         Ok(true)
     }
 
-    fn record(&self, result: wry::Result<()>, what: &str) {
-        *self.trouble.borrow_mut() = result.err().map(|error| format!("{what}：{error}"));
+    /// 记下 `trouble` 这件事的结果 `result`（`what` 为没做成时的说法）；原因有变化时返回 true，要重画才显示得出来。
+    fn record(&self, trouble: Trouble, result: wry::Result<()>, what: &str) -> bool {
+        let reason = result.err().map(|error| format!("{what}：{error}"));
+        let mut troubles = self.troubles.borrow_mut();
+        let slot = &mut troubles[trouble as usize];
+        let changed = *slot != reason;
+        *slot = reason;
+        changed
     }
 }
 
@@ -179,27 +211,30 @@ impl Element for WebViewElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let view = self.view.read(cx);
+        let mut changed = false;
         #[cfg(target_os = "linux")]
         {
             if view.scale_factor.replace(window.scale_factor()) != window.scale_factor() {
                 let matched = linux::match_scale_factor(&view.webview, window.scale_factor());
-                view.record(matched, "网页缩放没能对齐窗口");
+                changed |= view.record(Trouble::Scale, matched, "网页缩放没能对齐窗口");
             }
             view.origin.set(bounds.origin);
         }
         let clip = window.content_mask().bounds;
-        match view.place(bounds, clip) {
+        let placed = view.place(bounds, clip);
+        let hitbox = match &placed {
+            // 原生视图盖住这一块，下面的 GPUI 内容不该收到点击
             Ok(true) => {
-                view.record(Ok(()), "");
-                // 原生视图盖住这一块，下面的 GPUI 内容不该收到点击
                 Some(window.insert_hitbox(bounds.intersect(&clip), HitboxBehavior::BlockMouse))
             }
-            Ok(false) => None,
-            Err(error) => {
-                view.record(Err(error), "网页没能摆到位置上");
-                None
-            }
+            Ok(false) | Err(_) => None,
+        };
+        changed |= view.record(Trouble::Place, placed.map(|_| ()), "网页没能摆到位置上");
+        if changed {
+            // 原因随下一帧显示出来；原因不再变时不再请求
+            window.refresh();
         }
+        hitbox
     }
 
     fn paint(
@@ -216,11 +251,16 @@ impl Element for WebViewElement {
         let view = self.view.clone();
         let webview = self.webview.clone();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
+            window.on_mouse_event(move |event: &MouseDownEvent, _, window, cx| {
                 // 点在网页外面时把键盘焦点交还窗口，输入框才收得到字
                 if !bounds.contains(&event.position) {
                     let returned = webview.focus_parent();
-                    view.read(cx).record(returned, "键盘焦点没能交还窗口");
+                    if view
+                        .read(cx)
+                        .record(Trouble::Focus, returned, "键盘焦点没能交还窗口")
+                    {
+                        window.refresh();
+                    }
                 }
             });
         });

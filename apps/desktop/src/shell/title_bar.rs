@@ -43,7 +43,7 @@ impl Shell {
                 format!("可用 {}", format::bytes(*bytes)),
                 *bytes < LOW_SPACE,
             ),
-            Err(reason) => (format!("可用空间：{reason}"), true),
+            Err(reason) => (reason.clone(), true),
         });
         TitleBar::new()
             .h(px(TITLE_HEIGHT))

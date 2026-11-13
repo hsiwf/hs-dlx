@@ -49,6 +49,8 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
+    /// 地址取到的不是 HLS（多为网页）：在嗅探页里打开它，找页面里的视频流
+    Sniff(Url),
 }
 
 /// 探测进行到哪一步，粘贴栏与任务列表据此显示状态。

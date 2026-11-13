@@ -34,6 +34,7 @@ use crate::signals::Level;
 use crate::sniff::SniffView;
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
+use crate::wait::within;
 
 /// 窗口的最小宽：放得下列表收到最窄时、最宽的一个视图（待机页没有列表，比它们窄）。
 pub const MIN_WIDTH: f32 =
@@ -52,12 +53,14 @@ const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(10);
 /// 读一次可用空间最多等多久：网络盘掉线时读会卡住。
 const FREE_SPACE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 保存目录 `folder` 所在盘对本用户可用的字节数；目录不在（被删、所在的盘没接上）或读不出时为原因。
+/// 保存目录 `folder` 所在盘对本用户可用的字节数；目录不在（被删、所在的盘没接上）或读不出时为原因（顶栏照原样显示）。
 fn free_space(folder: &std::path::Path) -> Result<u64, String> {
     match folder.try_exists() {
-        Ok(true) => fs4::available_space(folder).map_err(|error| format!("读不出：{error}")),
+        Ok(true) => {
+            fs4::available_space(folder).map_err(|error| format!("读不出可用空间：{error}"))
+        }
         Ok(false) => Err("保存目录不在".to_owned()),
-        Err(error) => Err(format!("读不出：{error}")),
+        Err(error) => Err(format!("读不出可用空间：{error}")),
     }
 }
 
@@ -349,18 +352,18 @@ impl Shell {
                     cx.background_executor()
                         .spawn(async move { free_space(&target) })
                 );
-                let mut timer = std::pin::pin!(cx.background_executor().timer(FREE_SPACE_TIMEOUT));
-                let early = std::future::poll_fn(|context| {
-                    if let std::task::Poll::Ready(value) = read.as_mut().poll(context) {
-                        return std::task::Poll::Ready(Some(value));
-                    }
-                    timer.as_mut().poll(context).map(|()| None)
-                })
+                let early = within(
+                    read.as_mut(),
+                    cx.background_executor().timer(FREE_SPACE_TIMEOUT),
+                )
                 .await;
                 let value = match early {
                     Some(value) => value,
                     None => {
-                        let late = Err(format!("读了 {} 秒没有结果", FREE_SPACE_TIMEOUT.as_secs()));
+                        let late = Err(format!(
+                            "可用空间读了 {} 秒没有结果",
+                            FREE_SPACE_TIMEOUT.as_secs()
+                        ));
                         let alive = this.update(cx, |this, cx| {
                             this.free_space = Some(late);
                             cx.notify();

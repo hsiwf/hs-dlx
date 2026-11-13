@@ -12,7 +12,7 @@ mod signals;
 mod sniff;
 mod theme;
 mod ui;
-mod webview;
+mod wait;
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -68,6 +68,16 @@ fn window_options(cx: &gpui_kit::App) -> WindowOptions {
     }
 }
 
+/// 打开平台。Linux 上有 X11（含 Wayland 会话里的 XWayland）时只用它：嗅探页的网页只能嵌进 X11 窗口；没有时照默认选，
+/// 嗅探页打开时说明原因。
+fn application() -> gpui_kit::Application {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_some() {
+        return gpui_kit::platform::linux(gpui_kit::WindowingModes::X11);
+    }
+    gpui_kit::application()
+}
+
 fn main() {
     // 任何线程上的 panic 都是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务
     // 悄悄消失；存储里还标着运行中的任务下次打开时按暂停处理
@@ -76,7 +86,7 @@ fn main() {
         report(info);
         std::process::abort();
     }));
-    gpui_kit::application()
+    application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);

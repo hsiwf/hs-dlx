@@ -15,7 +15,7 @@ use crate::sniff::{SniffEvent, SniffView};
 impl Shell {
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(url) = links::http_url(text) else {
-            self.input_error = Some("要 http 或 https 开头的链接".to_owned());
+            self.input_error = Some(links::NOT_HTTP.to_owned());
             cx.notify();
             return;
         };
@@ -23,11 +23,6 @@ impl Shell {
         self.confirm_discard = None;
         if self.clipboard.as_ref() == Some(&url) {
             self.clipboard = None;
-        }
-        // 不是 m3u8 的网页地址：在嗅探页里打开，找页面里的视频流
-        if links::stream_url(url.as_str()).is_none() {
-            self.open_sniff(url, window, cx);
-            return;
         }
         self.open_new_task(
             Link {
@@ -76,6 +71,7 @@ impl Shell {
                             view.update(cx, |view, cx| view.focus(window, cx));
                         }
                     }
+                    NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     NewTaskEvent::FolderChanged(folder) => {
                         this.folder = folder.clone();
                         this.watch_free_space(cx);

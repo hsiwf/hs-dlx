@@ -1,17 +1,17 @@
 //! 新建页右边的选项栏：标题与摘要、清晰度之外的选择（音轨、输出、保存位置、请求头）、请求经哪里走与开始按钮；
-//! 探测失败时为失败原因与能做的事（改请求头重新探测、重新探测）。
+//! 探测失败时为失败原因与能做的事（改请求头重新探测、重新探测、在嗅探页里打开地址）。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::OutputKind;
+use hs_m3u8_app::{FailureKind, OutputKind};
 use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, Route, duration_of};
 use crate::ui::{self, Tone};
-use crate::{format, theme};
+use crate::{format, links, theme};
 
 /// 选项栏的宽度。
 const OPTION_WIDTH: f32 = 320.;
@@ -52,9 +52,15 @@ impl NewTask {
                 cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
             )),
             Probing::Failed(failure) => {
-                // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测
+                // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测。取到的不是
+                // 播放列表的（多为网页）可以在嗅探页里打开它找视频流：地址不像播放列表时先做这个
                 let headers = failure.kind.headers_may_help();
                 let again = headers || failure.kind.retry_helps();
+                let page = matches!(
+                    failure.kind,
+                    FailureKind::Malformed | FailureKind::Unsupported
+                );
+                let page_first = page && links::stream_url(self.url.as_str()).is_none();
                 side.child(
                     ui::card(theme::error_edge())
                         .child(SharedString::from(failure.message.clone())),
@@ -75,6 +81,10 @@ impl NewTask {
                     div()
                         .flex()
                         .gap(px(10.))
+                        .flex_wrap()
+                        .when(page_first, |row| {
+                            row.child(self.sniff_button(Tone::Glow, cx))
+                        })
                         .when(again, |row| {
                             row.child(ui::button(
                                 "reprobe",
@@ -83,9 +93,12 @@ impl NewTask {
                                 } else {
                                     "重新探测"
                                 },
-                                Tone::Glow,
+                                if page_first { Tone::Plain } else { Tone::Glow },
                                 cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
                             ))
+                        })
+                        .when(page && !page_first, |row| {
+                            row.child(self.sniff_button(Tone::Plain, cx))
                         })
                         .child(ui::button(
                             "dismiss",
@@ -97,6 +110,17 @@ impl NewTask {
             }
             Probing::Ready(probe) => self.ready_side(side, probe, cx),
         }
+    }
+
+    /// 在嗅探页里打开这个地址的按钮。
+    fn sniff_button(&self, tone: Tone, cx: &mut Context<Self>) -> Stateful<Div> {
+        let url = self.url.clone();
+        ui::button(
+            "sniff",
+            "在网页里找视频流",
+            tone,
+            cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+        )
     }
 
     /// 「网络」一行：这个地址的请求经哪个代理或为什么直连；还没读到系统代理时为 None。
