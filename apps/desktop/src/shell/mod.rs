@@ -44,6 +44,18 @@ pub const MIN_HEIGHT: f32 = TITLE_HEIGHT
     )
     + paste_bar::HEIGHT;
 
+/// 多久读一次保存目录所在盘的可用空间。
+const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// `folder`（还不存在时取最近的已存在的上级）所在盘对本用户可用的字节数；读不出时为原因。
+fn free_space(folder: &std::path::Path) -> Result<u64, String> {
+    let existing = folder
+        .ancestors()
+        .find(|path| path.exists())
+        .ok_or_else(|| format!("{} 及其上级都不存在", folder.display()))?;
+    fs4::available_space(existing).map_err(|error| error.to_string())
+}
+
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
 struct Notice {
     id: u64,
@@ -77,7 +89,10 @@ pub struct Shell {
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
     early: Vec<Event>,
     _events: Task<()>,
+    /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出时为原因
+    free_space: Option<Result<u64, String>>,
     _ticker: Task<()>,
+    _free_space: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -146,6 +161,26 @@ impl Shell {
             }
         });
         // 速度按时间窗算，没有新进度时也要随时间降下来：有任务在运行时每秒重画一次
+        // 盘余随下载变化，读一次很快，但网络盘上可能卡住：在后台读，每 10 秒一次
+        let free_space = cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(folder) = this.read_with(cx, |this, _| this.folder.clone()) else {
+                    break;
+                };
+                let read = cx
+                    .background_executor()
+                    .spawn(async move { free_space(&folder) })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    this.free_space = Some(read);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(FREE_SPACE_INTERVAL).await;
+            }
+        });
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -178,7 +213,9 @@ impl Shell {
             creating: 0,
             early: Vec::new(),
             _events: receiving,
+            free_space: None,
             _ticker: ticker,
+            _free_space: free_space,
             _subscriptions: vec![typed, activated, quitting],
         };
         let ids: Vec<TaskId> = shell.rows.iter().map(|r| r.task.id).collect();

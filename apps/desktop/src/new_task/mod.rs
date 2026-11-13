@@ -12,12 +12,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{
-    AppContext as _, Bounds, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
-    PathPromptOptions, Pixels, Render, Styled as _, Task, Window, div, px,
+    AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
+    Task, Window, div, px,
 };
-use hs_m3u8_app::{Draft, OutputKind, Service};
+use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
-use hs_m3u8_core::{Probe, Source, Url};
+use hs_m3u8_core::{Probe, ProxySource, Source, Url};
 
 use crate::headers::HeadersEditor;
 use crate::ui::{BOTTOM, GAP};
@@ -57,13 +58,44 @@ impl Phase {
     }
 }
 
+/// 请求经哪里走（任务用系统代理设置，见 [`hs_m3u8_core::Proxy::System`]）。
+pub(super) enum Route {
+    /// 经这个代理（已去掉凭据的写法）与读到它的地方
+    Proxy(String, &'static str),
+    /// 直连，值为原因
+    Direct(&'static str),
+    /// 系统代理设置用不了或读不出，值为原因；任务开始时同样会失败
+    Broken(String),
+}
+
+impl Route {
+    fn of(url: &Url) -> Route {
+        match hs_m3u8_core::system_proxy() {
+            Ok(Some(system)) => match system.proxy_for(url) {
+                Some(proxy) => Route::Proxy(
+                    hs_m3u8_core::bare_url(proxy),
+                    match system.source {
+                        ProxySource::Environment => "环境变量",
+                        ProxySource::MacOs => "系统设置",
+                        ProxySource::Windows => "Internet 选项",
+                    },
+                ),
+                None => Route::Direct("这个地址不经代理"),
+            },
+            Ok(None) => Route::Direct("系统没设代理"),
+            Err(error) => Route::Broken(error.to_string()),
+        }
+    }
+}
+
 enum Probing {
     Running,
-    Failed(String),
+    Failed(Failure),
     Ready(Box<Probe>),
 }
 
 pub struct NewTask {
+    service: Rc<Service>,
     url: Url,
     probing: Probing,
     /// 选中的变体在 `MasterInfo::variants` 里的下标；来源是媒体播放列表时不用
@@ -82,6 +114,11 @@ pub struct NewTask {
     creating: bool,
     /// 额外的请求头
     headers: Entity<HeadersEditor>,
+    /// 探测完成后获得焦点：方向键换档、回车开始、Esc 关闭
+    focus: FocusHandle,
+    /// 这个地址的请求经哪里走：还没读到系统代理时为 None
+    route: Option<Route>,
+    _route: Task<()>,
     _probe: Task<()>,
 }
 
@@ -96,27 +133,22 @@ impl NewTask {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let handle = service.probe(Source::new(url.clone()));
         let headers = cx.new(|cx| HeadersEditor::new(Vec::new(), window, cx));
-        let probe = cx.spawn(async move |this, cx| {
-            let probing = match handle.await {
-                Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
-                Ok(Err(error)) => Probing::Failed(error.to_string()),
-                Err(join) => Probing::Failed(format!("探测中途出错：{join}")),
-            };
-            // 视图在探测期间被关掉时不再需要结果
+        // 读系统代理要调操作系统的接口，在后台读
+        let target = url.clone();
+        let reading = cx
+            .background_executor()
+            .spawn(async move { Route::of(&target) });
+        let route = cx.spawn(async move |this, cx| {
+            let route = reading.await;
+            // 视图在读的期间被关掉时不再需要结果
             let _closed = this.update(cx, |this, cx| {
-                if let Probing::Ready(probe) = &probing
-                    && let Some(master) = &probe.master
-                {
-                    this.variant = master.selected.variant.index;
-                    this.audio = master.selected.audio.as_ref().map(|a| a.index);
-                }
-                this.probing = probing;
+                this.route = Some(route);
                 cx.notify();
             });
         });
-        NewTask {
+        let mut view = NewTask {
+            service,
             url,
             probing: Probing::Running,
             variant: 0,
@@ -129,7 +161,60 @@ impl NewTask {
             error: None,
             creating: false,
             headers,
-            _probe: probe,
+            focus: cx.focus_handle(),
+            route: None,
+            _route: route,
+            _probe: Task::ready(()),
+        };
+        view.probe(Vec::new(), window, cx);
+        view
+    }
+
+    /// 带着请求头 `headers` 探测（之前的探测结果作废）。
+    fn probe(
+        &mut self,
+        headers: Vec<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut source = Source::new(self.url.clone());
+        source.http.headers = headers;
+        let handle = self.service.probe(source);
+        self.probing = Probing::Running;
+        self._probe = cx.spawn_in(window, async move |this, cx| {
+            let probing = match handle.await {
+                Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
+                Ok(Err(error)) => Probing::Failed(Failure::of(&error)),
+                Err(join) => Probing::Failed(Failure {
+                    kind: FailureKind::Other,
+                    message: format!("探测中途出错：{join}"),
+                }),
+            };
+            // 视图在探测期间被关掉时不再需要结果
+            let _closed = this.update_in(cx, |this, window, cx| {
+                if let Probing::Ready(probe) = &probing
+                    && let Some(master) = &probe.master
+                {
+                    this.variant = master.selected.variant.index;
+                    this.audio = master.selected.audio.as_ref().map(|a| a.index);
+                }
+                if matches!(probing, Probing::Ready(_)) {
+                    this.focus.focus(window, cx);
+                }
+                this.probing = probing;
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    /// 带上请求头编辑框里的请求头重新探测；输入框里还没按回车的一条加不进去时不探测（原因显示在输入框下面）。
+    fn reprobe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(headers) = self
+            .headers
+            .update(cx, |editor, cx| editor.take(window, cx))
+        {
+            self.probe(headers, window, cx);
         }
     }
 
@@ -142,6 +227,40 @@ impl NewTask {
             Probing::Running => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
             Probing::Ready(_) => Phase::Ready,
+        }
+    }
+
+    /// 新建页自己有焦点时的按键：↑ ← 换到码率高一档（外一环），↓ → 换到低一档，回车开始，Esc 关闭。
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "up" | "left" => self.step_variant(-1, cx),
+            "down" | "right" => self.step_variant(1, cx),
+            "enter" => self.start(window, cx),
+            "escape" => cx.emit(NewTaskEvent::Dismissed),
+            _ => {}
+        }
+    }
+
+    /// 按环由外向内的顺序从选中的一档挪 `step` 档；到头了不动。
+    fn step_variant(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Probing::Ready(probe) = &self.probing else {
+            return;
+        };
+        let Some(master) = &probe.master else {
+            return;
+        };
+        let order: Vec<usize> = rings::rings(&master.variants)
+            .iter()
+            .map(|ring| ring.index)
+            .collect();
+        let Some(at) = order.iter().position(|&index| index == self.variant) else {
+            return;
+        };
+        if let Some(&index) = at.checked_add_signed(step).and_then(|to| order.get(to)) {
+            self.select_variant(index, cx);
         }
     }
 
@@ -246,6 +365,8 @@ impl Render for NewTask {
         let side = self.render_side(cx);
         // 中间一栏至少放得下整个同心环区域：窗口窄时先收两侧的栏
         div()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key_down))
             .flex_1()
             .min_w(px(MIN_WIDTH))
             .flex()

@@ -39,15 +39,15 @@ const HIT_SLOP: f32 = 8.;
 
 /// 一档清晰度的环：变体下标、半径（环宽的中线）与环宽。
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Ring {
-    index: usize,
+pub(super) struct Ring {
+    pub(super) index: usize,
     radius: f32,
     width: f32,
 }
 
 /// 由外向内的各环：码率从高到低，最外一环半径 [`OUTER`]、最内不小于 [`INNER`]、相邻两环的半径差至多 48。环宽按码率
 /// 在 4 到 26 之间，且与相邻环留出 8 的缝；档数多到半径差不足 11 时环宽压到 3，缝随之变窄。
-fn rings(variants: &[VariantInfo]) -> Vec<Ring> {
+pub(super) fn rings(variants: &[VariantInfo]) -> Vec<Ring> {
     let rates: Vec<(usize, Option<u64>)> =
         variants.iter().map(|v| (v.index, v.bandwidth)).collect();
     rings_of(&rates)
@@ -167,6 +167,26 @@ impl NewTask {
             },
             Probing::Ready(probe) => self.ready_figure(probe),
         };
+        // 按键在界面上看不出来：探测完成后在同心环下面写一行
+        let keys_hint = match &self.probing {
+            Probing::Ready(probe) => Some(
+                if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
+                    "↑ ↓ 换一档 · 回车开始"
+                } else {
+                    "回车开始"
+                },
+            ),
+            Probing::Running | Probing::Failed(_) => None,
+        }
+        .map(|text| {
+            div()
+                .absolute()
+                .left_0()
+                .top(px(BOX_TOP + BOX))
+                .w(px(BOX))
+                .text_center()
+                .child(ui::caption(text))
+        });
         let bounds_cell = self.rings_bounds.clone();
         let center_color = match self.probing {
             Probing::Failed(_) => theme::orange(),
@@ -241,6 +261,7 @@ impl NewTask {
                     )
                     .children(labels),
             )
+            .children(keys_hint)
     }
 
     /// 探测完成时的同心环：圆心写选中一档的清晰度与大小上限，只有一档时写时长与片数。

@@ -1,4 +1,4 @@
-//! 顶栏：标志与名字，右边是进行中的任务数与总速度。
+//! 顶栏：标志与名字，右边是进行中的任务数、总速度与保存目录所在盘的可用空间。
 
 use std::time::Instant;
 
@@ -18,6 +18,8 @@ const LOGO_ARC: f32 = 0.72;
 const LOGO_MARGIN: f32 = 14.;
 const LOGO_GAP: f32 = 10.;
 const STATUS_MARGIN: f32 = 28.;
+/// 可用空间少于这么多时顶栏的状态标成橙色：多数视频放不下了。
+const LOW_SPACE: u64 = 1 << 30;
 
 impl Shell {
     pub(super) fn render_header(&self, now: Instant) -> impl IntoElement {
@@ -26,16 +28,22 @@ impl Shell {
             .iter()
             .filter(|r| r.task.status == Status::Running)
             .collect();
-        let status = if running.is_empty() {
-            String::new()
-        } else {
+        let mut parts = Vec::new();
+        if !running.is_empty() {
             let speed: f64 = running.iter().map(|r| r.rate.bytes_per_second(now)).sum();
-            format!(
+            parts.push(format!(
                 "{} 个进行中 · ↓ {}/s",
                 running.len(),
                 format::bytes(speed as u64)
-            )
-        };
+            ));
+        }
+        let low = matches!(self.free_space, Some(Ok(free)) if free < LOW_SPACE);
+        match &self.free_space {
+            Some(Ok(free)) => parts.push(format!("盘余 {}", format::bytes(*free))),
+            Some(Err(reason)) => parts.push(format!("盘余读不出（{reason}）")),
+            None => {}
+        }
+        let status = parts.join(" · ");
         TitleBar::new()
             .h(px(TITLE_HEIGHT))
             .bg(theme::ground())
@@ -73,7 +81,7 @@ impl Shell {
                 div()
                     .pr(px(STATUS_MARGIN))
                     .text_size(px(13.))
-                    .text_color(theme::muted())
+                    .text_color(if low { theme::orange() } else { theme::muted() })
                     .child(status),
             ))
     }
