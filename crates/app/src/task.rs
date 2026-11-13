@@ -26,10 +26,12 @@ impl std::fmt::Display for TaskId {
     }
 }
 
-/// 新建任务时用户给定的：标题与输出路径由服务按它取（见 [`crate::Service::create`]）。
+/// 新建任务时用户给定的：输出路径由服务按它取（见 [`crate::Service::create`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub url: Url,
+    /// 视频所在网页的标题，任务的标题与主名照它取（见 [`crate::task_title`]）；None 时由地址得出
+    pub title: Option<String>,
     /// 选轨偏好；按下标选的存不了（主播放列表变了下标就不是同一条），报 [`crate::Error::InvalidInput`]
     pub preference: Preference,
     /// 额外的请求头
@@ -105,6 +107,9 @@ pub struct Task {
     pub total: Option<usize>,
     /// 完成时写出的结果；没完成时为 None
     pub result: Option<Finished>,
+    /// 用户选了不再续录（[`crate::Service::write_recorded`]）：再运行时只写出已录的，直到用
+    /// [`crate::Service::resume`] 续录
+    pub write_only: bool,
 }
 
 /// 完成时写出的结果，供之后显示。

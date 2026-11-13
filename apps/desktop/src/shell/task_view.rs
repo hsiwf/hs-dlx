@@ -10,7 +10,7 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
-use super::plan::{Action, stopped_plan};
+use super::plan::{Action, Plan, stopped_plan};
 use super::row::{Row, look};
 use super::{Shell, live_view};
 use crate::ring;
@@ -163,15 +163,12 @@ impl Shell {
             .editing_headers
             .as_ref()
             .filter(|(id, _)| *id == row.task.id)?;
-        // 存完接着跑：暂停的继续；失败的在重试或改请求头可能有用时重试，其余（再试也一样的）只保存
-        let (label, run_after) = match &row.task.status {
-            Status::Paused => ("保存并继续", true),
-            Status::Failed(failure)
-                if failure.kind.retry_helps() || failure.kind.headers_may_help() =>
-            {
-                ("保存并重试", true)
-            }
-            _ => ("保存", false),
+        let resume = self.plan(row).resume_after_headers;
+        let label = match (resume, &row.task.status) {
+            (false, _) => "保存",
+            (true, _) if row.task.write_only => "保存并续录",
+            (true, Status::Failed(_)) => "保存并重试",
+            (true, _) => "保存并继续",
         };
         Some(
             div()
@@ -194,7 +191,7 @@ impl Shell {
                             label,
                             Tone::Glow,
                             cx.listener(move |this, _, window, cx| {
-                                this.save_headers(run_after, window, cx)
+                                this.save_headers(resume, window, cx)
                             }),
                         ))
                         .child(ui::button(
@@ -210,6 +207,19 @@ impl Shell {
         )
     }
 
+    /// 停着的任务 `row` 的操作（见 [`stopped_plan`]）。
+    fn plan(&self, row: &Row) -> Plan {
+        let failure = match &row.task.status {
+            Status::Failed(failure) => Some(failure.kind),
+            _ => None,
+        };
+        let editing = self
+            .editing_headers
+            .as_ref()
+            .is_some_and(|(at, _)| *at == row.task.id);
+        stopped_plan(failure, row.recording(), row.task.write_only, editing)
+    }
+
     /// 暂停或失败的任务的操作（见 [`stopped_plan`]），第一个发光，改请求头不在第一个时只是文字。
     fn stopped_actions(
         &self,
@@ -222,17 +232,9 @@ impl Shell {
             Status::Failed(failure) => Some(failure.kind),
             _ => None,
         };
-        let editing = self
-            .editing_headers
-            .as_ref()
-            .is_some_and(|(at, _)| *at == id);
-        let plan = stopped_plan(
-            failure,
-            row.recording(),
-            row.writing_recorded.is_some(),
-            editing,
-        );
-        let mut actions: Vec<AnyElement> = plan
+        let mut actions: Vec<AnyElement> = self
+            .plan(row)
+            .actions
             .iter()
             .enumerate()
             .map(|(index, action)| {
@@ -262,10 +264,10 @@ impl Shell {
                     ),
                     Action::Resume => ui::button(
                         "resume",
-                        if failure.is_some() {
-                            "重试"
-                        } else {
-                            "继续"
+                        match (row.task.write_only, failure) {
+                            (true, _) => "续录",
+                            (false, Some(_)) => "重试",
+                            (false, None) => "继续",
                         },
                         tone,
                         cx.listener(move |this, _, _, cx| this.resume(id, cx)),

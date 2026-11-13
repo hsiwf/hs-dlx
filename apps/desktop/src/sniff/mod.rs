@@ -16,6 +16,7 @@ use hs_m3u8_core::{Url, check_option_header};
 
 use self::script::Report;
 use crate::links::http_url;
+use crate::new_task::Link;
 use crate::theme;
 use crate::ui::{self, CAPTION_LINE, GAP, TEXT_LINE, Tone};
 use crate::webview::WebView;
@@ -29,11 +30,8 @@ pub const PAGE_MIN_WIDTH: f32 = 480.;
 
 /// 嗅探页发给外面的事件。
 pub enum SniffEvent {
-    /// 带着这些请求头探测这个流
-    Probe {
-        url: Url,
-        headers: Vec<(String, String)>,
-    },
+    /// 探测这个流
+    Probe(Link),
     Dismissed,
 }
 
@@ -133,6 +131,11 @@ impl SniffView {
         cx.notify();
     }
 
+    /// 网页的标题；还没有时为空。
+    pub fn page_title(&self) -> String {
+        self.title.clone()
+    }
+
     fn webview(&self) -> Option<&Entity<WebView>> {
         self.webview.as_ref().ok()
     }
@@ -206,10 +209,11 @@ impl SniffView {
         match self.headers_for(index, cx) {
             Ok(headers) => {
                 self.error = None;
-                cx.emit(SniffEvent::Probe {
+                cx.emit(SniffEvent::Probe(Link {
                     url: self.found[index].url.clone(),
+                    title: (!self.title.is_empty()).then(|| self.title.clone()),
                     headers,
-                });
+                }));
             }
             Err(error) => self.error = Some(error),
         }

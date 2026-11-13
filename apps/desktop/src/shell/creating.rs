@@ -6,10 +6,10 @@ use gpui_kit::{AppContext as _, Context, Entity, Focusable as _, Window};
 use hs_m3u8_app::{Draft, Event};
 use hs_m3u8_core::Url;
 
-use super::Shell;
 use super::row::Row;
+use super::{Page, Shell};
 use crate::links;
-use crate::new_task::{NewTask, NewTaskEvent};
+use crate::new_task::{Link, NewTask, NewTaskEvent};
 use crate::sniff::{SniffEvent, SniffView};
 
 impl Shell {
@@ -29,23 +29,27 @@ impl Shell {
             self.open_sniff(url, window, cx);
             return;
         }
-        self.open_new_task(url, Vec::new(), window, cx);
+        self.open_new_task(
+            Link {
+                url,
+                title: None,
+                headers: Vec::new(),
+            },
+            window,
+            cx,
+        );
     }
 
-    /// 打开新建页探测 `url`，带着请求头 `headers`；嗅探页开着时先把它的网页藏起来。
+    /// 打开新建页探测 `link`（已开着的换成这个）。
     pub(super) fn open_new_task(
         &mut self,
-        url: Url,
-        headers: Vec<(String, String)>,
+        link: Link,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((sniff, _)) = &self.sniff {
-            sniff.update(cx, |sniff, cx| sniff.hide(cx));
-        }
         let (service, folder, home) =
             (self.service.clone(), self.folder.clone(), self.home.clone());
-        let view = cx.new(|cx| NewTask::new(service, url, headers, folder, home, window, cx));
+        let view = cx.new(|cx| NewTask::new(service, link, folder, home, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -54,7 +58,15 @@ impl Shell {
                     NewTaskEvent::Create(draft) => {
                         this.create(view.clone(), (**draft).clone(), window, cx)
                     }
-                    NewTaskEvent::Dismissed => this.new_task = None,
+                    NewTaskEvent::Dismissed => {
+                        let back = match this.page {
+                            Page::NewTask { from_sniff: true } if this.sniff.is_some() => {
+                                Page::Sniff
+                            }
+                            _ => Page::Task,
+                        };
+                        this.show(back, cx);
+                    }
                     // 用户还在粘贴栏里打别的链接时不抢焦点：只在粘贴栏里还是这个链接、或焦点不在粘贴栏时给
                     NewTaskEvent::Ready => {
                         let typing = this.paste.read(cx).focus_handle(cx).is_focused(window);
@@ -72,8 +84,14 @@ impl Shell {
                 cx.notify();
             },
         );
+        let from_sniff = match self.page {
+            Page::Sniff => true,
+            Page::NewTask { from_sniff } => from_sniff,
+            Page::Task => false,
+        };
+        // 先换页（关掉旧的新建视图），再放进新的
+        self.show(Page::NewTask { from_sniff }, cx);
         self.new_task = Some((view, subscription));
-        cx.notify();
     }
 
     /// 把 `url` 填进粘贴栏并探测。
@@ -159,8 +177,8 @@ impl Shell {
             self.service.pause(id);
         }
         if self.showing(view) {
-            self.new_task = None;
             self.selected = Some(id);
+            self.show(Page::Task, cx);
             self.paste
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -202,16 +220,16 @@ impl Shell {
             window,
             |this: &mut Self, _, event: &SniffEvent, window, cx| {
                 match event {
-                    SniffEvent::Probe { url, headers } => {
-                        this.open_new_task(url.clone(), headers.clone(), window, cx)
+                    SniffEvent::Probe(link) => this.open_new_task(link.clone(), window, cx),
+                    SniffEvent::Dismissed => {
+                        this.show(Page::Task, cx);
+                        this.sniff = None;
                     }
-                    SniffEvent::Dismissed => this.sniff = None,
                 }
                 cx.notify();
             },
         );
-        self.new_task = None;
         self.sniff = Some((view, subscription));
-        cx.notify();
+        self.show(Page::Sniff, cx);
     }
 }

@@ -7,7 +7,7 @@ use gpui_kit::{
 };
 use hs_m3u8_core::bare_url;
 
-use super::Shell;
+use super::{Page, Shell};
 use crate::links::http_url;
 use crate::theme;
 use crate::ui::{self, CAPTION_LINE, TEXT_LINE, Tone};
@@ -57,11 +57,12 @@ impl Shell {
             .into_any_element(),
         };
         // 待机页已经把剪贴板里的链接放在正中，别处只在粘贴栏空着时提一句
-        let standby = self.new_task.is_none() && self.selected_row().is_none();
+        let standby = self.page == Page::Task && self.selected_row().is_none();
+        let new_task = matches!(self.page, Page::NewTask { .. });
         let hint = self
             .clipboard
             .clone()
-            .filter(|_| !standby && value.is_empty() && self.new_task.is_none())
+            .filter(|_| !standby && value.is_empty() && !new_task)
             .map(|url| {
                 div()
                     .flex()

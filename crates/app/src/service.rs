@@ -205,7 +205,7 @@ impl Service {
     }
 
     /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里，
-    /// 主名由地址得出（见 [`crate::title_of`]），避开磁盘上已有的与存储里各任务占用的输出与任务目录（不分大小写与
+    /// 主名为任务的标题（见 [`crate::task_title`]），避开磁盘上已有的与存储里各任务占用的输出与任务目录（不分大小写与
     /// Unicode 写法），被占用时加编号；任务的标题即这个主名，任务目录为核心的默认位置。`draft.folder` 不是绝对路径、
     /// 选轨偏好存不了时报 [`Error::InvalidInput`]。取名要查磁盘（网络盘上可能慢），在运行时的阻塞线程上、存储锁外做，
     /// 10 秒内查不完报 [`Error::TimedOut`]；返回的句柄在任何执行器上都可等待。存储写不进时什么也不留：已开始的任务
@@ -216,43 +216,39 @@ impl Service {
             .spawn(async move { shared.create(draft, created_at).await })
     }
 
-    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下。已完成的报 [`Error::AlreadyDone`]，
-    /// 没有自己的任务目录的报 [`Error::NoWorkDir`]。存储写不进时任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
+    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下；之前选了只写出已录的，从此改回续录
+    /// （[`Task::write_only`] 为否）。在运行、正在放弃、已完成、放弃没做完的报 [`Error::Running`]、[`Error::Discarding`]、
+    /// [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有自己的任务目录的报 [`Error::NoWorkDir`]。存储写不进时
+    /// 任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
     pub fn resume(&self, id: TaskId) -> Result<(), Error> {
         let _entered = self.runtime().enter();
         self.shared.resume(id, Run::Resume)
     }
 
     /// 不再续录，只把停着的直播录制任务目录里已录的写成输出（见 [`Engine::merge_recorded`]）：用于来源变了、接不上，
-    /// 或不想再录的时候。拒绝的情形同 [`Service::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
-    /// 停下。停下后照常发 [`Event::Ended`]。
+    /// 或不想再录的时候。记下这个选择（[`Task::write_only`]），之后由 [`Service::resume`] 改回续录。拒绝的情形同
+    /// [`Service::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
+    /// （[`crate::FailureKind::NothingToWrite`]）停下。停下后照常发 [`Event::Ended`]。
     pub fn write_recorded(&self, id: TaskId) -> Result<(), Error> {
         let _entered = self.runtime().enter();
         self.shared.resume(id, Run::WriteRecorded)
     }
 
-    /// 把停着的任务的输出改为只要本地 HLS（目录与 MP4 同名、去掉扩展名），任务目录不变，已下的分片照样用：用于内容
-    /// 放不进 MP4（[`crate::FailureKind::Mp4Unsupported`]）之后，再继续或只写出已录的。只输出本地 HLS 的不变；新路径已被
-    /// 别的任务占着时报 [`Error::PathTaken`]；拒绝的情形同 [`Service::set_headers`]。
-    pub fn switch_to_hls(&self, id: TaskId) -> Result<(), Error> {
+    /// 把停着的任务的输出改为只要本地 HLS，任务目录不变，已下的分片照样用：用于内容放不进 MP4
+    /// （[`crate::FailureKind::Mp4Unsupported`]）之后，再继续或只写出已录的。只要 MP4 的，目录与 MP4 同名、去掉扩展名；
+    /// 两者都要的留下原来的本地 HLS；只要本地 HLS 的不变。返回改后的任务。新路径已被别的任务占着时报
+    /// [`Error::PathTaken`]；拒绝的情形同 [`Service::set_headers`]。
+    pub fn switch_to_hls(&self, id: TaskId) -> Result<Task, Error> {
         self.shared.write(|tx| {
-            if lock(&self.shared.running).contains_key(&id) {
-                return Err(Error::Running(id));
-            }
-            if lock(&self.shared.discarding).contains(&id) {
-                return Err(Error::Discarding(id));
-            }
-            let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
-            match task.status {
-                Status::Done => return Err(Error::AlreadyDone(id)),
-                Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
-                Status::Running | Status::Paused | Status::Failed(_) => {}
-            }
-            let hls = match task.spec.output {
-                OutputSpec::Hls(_) => return Ok(()),
-                OutputSpec::Mp4(mp4) | OutputSpec::Both { mp4, .. } => mp4.with_extension(""),
+            let mut task = self.shared.stopped(tx, id)?;
+            let hls = match &task.spec.output {
+                OutputSpec::Hls(_) => return Ok(task),
+                OutputSpec::Mp4(mp4) => mp4.with_extension(""),
+                OutputSpec::Both { hls, .. } => hls.clone(),
             };
-            store::set_output(tx, id, &OutputSpec::Hls(hls))
+            task.spec.output = OutputSpec::Hls(hls);
+            store::set_output(tx, id, &task.spec.output)?;
+            Ok(task)
         })
     }
 
@@ -309,17 +305,7 @@ impl Service {
             check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
         self.shared.write(|tx| {
-            if lock(&self.shared.running).contains_key(&id) {
-                return Err(Error::Running(id));
-            }
-            if lock(&self.shared.discarding).contains(&id) {
-                return Err(Error::Discarding(id));
-            }
-            match store::get(tx, id)?.ok_or(Error::NotFound(id))?.status {
-                Status::Done => return Err(Error::AlreadyDone(id)),
-                Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
-                Status::Running | Status::Paused | Status::Failed(_) => {}
-            }
+            self.shared.stopped(tx, id)?;
             store::set_headers(tx, id, &headers)
         })
     }
@@ -478,6 +464,24 @@ impl Shared {
         Ok(())
     }
 
+    /// 停着的任务 `id`（暂停或失败；存储里标着运行中而已不在运行的按停着算）：在运行、正在放弃、已完成、放弃没做完的
+    /// 报 [`Error::Running`]、[`Error::Discarding`]、[`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有时报
+    /// [`Error::NotFound`]。调用方持着 `store` 锁（`tx` 是它的事务），检查与之后的写入之间任务不会开始或开始放弃。
+    fn stopped(&self, tx: &Transaction<'_>, id: TaskId) -> Result<Task, Error> {
+        if lock(&self.running).contains_key(&id) {
+            return Err(Error::Running(id));
+        }
+        if lock(&self.discarding).contains(&id) {
+            return Err(Error::Discarding(id));
+        }
+        let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
+        match task.status {
+            Status::Done => Err(Error::AlreadyDone(id)),
+            Status::DiscardUnfinished => Err(Error::DiscardUnfinished(id)),
+            Status::Running | Status::Paused | Status::Failed(_) => Ok(task),
+        }
+    }
+
     /// 存储里的任务 `id`；没有时报 [`Error::NotFound`]。
     fn get(&self, id: TaskId) -> Result<Task, Error> {
         let mut store = lock(&self.store);
@@ -514,7 +518,7 @@ impl Shared {
             cause,
         })?;
         let preference = StoredPreference::try_from(&draft.preference)?;
-        let title = naming::title_of(&draft.url);
+        let title = naming::task_title(&draft.url, draft.title.as_deref());
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
         loop {
@@ -584,25 +588,15 @@ impl Shared {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
-        if lock(&self.running).contains_key(&id) {
-            return Err(Error::Running(id));
-        }
-        if lock(&self.discarding).contains(&id) {
-            return Err(Error::Discarding(id));
-        }
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
-        let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
-        match task.status {
-            Status::Done => return Err(Error::AlreadyDone(id)),
-            Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
-            Status::Running | Status::Paused | Status::Failed(_) => {}
-        }
+        let task = self.stopped(&tx, id)?;
         let job = match run {
             Run::Resume => self.engine.start(request(&task)?)?,
             Run::WriteRecorded => self.engine.merge_recorded(output_options(&task)?)?,
         };
         store::set_status(&tx, id, &Status::Running)?;
+        store::set_write_only(&tx, id, run == Run::WriteRecorded)?;
         let committed = self.commit(tx, applied);
         if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
@@ -711,7 +705,12 @@ impl Shared {
                 total,
             };
             let saved = shared.write(|tx| save_ending(tx, id, &ending));
-            if saved.is_err() {
+            if let Err(error) = &saved {
+                // 违反约束的结束状态永远写不进：留着待补写会让之后的每次写入都失败
+                assert!(
+                    !error.violates_constraint(),
+                    "{id}的结束状态与存储的表结构不一致：{error}"
+                );
                 lock(&shared.unsaved).insert(id, ending.clone());
             }
             drop(guard);

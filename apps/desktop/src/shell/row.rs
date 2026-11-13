@@ -52,8 +52,8 @@ pub struct Row {
     pub discarding: bool,
     /// 直播录制这次打开应用以来的时间线（钟面用）
     pub timeline: Timeline,
-    /// 最近一次运行是只写出已录的（不联网）时为开始时的已录时长：运行中不算录制、不给停止；失败后重试也只写出
-    pub writing_recorded: Option<Duration>,
+    /// 开始只写出已录的那一刻的已录时长：那次运行在核心报出进度之前按它显示
+    pub recorded_before_writing: Duration,
 }
 
 impl Row {
@@ -63,15 +63,7 @@ impl Row {
             .timestamp_opt(task.created_at, 0)
             .earliest()
             .map_or_else(|| "—".to_owned(), |t| t.format("%m-%d %H:%M").to_string());
-        let target = task.spec.output.options().target;
-        let file_name = target
-            .mp4()
-            .or(target.hls())
-            .expect("输出至少有 MP4 与本地 HLS 之一")
-            .file_name()
-            .expect("存储读回任务时已校验输出路径以文件名结尾")
-            .to_string_lossy()
-            .into_owned();
+        let file_name = file_name(&task.spec.output);
         let mut signals = Vec::new();
         signals::push(
             &mut signals,
@@ -100,8 +92,14 @@ impl Row {
             resuming: false,
             discarding: false,
             timeline: Timeline::default(),
-            writing_recorded: None,
+            recorded_before_writing: Duration::ZERO,
         }
+    }
+
+    /// 换上改后的输出（改存本地 HLS 之后）。
+    pub fn set_output(&mut self, output: OutputSpec) {
+        self.file_name = file_name(&output);
+        self.task.spec.output = output;
     }
 
     pub fn signal(&mut self, level: Level, text: String) {
@@ -138,7 +136,7 @@ impl Row {
     /// 是直播的录制：运行中过了准备阶段的按阶段；其余（停下的、还在准备的）按任务目录里的记录（继续前读到的），
     /// 没读到时按新建时的选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
     pub fn recording(&self) -> bool {
-        if self.task.status == Status::Running && self.writing_recorded.is_some() {
+        if self.task.status == Status::Running && self.task.write_only {
             return false;
         }
         if let Some(p) = &self.progress
@@ -218,6 +216,19 @@ fn percent(fraction: f32) -> String {
     format!("{}%", (fraction * 100.0).floor())
 }
 
+/// 输出的文件名（同时要 MP4 与本地 HLS 时为 MP4 的）。
+fn file_name(output: &OutputSpec) -> String {
+    let target = output.options().target;
+    target
+        .mp4()
+        .or(target.hls())
+        .expect("输出至少有 MP4 与本地 HLS 之一")
+        .file_name()
+        .expect("存储读回任务时已校验输出路径以文件名结尾")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// 任务为什么停着。
 enum Stopped<'a> {
     Paused,
@@ -251,7 +262,11 @@ fn failure_text(failure: &Failure) -> (String, &'static str) {
             "取到的不是视频该有的内容，多为错误页或登录页，常要补 Cookie",
         ),
         FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
-        FailureKind::Mp4Unsupported => ("MP4".into(), "内容放不进 MP4：改存本地 HLS，已下的照样用"),
+        FailureKind::Mp4Unsupported => (
+            "不兼容".into(),
+            "内容放不进 MP4：改存本地 HLS，已下的照样用",
+        ),
+        FailureKind::NothingToWrite => ("没录到".into(), "没有可写出的已录内容，续录后再写出"),
         FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
         FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见右边的信号"),
         FailureKind::Other => ("!".into(), "原因见右边的信号"),
@@ -439,12 +454,12 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             short: percent,
         };
     }
-    if let Some(recorded) = row.writing_recorded {
+    if row.task.write_only {
         return Look {
             state: "准备写出".to_owned(),
             color: theme::cyan(),
             ticks: Ticks::of(0, 0, true),
-            big: format::clock(amount.duration.max(recorded)),
+            big: format::clock(amount.duration.max(row.recorded_before_writing)),
             line: "不联网，只写出已录的".to_owned(),
             fraction: 0.0,
             orb: theme::cyan(),
@@ -547,6 +562,7 @@ mod tests {
             created_at: 0,
             total,
             result: None,
+            write_only: false,
         };
         Row::new(task, Instant::now())
     }

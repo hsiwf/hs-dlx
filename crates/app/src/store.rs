@@ -47,6 +47,7 @@ fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
 /// - 失败的种类（[`crate::FailureKind`] 在存储里的写法，CHECK 列出全部写法），只在失败时有；第 1 版失败的行记为
 ///   其余。
 /// - 点播的总片数，与完成时写出的结果（时长、字节数、视频的宽高）。
+/// - 继续时只写出已录的（[`Task::write_only`]），第 1 版的行为否。
 fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
         "CREATE TABLE task_v2 (
@@ -66,7 +67,8 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
                 (status = 'failed') = (failure IS NOT NULL)
                 AND (failure IS NULL
                      OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'malformed',
-                                    'stalled', 'mp4-unsupported', 'unsupported', 'unrecoverable', 'other')
+                                    'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported', 'unrecoverable',
+                                    'other')
                      OR failure GLOB 'status:[0-9][0-9][0-9]')
             ),
             created_at INTEGER NOT NULL,
@@ -74,7 +76,8 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             duration_ms INTEGER CHECK (duration_ms >= 0),
             bytes INTEGER CHECK (bytes >= 0),
             width INTEGER CHECK (width > 0),
-            height INTEGER CHECK (height > 0)
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1))
         ) STRICT;
         INSERT INTO task_v2 (id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status,
                              error, failure, created_at)
@@ -243,7 +246,7 @@ impl Store {
 
 /// 读出一个任务的各列，顺序与 [`Row::read`] 一致。
 const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status, \
-                       error, failure, created_at, total, duration_ms, bytes, width, height";
+                       error, failure, created_at, total, duration_ms, bytes, width, height, write_only";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录
 /// 相同（按 [`naming::path_key`] 比较）时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；
@@ -403,6 +406,18 @@ pub fn set_result(tx: &Transaction<'_>, id: TaskId, result: &Finished) -> Result
     Ok(())
 }
 
+/// 记下继续时是否只写出已录的（见 [`Task::write_only`]）；没有这个任务时报 [`Error::NotFound`]。
+pub fn set_write_only(tx: &Transaction<'_>, id: TaskId, write_only: bool) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET write_only = ?2 WHERE id = ?1",
+        params![id.0, write_only],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
 /// 改状态；没有这个任务时报 [`Error::NotFound`]。
 pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(), Error> {
     let (name, error, failure) = match status {
@@ -463,6 +478,7 @@ struct Row {
     bytes: Option<i64>,
     width: Option<u32>,
     height: Option<u32>,
+    write_only: bool,
 }
 
 impl Row {
@@ -487,6 +503,7 @@ impl Row {
             bytes: row.get(16)?,
             width: row.get(17)?,
             height: row.get(18)?,
+            write_only: row.get(19)?,
         })
     }
 
@@ -548,6 +565,7 @@ impl Row {
             created_at: self.created_at,
             total,
             result,
+            write_only: self.write_only,
         })
     }
 }

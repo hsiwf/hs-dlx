@@ -25,8 +25,7 @@ const GENERIC: [&str; 5] = ["index", "master", "playlist", "prog_index", "main"]
 const STEM_LIMIT: usize = 200;
 
 /// 列表与文件名用的标题：地址路径的最后一段（百分号解码、去掉 `.m3u8`）；是 index、master 之类的通用名时取上一级
-/// 目录名。文件名里不能出现的字符换成 `_`，超过 200 字节时在字符边界截断（给编号与后缀留出文件名上限 255 字节的余
-/// 量）；什么都不剩时用主机名。
+/// 目录名；整理成文件主名（同 [`task_title`]），什么都不剩时用主机名。
 pub fn title_of(url: &Url) -> String {
     let segments: Vec<String> = url
         .path_segments()
@@ -50,7 +49,27 @@ pub fn title_of(url: &Url) -> String {
     } else {
         last
     };
-    let clean: String = name
+    let clean = clean_title(&name);
+    if clean.is_empty() {
+        url.host_str().unwrap_or("视频").to_owned()
+    } else {
+        clean
+    }
+}
+
+/// 任务的标题：给了 `title`（如视频所在网页的标题）时为它整理成文件主名后的（不能出现在文件名里的字符与控制字符换成
+/// `_`，去掉首尾的空白与 `.`，截到 200 字节），什么都不剩或没给时由地址得出（[`title_of`]）。
+pub fn task_title(url: &Url, title: Option<&str>) -> String {
+    title
+        .map(clean_title)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| title_of(url))
+}
+
+/// 把 `text` 整理成能当文件主名的标题：文件名里不能出现的字符与控制字符换成 `_`，去掉首尾的空白与 `.`，超过 200
+/// 字节时在字符边界截断（给编号与后缀留出文件名上限 255 字节的余量）。可能为空。
+fn clean_title(text: &str) -> String {
+    let clean: String = text
         .chars()
         .map(|c| {
             if "/\\:*?\"<>|".contains(c) || c.is_control() {
@@ -60,12 +79,7 @@ pub fn title_of(url: &Url) -> String {
             }
         })
         .collect();
-    let clean = truncate(clean.trim().trim_matches('.'), STEM_LIMIT);
-    if clean.is_empty() {
-        url.host_str().unwrap_or("视频").to_owned()
-    } else {
-        clean.to_owned()
-    }
+    truncate(clean.trim().trim_matches('.'), STEM_LIMIT).to_owned()
 }
 
 /// `text` 的前缀，不超过 `limit` 字节、落在字符边界上。

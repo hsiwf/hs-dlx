@@ -6,7 +6,7 @@ use gpui_kit::{
     Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::{OutputKind, title_of};
+use hs_m3u8_app::OutputKind;
 use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, Route, duration_of};
@@ -34,14 +34,13 @@ impl NewTask {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    // 由地址得出的标题；开始时与已有的重名会加编号
                     .child(
                         div()
                             .text_size(px(20.))
                             .line_height(px(28.))
                             .font_weight(FontWeight::BOLD)
                             .line_clamp(2)
-                            .child(title_of(&self.url)),
+                            .child(self.title.clone()),
                     )
                     .child(ui::num(ui::caption(self.summary(&host)))),
             );

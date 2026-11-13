@@ -75,6 +75,17 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// 写存储时违反了表的约束（CHECK、NOT NULL 等）：本应用写的值与表结构不一致，不是外部故障。
+    pub(crate) fn violates_constraint(&self) -> bool {
+        matches!(
+            self,
+            Error::Store(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation
+        )
+    }
+}
+
 fn join(leftovers: &[hs_m3u8_core::Leftover]) -> String {
     leftovers
         .iter()

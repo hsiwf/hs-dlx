@@ -1,4 +1,5 @@
-//! 左边的任务列表：每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」。
+//! 左边的任务列表：每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，嗅探页开着（没显示）时有一项回到
+//! 网页。
 
 use std::time::Instant;
 
@@ -8,8 +9,8 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
 
-use super::Shell;
 use super::row::{Row, look};
+use super::{Page, Shell};
 use crate::new_task::Phase;
 use crate::{ring, theme, ui};
 
@@ -28,7 +29,11 @@ impl Shell {
             .new_task
             .as_ref()
             .map(|(view, _)| new_task_item(view.read(cx).phase()));
-        let dim = self.new_task.is_some();
+        let sniff = self.sniff.as_ref().map(|(view, _)| {
+            let title = view.read(cx).page_title();
+            sniff_item(title, cx)
+        });
+        let dim = matches!(self.page, Page::NewTask { .. });
         let orbs: Vec<_> = self
             .rows
             .iter()
@@ -46,6 +51,7 @@ impl Shell {
             .py(px(8.))
             .overflow_y_scroll()
             .children(new_task)
+            .children(sniff)
             .children(orbs)
     }
 
@@ -58,7 +64,7 @@ impl Shell {
     ) -> Stateful<Div> {
         let id = row.task.id;
         let look = look(row, now);
-        let on = self.selected == Some(id) && self.new_task.is_none();
+        let on = self.selected == Some(id) && self.page == Page::Task;
         let (fraction, color) = (look.fraction, look.orb);
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.55))
@@ -127,6 +133,39 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
                 .text_color(theme::muted())
                 .truncate()
                 .child(state),
+        ))
+}
+
+/// 回到嗅探页的一项：两个同心实线环（与嗅探页里流前面的一样），写网页的标题。
+fn sniff_item(title: String, cx: &mut Context<Shell>) -> Stateful<Div> {
+    let ring = |size: f32, width: f32, color| {
+        div()
+            .absolute()
+            .left(px((ORB - size) / 2.))
+            .top(px((ORB - size) / 2.))
+            .size(px(size))
+            .rounded_full()
+            .border(px(width))
+            .border_color(color)
+    };
+    ui::list_item("sniff", false)
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| this.show(Page::Sniff, cx)))
+        .child(
+            div()
+                .relative()
+                .size(px(ORB))
+                .flex_none()
+                .child(ring(ORB, ORB_WIDTH, theme::cyan()))
+                .child(ring(ORB - 20., 2., theme::cyan_dim())),
+        )
+        .child(two_lines(
+            if title.is_empty() {
+                "网页".to_owned()
+            } else {
+                title
+            },
+            "找视频流 · 点这里回去".to_owned(),
         ))
 }
 

@@ -118,7 +118,8 @@ impl Shell {
             Ok(()) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 // 核心报出进度之前，已录时长先按停下时知道的显示
-                row.writing_recorded = Some(row.recorded());
+                row.recorded_before_writing = row.recorded();
+                row.task.write_only = true;
                 row.task.status = Status::Running;
                 row.progress = None;
                 row.forget_disk();
@@ -131,24 +132,27 @@ impl Shell {
         cx.notify();
     }
 
-    /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下。
+    /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。
     pub(super) fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) {
         let title = self.title(id);
-        let Some(live) = self.row(id).map(Row::recording) else {
-            return;
-        };
-        if let Err(error) = self.service.switch_to_hls(id) {
-            self.notify(format!("「{title}」没能改存本地 HLS：{error}"));
+        if self.quitting {
+            self.notify(format!("正在退出，「{title}」没有改存本地 HLS"));
             cx.notify();
             return;
         }
-        match self.service.task(id) {
+        let Some(live) = self.row(id).filter(|row| row.idle()).map(Row::recording) else {
+            return;
+        };
+        match self.service.switch_to_hls(id) {
             Ok(task) => {
-                if let Some(row) = self.row_mut(id) {
-                    row.task.spec.output = task.spec.output;
-                }
+                let row = self.row_mut(id).expect("上面刚找到这一行");
+                row.set_output(task.spec.output);
             }
-            Err(error) => self.notify(format!("读不出「{title}」改后的输出：{error}")),
+            Err(error) => {
+                self.notify(format!("「{title}」没能改存本地 HLS：{error}"));
+                cx.notify();
+                return;
+            }
         }
         if live {
             self.write_recorded(id, cx);
@@ -183,7 +187,7 @@ impl Shell {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 row.task.status = Status::Running;
                 row.progress = None;
-                row.writing_recorded = None;
+                row.task.write_only = false;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
@@ -278,11 +282,11 @@ impl Shell {
         cx.notify();
     }
 
-    /// 存下编辑框里的请求头，`run_after` 时接着继续；编辑框里还没按回车的一条加不进去时什么也不做（原因显示在编辑
+    /// 存下编辑框里的请求头，`resume` 时接着续传续录；编辑框里还没按回车的一条加不进去时什么也不做（原因显示在编辑
     /// 框里）。
     pub(super) fn save_headers(
         &mut self,
-        run_after: bool,
+        resume: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -298,7 +302,7 @@ impl Shell {
                 if let Some(row) = self.row_mut(id) {
                     row.task.spec.headers = headers;
                 }
-                if run_after {
+                if resume {
                     self.resume(id, cx);
                 }
             }

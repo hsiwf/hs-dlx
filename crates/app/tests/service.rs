@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
-use hs_m3u8_app::{Draft, Error, Event, OutputKind, OutputSpec, Service, Status, Store, TaskId};
+use hs_m3u8_app::{
+    Draft, Error, Event, FailureKind, OutputKind, OutputSpec, Service, Status, Store, TaskId,
+};
 use hs_m3u8_core::Url;
 use hs_m3u8_core::hls::Preference;
 use tokio::runtime::Runtime;
@@ -106,6 +108,7 @@ fn test_dir(name: &str) -> PathBuf {
 fn draft(url: Url, folder: PathBuf) -> Draft {
     Draft {
         url,
+        title: None,
         preference: Preference::default(),
         headers: Vec::new(),
         output: OutputKind::Mp4,
@@ -503,8 +506,8 @@ fn concurrent_creates_get_separate_outputs() {
     }
 }
 
-/// 只写出已录的用于直播录制：点播下载的任务目录照样开始一次运行，核心报目录里不是直播录制，任务以失败停下、任务目录
-/// 留着。
+/// 只写出已录的用于直播录制：点播下载的任务目录照样开始一次运行，核心报目录里不是直播录制，任务以「没有可写出的」
+/// 失败停下、任务目录留着；这个选择存进存储，续传时改回。
 #[test]
 fn writing_recorded_content_of_a_download_fails_visibly() {
     let dir = test_dir("write-recorded");
@@ -525,9 +528,19 @@ fn writing_recorded_content_of_a_download_fails_visibly() {
     service.write_recorded(id).unwrap();
     let status = rt.block_on(ended(&mut events, id, |_| {}));
 
-    assert!(matches!(status, Status::Failed(_)), "{status:?}");
-    assert_eq!(service.task(id).unwrap().status, status);
+    assert!(
+        matches!(&status, Status::Failed(failure) if failure.kind == FailureKind::NothingToWrite),
+        "{status:?}"
+    );
+    let task = service.task(id).unwrap();
+    assert_eq!(task.status, status);
+    assert!(task.write_only);
     assert!(folder.join("index.hsdl").is_dir());
+
+    server.gate.open();
+    service.resume(id).unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Done);
+    assert!(!service.task(id).unwrap().write_only);
 }
 
 /// 下到一半改存本地 HLS：任务目录不变，继续后写出同名的本地 HLS 目录，不再写 MP4。
@@ -548,11 +561,9 @@ fn a_paused_task_can_switch_to_local_hls() {
     service.pause(id);
     assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Paused);
 
-    service.switch_to_hls(id).unwrap();
-    assert_eq!(
-        service.task(id).unwrap().spec.output,
-        OutputSpec::Hls(folder.join("index"))
-    );
+    let switched = service.switch_to_hls(id).unwrap();
+    assert_eq!(switched.spec.output, OutputSpec::Hls(folder.join("index")));
+    assert_eq!(service.task(id).unwrap(), switched);
     server.gate.open();
     service.resume(id).unwrap();
 

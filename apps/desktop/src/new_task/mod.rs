@@ -16,7 +16,7 @@ use gpui_kit::{
     IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
     Task, Window, div, px,
 };
-use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service};
+use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, task_title};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, ProxySource, Source, Url};
 
@@ -29,6 +29,16 @@ const OPTION_MIN_WIDTH: f32 = 260.;
 pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + OPTION_MIN_WIDTH;
 /// 新建页的最小高：同心环区域与下边距。
 pub const MIN_HEIGHT: f32 = FIGURE_HEIGHT + BOTTOM;
+
+/// 要探测的链接。
+#[derive(Clone)]
+pub struct Link {
+    pub url: Url,
+    /// 视频所在网页的标题，任务照它取名（见 [`hs_m3u8_app::task_title`]）；没有时由地址得出
+    pub title: Option<String>,
+    /// 探测与下载时带的请求头
+    pub headers: Vec<(String, String)>,
+}
 
 /// 新建任务视图发给外面的事件。
 pub enum NewTaskEvent {
@@ -99,6 +109,10 @@ enum Probing {
 pub struct NewTask {
     service: Rc<Service>,
     url: Url,
+    /// 任务的标题，开始时与已有的重名会加编号
+    title: String,
+    /// 交给服务的网页标题（见 [`Link::title`]）
+    page_title: Option<String>,
     probing: Probing,
     /// 选中的变体在 `MasterInfo::variants` 里的下标；来源是媒体播放列表时不用
     variant: usize,
@@ -129,13 +143,17 @@ impl EventEmitter<NewTaskEvent> for NewTask {}
 impl NewTask {
     pub fn new(
         service: Rc<Service>,
-        url: Url,
-        headers: Vec<(String, String)>,
+        link: Link,
         folder: PathBuf,
         home: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let Link {
+            url,
+            title: page_title,
+            headers,
+        } = link;
         let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
         // 读系统代理要调操作系统的接口，在后台读
         let target = url.clone();
@@ -152,6 +170,8 @@ impl NewTask {
         });
         let mut view = NewTask {
             service,
+            title: task_title(&url, page_title.as_deref()),
+            page_title,
             url,
             probing: Probing::Running,
             variant: 0,
@@ -339,6 +359,7 @@ impl NewTask {
         };
         let draft = Draft {
             url: self.url.clone(),
+            title: self.page_title.clone(),
             preference,
             headers,
             output: self.output,

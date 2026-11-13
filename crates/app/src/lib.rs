@@ -10,7 +10,7 @@ mod task;
 
 pub use error::Error;
 pub use failure::{Failure, FailureKind};
-pub use naming::title_of;
+pub use naming::{task_title, title_of};
 pub use preference::StoredPreference;
 pub use service::{Event, Events, Service};
 pub use store::Store;

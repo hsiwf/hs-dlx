@@ -43,13 +43,15 @@ pub enum FailureKind {
     Malformed,
     /// 直播长时间录不到新分片
     Stalled,
+    /// 没有可写出的：直播没录到可合并的分片，或只写出已录的时任务目录里不是直播录制；续录可以，再写出也一样
+    NothingToWrite,
     /// 内容放不进 MP4：改存本地 HLS 可以，已下的分片照样用
     Mp4Unsupported,
     /// 来源用了不支持的特性（DRM 等加密、只有关键帧的轨、增量更新的播放列表等），或不是 HLS
     Unsupported,
     /// 再试也一样的其余失败：任务目录认不出、参数不对、重定向过多、服务器不照范围请求回应、合并时内容不对等
     Unrecoverable,
-    /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端）
+    /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
     Other,
 }
 
@@ -89,9 +91,10 @@ impl FailureKind {
                 | WorkDirProblem::SourceUnverified
                 | WorkDirProblem::Unaligned { .. } => FailureKind::SourceChanged,
                 WorkDirProblem::Locked => FailureKind::Other,
-                WorkDirProblem::Corrupt(_)
-                | WorkDirProblem::UnsupportedVersion { .. }
-                | WorkDirProblem::NotLiveRecording => FailureKind::Unrecoverable,
+                WorkDirProblem::NotLiveRecording => FailureKind::NothingToWrite,
+                WorkDirProblem::Corrupt(_) | WorkDirProblem::UnsupportedVersion { .. } => {
+                    FailureKind::Unrecoverable
+                }
             },
             CoreError::Select(_) => FailureKind::SourceChanged,
             CoreError::Playlist { .. }
@@ -116,10 +119,10 @@ impl FailureKind {
             CoreError::NotMediaPlaylist { .. } | CoreError::ResponseTooLarge { .. } => {
                 FailureKind::Unsupported
             }
-            CoreError::InvalidInput(_)
-            | CoreError::LiveNotEnabled
-            | CoreError::NothingRecorded
-            | CoreError::Hook { .. } => FailureKind::Unrecoverable,
+            CoreError::NothingRecorded => FailureKind::NothingToWrite,
+            CoreError::InvalidInput(_) | CoreError::LiveNotEnabled | CoreError::Hook { .. } => {
+                FailureKind::Unrecoverable
+            }
             CoreError::HttpClientInit(_) | CoreError::Cancelled => FailureKind::Other,
         }
     }
@@ -169,8 +172,8 @@ impl FailureKind {
     }
 
     /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件）后再试，有没有可能成功；不需要处理什么的暂时性故障
-    /// （408、429、5xx、超时、停滞）同样算。证书、内容不对、来源变了、放不进 MP4、不支持与其余再试也一样的不算：
-    /// 它们要改请求头、换输出，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
+    /// （408、429、5xx、超时、停滞）同样算。证书、内容不对、来源变了、放不进 MP4、没有可写出的、不支持与其余再试也
+    /// 一样的不算：它们要改请求头、换输出、改为续录，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
     pub fn retry_helps(self) -> bool {
         match self {
             FailureKind::Status(code) => matches!(code, 408 | 429 | 500..=599),
@@ -183,6 +186,7 @@ impl FailureKind {
             | FailureKind::SourceChanged
             | FailureKind::Malformed
             | FailureKind::Mp4Unsupported
+            | FailureKind::NothingToWrite
             | FailureKind::Unsupported
             | FailureKind::Unrecoverable => false,
         }
@@ -196,8 +200,8 @@ impl FailureKind {
         )
     }
 
-    /// 在存储里的写法：`status:<状态码>` 或种类名。存储格式的一部分：改写法或加种类都要加一项存储迁移（存储里有
-    /// CHECK 列出全部写法，旧版本应用打不开新写法的存储，而不是读出认不出的行）。
+    /// 在存储里的写法：`status:<状态码>` 或种类名。存储格式的一部分：存储的 failure 列有 CHECK 列出全部写法，改写法或
+    /// 加种类要随表结构一起改（已发布的表结构版本只能追加迁移），旧版本应用因此打不开新写法的存储，而不是读出认不出的行。
     pub(crate) fn code(self) -> String {
         match self {
             FailureKind::Status(code) => format!("status:{code}"),
@@ -210,6 +214,7 @@ impl FailureKind {
             FailureKind::Unrecoverable => "unrecoverable".into(),
             FailureKind::Malformed => "malformed".into(),
             FailureKind::Stalled => "stalled".into(),
+            FailureKind::NothingToWrite => "nothing-to-write".into(),
             FailureKind::Unsupported => "unsupported".into(),
             FailureKind::Other => "other".into(),
         }
@@ -227,6 +232,7 @@ impl FailureKind {
             "unrecoverable" => FailureKind::Unrecoverable,
             "malformed" => FailureKind::Malformed,
             "stalled" => FailureKind::Stalled,
+            "nothing-to-write" => FailureKind::NothingToWrite,
             "unsupported" => FailureKind::Unsupported,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
@@ -234,7 +240,8 @@ impl FailureKind {
     }
 }
 
-/// 每一种失败（状态码取一个）。下面的 match 列出全部种类：加种类时编译器逼着补进来，存储与写法的测试才覆盖得到。
+/// 每一种失败（状态码取一个），存储与写法的测试逐个用。下面的 match 列出全部种类：加种类时它先编译不过，提醒把新种类
+/// 也加进列表。
 #[cfg(test)]
 pub(crate) fn every() -> Vec<FailureKind> {
     let all = vec![
@@ -246,6 +253,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::SourceChanged,
         FailureKind::Malformed,
         FailureKind::Stalled,
+        FailureKind::NothingToWrite,
         FailureKind::Mp4Unsupported,
         FailureKind::Unsupported,
         FailureKind::Unrecoverable,
@@ -261,6 +269,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::SourceChanged
             | FailureKind::Malformed
             | FailureKind::Stalled
+            | FailureKind::NothingToWrite
             | FailureKind::Mp4Unsupported
             | FailureKind::Unsupported
             | FailureKind::Unrecoverable
