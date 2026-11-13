@@ -34,8 +34,10 @@ pub struct Row {
     pub task: Task,
     /// 这次运行最近的进度；继续时清掉
     pub progress: Option<Progress>,
-    /// 任务不在运行时任务目录里已完成的内容
+    /// 任务不在运行时任务目录里已完成的内容；停下时作废重读，运行中留着继续前读到的
     pub disk: Disk,
+    /// 读任务目录的代次：每次作废 `disk` 时加一，只收发起时代次相同的结果
+    pub reading: u64,
     /// 完成任务的输出在不在；还没查时为 None
     pub present: Option<Present>,
     pub rate: Rate,
@@ -62,7 +64,7 @@ impl Row {
             .or(target.hls())
             .expect("输出至少有 MP4 与本地 HLS 之一")
             .file_name()
-            .expect("core 只接受以文件名结尾的输出路径")
+            .expect("存储读回任务时已校验输出路径以文件名结尾")
             .to_string_lossy()
             .into_owned();
         let mut signals = Vec::new();
@@ -76,6 +78,7 @@ impl Row {
             task,
             progress: None,
             disk: Disk::Unread,
+            reading: 0,
             present: None,
             rate: Rate::new(now, Some(0)),
             signals,
@@ -95,20 +98,26 @@ impl Row {
         !self.resuming && !self.discarding
     }
 
-    /// 是直播的录制：运行中按进度的阶段（还在准备时按新建时的选择）；停下的按任务目录里的记录，没读到时按新建时的
-    /// 选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
+    /// 作废读到的任务目录内容（任务停下时：内容变了），之后发起的读才算数。
+    pub fn forget_disk(&mut self) {
+        self.disk = Disk::Unread;
+        self.reading += 1;
+    }
+
+    /// 是直播的录制：运行中到了录制或下载阶段的按阶段；其余（停下的、还在准备的）按任务目录里的记录（继续前读到的），
+    /// 没读到时按新建时的选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
     pub fn recording(&self) -> bool {
         if let Some(p) = &self.progress
             && self.task.status == Status::Running
         {
-            return match p.stage {
-                Stage::Recording => true,
-                Stage::Preparing => self.task.spec.live,
-                Stage::Downloading | Stage::Writing | Stage::Done => false,
-            };
+            match p.stage {
+                Stage::Recording => return true,
+                Stage::Downloading | Stage::Writing | Stage::Done => return false,
+                Stage::Preparing => {}
+            }
         }
         match &self.disk {
-            Disk::Read(Some(saved)) if self.task.status != Status::Running => saved.live,
+            Disk::Read(Some(saved)) => saved.live,
             _ => self.task.spec.live,
         }
     }
@@ -168,78 +177,100 @@ impl Amount {
             (self.done as f32 / self.total as f32).min(1.0)
         }
     }
+}
 
-    /// 向下取整的百分比：没下完不写 100%。
-    fn percent(&self) -> String {
-        format!("{}%", (self.fraction() * 100.0).floor())
-    }
+/// 向下取整的百分比（`fraction` 为 0 到 1）：没做完不写 100%。
+fn percent(fraction: f32) -> String {
+    format!("{}%", (fraction * 100.0).floor())
+}
+
+/// 任务为什么停着。
+enum Stopped<'a> {
+    Paused,
+    /// 值为错误的说明
+    Failed(&'a str),
 }
 
 pub fn look(row: &Row, now: Instant) -> Look {
-    let amount = Amount::of(row);
-    let (done, total) = amount.as_ref().map_or((0, 0), |a| (a.done, a.total));
-    let ticks = Ticks::of(total, done, false);
     if row.discarding {
-        return Look {
-            state: "放弃中".to_owned(),
-            color: theme::muted(),
-            ticks: Ticks {
-                color: theme::finished(),
-                glow: false,
-                ..ticks
-            },
-            big: "…".to_owned(),
-            line: "停下并删除任务目录".to_owned(),
-            fraction: 0.0,
-            orb: theme::finished(),
-            short: "…".to_owned(),
-        };
+        return discarding(row);
     }
-    let mut look = match &row.task.status {
-        Status::Running => running(row, amount.unwrap_or_default(), now),
-        Status::Paused => stopped(
-            row,
-            amount,
-            ticks,
-            "已暂停",
-            theme::muted(),
-            theme::cyan_dim(),
-        ),
-        Status::Failed(message) => {
-            let mut look = stopped(
-                row,
-                amount,
-                ticks,
-                "需要处理",
-                theme::orange(),
-                theme::finished(),
-            );
-            look.orb = theme::orange();
-            look.big = "!".to_owned();
-            look.short = "!".to_owned();
-            look.line = message.clone();
-            look
-        }
+    match &row.task.status {
+        Status::Running => running(row, Amount::of(row).unwrap_or_default(), now),
+        Status::Paused => stopped(row, Stopped::Paused),
+        Status::Failed(message) => stopped(row, Stopped::Failed(message)),
         Status::Done => done_look(row),
-    };
-    if row.resuming {
-        look.state = "正在继续".to_owned();
     }
-    look
 }
 
-/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光。
-fn stopped(
-    row: &Row,
-    amount: Option<Amount>,
-    ticks: Ticks,
-    state: &str,
-    color: Hsla,
-    lit: Hsla,
-) -> Look {
-    let known = amount.as_ref().is_some_and(|a| a.total > 0);
+/// 正在放弃：刻度按已有的内容、不发光，等它删完。
+fn discarding(row: &Row) -> Look {
+    let (done, total) = Amount::of(row).map_or((0, 0), |a| (a.done, a.total));
+    Look {
+        state: "放弃中".to_owned(),
+        color: theme::muted(),
+        ticks: Ticks {
+            color: theme::finished(),
+            glow: false,
+            ..Ticks::of(total, done, false)
+        },
+        big: "…".to_owned(),
+        line: "停下并删除任务目录".to_owned(),
+        fraction: 0.0,
+        orb: theme::finished(),
+        short: "…".to_owned(),
+    }
+}
+
+/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字是「!」、说明是错误。点了继续、还在读
+/// 任务目录时状态写「正在继续」。
+fn stopped(row: &Row, why: Stopped<'_>) -> Look {
+    let amount = Amount::of(row);
+    let (done, total) = amount.as_ref().map_or((0, 0), |a| (a.done, a.total));
+    let known = total > 0;
     let recording = row.recording();
-    let line = match (&amount, &row.disk) {
+    let state = |state: &str| if row.resuming { "正在继续" } else { state }.to_owned();
+    let ticks = |lit: Hsla| Ticks {
+        color: lit,
+        glow: false,
+        ..Ticks::of(total, done, false)
+    };
+    let fraction = amount.as_ref().map_or(0.0, Amount::fraction);
+    match why {
+        Stopped::Paused => {
+            let (big, line) = paused_text(row, amount.as_ref(), recording);
+            Look {
+                state: state("已暂停"),
+                color: theme::muted(),
+                ticks: ticks(theme::cyan_dim()),
+                short: if known && !recording {
+                    big.clone()
+                } else {
+                    "‖".to_owned()
+                },
+                big,
+                line,
+                fraction,
+                orb: theme::cyan_dim(),
+            }
+        }
+        Stopped::Failed(message) => Look {
+            state: state("需要处理"),
+            color: theme::orange(),
+            ticks: ticks(theme::finished()),
+            big: "!".to_owned(),
+            line: message.to_owned(),
+            fraction,
+            orb: theme::orange(),
+            short: "!".to_owned(),
+        },
+    }
+}
+
+/// 暂停的任务的大字与说明：录制写已录的时长，点播写百分比与片数；没有内容时说明为什么。
+fn paused_text(row: &Row, amount: Option<&Amount>, recording: bool) -> (String, String) {
+    let known = amount.is_some_and(|a| a.total > 0);
+    let line = match (amount, &row.disk) {
         (Some(a), _) if recording => {
             format!(
                 "已录 {} · {}",
@@ -263,29 +294,12 @@ fn stopped(
         }
         _ => "还没有下载内容".to_owned(),
     };
-    let big = match &amount {
+    let big = match amount {
         Some(a) if recording => format::clock(a.duration),
-        Some(a) if known => a.percent(),
+        Some(a) if known => percent(a.fraction()),
         _ => "‖".to_owned(),
     };
-    Look {
-        state: state.to_owned(),
-        color,
-        ticks: Ticks {
-            color: lit,
-            glow: false,
-            ..ticks
-        },
-        short: if known && !recording {
-            big.clone()
-        } else {
-            "‖".to_owned()
-        },
-        big,
-        line,
-        fraction: amount.as_ref().map_or(0.0, Amount::fraction),
-        orb: theme::cyan_dim(),
-    }
+    (big, line)
 }
 
 /// 已完成的任务：整圈点亮（刻度数按存储里的总片数，与下载时一致），大字为时长，下面写输出的种类、视频的宽高与大小。
@@ -330,7 +344,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
         let written = count.map_or(0.0, |c| {
             (c.done as f32 / c.total.max(1) as f32).clamp(0.0, 1.0)
         });
-        let percent = format!("{}%", (written * 100.0).floor());
+        let percent = percent(written);
         let ticks = Ticks::of(amount.total, amount.done, false);
         return Look {
             state: kind.to_owned(),
@@ -399,11 +413,11 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
         state: "下载中".to_owned(),
         color: theme::cyan(),
         ticks,
-        big: amount.percent(),
+        big: percent(amount.fraction()),
         line,
         fraction: amount.fraction(),
         orb: theme::cyan(),
-        short: amount.percent(),
+        short: percent(amount.fraction()),
     }
 }
 
@@ -442,6 +456,7 @@ mod tests {
                 live,
             },
             status,
+            work_dir: Some("/m/talk.hsdl".into()),
             created_at: 0,
             total,
             result: None,

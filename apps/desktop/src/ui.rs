@@ -8,46 +8,63 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled, Window, div, point, px,
 };
 
-use crate::{ring, theme};
+use crate::{new_task, ring, theme};
 
 /// 顶栏高度；macOS 的红绿灯按它垂直居中。
 pub const TITLE_HEIGHT: f32 = 56.;
-/// 主体左右的内边距、各栏之间的间距、各视图中间一栏的下边距。
+/// 主体左右的内边距。
 pub const PAD: f32 = 20.;
+/// 各栏之间的间距。
 pub const GAP: f32 = 8.;
+/// 各视图中间一栏的下边距。
 pub const BOTTOM: f32 = 24.;
 /// 按钮与胶囊的高度。
 pub const BUTTON_HEIGHT: f32 = 38.;
-/// 左边任务列表的宽度，窗口窄时最多收到的宽度。
+/// 小标题（12 号字）的行高。
+pub const CAPTION_LINE: f32 = 18.;
+/// 正文（13 号字）的行高。
+pub const TEXT_LINE: f32 = 20.;
+/// 左边任务列表的宽度。
 pub const LIST_WIDTH: f32 = 300.;
+/// 窗口窄时任务列表最多收到的宽度。
 pub const LIST_MIN_WIDTH: f32 = 240.;
-/// 右边栏的宽度：任务视图的信号、新建页的选项；窗口窄时最多收到的宽度。
+/// 任务视图右边信号栏的宽度。
 pub const SIGNAL_WIDTH: f32 = 300.;
+/// 窗口窄时信号栏最多收到的宽度。
+pub const SIGNAL_MIN_WIDTH: f32 = 240.;
+/// 新建页右边选项栏的宽度。
 pub const OPTION_WIDTH: f32 = 320.;
-pub const SIDE_MIN_WIDTH: f32 = 260.;
-/// 新建页同心环区域（连同右侧的标签）的宽与高。
-pub const FIGURE_WIDTH: f32 = 680.;
-pub const FIGURE_HEIGHT: f32 = 520.;
-/// 任务视图中间一栏：中央刻度环、到按钮的间距、一行按钮、下边距。
+/// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
+pub const OPTION_MIN_WIDTH: f32 = 260.;
+/// 任务视图里中央刻度环到下面一行按钮的间距。
 pub const ACTIONS_GAP: f32 = 24.;
+/// 任务视图中间一栏的高：中央刻度环、间距、一行按钮、下边距。
 pub const TASK_VIEW_HEIGHT: f32 = ring::AREA + ACTIONS_GAP + BUTTON_HEIGHT + BOTTOM;
-/// 待机页中间一栏：中央刻度环、到剪贴板卡片的间距、卡片（上下各 10 加一个按钮）、下边距。
+/// 待机页里中央刻度环到剪贴板卡片的间距。
 pub const SUGGESTION_GAP: f32 = 28.;
+/// 剪贴板卡片的上下内边距。
 pub const SUGGESTION_PADDING: f32 = 10.;
-pub const STANDBY_HEIGHT: f32 =
-    ring::AREA + SUGGESTION_GAP + 2. * SUGGESTION_PADDING + BUTTON_HEIGHT + BOTTOM;
-/// 新建页中间一栏：同心环区域与下边距。
-pub const NEW_TASK_HEIGHT: f32 = FIGURE_HEIGHT + BOTTOM;
-/// 底部粘贴栏：胶囊、上下边距，上面一行剪贴板提示、下面一行输入错误（各一行字加间距）。
+/// 待机页中间一栏的高：中央刻度环、间距、剪贴板卡片（内边距加按钮与两行字中高的一个）、下边距。
+pub const STANDBY_HEIGHT: f32 = ring::AREA
+    + SUGGESTION_GAP
+    + 2. * SUGGESTION_PADDING
+    + max(BUTTON_HEIGHT, CAPTION_LINE + 2. + TEXT_LINE)
+    + BOTTOM;
+/// 新建页中间一栏的高：同心环区域与下边距。
+pub const NEW_TASK_HEIGHT: f32 = new_task::FIGURE_HEIGHT + BOTTOM;
+/// 粘贴栏胶囊的高度。
 pub const PILL_HEIGHT: f32 = 56.;
-pub const FOOTER_TOP: f32 = 8.;
+/// 粘贴栏的下边距。
 pub const FOOTER_BOTTOM: f32 = 24.;
+/// 粘贴栏里各行（剪贴板提示、胶囊、输入错误）之间的间距。
 pub const FOOTER_GAP: f32 = 10.;
-pub const FOOTER_LINE: f32 = 18.;
+/// 粘贴栏的高：胶囊、下边距，上面一行剪贴板提示（小标题）、下面一行输入错误（正文），各带间距。
 pub const FOOTER_HEIGHT: f32 =
-    PILL_HEIGHT + FOOTER_TOP + FOOTER_BOTTOM + 2. * (FOOTER_LINE + FOOTER_GAP);
-/// 窗口的最小尺寸：宽放得下新建页的三栏（列表与右栏收到最窄），高放得下顶栏、最高的中间一栏与粘贴栏。
-pub const MIN_WIDTH: f32 = 2. * PAD + LIST_MIN_WIDTH + GAP + FIGURE_WIDTH + GAP + SIDE_MIN_WIDTH;
+    PILL_HEIGHT + FOOTER_BOTTOM + (CAPTION_LINE + FOOTER_GAP) + (TEXT_LINE + FOOTER_GAP);
+/// 窗口的最小宽：放得下新建页的三栏（列表与选项栏收到最窄，中间是整个同心环区域）。
+pub const MIN_WIDTH: f32 =
+    2. * PAD + LIST_MIN_WIDTH + GAP + new_task::FIGURE_WIDTH + GAP + OPTION_MIN_WIDTH;
+/// 窗口的最小高：放得下顶栏、最高的中间一栏与粘贴栏。
 pub const MIN_HEIGHT: f32 =
     TITLE_HEIGHT + max(max(TASK_VIEW_HEIGHT, STANDBY_HEIGHT), NEW_TASK_HEIGHT) + FOOTER_HEIGHT;
 
@@ -147,6 +164,7 @@ pub fn chip(
 pub fn caption(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(12.))
+        .line_height(px(CAPTION_LINE))
         .text_color(theme::muted())
         .child(text.into())
 }
@@ -219,6 +237,7 @@ pub fn list_item(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
 pub fn error_text(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(13.))
+        .line_height(px(TEXT_LINE))
         .text_color(theme::orange())
         .child(text.into())
 }

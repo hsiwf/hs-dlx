@@ -12,51 +12,52 @@ pub fn disc() -> Hsla {
     rgb(0x0B0E15).into()
 }
 
-/// 卡片、提示条、粘贴栏的底色
+/// 浮在底色上的面：卡片、提示、输入框
 pub fn panel() -> Hsla {
     rgb(0x0E1118).into()
 }
 
-/// 按钮的底色、列表项悬停的底色
+/// 可点的东西静止时的底色，以及悬停时稍微抬起的底色
 pub fn raised() -> Hsla {
     rgb(0x0F131C).into()
 }
 
-/// 选中的列表项、按钮悬停的底色
+/// 选中与按下前（悬停）的底色
 pub fn selected() -> Hsla {
     rgb(0x111827).into()
 }
 
-/// 描边里最暗的一档：空刻度、进度环的底、普通信号卡片
+/// 最暗的线：还没做的刻度、进度的底、普通级别的描边
 pub fn line() -> Hsla {
     rgb(0x1A2030).into()
 }
 
-/// 没选中的清晰度环
+/// 可选、但没选中的环
 pub fn ring_idle() -> Hsla {
     rgb(0x1E2636).into()
 }
 
-/// 悬停时的描边（清晰度环、胶囊、按钮）、没选中的清晰度标签前的圆点
+/// 悬停时的描边，与没选中项的标记
 pub fn hover_edge() -> Hsla {
     rgb(0x2C3850).into()
 }
 
-/// 描边里中间的一档：选中的列表项、粘贴栏、剪贴板卡片、清晰度环的引线
+/// 中间一档的线：面的轮廓、选中项的描边、引线
 pub fn edge() -> Hsla {
     rgb(0x22304A).into()
 }
 
-/// 描边里较亮的一档：按钮与没选中的胶囊
+/// 较亮的线：可点的东西的轮廓
 pub fn stroke() -> Hsla {
     rgb(0x2A3346).into()
 }
 
+/// 正文
 pub fn text() -> Hsla {
     rgb(0xEDEFF5).into()
 }
 
-/// 列表小环里的字、没选中的胶囊上的字
+/// 比正文稍暗的字：次一级但仍要读的
 pub fn soft() -> Hsla {
     rgb(0xC9CEDB).into()
 }
@@ -66,17 +67,17 @@ pub fn muted() -> Hsla {
     rgb(0x8C93A6).into()
 }
 
-/// 进度、选中、主按钮
+/// 主色：进度、选中、每屏最该按的那一个
 pub fn cyan() -> Hsla {
     rgb(0x5BE7F5).into()
 }
 
-/// 写出中的列表小环、青色按钮与链接悬停时
+/// 主色的浅一档：主色悬停时、写出阶段
 pub fn cyan_pale() -> Hsla {
     rgb(0xA8F3FA).into()
 }
 
-/// 正在下的刻度、暂停的已完成刻度
+/// 主色的暗一档：不在动的进度（暂停）、正在下的刻度
 pub fn cyan_dim() -> Hsla {
     rgb(0x2C7F88).into()
 }
@@ -86,32 +87,32 @@ pub fn on_cyan() -> Hsla {
     rgb(0x04161A).into()
 }
 
-/// 已写出的刻度
+/// 写出阶段已写出的部分
 pub fn written() -> Hsla {
     rgb(0xE8ECF5).into()
 }
 
-/// 重试、需要处理
+/// 要留意的：重试、失败、要用户处理的提示
 pub fn orange() -> Hsla {
     rgb(0xFF9F43).into()
 }
 
-/// 录制中
+/// 直播录制
 pub fn red() -> Hsla {
     rgb(0xFF5A5F).into()
 }
 
-/// 不再需要注意的：已完成任务的列表小环、失败与放弃中任务的刻度
+/// 不再需要注意的：已完成、作废的进度
 pub fn finished() -> Hsla {
     rgb(0x3B4253).into()
 }
 
-/// 重试类信号卡片的描边
+/// 要留意级别的描边：重试类信号与要用户关掉的提示
 pub fn warn_edge() -> Hsla {
     rgb(0x5A3A18).into()
 }
 
-/// 失败类信号卡片的描边
+/// 失败级别的描边
 pub fn error_edge() -> Hsla {
     rgb(0x5A1F22).into()
 }

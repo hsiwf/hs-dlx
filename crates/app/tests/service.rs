@@ -123,19 +123,35 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
     Service::new(Store::open(store).unwrap(), NonZeroUsize::new(8).unwrap()).unwrap()
 }
 
-/// 等到任务 `id` 停下，返回它的状态；中途的进度事件交给 `on_progress`。
-async fn ended(
+/// 等到任务 `id` 停下，返回它的状态与没写进存储的原因；中途的进度事件交给 `on_progress`。
+async fn stopped(
     events: &mut mpsc::UnboundedReceiver<Event>,
     id: TaskId,
     mut on_progress: impl FnMut(&hs_m3u8_core::Progress),
-) -> Status {
+) -> (Status, Option<Error>) {
     loop {
         match events.recv().await.expect("服务还在，事件通道不会关闭") {
             Event::Progress { id: at, progress } if at == id => on_progress(&progress),
-            Event::Ended { id: at, status, .. } if at == id => return status,
-            Event::StoreFailed { error, .. } => panic!("没写进存储：{error}"),
+            Event::Ended {
+                id: at,
+                status,
+                unsaved,
+                ..
+            } if at == id => return (status, unsaved),
             _ => {}
         }
+    }
+}
+
+/// 等到任务 `id` 停下、状态写进存储，返回它的状态；中途的进度事件交给 `on_progress`。
+async fn ended(
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    id: TaskId,
+    on_progress: impl FnMut(&hs_m3u8_core::Progress),
+) -> Status {
+    match stopped(events, id, on_progress).await {
+        (status, None) => status,
+        (_, Some(error)) => panic!("没写进存储：{error}"),
     }
 }
 
@@ -183,6 +199,11 @@ fn a_task_downloads_and_is_recorded_as_done() {
     assert_eq!(done.status, Status::Done);
     let result = done.result.expect("完成时记下写出的结果");
     assert!(result.bytes > 0 && result.duration.is_some(), "{result:?}");
+    assert_eq!(done.total, Some(2));
+    assert!(matches!(
+        service.resume(task.id),
+        Err(Error::AlreadyDone(_))
+    ));
     service.forget(task.id).unwrap();
     assert!(service.tasks().unwrap().is_empty());
     assert!(folder.join("index.mp4").is_file());
@@ -304,4 +325,74 @@ fn a_relative_folder_is_refused() {
         .unwrap();
     assert!(matches!(refused, Err(Error::InvalidInput(_))));
     assert!(service.tasks().unwrap().is_empty());
+}
+
+/// 任务停下时存储被别的连接占着：结束状态没写进去，事件里带着原因，服务记着它、列任务时按它返回；存储放开后关闭服务
+/// 时补写进去，重开后是已完成。
+#[test]
+fn an_ending_that_cannot_be_saved_is_saved_later() {
+    let dir = test_dir("unsaved");
+    let folder = dir.join("out");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let id = {
+        let (service, mut events) = service(&store);
+        let id = create(
+            &rt,
+            &service,
+            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        )
+        .id;
+        rt.block_on(first_segment(&mut events, id));
+        let mut other = rusqlite::Connection::open(&store).unwrap();
+        let holding = other
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .unwrap();
+        server.gate.open();
+        let (status, unsaved) = rt.block_on(stopped(&mut events, id, |_| {}));
+        assert_eq!(status, Status::Done);
+        assert!(matches!(unsaved, Some(Error::Store(_))), "{unsaved:?}");
+        assert!(service.has_unsaved());
+        drop(holding);
+        let task = service.tasks().unwrap().remove(0);
+        assert_eq!(task.status, Status::Done);
+        assert!(task.result.is_some());
+        id
+    };
+    let (service, _events) = service(&store);
+    let task = service.tasks().unwrap().remove(0);
+    assert_eq!((task.id, task.status), (id, Status::Done));
+    assert!(task.result.is_some());
+    assert!(!service.has_unsaved());
+}
+
+/// 任务目录里有不是本库写的文件时放弃删不干净：任务留在列表里、报出留下的东西；拿走那个文件后再放弃即删掉。
+#[test]
+fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
+    let dir = test_dir("discard-left");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let id = create(
+        &rt,
+        &service,
+        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+    )
+    .id;
+    rt.block_on(first_segment(&mut events, id));
+    service.pause(id);
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Paused);
+    let foreign = folder.join("index.hsdl").join("notes.txt");
+    std::fs::write(&foreign, b"mine").unwrap();
+
+    let left = rt.block_on(service.discard(id)).unwrap();
+    assert!(matches!(left, Err(Error::WorkDirLeft { .. })), "{left:?}");
+    assert_eq!(service.tasks().unwrap().len(), 1);
+
+    std::fs::remove_file(&foreign).unwrap();
+    assert_eq!(rt.block_on(service.discard(id)).unwrap().unwrap(), []);
+    assert!(service.tasks().unwrap().is_empty());
+    assert!(!folder.join("index.hsdl").exists());
 }

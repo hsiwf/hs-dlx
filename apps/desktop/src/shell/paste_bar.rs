@@ -10,7 +10,7 @@ use hs_m3u8_core::bare_url;
 use super::Shell;
 use crate::links::http_url;
 use crate::theme;
-use crate::ui::{self, FOOTER_BOTTOM, FOOTER_GAP, FOOTER_TOP, PILL_HEIGHT, Tone};
+use crate::ui::{self, CAPTION_LINE, FOOTER_BOTTOM, FOOTER_GAP, PILL_HEIGHT, Tone};
 
 /// 粘贴栏胶囊的最大宽度。
 const PILL_MAX_WIDTH: f32 = 880.;
@@ -58,6 +58,7 @@ impl Shell {
                     .items_center()
                     .gap(px(8.))
                     .text_size(px(12.))
+                    .line_height(px(CAPTION_LINE))
                     .text_color(theme::muted())
                     .child(format!("剪贴板：{}", bare_url(&url)))
                     .child(
@@ -78,7 +79,6 @@ impl Shell {
             .items_center()
             .gap(px(FOOTER_GAP))
             .px(px(28.))
-            .pt(px(FOOTER_TOP))
             .pb(px(FOOTER_BOTTOM))
             .children(hint)
             .child(

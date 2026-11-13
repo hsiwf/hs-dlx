@@ -63,7 +63,8 @@ pub enum OutputSpec {
 }
 
 impl OutputSpec {
-    /// 核心的输出选项：任务目录取默认位置（与输出同级的 `<主名>.hsdl`），重开应用时由同一输出路径找回。
+    /// 核心的输出选项，任务目录取核心的默认位置（与输出同级的 `<主名>.hsdl`）。新建任务时由此定下任务目录，记在
+    /// [`Task::work_dir`]，之后照它指定。
     pub fn options(&self) -> OutputOptions {
         OutputOptions::new(match self.clone() {
             OutputSpec::Mp4(path) => Target::Mp4(path),
@@ -92,6 +93,9 @@ pub struct Task {
     pub id: TaskId,
     pub spec: TaskSpec,
     pub status: Status,
+    /// 任务目录（绝对路径），新建时定下、之后不变。None 时任务没有自己的任务目录：旧版本存储里已完成的，或与别的任务
+    /// 共用任务目录、迁移时让给了那个任务的（状态为失败）；这样的任务不能继续，只能从列表移除
+    pub work_dir: Option<PathBuf>,
     /// 新建时间，Unix 秒
     pub created_at: i64,
     /// 点播的总片数（各轨合计），第一次运行拿到播放列表后记下，用于任务没在运行时显示进度；直播与还没拿到时为 None

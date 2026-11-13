@@ -16,8 +16,8 @@ use crate::ring;
 use crate::signals::{Level, Signal};
 use crate::theme;
 use crate::ui::{
-    self, ACTIONS_GAP, BOTTOM, SIDE_MIN_WIDTH, SIGNAL_WIDTH, SUGGESTION_GAP, SUGGESTION_PADDING,
-    Tone,
+    self, ACTIONS_GAP, BOTTOM, SIGNAL_MIN_WIDTH, SIGNAL_WIDTH, SUGGESTION_GAP, SUGGESTION_PADDING,
+    TEXT_LINE, Tone,
 };
 
 /// 中央刻度环里的深色圆盘离绘制区域边缘多远、里面的字离圆盘边多远。
@@ -77,9 +77,10 @@ impl Shell {
                         .child(SharedString::from(look.line)),
                 )),
         );
+        // 中间一栏至少放得下中央刻度环：窗口窄时先收两侧的栏
         let main = div()
             .flex_1()
-            .min_w_0()
+            .min_w(px(ring::AREA))
             .flex()
             .flex_col()
             .items_center()
@@ -99,7 +100,7 @@ impl Shell {
         let aside = div()
             .flex_basis(px(SIGNAL_WIDTH))
             .flex_shrink(1.)
-            .min_w(px(SIDE_MIN_WIDTH))
+            .min_w(px(SIGNAL_MIN_WIDTH))
             .min_h_0()
             .flex()
             .flex_col()
@@ -169,6 +170,16 @@ impl Shell {
                 discard(cx),
             ],
             Status::Running => vec![pause(cx), discard(cx)],
+            // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录
+            Status::Paused | Status::Failed(_) if row.task.work_dir.is_none() => vec![
+                ui::button(
+                    "forget",
+                    "从列表移除",
+                    Tone::Plain,
+                    cx.listener(move |this, _, _, cx| this.forget(id, cx)),
+                )
+                .into_any_element(),
+            ],
             Status::Paused | Status::Failed(_) => vec![
                 ui::button(
                     "resume",
@@ -259,7 +270,8 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(14.))
-                .w(px(560.))
+                .w_full()
+                .max_w(px(560.))
                 .pl(px(20.))
                 .pr(px(10.))
                 .py(px(SUGGESTION_PADDING))
@@ -276,7 +288,13 @@ impl Shell {
                         .flex_col()
                         .gap(px(2.))
                         .child(ui::caption("剪贴板里的链接"))
-                        .child(div().text_size(px(13.)).truncate().child(shown)),
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .line_height(px(TEXT_LINE))
+                                .truncate()
+                                .child(shown),
+                        ),
                 )
                 .child(ui::button(
                     "probe-clipboard",
@@ -287,7 +305,7 @@ impl Shell {
         });
         div()
             .flex_1()
-            .min_w_0()
+            .min_w(px(ring::AREA))
             .flex()
             .flex_col()
             .items_center()

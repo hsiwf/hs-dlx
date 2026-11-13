@@ -15,7 +15,7 @@ use crate::{Error, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming}
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 2] = [create_task_table, add_work_dir_total_and_result];
+const MIGRATIONS: [Migration; 2] = [create_task_table, rebuild_with_work_dir_and_result];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
@@ -37,76 +37,98 @@ fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// 第 2 版：
-/// - 任务目录单列一列，另记它的比较键（[`naming::path_key`]）并且键唯一：两个任务共用一个任务目录时，放弃其中一个会
-///   删掉另一个已下的内容。没完成的行按第 1 版的规则补算（与输出同级的 `<主名>.hsdl`），已完成的不占（任务目录已在
-///   完成时删掉）；补算出重复的报 [`Error::Corrupt`]，说明是哪几个任务。
+/// 第 2 版，重建表：
+/// - 编号不再重用（AUTOINCREMENT）：界面按编号认领异步回来的结果，删掉的任务的编号给了新任务就会认错。
+/// - 任务目录单列（绝对路径；NULL 时任务没有自己的任务目录）。第 1 版的行按第 1 版的规则补算：没完成的取与输出同级的
+///   `<主名>.hsdl`，已完成的为 NULL（任务目录已在完成时删掉）。补算出的任务目录相同（按迁移时的 [`naming::path_key`]
+///   比较）的一组里，编号最小的留着它，其余的改为失败、任务目录为 NULL：放弃它们会删掉留着的那个已下的内容。
 /// - 点播的总片数，与完成时写出的结果（时长、字节数、视频的宽高）。
-fn add_work_dir_total_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
+fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
-        "ALTER TABLE task ADD COLUMN work_dir TEXT;
-         ALTER TABLE task ADD COLUMN work_dir_key TEXT;
-         ALTER TABLE task ADD COLUMN total INTEGER CHECK (total >= 0);
-         ALTER TABLE task ADD COLUMN duration_ms INTEGER CHECK (duration_ms >= 0);
-         ALTER TABLE task ADD COLUMN bytes INTEGER CHECK (bytes >= 0);
-         ALTER TABLE task ADD COLUMN width INTEGER CHECK (width > 0);
-         ALTER TABLE task ADD COLUMN height INTEGER CHECK (height > 0);",
+        "CREATE TABLE task_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            preference TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            output_kind TEXT NOT NULL CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            work_dir TEXT,
+            live INTEGER NOT NULL CHECK (live IN (0, 1)),
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done')),
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0)
+        ) STRICT;
+        INSERT INTO task_v2 (id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status,
+                             error, created_at)
+            SELECT id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status, error,
+                   created_at
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v2 RENAME TO task;",
     )?;
     /// 第 1 版的一行里迁移要用的列。
     struct V1Row {
         id: i64,
+        title: String,
         status: String,
         kind: String,
         mp4: Option<String>,
         hls: Option<String>,
     }
     let rows: Vec<V1Row> = tx
-        .prepare("SELECT id, status, output_kind, mp4_path, hls_path FROM task ORDER BY id")?
+        .prepare("SELECT id, title, status, output_kind, mp4_path, hls_path FROM task ORDER BY id")?
         .query_map([], |row| {
             Ok(V1Row {
                 id: row.get(0)?,
-                status: row.get(1)?,
-                kind: row.get(2)?,
-                mp4: row.get(3)?,
-                hls: row.get(4)?,
+                title: row.get(1)?,
+                status: row.get(2)?,
+                kind: row.get(3)?,
+                mp4: row.get(4)?,
+                hls: row.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // 任务目录的比较键 → 没完成的任务
-    let mut active: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
-    for V1Row {
-        id,
-        status,
-        kind,
-        mp4,
-        hls,
-    } in rows
-    {
-        let work_dir = match (kind.as_str(), mp4, hls) {
+    // 任务目录的比较键 → 留着它的任务的标题
+    let mut owners: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for row in rows {
+        let work_dir = match (row.kind.as_str(), row.mp4, row.hls) {
             ("mp4" | "both", Some(mp4), _) => v1_work_dir(&mp4, true),
             ("hls", None, Some(hls)) => v1_work_dir(&hls, false),
             _ => None,
         }
-        .ok_or_else(|| Error::Corrupt(format!("任务 {id} 的输出")))?;
-        if status == "done" {
+        .ok_or_else(|| Error::Corrupt(format!("任务 {} 的输出", row.id)))?;
+        if row.status == "done" {
             continue;
         }
-        let key = naming::path_key(&work_dir);
-        active.entry(key.clone()).or_default().push(id);
-        tx.execute(
-            "UPDATE task SET work_dir = ?2, work_dir_key = ?3 WHERE id = ?1",
-            params![id, work_dir, key],
-        )?;
+        match owners.entry(naming::path_key(&work_dir)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(row.title);
+                tx.execute(
+                    "UPDATE task SET work_dir = ?2 WHERE id = ?1",
+                    params![row.id, work_dir],
+                )?;
+            }
+            std::collections::hash_map::Entry::Occupied(owner) => {
+                tx.execute(
+                    "UPDATE task SET status = 'failed', error = ?2 WHERE id = ?1",
+                    params![
+                        row.id,
+                        format!(
+                            "与「{}」共用任务目录 {work_dir}，放弃这个任务会删掉那个任务已下的内容；只能从列表移除",
+                            owner.get()
+                        )
+                    ],
+                )?;
+            }
+        }
     }
-    if let Some((key, ids)) = active.iter().find(|(_, ids)| ids.len() > 1) {
-        let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
-        return Err(Error::Corrupt(format!(
-            "任务 {} 共用任务目录 {key}（旧版本取名只看磁盘时可能出现）；放弃其中任何一个都会删掉另一个已下的内容，要先在存储\
-             里删掉多余的任务",
-            ids.join("、")
-        )));
-    }
-    tx.execute_batch("CREATE UNIQUE INDEX task_work_dir_key ON task (work_dir_key);")?;
     Ok(())
 }
 
@@ -123,6 +145,9 @@ fn v1_work_dir(path: &str, strip_extension: bool) -> Option<String> {
     dir.push(".hsdl");
     path.parent()?.join(dir).into_os_string().into_string().ok()
 }
+
+/// 存储被别的连接占着时等多久再报错：有单实例锁，占着它的只会是外部工具（如 sqlite3 命令行），而写存储常在界面线程上。
+const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 打开的任务存储。
 pub struct Store {
@@ -150,6 +175,7 @@ impl Store {
             Err(TryLockError::Error(cause)) => return Err(io("加锁", &lock_path)(cause)),
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         restrict_to_owner(path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store {
@@ -195,27 +221,32 @@ impl Store {
 }
 
 /// 读出一个任务的各列，顺序与 [`Row::read`] 一致。
-const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, live, status, error, \
-                       created_at, total, duration_ms, bytes, width, height";
+const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status, \
+                       error, created_at, total, duration_ms, bytes, width, height";
 
-/// 新建任务，状态为运行中；返回分配的编号。任务目录与已有任务的相同（按 [`naming::path_key`] 比较）时报
-/// [`Error::WorkDirTaken`]。
-pub fn insert(tx: &Transaction<'_>, spec: &TaskSpec, created_at: i64) -> Result<TaskId, Error> {
+/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。任务目录与已有任务的输出或任务目录相同
+/// （按 [`naming::path_key`] 比较）时报 [`Error::WorkDirTaken`]：两个任务共用任务目录时，放弃其中一个会删掉另一个已下
+/// 的内容。
+pub fn insert(
+    tx: &Transaction<'_>,
+    spec: &TaskSpec,
+    work_dir: &Path,
+    created_at: i64,
+) -> Result<TaskId, Error> {
     let (kind, mp4, hls) = output_columns(&spec.output)?;
-    let work_dir = work_dir_of(&spec.output)?;
-    let key = naming::path_key(&work_dir);
-    let taken: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM task WHERE work_dir_key = ?1)",
-        [&key],
-        |row| row.get(0),
-    )?;
-    if taken {
-        return Err(Error::WorkDirTaken(work_dir.into()));
+    let work_dir_text = utf8(work_dir)?;
+    if !work_dir.is_absolute() {
+        return Err(Error::InvalidInput(format!(
+            "任务目录不是绝对路径：{work_dir_text}"
+        )));
+    }
+    if taken_paths(tx)?.contains(&naming::path_key(&work_dir_text)) {
+        return Err(Error::WorkDirTaken(work_dir.to_path_buf()));
     }
     tx.execute(
-        "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, hls_path, live, status, created_at,
-                           work_dir, work_dir_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10, ?11)",
+        "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status,
+                           created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10)",
         params![
             spec.title,
             spec.url.as_str(),
@@ -224,10 +255,9 @@ pub fn insert(tx: &Transaction<'_>, spec: &TaskSpec, created_at: i64) -> Result<
             kind,
             mp4,
             hls,
+            work_dir_text,
             spec.live,
             created_at,
-            work_dir,
-            key
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -348,6 +378,7 @@ struct Row {
     output_kind: String,
     mp4_path: Option<String>,
     hls_path: Option<String>,
+    work_dir: Option<String>,
     live: bool,
     status: String,
     error: Option<String>,
@@ -370,15 +401,16 @@ impl Row {
             output_kind: row.get(5)?,
             mp4_path: row.get(6)?,
             hls_path: row.get(7)?,
-            live: row.get(8)?,
-            status: row.get(9)?,
-            error: row.get(10)?,
-            created_at: row.get(11)?,
-            total: row.get(12)?,
-            duration_ms: row.get(13)?,
-            bytes: row.get(14)?,
-            width: row.get(15)?,
-            height: row.get(16)?,
+            work_dir: row.get(8)?,
+            live: row.get(9)?,
+            status: row.get(10)?,
+            error: row.get(11)?,
+            created_at: row.get(12)?,
+            total: row.get(13)?,
+            duration_ms: row.get(14)?,
+            bytes: row.get(15)?,
+            width: row.get(16)?,
+            height: row.get(17)?,
         })
     }
 
@@ -392,6 +424,10 @@ impl Row {
             serde_json::from_str(&self.headers).map_err(|_| corrupt("请求头"))?;
         let output = output_spec(&self.output_kind, self.mp4_path, self.hls_path)
             .ok_or_else(|| corrupt("输出"))?;
+        let work_dir = match self.work_dir.map(PathBuf::from) {
+            Some(dir) if !named_absolute(&dir) => return Err(corrupt("任务目录")),
+            dir => dir,
+        };
         let total = self
             .total
             .map(usize::try_from)
@@ -428,6 +464,7 @@ impl Row {
                 live: self.live,
             },
             status,
+            work_dir,
             created_at: self.created_at,
             total,
             result,
@@ -435,40 +472,44 @@ impl Row {
     }
 }
 
-/// 表里的输出三列读回成输出；种类与路径对不上时为 None。
+/// 表里的输出三列读回成输出；种类与路径对不上、或路径不是以文件名结尾的绝对路径时为 None。
 fn output_spec(kind: &str, mp4: Option<String>, hls: Option<String>) -> Option<OutputSpec> {
-    match (kind, mp4, hls) {
-        ("mp4", Some(mp4), None) => Some(OutputSpec::Mp4(mp4.into())),
-        ("hls", None, Some(hls)) => Some(OutputSpec::Hls(hls.into())),
-        ("both", Some(mp4), Some(hls)) => Some(OutputSpec::Both {
+    let output = match (kind, mp4, hls) {
+        ("mp4", Some(mp4), None) => OutputSpec::Mp4(mp4.into()),
+        ("hls", None, Some(hls)) => OutputSpec::Hls(hls.into()),
+        ("both", Some(mp4), Some(hls)) => OutputSpec::Both {
             mp4: mp4.into(),
             hls: hls.into(),
-        }),
-        _ => None,
-    }
+        },
+        _ => return None,
+    };
+    let valid = match &output {
+        OutputSpec::Mp4(path) | OutputSpec::Hls(path) => named_absolute(path),
+        OutputSpec::Both { mp4, hls } => named_absolute(mp4) && named_absolute(hls),
+    };
+    valid.then_some(output)
 }
 
-/// 输出对应的任务目录（核心按输出路径算出的绝对路径），在表里的写法。
-fn work_dir_of(output: &OutputSpec) -> Result<String, Error> {
-    let path = output.options().resolved_work_dir()?;
-    path.into_os_string()
-        .into_string()
-        .map_err(|path| Error::InvalidInput(format!("任务目录路径不是 UTF-8：{}", path.display())))
+/// 是以文件名结尾的绝对路径（不以 `..` 或根结尾）。
+fn named_absolute(path: &Path) -> bool {
+    path.is_absolute() && path.file_name().is_some()
 }
 
-/// 输出在表里的三列：种类与两个路径。路径须是 UTF-8（核心对输出路径的要求相同）。
+/// 路径在表里的写法：须是 UTF-8（核心对输出路径的要求相同）。
+fn utf8(path: &Path) -> Result<String, Error> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::InvalidInput(format!("路径不是 UTF-8：{}", path.display())))
+}
+
+/// 输出在表里的三列：种类与两个路径。
 fn output_columns(
     output: &OutputSpec,
 ) -> Result<(&'static str, Option<String>, Option<String>), Error> {
-    let text = |path: &PathBuf| {
-        path.to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| Error::InvalidInput(format!("输出路径不是 UTF-8：{}", path.display())))
-    };
     Ok(match output {
-        OutputSpec::Mp4(mp4) => ("mp4", Some(text(mp4)?), None),
-        OutputSpec::Hls(hls) => ("hls", None, Some(text(hls)?)),
-        OutputSpec::Both { mp4, hls } => ("both", Some(text(mp4)?), Some(text(hls)?)),
+        OutputSpec::Mp4(mp4) => ("mp4", Some(utf8(mp4)?), None),
+        OutputSpec::Hls(hls) => ("hls", None, Some(utf8(hls)?)),
+        OutputSpec::Both { mp4, hls } => ("both", Some(utf8(mp4)?), Some(utf8(hls)?)),
     })
 }
 
@@ -522,20 +563,22 @@ mod tests {
         }
     }
 
+    /// 新建任务，任务目录取核心的默认位置。
+    fn add(tx: &Transaction<'_>, output: OutputSpec, created_at: i64) -> Result<TaskId, Error> {
+        let work_dir = output.options().resolved_work_dir().unwrap();
+        insert(tx, &spec(output), &work_dir, created_at)
+    }
+
     #[test]
     fn tasks_round_trip_and_change_status() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let a = insert(&tx, &spec(OutputSpec::Mp4("/m/a.mp4".into())), 100).unwrap();
-        let b = insert(
-            &tx,
-            &spec(OutputSpec::Both {
-                mp4: "/m/b.mp4".into(),
-                hls: "/m/b".into(),
-            }),
-            200,
-        )
-        .unwrap();
+        let a = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 100).unwrap();
+        let both = OutputSpec::Both {
+            mp4: "/m/b.mp4".into(),
+            hls: "/m/b".into(),
+        };
+        let b = add(&tx, both, 200).unwrap();
         set_status(&tx, a, &Status::Failed("403".into())).unwrap();
         set_status(&tx, b, &Status::Done).unwrap();
         tx.commit().unwrap();
@@ -544,6 +587,7 @@ mod tests {
         let tasks = list(&tx).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].spec, spec(OutputSpec::Mp4("/m/a.mp4".into())));
+        assert_eq!(tasks[0].work_dir.as_deref(), Some(Path::new("/m/a.hsdl")));
         assert_eq!(tasks[0].status, Status::Failed("403".into()));
         assert_eq!(tasks[1].status, Status::Done);
         assert_eq!(get(&tx, b).unwrap().unwrap().created_at, 200);
@@ -560,34 +604,58 @@ mod tests {
     fn interrupted_tasks_become_paused() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let running = insert(&tx, &spec(OutputSpec::Hls("/m/c".into())), 1).unwrap();
-        let done = insert(&tx, &spec(OutputSpec::Hls("/m/d".into())), 2).unwrap();
+        let running = add(&tx, OutputSpec::Hls("/m/c".into()), 1).unwrap();
+        let done = add(&tx, OutputSpec::Hls("/m/d".into()), 2).unwrap();
         set_status(&tx, done, &Status::Done).unwrap();
         assert_eq!(pause_interrupted(&tx).unwrap(), 1);
         assert_eq!(get(&tx, running).unwrap().unwrap().status, Status::Paused);
         assert_eq!(get(&tx, done).unwrap().unwrap().status, Status::Done);
     }
 
+    /// 删掉编号最大的任务后，新任务也不拿它的编号。
     #[test]
-    fn a_store_from_a_newer_version_is_refused_and_rows_are_checked() {
-        let dir = std::env::temp_dir().join(format!("hs-m3u8-app-store-{}", std::process::id()));
-        let path = dir.join("tasks.sqlite");
+    fn ids_are_not_reused() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let first = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
+        delete(&tx, first).unwrap();
+        let second = add(&tx, OutputSpec::Mp4("/m/b.mp4".into()), 2).unwrap();
+        assert!(second.0 > first.0, "{first:?} {second:?}");
+    }
+
+    /// 改过的存储里读不回的行报 [`Error::Corrupt`]：选轨偏好不是 JSON、输出是相对路径。
+    #[test]
+    fn rows_that_cannot_be_read_back_are_reported() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let preference = to_json(&StoredPreference::try_from(&Preference::default()).unwrap());
+        for (preference, mp4) in [("{}", "/m/x.mp4"), (preference.as_str(), "m/x.mp4")] {
+            tx.execute(
+                "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, created_at)
+                 VALUES ('x', 'https://a/b.m3u8', ?1, '[]', 'mp4', ?2, 0, 'done', 1)",
+                params![preference, mp4],
+            )
+            .unwrap();
+            assert!(matches!(list(&tx), Err(Error::Corrupt(_))));
+            tx.execute("DELETE FROM task", []).unwrap();
+        }
+    }
+
+    /// 测试用的空目录，名字带进程号。
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hs-m3u8-app-{name}-{}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }
-        {
-            let mut store = Store::open(&path).unwrap();
-            let tx = store.transaction().unwrap();
-            tx.execute(
-                "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, created_at)
-                 VALUES ('x', 'https://a/b.m3u8', '{}', '[]', 'mp4', '/m/x.mp4', 0, 'done', 1)",
-                [],
-            )
-            .unwrap();
-            tx.commit().unwrap();
-            let tx = store.transaction().unwrap();
-            assert!(matches!(list(&tx), Err(Error::Corrupt(_))));
-        }
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_store_from_a_newer_version_is_refused() {
+        let dir = scratch("newer");
+        let path = dir.join("tasks.sqlite");
+        drop(Store::open(&path).unwrap());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -604,26 +672,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 测试用的空目录，名字带进程号。
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hs-m3u8-app-{name}-{}", std::process::id()));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// 第 1 版的存储：建表、插入 `rows`（状态、MP4 路径），版本记为 1。
-    fn version_1(path: &Path, rows: &[(&str, &str)]) {
+    /// 第 1 版的存储：建表、插入 `rows`（标题、状态、MP4 路径），版本记为 1。
+    fn version_1(path: &Path, rows: &[(&str, &str, &str)]) {
         let mut conn = Connection::open(path).unwrap();
         let tx = conn.transaction().unwrap();
         create_task_table(&tx).unwrap();
-        for (status, mp4) in rows {
+        for (title, status, mp4) in rows {
             tx.execute(
                 "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, error, created_at)
-                 VALUES ('a', 'https://a/b.m3u8', ?1, '[]', 'mp4', ?2, 0, ?3, ?4, 1)",
+                 VALUES (?1, 'https://a/b.m3u8', ?2, '[]', 'mp4', ?3, 0, ?4, ?5, 1)",
                 params![
+                    title,
                     to_json(&StoredPreference::try_from(&Preference::default()).unwrap()),
                     mp4,
                     status,
@@ -636,40 +695,51 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// 第 1 版的存储升到当前版本：没完成的任务补上按输出算出的任务目录（之后新建的任务避开它），已完成的不占；
-    /// 已完成的与没完成的同名不算冲突。
+    /// 第 1 版的存储升到当前版本：没完成的任务补上按输出算出的任务目录（之后新建的任务避开它），已完成的没有；已完成的
+    /// 与没完成的同名不算冲突。没完成的两个任务的任务目录只差大小写时，编号小的留着它，另一个改为失败、没有任务目录。
+    /// 迁移后的编号接着原有的最大编号分配，也不重用。
     #[test]
     fn version_1_rows_get_their_work_dir() {
         let dir = scratch("migrate");
         let path = dir.join("tasks.sqlite");
-        version_1(&path, &[("paused", "/m/a.mp4"), ("done", "/m/A.mp4")]);
+        version_1(
+            &path,
+            &[
+                ("甲", "paused", "/m/a.mp4"),
+                ("乙", "done", "/m/A.mp4"),
+                ("丙", "failed", "/m/A.mp4"),
+                ("丁", "running", "/m/d.mp4"),
+            ],
+        );
         let mut store = Store::open(&path).unwrap();
         let tx = store.transaction().unwrap();
         let taken = taken_paths(&tx).unwrap();
         assert!(taken.contains(&naming::path_key("/m/a.hsdl")), "{taken:?}");
         let tasks = list(&tx).unwrap();
+        let work_dirs: Vec<Option<&Path>> =
+            tasks.iter().map(|task| task.work_dir.as_deref()).collect();
+        assert_eq!(
+            work_dirs,
+            [
+                Some(Path::new("/m/a.hsdl")),
+                None,
+                None,
+                Some(Path::new("/m/d.hsdl"))
+            ]
+        );
+        assert_eq!(tasks[1].status, Status::Done);
+        assert!(
+            matches!(&tasks[2].status, Status::Failed(message) if message.contains("「甲」")),
+            "{:?}",
+            tasks[2].status
+        );
         assert_eq!((tasks[0].total, &tasks[1].result), (None, &None));
+        let last = tasks[3].id;
+        delete(&tx, last).unwrap();
+        let next = add(&tx, OutputSpec::Mp4("/m/e.mp4".into()), 2).unwrap();
+        assert_eq!(next.0, last.0 + 1);
         drop(tx);
         drop(store);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// 第 1 版里两个没完成的任务共用一个任务目录（只差大小写）：迁移报错并指出是哪两个任务，存储不动。
-    #[test]
-    fn version_1_duplicates_are_reported() {
-        let dir = scratch("migrate-duplicates");
-        let path = dir.join("tasks.sqlite");
-        version_1(&path, &[("paused", "/m/a.mp4"), ("failed", "/m/A.mp4")]);
-        match Store::open(&path) {
-            Err(Error::Corrupt(message)) => assert!(message.contains("任务 1、2"), "{message}"),
-            Err(other) => panic!("{other}"),
-            Ok(_) => panic!("迁移应当失败"),
-        }
-        let version: i64 = Connection::open(&path)
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -685,15 +755,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 任务目录与已有任务相同的拒收；MP4 `a.mp4` 与本地 HLS `a` 的任务目录都是 `a.hsdl`。记下总片数后读得回。
+    /// 任务目录与已有任务相同的拒收：MP4 `a.mp4` 与本地 HLS `A` 的任务目录都是 `a.hsdl`（只差大小写）。记下总片数后
+    /// 读得回。
     #[test]
     fn work_dirs_are_unique_and_totals_are_kept() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let a = insert(&tx, &spec(OutputSpec::Mp4("/m/a.mp4".into())), 1).unwrap();
+        let a = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
         assert!(matches!(
-            insert(&tx, &spec(OutputSpec::Hls("/m/a".into())), 2),
-            Err(Error::WorkDirTaken(path)) if path == Path::new("/m/a.hsdl")
+            add(&tx, OutputSpec::Hls("/m/A".into()), 2),
+            Err(Error::WorkDirTaken(path)) if path == Path::new("/m/A.hsdl")
         ));
         set_total(&tx, a, 664).unwrap();
         assert_eq!(get(&tx, a).unwrap().unwrap().total, Some(664));

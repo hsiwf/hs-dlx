@@ -82,17 +82,20 @@ impl Shell {
                         .absolute()
                         .size_full(),
                     )
-                    .child(ui::num(
-                        div()
-                            .absolute()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .text_color(theme::soft())
-                            .child(look.short),
-                    )),
+                    // 新建时其余任务只留环，中间空着，视线落在新建上
+                    .when(!dim, |orb| {
+                        orb.child(ui::num(
+                            div()
+                                .absolute()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(11.))
+                                .text_color(theme::soft())
+                                .child(look.short),
+                        ))
+                    }),
             )
             .child(two_lines(
                 row.task.spec.title.clone(),

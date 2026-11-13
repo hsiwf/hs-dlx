@@ -1,0 +1,400 @@
+//! 新建页中间的同心环：各档清晰度的几何、点击判定与画法。
+
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    AbsoluteLength, Context, Div, FontWeight, InteractiveElement as _, MouseButton,
+    ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled, canvas, div, px,
+};
+use hs_m3u8_core::{Probe, VariantInfo};
+
+use super::{NewTask, Probing, duration_of};
+use crate::{format, theme, ui};
+
+/// 同心环所在方框的边长。
+const BOX: f32 = 480.;
+/// 方框在整块区域里的上下边距。
+const BOX_TOP: f32 = 20.;
+/// 最外一环的半径（环宽的中线）。
+const OUTER: f32 = 222.;
+/// 最内一环的半径。
+const INNER: f32 = 102.;
+/// 只有一档（来源本身是媒体播放列表）时那一环的半径。
+const SINGLE_RADIUS: f32 = 174.;
+/// 只有一档时那一环的宽。
+const SINGLE_WIDTH: f32 = 14.;
+/// 探测中占位的三个暗环的半径。
+const PLACEHOLDER_RADII: [f32; 3] = [OUTER, SINGLE_RADIUS, 134.];
+/// 圆心处写字的方框边长。
+const CENTER_BOX: f32 = 180.;
+/// 标签所在的横坐标（相对同心环区域）：引线从环上 45° 处水平拉到这里。
+const LABEL_X: f32 = 496.;
+/// 标签一列的宽：圆点加一行 12 号字的清晰度与码率（如「1080p · 4.2 Mbps」，不换行）。
+const LABEL_WIDTH: f32 = 184.;
+/// 同心环区域（连同右侧的标签）的宽。
+pub const FIGURE_WIDTH: f32 = LABEL_X + LABEL_WIDTH;
+/// 同心环区域的高。
+pub const FIGURE_HEIGHT: f32 = BOX_TOP + BOX + BOX_TOP;
+/// 点在环宽之外多远以内仍算点中这一环。
+const HIT_SLOP: f32 = 8.;
+
+/// 一档清晰度的环：变体下标、半径（环宽的中线）与环宽。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Ring {
+    index: usize,
+    radius: f32,
+    width: f32,
+}
+
+/// 由外向内的各环：码率从高到低，最外一环半径 [`OUTER`]、最内不小于 [`INNER`]、相邻两环的半径差至多 48。环宽按码率
+/// 在 4 到 26 之间，且与相邻环留出 8 的缝；档数多到半径差不足 11 时环宽压到 3，缝随之变窄。
+fn rings(variants: &[VariantInfo]) -> Vec<Ring> {
+    let rates: Vec<(usize, Option<u64>)> =
+        variants.iter().map(|v| (v.index, v.bandwidth)).collect();
+    rings_of(&rates)
+}
+
+/// [`rings`] 的计算：`rates` 为各档的（变体下标, 码率）。
+fn rings_of(rates: &[(usize, Option<u64>)]) -> Vec<Ring> {
+    let mut order = rates.to_vec();
+    order.sort_by_key(|&(_, bandwidth)| std::cmp::Reverse(bandwidth.unwrap_or(0)));
+    let top = order.first().and_then(|&(_, bw)| bw).unwrap_or(1).max(1) as f32;
+    let step = match order.len() {
+        0 | 1 => 0.0,
+        n => (48.0_f32).min((OUTER - INNER) / (n - 1) as f32),
+    };
+    order
+        .iter()
+        .enumerate()
+        .map(|(i, &(index, bandwidth))| {
+            let width = 4.0 + 22.0 * bandwidth.unwrap_or(0) as f32 / top;
+            let room = if step > 0.0 { step - 8.0 } else { 26.0 };
+            Ring {
+                index,
+                radius: OUTER - step * i as f32,
+                width: width.min(room).max(3.0),
+            }
+        })
+        .collect()
+}
+
+/// 离圆心 `distance` 的点落在哪一环上：在环宽之外 [`HIT_SLOP`] 以内的环里离得最近的那个；都不在时为 None。
+fn hit(rings: &[Ring], distance: f32) -> Option<usize> {
+    rings
+        .iter()
+        .map(|ring| {
+            (
+                ring.index,
+                (distance - ring.radius).abs() - ring.width / 2.0,
+            )
+        })
+        .filter(|(_, gap)| *gap <= HIT_SLOP)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+}
+
+/// 设任意宽度的四边边框（GPUI 只给了 0 到 8 的整数档）。
+fn border_width<E: Styled>(mut element: E, width: f32) -> E {
+    let width: AbsoluteLength = px(width).into();
+    let widths = &mut element.style().border_widths;
+    widths.top = Some(width);
+    widths.right = Some(width);
+    widths.bottom = Some(width);
+    widths.left = Some(width);
+    element
+}
+
+/// 一个环：半径 `radius`（环宽中线）、宽 `width`，画在 [`BOX`] 见方区域的中心。
+fn ring_div(radius: f32, width: f32) -> Div {
+    let size = 2. * radius + width;
+    let offset = BOX / 2. - size / 2.;
+    border_width(
+        div()
+            .absolute()
+            .left(px(offset))
+            .top(px(offset))
+            .size(px(size))
+            .rounded_full(),
+        width,
+    )
+}
+
+/// 选中的环：青色的环，外加两圈更宽更淡的同心环作光晕。阴影会透过透明的环心铺满整个圆，所以光晕用环画。
+fn lit_ring(radius: f32, width: f32) -> Vec<Div> {
+    vec![
+        ring_div(radius, width + 18.).border_color(theme::alpha(theme::cyan(), 0.06)),
+        ring_div(radius, width + 8.).border_color(theme::alpha(theme::cyan(), 0.14)),
+        ring_div(radius, width).border_color(theme::cyan()),
+    ]
+}
+
+impl NewTask {
+    /// 窗口坐标 `position` 落在哪一环上（见 [`hit`]）。
+    fn ring_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let Probing::Ready(probe) = &self.probing else {
+            return None;
+        };
+        let master = probe.master.as_ref()?;
+        let center = self.rings_bounds.get().center();
+        let (dx, dy) = (
+            f32::from(position.x - center.x),
+            f32::from(position.y - center.y),
+        );
+        hit(&rings(&master.variants), (dx * dx + dy * dy).sqrt())
+    }
+
+    pub(super) fn render_figure(&self, cx: &mut Context<Self>) -> Div {
+        let Figure {
+            rings,
+            labels,
+            center,
+            note,
+        } = match &self.probing {
+            Probing::Running => Figure {
+                // 探测中：三个暗环占位
+                rings: PLACEHOLDER_RADII
+                    .into_iter()
+                    .map(|r| ring_div(r, 4.).border_color(theme::ring_idle()))
+                    .collect(),
+                labels: Vec::new(),
+                center: "探测中".to_owned(),
+                note: self.url.host_str().unwrap_or_default().to_owned(),
+            },
+            Probing::Failed(_) => Figure {
+                rings: vec![ring_div(SINGLE_RADIUS, 4.).border_color(theme::orange())],
+                labels: Vec::new(),
+                center: "探测失败".to_owned(),
+                note: String::new(),
+            },
+            Probing::Ready(probe) => self.ready_figure(probe),
+        };
+        let bounds_cell = self.rings_bounds.clone();
+        let center_color = match self.probing {
+            Probing::Failed(_) => theme::orange(),
+            _ => theme::text(),
+        };
+        div()
+            .relative()
+            .w(px(FIGURE_WIDTH))
+            .h(px(FIGURE_HEIGHT))
+            .flex_none()
+            .child(
+                div()
+                    .id("rings")
+                    .absolute()
+                    .left_0()
+                    .top(px(BOX_TOP))
+                    .size(px(BOX))
+                    .when(self.hovered.is_some(), |s| s.cursor_pointer())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui_kit::MouseDownEvent, _, cx| {
+                            if let Some(index) = this.ring_at(event.position) {
+                                this.select_variant(index, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(|this, event: &gpui_kit::MouseMoveEvent, _, cx| {
+                            let hovered = this.ring_at(event.position);
+                            if hovered != this.hovered {
+                                this.hovered = hovered;
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !*hovered && this.hovered.is_some() {
+                            this.hovered = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {})
+                            .absolute()
+                            .size_full(),
+                    )
+                    .children(rings)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(BOX / 2. - CENTER_BOX / 2.))
+                            .top(px(BOX / 2. - CENTER_BOX / 2.))
+                            .size(px(CENTER_BOX))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(6.))
+                            .child(ui::num(
+                                div()
+                                    .text_size(px(30.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(center_color)
+                                    .child(center),
+                            ))
+                            .child(ui::num(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::muted())
+                                    .child(note),
+                            )),
+                    )
+                    .children(labels),
+            )
+    }
+
+    /// 探测完成时的同心环：圆心写选中一档的清晰度与大小上限，只有一档时写时长与片数。
+    fn ready_figure(&self, probe: &Probe) -> Figure {
+        let duration = duration_of(probe);
+        let Some(master) = &probe.master else {
+            // 来源本身是媒体播放列表：只有一档，没有可选的。直播的时长与片数是当前窗口的，不写
+            let segments = probe.tracks.first().map_or(0, |t| t.segments);
+            let (center, note) = if probe.live {
+                ("直播".to_owned(), "开始后一直录到停止".to_owned())
+            } else {
+                (format::clock(duration), format!("{segments} 个分片"))
+            };
+            return Figure {
+                rings: lit_ring(SINGLE_RADIUS, SINGLE_WIDTH),
+                labels: Vec::new(),
+                center,
+                note,
+            };
+        };
+        let rings = rings(&master.variants);
+        // 相邻标签的竖向间距不够 16 时只给选中与悬停的环写标签
+        let crowded = rings
+            .windows(2)
+            .any(|pair| (pair[0].radius - pair[1].radius) * std::f32::consts::FRAC_1_SQRT_2 < 16.);
+        let c = BOX / 2.;
+        let mut ring_divs = Vec::new();
+        let mut labels = Vec::new();
+        for ring in &rings {
+            let on = ring.index == self.variant;
+            let hover = self.hovered == Some(ring.index);
+            let color = if on {
+                theme::cyan()
+            } else if hover {
+                theme::hover_edge()
+            } else {
+                theme::ring_idle()
+            };
+            if on {
+                ring_divs.extend(lit_ring(ring.radius, ring.width));
+            } else {
+                ring_divs.push(ring_div(ring.radius, ring.width).border_color(color));
+            }
+            if crowded && !on && !hover {
+                continue;
+            }
+            let v = &master.variants[ring.index];
+            let anchor = ring.radius * std::f32::consts::FRAC_1_SQRT_2;
+            let (x, y) = (c + anchor, c - anchor);
+            let text = match v.bandwidth {
+                Some(bw) if v.resolution.is_some() => {
+                    format!("{} · {}", format::variant(v), format::bitrate(bw))
+                }
+                _ => format::variant(v),
+            };
+            labels.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(LABEL_X - 4. - x))
+                    .h(px(1.))
+                    .bg(if on { theme::cyan() } else { theme::edge() }),
+            );
+            labels.push(
+                div()
+                    .absolute()
+                    .left(px(LABEL_X))
+                    .top(px(y - 8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .child(if on {
+                        ui::dot(theme::cyan(), 6.)
+                    } else {
+                        div().size(px(6.)).rounded_full().bg(theme::hover_edge())
+                    })
+                    .child(ui::num(
+                        div()
+                            .text_color(if on { theme::text() } else { theme::muted() })
+                            .when(on, |s| s.font_weight(FontWeight::SEMIBOLD))
+                            .child(text),
+                    )),
+            );
+        }
+        let picked = &master.variants[self.variant];
+        let size = picked
+            .bandwidth
+            .filter(|_| !probe.live)
+            .map(|bw| format::size_bound(bw, duration))
+            .unwrap_or_default();
+        Figure {
+            rings: ring_divs,
+            labels,
+            center: format::variant(picked),
+            note: size,
+        }
+    }
+}
+
+/// 同心环区域里随探测状态变的部分。
+struct Figure {
+    /// 各环；选中的一环是叠起来的几层
+    rings: Vec<Div>,
+    /// 引线与标签
+    labels: Vec<Div>,
+    /// 圆心的大字
+    center: String,
+    /// 圆心大字下面的小字
+    note: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 四档：由外向内按码率排，环宽随码率，最内一环不小于下限；点在两环之间离谁近算谁，离得远的不算。
+    #[test]
+    fn rings_follow_bitrate_and_clicks_pick_the_nearest() {
+        let rates = [
+            (0, Some(1_200_000)),
+            (1, Some(18_200_000)),
+            (2, Some(6_300_000)),
+            (3, Some(3_100_000)),
+        ];
+        let rings = rings_of(&rates);
+        let order: Vec<usize> = rings.iter().map(|r| r.index).collect();
+        assert_eq!(order, [1, 2, 3, 0]);
+        assert_eq!((rings[0].radius, rings[0].width), (OUTER, 26.));
+        assert_eq!(rings[3].radius, INNER);
+        assert!(rings.windows(2).all(|pair| pair[0].width > pair[1].width));
+        assert_eq!(hit(&rings, OUTER), Some(1));
+        assert_eq!(hit(&rings, OUTER + 13. + HIT_SLOP), Some(1));
+        assert_eq!(hit(&rings, OUTER + 13. + HIT_SLOP + 1.), None);
+        assert_eq!(hit(&rings, INNER - 30.), None);
+    }
+
+    /// 档数很多时半径差变小，环宽压到下限，仍从外到内排开、不重叠。
+    #[test]
+    fn many_variants_still_fit() {
+        let rates: Vec<(usize, Option<u64>)> = (0..20)
+            .map(|i| (i, Some(1_000_000 * (i as u64 + 1))))
+            .collect();
+        let rings = rings_of(&rates);
+        assert_eq!(rings.len(), 20);
+        assert!(rings.iter().all(|r| r.width == 3.));
+        assert!(
+            rings
+                .windows(2)
+                .all(|pair| pair[0].radius - pair[1].radius >= pair[0].width)
+        );
+        let innermost = rings.last().map_or(0., |r| r.radius);
+        assert!((innermost - INNER).abs() < 1e-3, "{innermost}");
+    }
+}

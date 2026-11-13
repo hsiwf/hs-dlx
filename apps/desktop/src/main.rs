@@ -65,6 +65,13 @@ fn window_options(cx: &gpui_kit::App) -> WindowOptions {
 }
 
 fn main() {
+    // 任何线程上的 panic 都是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务
+    // 悄悄消失；存储里还标着运行中的任务下次打开时按暂停处理
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::abort();
+    }));
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {

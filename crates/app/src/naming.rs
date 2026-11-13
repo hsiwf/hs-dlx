@@ -176,7 +176,7 @@ mod tests {
             output_for(&dir, "talk", OutputKind::Mp4, &none).unwrap(),
             ("talk".to_owned(), OutputSpec::Mp4(dir.join("talk.mp4")))
         );
-        // 存储里的路径与这次的只差大小写和 Unicode 写法（NFD 的「é」），也算占用
+        // 存储里的路径与这次的只差大小写，也算占用（Unicode 写法见 path_keys_ignore_case_and_unicode_forms）
         let taken = HashSet::from([path_key(&dir.join("TALK.hsdl").to_string_lossy())]);
         assert_eq!(
             output_for(&dir, "talk", OutputKind::Both, &taken).unwrap(),

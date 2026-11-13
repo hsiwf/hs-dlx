@@ -54,6 +54,8 @@ pub struct Shell {
     confirm_discard: Option<TaskId>,
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行
     quitting: bool,
+    /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
+    creating: usize,
     _events: Task<()>,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -99,6 +101,12 @@ impl Shell {
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         );
+        // 从程序坞或菜单退出不经关窗：停下所有任务、补写状态（最多等 2 秒），退出已不可撤回
+        let quitting = cx.on_app_quit(|this: &mut Self, _| {
+            // 没有窗口能显示了；补写不进的下次打开时按暂停处理（见 Service::close）
+            let _unsaved = this.service.close();
+            async {}
+        });
         let activated = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.refresh_clipboard(cx);
@@ -146,9 +154,10 @@ impl Shell {
             clipboard: None,
             confirm_discard: None,
             quitting: false,
+            creating: 0,
             _events: receiving,
             _ticker: ticker,
-            _subscriptions: vec![typed, activated],
+            _subscriptions: vec![typed, activated, quitting],
         };
         let ids: Vec<TaskId> = shell.rows.iter().map(|r| r.task.id).collect();
         for id in ids {
@@ -177,43 +186,54 @@ impl Shell {
                 }
             }
             Event::Ended {
-                id, status, result, ..
-            } => self.ended(id, status, result, None, cx),
-            Event::StoreFailed {
                 id,
-                ended: Some(status),
+                status,
                 result,
-                error,
-                ..
-            } => {
-                let detail = format!("状态没能存下（{error}），下一次写存储时会再写");
-                self.ended(id, status, result, Some(detail), cx);
-            }
-            Event::StoreFailed {
-                id,
-                ended: None,
-                error,
-                ..
+                total,
+                leftovers,
+                unsaved,
             } => {
                 let title = self.title(id);
-                self.notify(format!("没能记下「{title}」的总片数：{error}"));
+                let mut problems: Vec<String> = leftovers
+                    .iter()
+                    .map(|leftover| format!("「{title}」完成时没删掉：{leftover}"))
+                    .collect();
+                if let Some(error) = unsaved {
+                    problems.push(format!(
+                        "「{title}」已停下，但状态没能写进存储（{error}），之后每次写存储时会再写"
+                    ));
+                }
+                self.ended(id, status, result, total, problems, cx);
             }
-            Event::Orphaned { work_dir, reason } => self.notify(format!(
-                "新建任务时存储写不进，已开始的任务取消了，但它的任务目录 {} 没删干净：{reason}",
-                work_dir.display()
-            )),
+            Event::TotalUnsaved { id, error } => {
+                let title = self.title(id);
+                self.notify(format!(
+                    "没能记下「{title}」的总片数：{error}；任务照常下载，停下时再记"
+                ));
+            }
+            Event::Orphaned { paths, reason } => {
+                let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                self.notify(format!(
+                    "新建任务时存储写不进，任务已取消，但留下了不在任何任务名下的 {}：{reason}",
+                    paths.join("、")
+                ));
+                if self.quitting {
+                    self.cancel_quit("有要处理的东西，没有退出".to_owned());
+                }
+            }
         }
         cx.notify();
     }
 
-    /// 任务停下：改状态、写信号、读任务目录或查输出；`unsaved` 为状态没存进存储的说明。退出中遇到失败就不退出，留给
-    /// 用户看。
+    /// 任务停下：改状态、总片数与结果，写信号，作废之前读到的任务目录内容后重读（或查输出）；`problems` 为要用户
+    /// 看的提示（没删掉的东西、状态没写进存储）。退出中遇到失败或要提示的就不退出，留给用户看。
     fn ended(
         &mut self,
         id: TaskId,
         status: Status,
         result: Option<Finished>,
-        unsaved: Option<String>,
+        total: Option<usize>,
+        problems: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         let title = self.title(id);
@@ -228,12 +248,16 @@ impl Shell {
             if result.is_some() {
                 row.task.result = result;
             }
+            if total.is_some() {
+                row.task.total = total;
+            }
+            row.forget_disk();
         }
-        if let Some(detail) = unsaved {
-            self.notify(format!("「{title}」已停下，但{detail}"));
+        if self.quitting && (failed || !problems.is_empty()) {
+            self.cancel_quit(format!("「{title}」停下时有要处理的，没有退出"));
         }
-        if failed && self.quitting {
-            self.cancel_quit(format!("「{title}」失败了，没有退出"));
+        for text in problems {
+            self.notify(text);
         }
         self.after_stop(id, cx);
         self.quit_if_idle(cx);
@@ -296,12 +320,14 @@ impl Shell {
         }
     }
 
-    /// 有任务在运行、继续或放弃：退出要等它们。
+    /// 有任务在运行、继续、放弃或新建：退出要等它们。
     fn busy(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|r| r.task.status == Status::Running || !r.idle())
-            .count()
+        self.creating
+            + self
+                .rows
+                .iter()
+                .filter(|r| r.task.status == Status::Running || !r.idle())
+                .count()
     }
 
     /// 列表里的名字；行已不在（放弃做完）时写编号。
@@ -324,7 +350,11 @@ impl Shell {
     }
 
     /// 读任务目录里已完成的内容；`then_resume` 时读完即继续，读到的片数作本次运行的起点（读不出时不估剩余时间）。
+    /// 读完（及继续）后，选了退出、都已停下的即退出。
     fn inspect(&mut self, id: TaskId, then_resume: bool, cx: &mut Context<Self>) {
+        let Some(reading) = self.row(id).map(|row| row.reading) else {
+            return;
+        };
         let handle = self.service.inspect(id);
         cx.spawn(async move |this, cx| {
             let result = handle.await;
@@ -335,12 +365,16 @@ impl Shell {
                     Ok(Err(error)) => Disk::Unreadable(error.to_string()),
                     Err(join) => Disk::Unreadable(format!("读的过程中出错：{join}")),
                 };
-                if let Some(row) = this.row_mut(id) {
+                // 读的期间任务又运行过、停下了的，这次读到的已过时，停下时另读了
+                if let Some(row) = this.row_mut(id)
+                    && row.reading == reading
+                {
                     row.disk = disk;
                 }
                 if then_resume {
                     this.resume_now(id);
                 }
+                this.quit_if_idle(cx);
                 cx.notify();
             });
         })
@@ -431,32 +465,65 @@ impl Shell {
             }
         };
         view.update(cx, |view, cx| view.creating(cx));
+        self.creating += 1;
         let handle = self.service.create(draft, created_at);
         cx.spawn_in(window, async move |this, cx| {
             let result = handle.await;
             // 等待期间窗口关掉时不再需要结果；任务照常在服务里开始，下次打开时在列表里
             let _closed = this.update_in(cx, |this, window, cx| {
-                let error = match result {
-                    Ok(Ok(task)) => {
-                        this.started(task, window, cx);
-                        return;
-                    }
-                    Ok(Err(error)) => error.to_string(),
-                    Err(join) => format!("新建中途出错：{join}"),
-                };
-                view.update(cx, |view, cx| view.failed(error, cx));
+                this.creating -= 1;
+                match result {
+                    Ok(Ok(task)) => this.started(&view, task, window, cx),
+                    Ok(Err(error)) => this.create_failed(&view, error.to_string(), cx),
+                    Err(join) => this.create_failed(&view, format!("新建中途出错：{join}"), cx),
+                }
+                this.quit_if_idle(cx);
+                cx.notify();
             });
         })
         .detach();
     }
 
-    fn started(&mut self, task: hs_m3u8_app::Task, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_task = None;
-        self.selected = Some(task.id);
+    /// 新建视图 `view` 发起的任务建成了：加进列表。`view` 还开着（用户没切走）时关掉它、选中新任务、清空粘贴栏；
+    /// 选了退出的随即暂停。
+    fn started(
+        &mut self,
+        view: &Entity<NewTask>,
+        task: hs_m3u8_app::Task,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = task.id;
         self.rows.push(Row::new(task, Instant::now()));
-        self.paste
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        cx.notify();
+        if self.quitting {
+            self.service.pause(id);
+        }
+        if self.showing(view) {
+            self.new_task = None;
+            self.selected = Some(id);
+            self.paste
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+    }
+
+    /// 新建失败：`view` 还开着时写在它上面，否则（用户已切走）提示。
+    fn create_failed(&mut self, view: &Entity<NewTask>, error: String, cx: &mut Context<Self>) {
+        if self.showing(view) {
+            view.update(cx, |view, cx| view.failed(error, cx));
+        } else {
+            let url = view.read(cx).url().clone();
+            self.notify(format!(
+                "新建 {} 失败：{error}",
+                hs_m3u8_core::bare_url(&url)
+            ));
+        }
+    }
+
+    /// 正显示着的新建视图是 `view`。
+    fn showing(&self, view: &Entity<NewTask>) -> bool {
+        self.new_task
+            .as_ref()
+            .is_some_and(|(shown, _)| shown == view)
     }
 
     fn select(&mut self, id: TaskId, cx: &mut Context<Self>) {
@@ -576,10 +643,29 @@ impl Shell {
     }
 
     /// 关窗前：有任务在运行时问一句。选了退出就暂停（或停止录制并写出）它们，等都停下再退出。
+    /// 没有任务在运行时先把没写进存储的状态补写进去，补写不进时问要不要仍然退出。
     fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let busy = self.busy();
         if busy == 0 {
-            return true;
+            let Err(error) = self.service.flush() else {
+                return true;
+            };
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "有任务的状态没能写进存储",
+                Some(&format!(
+                    "现在退出，这些任务下次打开时显示为暂停。原因：{error}"
+                )),
+                &[PromptButton::new("仍然退出"), PromptButton::cancel("取消")],
+                cx,
+            );
+            cx.spawn(async move |_, cx| {
+                if let Ok(0) = answer.await {
+                    cx.update(|cx| cx.quit());
+                }
+            })
+            .detach();
+            return false;
         }
         if self.quitting {
             // 已在等任务停下；右上角的提示里可以立即退出
@@ -643,10 +729,16 @@ impl Shell {
         self.notify(why);
     }
 
-    /// 选了退出、任务都停下（继续与放弃也做完）时退出。
+    /// 选了退出、任务都停下（继续、放弃与新建也做完）时，把没写进存储的状态补写进去后退出；补写不进时不退出。
     fn quit_if_idle(&mut self, cx: &mut Context<Self>) {
-        if self.quitting && self.busy() == 0 {
-            cx.quit();
+        if !self.quitting || self.busy() > 0 {
+            return;
+        }
+        match self.service.flush() {
+            Ok(()) => cx.quit(),
+            Err(error) => self.cancel_quit(format!(
+                "有任务的状态没能写进存储（{error}），没有退出；再关窗口时可以选择仍然退出"
+            )),
         }
     }
 }
@@ -687,7 +779,7 @@ impl Render for Shell {
             body = body.child(self.render_list(now, cx));
         }
         body = match (&self.new_task, self.selected_row()) {
-            (Some((view, _)), _) => body.child(div().flex_1().min_w_0().flex().child(view.clone())),
+            (Some((view, _)), _) => body.child(div().flex_1().flex().child(view.clone())),
             (None, Some(row)) => {
                 let (main, aside) = self.render_task(row, now, cx);
                 body.child(main).child(aside)

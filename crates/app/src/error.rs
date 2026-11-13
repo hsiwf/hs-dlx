@@ -21,9 +21,27 @@ pub enum Error {
     /// 任务正在放弃（停下、删任务目录），不能再继续或移除
     #[error("{0}正在放弃")]
     Discarding(TaskId),
-    /// 只从列表移除（不删任务目录）只用于已完成的任务
+    /// 只从列表移除（不删任务目录）只用于已完成或没有自己的任务目录的任务
     #[error("{0}没有完成，要连同任务目录一起放弃")]
     NotFinished(TaskId),
+    /// 已完成的任务不能再继续
+    #[error("{0}已完成")]
+    AlreadyDone(TaskId),
+    /// 任务没有自己的任务目录（见 [`crate::Task::work_dir`]），不能继续
+    #[error("{0}没有自己的任务目录，只能从列表移除")]
+    NoWorkDir(TaskId),
+    /// 放弃时任务目录没删干净（里面有不是本库写的文件，或删除出错）：任务留在存储里，处理后可再放弃
+    #[error("{id}的任务目录没删干净，任务留在列表里：{}", join(.leftovers))]
+    WorkDirLeft {
+        id: TaskId,
+        leftovers: Vec<hs_m3u8_core::Leftover>,
+    },
+    /// 读任务目录超时（如网络盘没有响应）；可重试
+    #[error("读{id}的任务目录超过 {} 秒没有结果", .after.as_secs())]
+    TimedOut {
+        id: TaskId,
+        after: std::time::Duration,
+    },
     /// 新任务的任务目录与存储里已有的任务相同
     #[error("任务目录已被另一个任务使用：{}", .0.display())]
     WorkDirTaken(std::path::PathBuf),
@@ -41,4 +59,12 @@ pub enum Error {
         path: std::path::PathBuf,
         cause: std::io::Error,
     },
+}
+
+fn join(leftovers: &[hs_m3u8_core::Leftover]) -> String {
+    leftovers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("；")
 }
