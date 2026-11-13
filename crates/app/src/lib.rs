@@ -8,6 +8,6 @@ mod task;
 
 pub use error::Error;
 pub use preference::StoredPreference;
-pub use service::{Event, Service};
+pub use service::{Event, Events, Service};
 pub use store::Store;
 pub use task::{OutputSpec, Status, Task, TaskId, TaskSpec};

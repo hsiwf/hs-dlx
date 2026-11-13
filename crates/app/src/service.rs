@@ -36,6 +36,9 @@ pub enum Event {
     StoreFailed { id: TaskId, error: Error },
 }
 
+/// 事件的接收端，在任何执行器上都可等待。
+pub type Events = mpsc::UnboundedReceiver<Event>;
+
 /// 一个正在运行的任务。
 struct Running {
     control: JobControl,
@@ -54,10 +57,7 @@ pub struct Service {
 impl Service {
     /// 用 `store` 建服务，同时最多 `max_requests` 个请求（见 [`Engine::new`]）；返回服务与事件的接收端。上次异常退出时
     /// 还标着运行中的任务改为暂停。
-    pub fn new(
-        mut store: Store,
-        max_requests: NonZeroUsize,
-    ) -> Result<(Service, mpsc::UnboundedReceiver<Event>), Error> {
+    pub fn new(mut store: Store, max_requests: NonZeroUsize) -> Result<(Service, Events), Error> {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
         tx.commit()?;
@@ -99,17 +99,19 @@ impl Service {
             .spawn(async move { engine.probe(&source).await })
     }
 
-    /// 新建任务并开始；`created_at` 为新建时间（Unix 秒）。参数不合要求或存储写不进时什么也不存、不开始。
-    pub fn create(&self, spec: TaskSpec, created_at: i64) -> Result<TaskId, Error> {
+    /// 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。参数不合要求或存储写不进时什么也不存、
+    /// 不开始。
+    pub fn create(&self, spec: TaskSpec, created_at: i64) -> Result<Task, Error> {
         let request = request(&spec);
         let mut store = lock(&self.store);
         let tx = store.transaction()?;
         let id = store::insert(&tx, &spec, created_at)?;
+        let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
         let job = self.launch(id, request)?;
         commit_or_cancel(tx, &job)?;
         drop(store);
         self.track(id, job);
-        Ok(id)
+        Ok(task)
     }
 
     /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下。

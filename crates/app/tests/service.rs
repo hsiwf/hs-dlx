@@ -155,7 +155,8 @@ fn a_task_downloads_and_is_recorded_as_done() {
             spec(server.base.join("index.m3u8").unwrap(), mp4.clone()),
             1,
         )
-        .unwrap();
+        .unwrap()
+        .id;
     let status = rt.block_on(ended(&mut events, id, |_| {}));
 
     assert_eq!(status, Status::Done);
@@ -179,7 +180,8 @@ fn a_paused_task_resumes_after_reopening() {
                 spec(server.base.join("index.m3u8").unwrap(), mp4.clone()),
                 1,
             )
-            .unwrap();
+            .unwrap()
+            .id;
         let mut paused = false;
         let status = rt.block_on(ended(&mut events, id, |progress| {
             if progress.segments.done == 1 && !paused {
@@ -214,7 +216,8 @@ fn discarding_a_running_task_removes_it() {
             spec(server.base.join("index.m3u8").unwrap(), dir.join("out.mp4")),
             1,
         )
-        .unwrap();
+        .unwrap()
+        .id;
     rt.block_on(async {
         loop {
             if let Some(Event::Progress { progress, .. }) = events.recv().await

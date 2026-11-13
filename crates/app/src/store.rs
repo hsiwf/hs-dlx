@@ -345,7 +345,9 @@ mod tests {
     fn a_store_from_a_newer_version_is_refused_and_rows_are_checked() {
         let dir = std::env::temp_dir().join(format!("hs-m3u8-app-store-{}", std::process::id()));
         let path = dir.join("tasks.sqlite");
-        let _ = std::fs::remove_dir_all(&dir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
         {
             let mut store = Store::open(&path).unwrap();
             let tx = store.transaction().unwrap();
