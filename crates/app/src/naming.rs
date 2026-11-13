@@ -1,4 +1,4 @@
-//! 新建任务的命名：从地址得出标题，在保存目录里选一个不与已有输出、任务目录冲突的主名，拼出输出路径。
+//! 新建任务的命名：从网页标题或地址得出标题，在保存目录里选一个不与已有输出、任务目录冲突的主名，拼出输出路径。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,7 +25,8 @@ const GENERIC: [&str; 5] = ["index", "master", "playlist", "prog_index", "main"]
 const STEM_LIMIT: usize = 200;
 
 /// 列表与文件名用的标题：地址路径的最后一段（百分号解码、去掉 `.m3u8`）；是 index、master 之类的通用名时取上一级
-/// 目录名；整理成文件主名（同 [`task_title`]），什么都不剩时用主机名。
+/// 目录名；整理成文件主名（不能出现在文件名里的字符与控制字符换成 `_`，去掉首尾的空白与 `.`，截到 200 字节），
+/// 什么都不剩时用主机名。
 pub fn title_of(url: &Url) -> String {
     let segments: Vec<String> = url
         .path_segments()
@@ -57,8 +58,8 @@ pub fn title_of(url: &Url) -> String {
     }
 }
 
-/// 任务的标题：给了 `title`（如视频所在网页的标题）时为它整理成文件主名后的（不能出现在文件名里的字符与控制字符换成
-/// `_`，去掉首尾的空白与 `.`，截到 200 字节），什么都不剩或没给时由地址得出（[`title_of`]）。
+/// 任务的标题：给了 `title`（如视频所在网页的标题）时为它照 [`title_of`] 的规则整理成文件主名后的，什么都不剩或没给
+/// 时由地址得出（[`title_of`]）。
 pub fn task_title(url: &Url, title: Option<&str>) -> String {
     title
         .map(clean_title)

@@ -29,7 +29,7 @@ impl Shell {
     pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let value = self.paste.read(cx).value();
         let typed = http_url(&value);
-        let probing = self.new_task.as_ref().and_then(|(view, _)| {
+        let probing = self.new_task().and_then(|view| {
             let view = view.read(cx);
             (typed.as_ref() == Some(view.url())).then(|| view.phase())
         });
@@ -57,8 +57,8 @@ impl Shell {
             .into_any_element(),
         };
         // 待机页已经把剪贴板里的链接放在正中，别处只在粘贴栏空着时提一句
-        let standby = self.page == Page::Task && self.selected_row().is_none();
-        let new_task = matches!(self.page, Page::NewTask { .. });
+        let standby = matches!(self.page, Page::Task) && self.selected_row().is_none();
+        let new_task = self.new_task().is_some();
         let hint = self
             .clipboard
             .clone()

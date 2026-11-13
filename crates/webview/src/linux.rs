@@ -17,6 +17,8 @@ use wry::raw_window_handle::{
 
 /// GPUI 多久处理一次积下的 GTK 事件：约一帧。
 const GTK_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// 一次最多处理多少个 GTK 事件：GLib 一直有就绪的事件源时，不让界面线程卡在这里。
+const GTK_EVENTS_PER_POLL: usize = 256;
 
 /// GTK 已初始化；由 GPUI 驱动它的主循环。
 struct GtkLoop {
@@ -54,7 +56,10 @@ impl GtkUser {
             let still = users.clone();
             cx.spawn(async move |cx| {
                 loop {
-                    while gtk::events_pending() {
+                    for _ in 0..GTK_EVENTS_PER_POLL {
+                        if !gtk::events_pending() {
+                            break;
+                        }
                         gtk::main_iteration_do(false);
                     }
                     if still.get() == 0 {

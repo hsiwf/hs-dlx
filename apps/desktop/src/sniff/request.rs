@@ -1,61 +1,77 @@
-//! 探测嗅探到的流时带的请求头：照网页里的播放器请求它时浏览器会带的给。
+//! 探测嗅探到的流时带的请求头：Cookie 照浏览器在这个请求里会带的给，Referer 只给网站。
 
 use hs_m3u8_core::{Url, check_option_header};
 use hs_m3u8_webview::cookies::Cookie;
+
+/// 一条流与它的来历。
+pub struct Found<'a> {
+    pub stream: &'a Url,
+    /// 报它的框架的地址，网页引擎给的；认不出是哪个框架时为 None
+    pub frame: Option<&'a Url>,
+    /// 报它的框架自报的 origin（网页能伪造）；不是 http(s) 的为 None
+    pub origin: Option<&'a Url>,
+    /// 网页的 User-Agent，为空时不带
+    pub agent: &'a str,
+    /// 顶层页面的地址，网页引擎给的；不是 http(s) 的为 None
+    pub top: Option<&'a Url>,
+    /// 网页引擎里会发往这条流的 Cookie
+    pub cookies: Vec<Cookie>,
+}
 
 /// 探测时带的请求头与没带上的 Cookie 个数。
 #[derive(Debug, PartialEq, Eq)]
 pub struct Headers {
     pub headers: Vec<(String, String)>,
-    /// 没有名字、核心收不了（只收 `名=值`）的 Cookie 个数
-    pub nameless: usize,
+    /// 放不进请求头的 Cookie 个数：没有名字（核心只收 `名=值`），或值里有控制字符
+    pub skipped: usize,
 }
 
-/// 探测流 `stream` 要带的请求头，都按核心的规则校验过：
+/// 探测 `found.stream` 要带的请求头，都按核心的规则校验过：
 ///
-/// - Referer：流所在框架的 `origin`（只到主机与端口，浏览器跨站时的默认做法；核心会把它发给分片与 key 所在的每个
-///   主机，完整的页面地址里常有会话参数）；`origin` 不是 http(s)，或从 https 页面请求 http 的流时不带。
-/// - User-Agent：网页的 `agent`，为空时不带。
-/// - Cookie：网页引擎里会发往这个流的 `cookies`。顶层页面 `top` 与流同一站点（协议相同、可注册域名相同）时全带；
-///   否则只带跨站也带的（[`Cookie::cross_site`]），网页里的播放器跨站请求时浏览器同样只带这些。
-pub fn headers_for(
-    stream: &Url,
-    origin: Option<&Url>,
-    agent: &str,
-    top: Option<&Url>,
-    cookies: Vec<Cookie>,
-) -> Result<Headers, String> {
+/// - Referer：报它的框架的网站（origin，浏览器跨站时的默认做法；核心会把它发给分片与 key 所在的每个主机，完整的页面
+///   地址里常有会话参数）。框架的地址先取网页引擎给的，认不出框架时取它自报的；不是 http(s)，或从 https 页面请求
+///   http 的流时不带。
+/// - User-Agent：网页的。
+/// - Cookie：流与顶层页面同一站点、且报它的框架（网页引擎认得出的）也与流同一站点时全带；否则只带跨站也带的
+///   （[`Cookie::cross_site`]）。别的站点的框架（如广告）能报任意地址，不能借它带上这个站点的登录 Cookie。放不进请求
+///   头的跳过，计入 [`Headers::skipped`]。
+pub fn headers_for(found: &Found<'_>) -> Result<Headers, String> {
     let mut headers = Vec::new();
-    if let Some(origin) = origin
-        && !(origin.scheme() == "https" && stream.scheme() == "http")
+    if let Some(origin) = found.frame.or(found.origin)
+        && !(origin.scheme() == "https" && found.stream.scheme() == "http")
     {
         headers.push((
             "Referer".to_owned(),
             format!("{}/", origin.origin().ascii_serialization()),
         ));
     }
-    if !agent.is_empty() {
-        headers.push(("User-Agent".to_owned(), agent.to_owned()));
+    if !found.agent.is_empty() {
+        headers.push(("User-Agent".to_owned(), found.agent.to_owned()));
     }
-    let same_site = top.is_some_and(|top| same_site(top, stream));
-    let (named, nameless): (Vec<Cookie>, Vec<Cookie>) = cookies
+    let same_site = [found.top, found.frame]
         .into_iter()
+        .all(|page| page.is_some_and(|page| same_site(page, found.stream)));
+    let mut skipped = 0;
+    let pairs: Vec<String> = found
+        .cookies
+        .iter()
         .filter(|cookie| same_site || cookie.cross_site)
-        .partition(|cookie| !cookie.name.is_empty());
-    if !named.is_empty() {
-        let pairs: Vec<String> = named
-            .iter()
-            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
-            .collect();
+        .filter_map(|cookie| {
+            let pair = format!("{}={}", cookie.name, cookie.value);
+            let fits = !cookie.name.is_empty() && check_option_header("Cookie", &pair).is_ok();
+            if !fits {
+                skipped += 1;
+            }
+            fits.then_some(pair)
+        })
+        .collect();
+    if !pairs.is_empty() {
         headers.push(("Cookie".to_owned(), pairs.join("; ")));
     }
     for (name, value) in &headers {
         check_option_header(name, value)?;
     }
-    Ok(Headers {
-        headers,
-        nameless: nameless.len(),
-    })
+    Ok(Headers { headers, skipped })
 }
 
 /// `a` 与 `b` 同一站点：协议相同、可注册域名（按公共后缀列表）相同；IP 地址与列表里认不出的主机按整个主机比。
@@ -80,19 +96,40 @@ mod tests {
         Url::parse(text).unwrap()
     }
 
-    fn cookie(name: &str, cross_site: bool) -> Cookie {
+    fn cookie(name: &str, value: &str, cross_site: bool) -> Cookie {
         Cookie {
             name: name.to_owned(),
-            value: "1".to_owned(),
+            value: value.to_owned(),
             cross_site,
         }
     }
 
+    fn found<'a>(stream: &'a Url, frame: Option<&'a Url>, top: Option<&'a Url>) -> Found<'a> {
+        Found {
+            stream,
+            frame,
+            origin: None,
+            agent: "",
+            top,
+            cookies: vec![
+                cookie("sid", "1", false),
+                cookie("cdn", "1", true),
+                cookie("", "1", true),
+                cookie("bad", "a\u{1}b", true),
+            ],
+        }
+    }
+
     #[test]
-    fn referer_is_the_frame_origin() {
+    fn referer_is_the_frame_site() {
         let stream = url("https://cdn.video.example/a/index.m3u8");
-        let origin = url("https://www.video.example");
-        let made = headers_for(&stream, Some(&origin), "UA", None, Vec::new()).unwrap();
+        let frame = url("https://www.video.example/watch?session=secret");
+        let made = headers_for(&Found {
+            agent: "UA",
+            cookies: Vec::new(),
+            ..found(&stream, Some(&frame), None)
+        })
+        .unwrap();
         assert_eq!(
             made.headers,
             [
@@ -105,29 +142,35 @@ mod tests {
         );
         // 从 https 页面请求 http 的流不带
         let plain = url("http://cdn.video.example/a/index.m3u8");
-        let made = headers_for(&plain, Some(&origin), "", None, Vec::new()).unwrap();
+        let made = headers_for(&Found {
+            cookies: Vec::new(),
+            ..found(&plain, Some(&frame), None)
+        })
+        .unwrap();
         assert_eq!(made.headers, []);
     }
 
     #[test]
-    fn cross_site_streams_get_only_cross_site_cookies() {
+    fn site_cookies_need_a_same_site_page_and_frame() {
         let stream = url("https://cdn.video.example/a/index.m3u8");
-        let cookies = || vec![cookie("sid", false), cookie("cdn", true), cookie("", true)];
-        // 同一站点（子域不同）：全带，没名字的不带并计数
         let top = url("https://www.video.example/watch/3");
-        let made = headers_for(&stream, None, "", Some(&top), cookies()).unwrap();
-        assert_eq!(
-            made.headers,
-            [("Cookie".to_owned(), "sid=1; cdn=1".to_owned())]
-        );
-        assert_eq!(made.nameless, 1);
-        // 别的站点：只带跨站也带的；可注册域名按公共后缀列表算（example.co.uk，不是 co.uk）
-        let other = url("https://player.example.co.uk/");
-        let made = headers_for(&stream, None, "", Some(&other), cookies()).unwrap();
-        assert_eq!(made.headers, [("Cookie".to_owned(), "cdn=1".to_owned())]);
-        assert!(same_site(&url("https://a.example.co.uk/"), &other));
-        assert!(!same_site(&url("https://a.other.co.uk/"), &other));
-        // 协议不同不算同一站点
+        // 页面与报它的框架都同站：全带；没名字的、值里有控制字符的跳过并计数，不连累别的
+        let made = headers_for(&found(&stream, Some(&top), Some(&top))).unwrap();
+        assert_eq!(made.headers.last().unwrap().1, "sid=1; cdn=1");
+        assert_eq!(made.skipped, 2);
+        // 别的站点的框架（广告）报的：只带跨站也带的
+        let ad = url("https://ads.example.co.uk/slot");
+        let made = headers_for(&found(&stream, Some(&ad), Some(&top))).unwrap();
+        assert_eq!(made.headers.last().unwrap().1, "cdn=1");
+        // 认不出框架时同样只带跨站也带的
+        let made = headers_for(&found(&stream, None, Some(&top))).unwrap();
+        assert_eq!(made.headers.last().unwrap().1, "cdn=1");
+        // 可注册域名按公共后缀列表算（example.co.uk，不是 co.uk）；协议不同不算同一站点
+        assert!(same_site(
+            &url("https://a.example.co.uk/"),
+            &url("https://b.example.co.uk/")
+        ));
+        assert!(!same_site(&url("https://a.other.co.uk/"), &ad));
         assert!(!same_site(&url("http://www.video.example/"), &stream));
     }
 }

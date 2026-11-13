@@ -55,9 +55,9 @@ impl Shell {
                     }
                     NewTaskEvent::Dismissed => {
                         let back = match this.page {
-                            Page::NewTask { from_sniff: true } if this.sniff.is_some() => {
-                                Page::Sniff
-                            }
+                            Page::NewTask {
+                                from_sniff: true, ..
+                            } if this.sniff.is_some() => Page::Sniff,
                             _ => Page::Task,
                         };
                         this.show(back, cx);
@@ -80,14 +80,19 @@ impl Shell {
                 cx.notify();
             },
         );
-        let from_sniff = match self.page {
+        let from_sniff = match &self.page {
             Page::Sniff => true,
-            Page::NewTask { from_sniff } => from_sniff,
+            Page::NewTask { from_sniff, .. } => *from_sniff,
             Page::Task => false,
         };
-        // 先换页（关掉旧的新建视图），再放进新的
-        self.show(Page::NewTask { from_sniff }, cx);
-        self.new_task = Some((view, subscription));
+        self.show(
+            Page::NewTask {
+                view,
+                _subscription: subscription,
+                from_sniff,
+            },
+            cx,
+        );
     }
 
     /// 按新建视图里的选择新建任务；退出中不新建。新建要查磁盘，在服务的运行时里做，期间新建视图显示正在开始。
@@ -195,9 +200,7 @@ impl Shell {
 
     /// 正显示着的新建视图是 `view`。
     pub(super) fn showing(&self, view: &Entity<NewTask>) -> bool {
-        self.new_task
-            .as_ref()
-            .is_some_and(|(shown, _)| shown == view)
+        self.new_task() == Some(view)
     }
 
     /// 在嗅探页里打开网页 `url`（已开着的换成这个）。

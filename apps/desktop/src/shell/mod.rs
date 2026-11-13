@@ -66,12 +66,15 @@ fn free_space(folder: &std::path::Path) -> Result<u64, String> {
 }
 
 /// 主体显示的页。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     /// 选中的任务；没有任务时为待机页
     Task,
-    /// 新建页（[`Shell::new_task`] 此时有值）；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页
-    NewTask { from_sniff: bool },
+    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页
+    NewTask {
+        view: Entity<NewTask>,
+        _subscription: Subscription,
+        from_sniff: bool,
+    },
     /// 嗅探页（[`Shell::sniff`] 此时有值），占满主体，不显示任务列表
     Sniff,
 }
@@ -88,8 +91,6 @@ pub struct Shell {
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
     page: Page,
-    /// 新建视图与对它的订阅：离开新建页时关掉，订阅一起释放
-    new_task: Option<(Entity<NewTask>, Subscription)>,
     /// 嗅探页与对它的订阅：关掉之前一直留着，不显示时网页藏起来、停止播放，任务列表里有一项可以回去
     sniff: Option<(Entity<SniffView>, Subscription)>,
     paste: Entity<InputState>,
@@ -195,7 +196,7 @@ impl Shell {
             Err(reason) => {
                 notices.push(Notice {
                     id: notices.len() as u64,
-                    text: format!("再次打开应用时没法把链接交给这个窗口：{reason}"),
+                    text: format!("收不了再次打开应用时转交的链接：{reason}"),
                 });
                 Task::ready(())
             }
@@ -227,7 +228,6 @@ impl Shell {
             rows,
             selected,
             page: Page::Task,
-            new_task: None,
             sniff: None,
             paste,
             folder,
@@ -260,17 +260,30 @@ impl Shell {
         shell
     }
 
-    /// 后打开的实例交来的：窗口到前台，有链接就探测；一次没收成的转交提示原因。
+    /// 再次打开应用时转交来的：窗口到前台，退出中的不再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次
+    /// 没收成的转交提示原因。
     fn receive(&mut self, received: Received, window: &mut Window, cx: &mut Context<Self>) {
         match received {
             Ok(handoff) => {
                 cx.activate(true);
                 window.activate_window();
+                if self.quitting {
+                    self.cancel_quit("再次打开了应用，没有退出".to_owned());
+                }
                 if let Handoff::Link(link) = handoff {
-                    self.probe_text(&link, window, cx);
+                    if self.new_task().is_some() {
+                        self.paste
+                            .update(cx, |input, cx| input.set_value(link, window, cx));
+                        self.notify(
+                            "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
+                                .to_owned(),
+                        );
+                    } else {
+                        self.probe_text(&link, window, cx);
+                    }
                 }
             }
-            Err(reason) => self.notify(format!("别的程序转交链接没成：{reason}")),
+            Err(reason) => self.notify(format!("再次打开应用时转交的链接没收到：{reason}")),
         }
         cx.notify();
     }
@@ -475,10 +488,7 @@ impl Shell {
             .read_from_clipboard()
             .and_then(|item| item.text())
             .and_then(|text| links::stream_url(&text));
-        let probing = self
-            .new_task
-            .as_ref()
-            .map(|(view, _)| view.read(cx).url().clone());
+        let probing = self.new_task().map(|view| view.read(cx).url().clone());
         self.clipboard = found.filter(|url| {
             !self.rows.iter().any(|row| &row.task.spec.url == url) && probing.as_ref() != Some(url)
         });
@@ -492,19 +502,34 @@ impl Shell {
         self.show(Page::Task, cx);
     }
 
-    /// 换到 `page`：离开新建页时关掉新建视图，离开嗅探页时把网页藏起来、停止播放（原生视图不随 GPUI 的画面消失）。
+    /// 换到 `page`（原来的新建页随之释放）；离开嗅探页时把网页藏起来、停止播放（原生视图不随 GPUI 的画面消失），回到
+    /// 嗅探页时恢复播放。
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
-        if self.page == Page::Sniff
-            && page != Page::Sniff
+        let (was, will) = (
+            matches!(self.page, Page::Sniff),
+            matches!(page, Page::Sniff),
+        );
+        if was != will
             && let Some((sniff, _)) = &self.sniff
         {
-            sniff.update(cx, |sniff, cx| sniff.hide(cx));
-        }
-        if !matches!(page, Page::NewTask { .. }) {
-            self.new_task = None;
+            sniff.update(cx, |sniff, cx| {
+                if will {
+                    sniff.reveal(cx);
+                } else {
+                    sniff.hide(cx);
+                }
+            });
         }
         self.page = page;
         cx.notify();
+    }
+
+    /// 显示着的新建视图；不在新建页时为 None。
+    fn new_task(&self) -> Option<&Entity<NewTask>> {
+        match &self.page {
+            Page::NewTask { view, .. } => Some(view),
+            Page::Task | Page::Sniff => None,
+        }
     }
 }
 
@@ -534,15 +559,12 @@ impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
-        let listed = !self.rows.is_empty() || self.new_task.is_some() || self.sniff.is_some();
-        if self.page != Page::Sniff && listed {
+        let listed = !self.rows.is_empty() || self.new_task().is_some() || self.sniff.is_some();
+        if !matches!(self.page, Page::Sniff) && listed {
             body = body.child(self.render_list(now, cx));
         }
-        body = match self.page {
-            Page::NewTask { .. } => {
-                let (view, _) = self.new_task.as_ref().expect("新建页显示时新建视图在");
-                body.child(view.clone())
-            }
+        body = match &self.page {
+            Page::NewTask { view, .. } => body.child(view.clone()),
             Page::Sniff => {
                 let (view, _) = self.sniff.as_ref().expect("嗅探页显示时嗅探视图在");
                 body.child(view.clone())

@@ -10,7 +10,7 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
-use super::plan::{Action, Plan, stopped_plan};
+use super::plan::{Action, Plan, resume_label, stopped_plan};
 use super::row::{Row, look};
 use super::{Shell, live_view};
 use crate::ring;
@@ -164,11 +164,11 @@ impl Shell {
             .as_ref()
             .filter(|(id, _)| *id == row.task.id)?;
         let resume = self.plan(row).resume_after_headers;
-        let label = match (resume, &row.task.status) {
-            (false, _) => "保存",
-            (true, _) if row.task.write_only => "保存并续录",
-            (true, Status::Failed(_)) => "保存并重试",
-            (true, _) => "保存并继续",
+        let failed = matches!(row.task.status, Status::Failed(_));
+        let label = if resume {
+            format!("保存并{}", resume_label(failed, row.task.write_only))
+        } else {
+            "保存".to_owned()
         };
         Some(
             div()
@@ -264,11 +264,7 @@ impl Shell {
                     ),
                     Action::Resume => ui::button(
                         "resume",
-                        match (row.task.write_only, failure) {
-                            (true, _) => "续录",
-                            (false, Some(_)) => "重试",
-                            (false, None) => "继续",
-                        },
+                        resume_label(failure.is_some(), row.task.write_only),
                         tone,
                         cx.listener(move |this, _, _, cx| this.resume(id, cx)),
                     ),

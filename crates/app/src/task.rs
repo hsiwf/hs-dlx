@@ -107,8 +107,8 @@ pub struct Task {
     pub total: Option<usize>,
     /// 完成时写出的结果；没完成时为 None
     pub result: Option<Finished>,
-    /// 用户选了不再续录（[`crate::Service::write_recorded`]）：再运行时只写出已录的，直到用
-    /// [`crate::Service::resume`] 续录
+    /// 最近一次运行是只写出已录的（[`crate::Service::write_recorded`] 置上，[`crate::Service::resume`] 清掉）：用户选了
+    /// 不再续录
     pub write_only: bool,
 }
 

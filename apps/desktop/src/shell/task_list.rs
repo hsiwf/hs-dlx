@@ -26,14 +26,13 @@ const ORB_WIDTH: f32 = 5.;
 impl Shell {
     pub(super) fn render_list(&self, now: Instant, cx: &mut Context<Self>) -> impl IntoElement {
         let new_task = self
-            .new_task
-            .as_ref()
-            .map(|(view, _)| new_task_item(view.read(cx).phase()));
+            .new_task()
+            .map(|view| new_task_item(view.read(cx).phase()));
+        let dim = self.new_task().is_some();
         let sniff = self.sniff.as_ref().map(|(view, _)| {
             let title = view.read(cx).page_title();
-            sniff_item(title, cx)
+            sniff_item(title, dim, cx)
         });
-        let dim = matches!(self.page, Page::NewTask { .. });
         let orbs: Vec<_> = self
             .rows
             .iter()
@@ -64,7 +63,7 @@ impl Shell {
     ) -> Stateful<Div> {
         let id = row.task.id;
         let look = look(row, now);
-        let on = self.selected == Some(id) && self.page == Page::Task;
+        let on = self.selected == Some(id) && matches!(self.page, Page::Task);
         let (fraction, color) = (look.fraction, look.orb);
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.55))
@@ -137,35 +136,15 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
 }
 
 /// 回到嗅探页的一项：两个同心实线环（与嗅探页里流前面的一样），写网页的标题。
-fn sniff_item(title: String, cx: &mut Context<Shell>) -> Stateful<Div> {
-    let ring = |size: f32, width: f32, color| {
-        div()
-            .absolute()
-            .left(px((ORB - size) / 2.))
-            .top(px((ORB - size) / 2.))
-            .size(px(size))
-            .rounded_full()
-            .border(px(width))
-            .border_color(color)
-    };
+fn sniff_item(title: Option<String>, dim: bool, cx: &mut Context<Shell>) -> Stateful<Div> {
     ui::list_item("sniff", false)
+        .when(dim, |item| item.opacity(0.55))
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| this.show(Page::Sniff, cx)))
-        .child(
-            div()
-                .relative()
-                .size(px(ORB))
-                .flex_none()
-                .child(ring(ORB, ORB_WIDTH, theme::cyan()))
-                .child(ring(ORB - 20., 2., theme::cyan_dim())),
-        )
+        .child(ui::rings(ORB, ORB_WIDTH, 20.))
         .child(two_lines(
-            if title.is_empty() {
-                "网页".to_owned()
-            } else {
-                title
-            },
-            "找视频流 · 点这里回去".to_owned(),
+            title.unwrap_or_else(|| "网页".to_owned()),
+            "在网页里找视频流".to_owned(),
         ))
 }
 

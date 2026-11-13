@@ -14,6 +14,8 @@ interprocess = { version = "2.4.8", features = ["tokio"] }
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
+# 管道名里的随机部分
+getrandom = "0.4.3"
 # 写命名管道的安全描述符（SDDL 是 UTF-16 字符串），与 interprocess 2.4.8 用的同一个大版本
 widestring = "1.2.1"
 

@@ -9,6 +9,14 @@
 pub mod cookies;
 #[cfg(target_os = "linux")]
 mod linux;
+mod media;
+
+/// wry 的网页消息（`with_ipc_handler` 收到的）是哪个框架发的：macOS 上为那个框架的地址；Windows 上只有顶层框架能发，
+/// 为顶层页面的地址；Linux 上 wry 给的总是顶层页面的地址、认不出是哪个框架发的，为 None。地址由网页引擎给出，页面
+/// 伪造不了。
+pub fn ipc_frame(request: &wry::http::Request<String>) -> Option<String> {
+    (!cfg!(target_os = "linux")).then(|| request.uri().to_string())
+}
 
 #[cfg(target_os = "linux")]
 use std::cell::Cell;
@@ -22,23 +30,22 @@ use gpui_kit::{
 };
 use wry::Rect;
 
-/// 摆放网页时可能没做成的几件事，各记各的：一件做成了不清掉另一件的原因。
-#[derive(Clone, Copy)]
-enum Trouble {
+/// 摆放网页时几件事各自最近一次没做成的原因，做成后清掉；各记各的，一件做成了不清掉另一件的原因。
+#[derive(Default)]
+struct Troubles {
     /// 摆到布局给的位置、显示出来
-    Place,
+    place: Option<String>,
     /// 点在网页外时把键盘焦点交还窗口
-    Focus,
-    /// 页面缩放对齐窗口的缩放：只有 Linux 要对齐
-    #[cfg(target_os = "linux")]
-    Scale,
+    focus: Option<String>,
+    /// 页面缩放对齐窗口的缩放：只有 Linux 要对齐，别的平台总为 None
+    scale: Option<String>,
 }
 
 /// 放在 GPUI 窗口里的网页。
 pub struct WebView {
     webview: Rc<wry::WebView>,
-    /// 各件事最近一次没做成的原因（下标为 [`Trouble`] 的值），做成后清掉。画的过程中报不出错误，放在这里由使用方显示
-    troubles: RefCell<[Option<String>; 3]>,
+    /// 画的过程中报不出错误，放在这里由使用方显示
+    troubles: RefCell<Troubles>,
     /// GPUI 的缩放倍数，页面的缩放按它对齐（GDK 只支持整数倍）
     #[cfg(target_os = "linux")]
     scale_factor: Cell<f32>,
@@ -87,7 +94,7 @@ impl WebView {
         let _ = cx;
         Ok(WebView {
             webview: Rc::new(webview),
-            troubles: RefCell::new([None, None, None]),
+            troubles: RefCell::new(Troubles::default()),
             #[cfg(target_os = "linux")]
             scale_factor: Cell::new(window.scale_factor()),
             #[cfg(target_os = "linux")]
@@ -102,11 +109,21 @@ impl WebView {
         &self.webview
     }
 
-    /// 摆放与交还焦点最近没做成的原因，几件都没做成时用「；」连起来；都做成了为 None。
+    /// 摆放、交还焦点与对齐缩放（Linux）最近没做成的原因，几件都没做成时用「；」连起来；都做成了为 None。
     pub fn trouble(&self) -> Option<String> {
         let troubles = self.troubles.borrow();
-        let reasons: Vec<&str> = troubles.iter().flatten().map(String::as_str).collect();
+        let reasons: Vec<&str> = [&troubles.place, &troubles.focus, &troubles.scale]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
         (!reasons.is_empty()).then(|| reasons.join("；"))
+    }
+
+    /// 暂停（`suspended`）或恢复网页里全部的视频与音频，由网页引擎做，页面自己的脚本挡不住：网页不显示时不出声。
+    /// macOS 上暂停期间页面也播不了；Windows 上为静音；Linux 上为静音。做不到时为原因。
+    pub fn suspend_media(&self, suspended: bool) -> Result<(), String> {
+        media::suspend(&self.webview, suspended)
     }
 
     /// 藏起网页（页面照旧留着）：所在的视图不再显示时调，下次画出来时重新摆出来。
@@ -140,11 +157,17 @@ impl WebView {
         Ok(true)
     }
 
-    /// 记下 `trouble` 这件事的结果 `result`（`what` 为没做成时的说法）；原因有变化时返回 true，要重画才显示得出来。
-    fn record(&self, trouble: Trouble, result: wry::Result<()>, what: &str) -> bool {
+    /// 记下一件事（`slot` 取出它在 [`Troubles`] 里的那一项）的结果 `result`，`what` 为没做成时的说法；原因有变化时
+    /// 返回 true，要重画才显示得出来。
+    fn record(
+        &self,
+        slot: fn(&mut Troubles) -> &mut Option<String>,
+        result: wry::Result<()>,
+        what: &str,
+    ) -> bool {
         let reason = result.err().map(|error| format!("{what}：{error}"));
         let mut troubles = self.troubles.borrow_mut();
-        let slot = &mut troubles[trouble as usize];
+        let slot = slot(&mut troubles);
         let changed = *slot != reason;
         *slot = reason;
         changed
@@ -216,7 +239,7 @@ impl Element for WebViewElement {
         {
             if view.scale_factor.replace(window.scale_factor()) != window.scale_factor() {
                 let matched = linux::match_scale_factor(&view.webview, window.scale_factor());
-                changed |= view.record(Trouble::Scale, matched, "网页缩放没能对齐窗口");
+                changed |= view.record(|t| &mut t.scale, matched, "网页缩放没能对齐窗口");
             }
             view.origin.set(bounds.origin);
         }
@@ -229,7 +252,7 @@ impl Element for WebViewElement {
             }
             Ok(false) | Err(_) => None,
         };
-        changed |= view.record(Trouble::Place, placed.map(|_| ()), "网页没能摆到位置上");
+        changed |= view.record(|t| &mut t.place, placed.map(|_| ()), "网页没能摆到位置上");
         if changed {
             // 原因随下一帧显示出来；原因不再变时不再请求
             window.refresh();
@@ -257,7 +280,7 @@ impl Element for WebViewElement {
                     let returned = webview.focus_parent();
                     if view
                         .read(cx)
-                        .record(Trouble::Focus, returned, "键盘焦点没能交还窗口")
+                        .record(|t| &mut t.focus, returned, "键盘焦点没能交还窗口")
                     {
                         window.refresh();
                     }

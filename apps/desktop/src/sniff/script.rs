@@ -1,4 +1,4 @@
-//! 注入网页每一层框架的脚本与它发回的消息。脚本找 HLS 播放列表的地址、数请求；发回的内容来自网页，按不可信数据校验，
+//! 注入网页各层框架的脚本与它发回的消息。脚本找 HLS 播放列表的地址、数请求；发回的内容来自网页，按不可信数据校验，
 //! 认不出的丢掉。页面的地址与标题不经脚本，由网页引擎报（见嗅探页）。
 
 use hs_m3u8_core::Url;
@@ -6,37 +6,24 @@ use serde::Deserialize;
 
 use crate::links::http_url;
 
-/// 注入每一层框架的脚本。
+/// 注入网页的脚本（Windows 上只注入顶层框架：WebView2 只给顶层框架发消息的通道）。
 ///
 /// - 播放列表：fetch 与 XHR 的响应类型是 HLS 播放列表（`application/vnd.apple.mpegurl` 之类）的，与地址路径以
 ///   `.m3u8` 结尾的请求（含资源加载记录与 video、source 元素上的），每个地址只报一次。
 /// - 请求数：资源加载记录的条数，每秒最多报一次；框架按脚本随机取的编号区分。
-/// - 顶层框架经 wry 的 `window.ipc` 发回 JSON（见 [`Report`]），并转发子框架经 `postMessage` 交来的（wry 只在顶层框架
-///   提供 ipc），转发时附上浏览器给出的来源框架的 origin。
-/// - `window.__hsM3u8Pause()`（只在顶层框架）暂停本框架的视频与音频，并让各层子框架也暂停。
+/// - 发回 JSON（见 [`Report`]），附上本框架的 origin：WebKit 上每一层框架都直接经引擎的 `ipc` 消息通道发（不经别的
+///   框架转发，嵌入它的页面截不到），别的引擎经 wry 的 `window.ipc`。
 pub const SCRIPT: &str = r#"
 (function () {
   if (window.__hsM3u8Sniff) return;
   Object.defineProperty(window, '__hsM3u8Sniff', { value: true });
-  var top = window === window.top;
   var frame = Math.random().toString(36).slice(2);
+  var handlers = window.webkit && window.webkit.messageHandlers;
+  var channel = handlers && handlers.ipc ? handlers.ipc : window.ipc;
   var send = function (message) {
-    if (top) {
-      message.origin = location.origin;
-      window.ipc.postMessage(JSON.stringify(message));
-    } else {
-      window.top.postMessage({ hsM3u8: message }, '*');
-    }
+    message.origin = location.origin;
+    channel.postMessage(JSON.stringify(message));
   };
-  if (top) {
-    window.addEventListener('message', function (event) {
-      var data = event.data;
-      if (event.source === window || !data || typeof data.hsM3u8 !== 'object' || data.hsM3u8 === null) return;
-      var message = data.hsM3u8;
-      message.origin = event.origin;
-      window.ipc.postMessage(JSON.stringify(message));
-    });
-  }
   var playlist = /^\s*(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(x-)?mpegurl)\s*(;|$)/i;
   var named = function (raw) {
     var url;
@@ -79,14 +66,6 @@ pub const SCRIPT: &str = r#"
       if (named(entry.name)) found(entry.name);
     });
   }).observe({ type: 'resource', buffered: true });
-  var pause = function () {
-    document.querySelectorAll('video, audio').forEach(function (media) { media.pause(); });
-    for (var i = 0; i < window.frames.length; i += 1) window.frames[i].postMessage({ hsM3u8Pause: true }, '*');
-  };
-  window.addEventListener('message', function (event) {
-    if (event.data && event.data.hsM3u8Pause === true) pause();
-  });
-  if (top) Object.defineProperty(window, '__hsM3u8Pause', { value: pause });
   setInterval(function () {
     document.querySelectorAll('video, source').forEach(function (media) {
       var src = media.currentSrc || media.src;
@@ -100,13 +79,10 @@ pub const SCRIPT: &str = r#"
 })();
 "#;
 
-/// 在顶层框架里执行：暂停网页里的视频与音频（见 [`SCRIPT`]）。
-pub const PAUSE: &str = "window.__hsM3u8Pause && window.__hsM3u8Pause();";
-
-/// 一条消息最长多少字节：页面能发任意多、任意长的消息，超过的不解析。
-const MAX_MESSAGE: usize = 16 * 1024;
-/// User-Agent 与框架编号最长多少字符，超出的截掉。
-const MAX_TEXT: usize = 300;
+/// 一条消息最长多少字节：页面能发任意多、任意长的消息，超过的不收。
+pub const MAX_MESSAGE: usize = 16 * 1024;
+/// User-Agent、框架编号与网页标题最长多少字符，超出的截掉。
+pub const MAX_TEXT: usize = 300;
 
 /// 脚本发回、校验过的一条消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +132,7 @@ pub fn parse(message: &str) -> Option<Report> {
 }
 
 /// 去掉控制字符、最多留 [`MAX_TEXT`] 个字符。
-fn clip(text: &str) -> String {
+pub fn clip(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
         .take(MAX_TEXT)

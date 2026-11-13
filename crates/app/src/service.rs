@@ -218,9 +218,9 @@ impl Service {
 
     /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下；之前选了只写出已录的，从此改回续录
     /// （[`Task::write_only`] 为否）。在运行、正在放弃、已完成、放弃没做完的报 [`Error::Running`]、[`Error::Discarding`]、
-    /// [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有自己的任务目录的报 [`Error::NoWorkDir`]。存储写不进时
-    /// 任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
-    pub fn resume(&self, id: TaskId) -> Result<(), Error> {
+    /// [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有自己的任务目录的报 [`Error::NoWorkDir`]。返回开始后的
+    /// 任务（运行中）。存储写不进时任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
+    pub fn resume(&self, id: TaskId) -> Result<Task, Error> {
         let _entered = self.runtime().enter();
         self.shared.resume(id, Run::Resume)
     }
@@ -228,8 +228,8 @@ impl Service {
     /// 不再续录，只把停着的直播录制任务目录里已录的写成输出（见 [`Engine::merge_recorded`]）：用于来源变了、接不上，
     /// 或不想再录的时候。记下这个选择（[`Task::write_only`]），之后由 [`Service::resume`] 改回续录。拒绝的情形同
     /// [`Service::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
-    /// （[`crate::FailureKind::NothingToWrite`]）停下。停下后照常发 [`Event::Ended`]。
-    pub fn write_recorded(&self, id: TaskId) -> Result<(), Error> {
+    /// （[`crate::FailureKind::NothingToWrite`]）停下。返回开始后的任务，停下后照常发 [`Event::Ended`]。
+    pub fn write_recorded(&self, id: TaskId) -> Result<Task, Error> {
         let _entered = self.runtime().enter();
         self.shared.resume(id, Run::WriteRecorded)
     }
@@ -582,21 +582,23 @@ impl Shared {
     }
 
     /// 让停着的任务 `id` 再运行一次：`run` 为 [`Run::Resume`] 时照新建时的请求续传续录，为 [`Run::WriteRecorded`] 时
-    /// 不联网，只把任务目录里已录的直播写成输出。
-    fn resume(self: &Arc<Self>, id: TaskId, run: Run) -> Result<(), Error> {
+    /// 不联网，只把任务目录里已录的直播写成输出。返回开始后的任务。
+    fn resume(self: &Arc<Self>, id: TaskId, run: Run) -> Result<Task, Error> {
         let mut store = lock(&self.store);
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
-        let task = self.stopped(&tx, id)?;
+        let mut task = self.stopped(&tx, id)?;
         let job = match run {
             Run::Resume => self.engine.start(request(&task)?)?,
             Run::WriteRecorded => self.engine.merge_recorded(output_options(&task)?)?,
         };
-        store::set_status(&tx, id, &Status::Running)?;
-        store::set_write_only(&tx, id, run == Run::WriteRecorded)?;
+        task.status = Status::Running;
+        task.write_only = run == Run::WriteRecorded;
+        store::set_status(&tx, id, &task.status)?;
+        store::set_write_only(&tx, id, task.write_only)?;
         let committed = self.commit(tx, applied);
         if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
@@ -604,7 +606,7 @@ impl Shared {
         }
         self.track(&task, job, run);
         drop(store);
-        committed
+        committed.map(|()| task)
     }
 
     /// 新建时存储写不进而不要的任务：取消，等它停下，再删掉它建出的任务目录；磁盘上还留下东西时发

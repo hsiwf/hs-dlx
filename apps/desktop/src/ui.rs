@@ -198,3 +198,24 @@ pub fn error_text(text: impl Into<SharedString>) -> Div {
         .text_color(theme::orange())
         .child(text.into())
 }
+
+/// 两个同心实线环（外环宽 `width`、亮色，内环小 `inset`、细而暗），边长 `size`：表示一个可以探测出几档清晰度的
+/// 地址，嗅探页里的流与任务列表里回到嗅探页的一项用它。
+pub fn rings(size: f32, width: f32, inset: f32) -> Div {
+    let ring = |ring: f32, width: f32, color| {
+        div()
+            .absolute()
+            .left(px((size - ring) / 2.))
+            .top(px((size - ring) / 2.))
+            .size(px(ring))
+            .rounded_full()
+            .border(px(width))
+            .border_color(color)
+    };
+    div()
+        .relative()
+        .size(px(size))
+        .flex_none()
+        .child(ring(size, width, theme::cyan()))
+        .child(ring(size - inset, 2., theme::cyan_dim()))
+}

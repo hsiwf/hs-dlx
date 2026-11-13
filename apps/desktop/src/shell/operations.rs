@@ -7,6 +7,7 @@ use gpui_kit::{AppContext as _, Context, Window};
 use hs_m3u8_app::{Status, TaskId};
 
 use super::Shell;
+use super::plan::resume_label;
 use super::row::{Disk, Present, Row};
 use crate::headers::HeadersEditor;
 use crate::rate::Rate;
@@ -115,12 +116,11 @@ impl Shell {
         }
         self.editing_headers = None;
         match self.service.write_recorded(id) {
-            Ok(()) => {
+            Ok(task) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 // 核心报出进度之前，已录时长先按停下时知道的显示
                 row.recorded_before_writing = row.recorded();
-                row.task.write_only = true;
-                row.task.status = Status::Running;
+                row.task = task;
                 row.progress = None;
                 row.forget_disk();
                 // 写出不联网，没有下载速度与剩余时间可估
@@ -182,19 +182,22 @@ impl Shell {
             ),
             Disk::Unread | Disk::Unreadable(_) => (None, None),
         };
+        let label = resume_label(
+            matches!(row.task.status, Status::Failed(_)),
+            row.task.write_only,
+        );
         match self.service.resume(id) {
-            Ok(()) => {
+            Ok(task) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
-                row.task.status = Status::Running;
+                row.task = task;
                 row.progress = None;
-                row.task.write_only = false;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
                 }
                 let text = match baseline {
-                    Some(n) if n > 0 => format!("继续：任务目录里已有 {n} 片"),
-                    _ => "继续".to_owned(),
+                    Some(n) if n > 0 => format!("{label}：任务目录里已有 {n} 片"),
+                    _ => label.to_owned(),
                 };
                 row.signal(Level::Info, text);
             }

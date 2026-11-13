@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 
-/// 等 `work` 与 `deadline` 先完成的那个：`work` 先完成时为它的结果，`deadline` 先到时为 None。`work` 由调用方钉住、
+/// 等 `work` 与 `deadline` 先完成的那个：`work` 先完成时为它的结果，`deadline` 先到时为 None。`work` 由调用方 pin 住、
 /// 传引用：超时后它照旧可以接着等。
 pub async fn within<T>(
     mut work: Pin<&mut impl Future<Output = T>>,
