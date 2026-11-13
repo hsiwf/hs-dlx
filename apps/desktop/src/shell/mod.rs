@@ -415,7 +415,7 @@ fn ended_signal(
         ),
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),
-        Status::Running | Status::Discarding => {
+        Status::Running | Status::DiscardUnfinished => {
             unreachable!("任务服务只在任务停下后发结束事件，停下的状态不会是运行中或放弃没做完")
         }
     }

@@ -14,8 +14,8 @@ use std::time::Duration;
 use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
-    CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output, Probe,
-    Progress, Saved, Source, Stage, Unsettled, check_header,
+    CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output,
+    OutputOptions, Probe, Progress, Saved, Source, Stage, Unsettled, check_header,
 };
 use rusqlite::Transaction;
 use tokio::runtime::Runtime;
@@ -220,7 +220,26 @@ impl Service {
     /// 没有自己的任务目录的报 [`Error::NoWorkDir`]。存储写不进时任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
     pub fn resume(&self, id: TaskId) -> Result<(), Error> {
         let _entered = self.runtime().enter();
-        self.shared.resume(id)
+        self.shared.resume(id, Run::Resume)
+    }
+
+    /// 不再续录，只把停着的直播录制任务目录里已录的写成输出（见 [`Engine::merge_recorded`]）：用于来源变了、接不上，
+    /// 或不想再录的时候。拒绝的情形同 [`Service::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
+    /// 停下。停下后照常发 [`Event::Ended`]。
+    pub fn write_recorded(&self, id: TaskId) -> Result<(), Error> {
+        let _entered = self.runtime().enter();
+        self.shared.resume(id, Run::WriteRecorded)
+    }
+
+    /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
+    pub fn task(&self, id: TaskId) -> Result<Task, Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        let mut task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+        if let Some(ending) = lock(&self.shared.unsaved).get(&id) {
+            ending.overlay(&mut task);
+        }
+        Ok(task)
     }
 
     /// 任务目录里已完成的内容（见 [`Engine::inspect`]）：任务不在运行时显示已下了多少、继续前算出续传的起点。任务没有
@@ -257,8 +276,9 @@ impl Service {
         })
     }
 
-    /// 换掉停着的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_header`]）的报 [`Error::InvalidInput`]；
-    /// 任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]。
+    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_header`]）的报
+    /// [`Error::InvalidInput`]；任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、放弃没做完
+    /// 的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
     pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
         for (name, value) in &headers {
             check_header(name, value).map_err(Error::InvalidInput)?;
@@ -269,6 +289,11 @@ impl Service {
             }
             if lock(&self.shared.discarding).contains(&id) {
                 return Err(Error::Discarding(id));
+            }
+            match store::get(tx, id)?.ok_or(Error::NotFound(id))?.status {
+                Status::Done => return Err(Error::AlreadyDone(id)),
+                Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
+                Status::Running | Status::Paused | Status::Failed(_) => {}
             }
             store::set_headers(tx, id, &headers)
         })
@@ -288,7 +313,7 @@ impl Service {
         }
     }
 
-    /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::Discarding`]，再删掉任务目录（见 [`Engine::discard`]）
+    /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::DiscardUnfinished`]，再删掉任务目录（见 [`Engine::discard`]）
     /// 与存储里的记录；返回留下的东西。
     /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
     /// 30 秒内做不完报 [`Error::TimedOut`]（之后再放弃从做到的地方接着做）。做完之前任务记为正在放弃，继续与移除都报
@@ -362,7 +387,7 @@ async fn run_discard(
         let _stopped = stopped.wait_for(|done| *done).await;
     }
     // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
-    shared.write(|tx| store::set_status(tx, id, &Status::Discarding))?;
+    shared.write(|tx| store::set_status(tx, id, &Status::DiscardUnfinished))?;
     let leftovers = match shared.get(id)?.work_dir {
         // 放弃超时时这个 future 被丢弃，核心在步与步之间停下，再放弃时从做到的地方接着做
         Some(work_dir) => {
@@ -527,7 +552,9 @@ impl Shared {
         Ok(task)
     }
 
-    fn resume(self: &Arc<Self>, id: TaskId) -> Result<(), Error> {
+    /// 让停着的任务 `id` 再运行一次：`run` 为 [`Run::Resume`] 时照新建时的请求续传续录，为 [`Run::WriteRecorded`] 时
+    /// 不联网，只把任务目录里已录的直播写成输出。
+    fn resume(self: &Arc<Self>, id: TaskId, run: Run) -> Result<(), Error> {
         let mut store = lock(&self.store);
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
@@ -543,12 +570,14 @@ impl Shared {
         let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
         match task.status {
             Status::Done => return Err(Error::AlreadyDone(id)),
-            Status::Discarding => return Err(Error::DiscardUnfinished(id)),
+            Status::DiscardUnfinished => return Err(Error::DiscardUnfinished(id)),
             Status::Running | Status::Paused | Status::Failed(_) => {}
         }
-        let request = request(&task)?;
+        let job = match run {
+            Run::Resume => self.engine.start(request(&task)?)?,
+            Run::WriteRecorded => self.engine.merge_recorded(output_options(&task)?)?,
+        };
         store::set_status(&tx, id, &Status::Running)?;
-        let job = self.engine.start(request)?;
         let committed = self.commit(tx, applied);
         if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
@@ -778,13 +807,27 @@ fn request(task: &Task) -> Result<JobRequest, Error> {
     let mut source = Source::new(spec.url.clone());
     source.preference = Preference::from(&spec.preference);
     source.http.headers.clone_from(&spec.headers);
-    let mut options = spec.output.options();
-    options.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
-    let mut request = JobRequest::new(source, options);
+    let mut request = JobRequest::new(source, output_options(task)?);
     if !spec.live {
         request.live = None;
     }
     Ok(request)
+}
+
+/// 任务的输出选项：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]。
+fn output_options(task: &Task) -> Result<OutputOptions, Error> {
+    let mut options = task.spec.output.options();
+    options.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
+    Ok(options)
+}
+
+/// 停着的任务再运行一次的方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// 照新建时的请求续传、续录
+    Resume,
+    /// 不联网，只把已录的直播写成输出
+    WriteRecorded,
 }
 
 /// 加锁；持锁期间只做内存与 SQLite 的读写，不会 panic，锁中毒即不变量被破坏。

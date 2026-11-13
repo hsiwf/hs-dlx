@@ -44,7 +44,7 @@ pub struct Timeline {
 
 /// 时间线上一处要说的事：同一位置的缺片与另起会话合在一起。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Event {
+pub struct Mark {
     pub at: Duration,
     /// 缺的片数；没缺时为 0
     pub missed: usize,
@@ -92,8 +92,8 @@ impl Timeline {
     }
 
     /// 从 `from` 起的缺片与另起会话，按位置先后，同一位置的合成一处。
-    pub fn events(&self, from: Duration) -> Vec<Event> {
-        let mut events: Vec<Event> = Vec::new();
+    pub fn marks(&self, from: Duration) -> Vec<Mark> {
+        let mut marks: Vec<Mark> = Vec::new();
         let missed = self.misses.iter().map(|&(at, count)| (at, count, None));
         let restarted = self
             .sessions
@@ -106,19 +106,19 @@ impl Timeline {
             .collect();
         all.sort_by_key(|&(at, ..)| at);
         for (at, count, session) in all {
-            match events.last_mut() {
+            match marks.last_mut() {
                 Some(last) if last.at == at => {
                     last.missed += count;
                     last.session = last.session.or(session);
                 }
-                _ => events.push(Event {
+                _ => marks.push(Mark {
                     at,
                     missed: count,
                     session,
                 }),
             }
         }
-        events
+        marks
     }
 }
 
@@ -223,7 +223,7 @@ pub fn paint(bounds: Bounds<Pixels>, face: &Face<'_>, window: &mut Window) {
 }
 
 /// 钟面四个刻度标记（00、15、30、45 分）相对圆心的位置：半径 `radius`、从 12 点顺时针。
-pub fn marks(radius: f32) -> [(&'static str, f32, f32); 4] {
+pub fn dial(radius: f32) -> [(&'static str, f32, f32); 4] {
     let at = |turn: f32| {
         let a = angle(turn);
         (radius * a.cos(), radius * a.sin())
@@ -289,14 +289,14 @@ mod tests {
         assert_eq!(timeline.session_at(minutes(45)), Some((minutes(41), 3)));
         // 同一位置的缺片与另起会话合成一处
         assert_eq!(
-            timeline.events(minutes(30)),
+            timeline.marks(minutes(30)),
             [
-                Event {
+                Mark {
                     at: minutes(41),
                     missed: 3,
                     session: Some(3)
                 },
-                Event {
+                Mark {
                     at: minutes(60),
                     missed: 2,
                     session: None

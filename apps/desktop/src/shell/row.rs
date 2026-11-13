@@ -52,6 +52,8 @@ pub struct Row {
     pub discarding: bool,
     /// 直播录制这次打开应用以来的时间线（钟面用）
     pub timeline: Timeline,
+    /// 这次运行只写出已录的（不联网）：不算录制，不给停止
+    pub writing_recorded: bool,
 }
 
 impl Row {
@@ -77,6 +79,15 @@ impl Row {
             Level::Info,
             format!("新建 · 保存为 {file_name}"),
         );
+        // 打开应用时就已失败的：完整的错误只在存储里，补进信号
+        if let Status::Failed(failure) = &task.status {
+            signals::push(
+                &mut signals,
+                "上次".to_owned(),
+                Level::Error,
+                failure.message.clone(),
+            );
+        }
         Row {
             task,
             progress: None,
@@ -89,6 +100,7 @@ impl Row {
             resuming: false,
             discarding: false,
             timeline: Timeline::default(),
+            writing_recorded: false,
         }
     }
 
@@ -126,6 +138,9 @@ impl Row {
     /// 是直播的录制：运行中过了准备阶段的按阶段；其余（停下的、还在准备的）按任务目录里的记录（继续前读到的），
     /// 没读到时按新建时的选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
     pub fn recording(&self) -> bool {
+        if self.task.status == Status::Running && self.writing_recorded {
+            return false;
+        }
         if let Some(p) = &self.progress
             && self.task.status == Status::Running
         {
@@ -210,7 +225,7 @@ enum Stopped<'a> {
 }
 
 /// 失败时圆盘里的大字与说明：大字为状态码或种类，说明写这类失败多半是怎么回事；完整的错误在信号里。
-pub fn failure_text(failure: &Failure) -> (String, &'static str) {
+fn failure_text(failure: &Failure) -> (String, &'static str) {
     match failure.kind {
         FailureKind::Status(code @ (401 | 403)) => (
             code.to_string(),
@@ -229,11 +244,18 @@ pub fn failure_text(failure: &Failure) -> (String, &'static str) {
         FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
         FailureKind::SourceChanged => (
             "不符".into(),
-            "来源与已下载的不是同一份内容，已下的不能接着用",
+            "来源与已下载的接不上：点播只能重新下载，直播可以写出已录的",
+        ),
+        FailureKind::Malformed => (
+            "内容".into(),
+            "取到的不是视频该有的内容，多为错误页或登录页，常要补 Cookie",
         ),
         FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
-        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性"),
-        FailureKind::Other => ("!".into(), "出错停下了"),
+        FailureKind::Unsupported => (
+            "不支持".into(),
+            "来源用了不支持的特性，或内容放不进 MP4（可改存本地 HLS 重新下载）",
+        ),
+        FailureKind::Other => ("!".into(), "原因见右边的信号"),
     }
 }
 
@@ -242,7 +264,7 @@ pub fn look(row: &Row, now: Instant) -> Look {
         return discarding(row, "放弃中", "停下并删除任务目录");
     }
     match &row.task.status {
-        Status::Discarding => discarding(
+        Status::DiscardUnfinished => discarding(
             row,
             "放弃没做完",
             "任务目录可能已删了一部分，再放弃一次即可",
@@ -273,8 +295,8 @@ fn discarding(row: &Row, state: &str, line: &str) -> Look {
     }
 }
 
-/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字是「!」、说明是错误。点了继续、还在读
-/// 任务目录时状态写「正在继续」。
+/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字与说明按种类（见 [`failure_text`]），完整的
+/// 错误在信号里。点了继续、还在读任务目录时状态写「正在继续」。
 fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let amount = Amount::of(row);
     let (done, total) = amount.as_ref().map_or((0, 0), |a| (a.done, a.total));
@@ -416,6 +438,18 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             fraction: written,
             orb: theme::cyan_pale(),
             short: percent,
+        };
+    }
+    if row.writing_recorded {
+        return Look {
+            state: "准备写出".to_owned(),
+            color: theme::cyan(),
+            ticks: Ticks::of(0, 0, true),
+            big: format::clock(amount.duration),
+            line: "不联网，只写出已录的".to_owned(),
+            fraction: 0.0,
+            orb: theme::cyan(),
+            short: "…".to_owned(),
         };
     }
     if row.recording() {

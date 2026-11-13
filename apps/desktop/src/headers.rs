@@ -59,7 +59,7 @@ impl HeadersEditor {
     }
 
     /// 编好的请求头，连同输入框里还没按回车的一条；那一条加不进去时为 None（原因显示在输入框下面）。
-    pub fn take(
+    pub fn confirm(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -79,10 +79,8 @@ impl HeadersEditor {
     /// 加一条「名称: 值」；加不进去时记下原因，返回 false。
     fn add(&mut self, text: &str) -> bool {
         match parse(text) {
-            Ok((name, value)) => {
-                self.headers
-                    .retain(|(old, _)| !old.eq_ignore_ascii_case(&name));
-                self.headers.push((name, value));
+            Ok(header) => {
+                merge(&mut self.headers, header);
                 self.error = None;
                 true
             }
@@ -91,6 +89,27 @@ impl HeadersEditor {
                 false
             }
         }
+    }
+}
+
+/// 把 `header` 加到 `headers` 末尾，同名的（不分大小写）先去掉。
+fn merge(headers: &mut Vec<(String, String)>, header: (String, String)) {
+    headers.retain(|(old, _)| !old.eq_ignore_ascii_case(&header.0));
+    headers.push(header);
+}
+
+/// 值是凭据、列出时遮住的请求头（不分大小写）：共享屏幕或截图时不露出来。
+const SECRET: [&str; 3] = ["cookie", "authorization", "proxy-authorization"];
+
+/// 列出时的值：凭据只露出长度。
+fn shown(name: &str, value: &str) -> String {
+    if SECRET
+        .iter()
+        .any(|secret| name.eq_ignore_ascii_case(secret))
+    {
+        format!("已填 {} 个字符", value.chars().count())
+    } else {
+        value.to_owned()
     }
 }
 
@@ -131,7 +150,7 @@ impl Render for HeadersEditor {
                         .min_w_0()
                         .truncate()
                         .text_color(theme::muted())
-                        .child(value.clone()),
+                        .child(shown(name, value)),
                 )
                 .child(
                     div()
@@ -181,5 +200,21 @@ mod tests {
         );
         assert!(parse("Referer https://a.example/").is_err());
         assert!(parse("Bad Name: x").is_err());
+    }
+
+    /// 同名的（不分大小写）换掉原有的一条，排到最后；凭据只露出长度。
+    #[test]
+    fn same_names_replace_and_secrets_are_hidden() {
+        let mut headers = vec![("Referer".into(), "a".into()), ("X-Id".into(), "1".into())];
+        merge(&mut headers, ("referer".into(), "b".into()));
+        assert_eq!(
+            headers,
+            [
+                ("X-Id".to_owned(), "1".to_owned()),
+                ("referer".to_owned(), "b".to_owned())
+            ]
+        );
+        assert_eq!(shown("COOKIE", "sid=12345"), "已填 9 个字符");
+        assert_eq!(shown("Referer", "https://a/"), "https://a/");
     }
 }

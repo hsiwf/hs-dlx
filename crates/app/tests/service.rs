@@ -204,6 +204,10 @@ fn a_task_downloads_and_is_recorded_as_done() {
         service.resume(task.id),
         Err(Error::AlreadyDone(_))
     ));
+    assert!(matches!(
+        service.set_headers(task.id, Vec::new()),
+        Err(Error::AlreadyDone(_))
+    ));
     service.forget(task.id).unwrap();
     assert!(service.tasks().unwrap().is_empty());
     assert!(folder.join("index.mp4").is_file());
@@ -455,7 +459,10 @@ fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
     let left = rt.block_on(service.discard(id)).unwrap();
     assert!(matches!(left, Err(Error::WorkDirLeft { .. })), "{left:?}");
     // 放弃没做完：任务留着、记为放弃没做完，不能继续
-    assert_eq!(service.tasks().unwrap()[0].status, Status::Discarding);
+    assert_eq!(
+        service.tasks().unwrap()[0].status,
+        Status::DiscardUnfinished
+    );
     assert!(matches!(
         service.resume(id),
         Err(Error::DiscardUnfinished(_))
@@ -494,4 +501,31 @@ fn concurrent_creates_get_separate_outputs() {
     for id in [first.id, second.id] {
         rt.block_on(service.discard(id)).unwrap().unwrap();
     }
+}
+
+/// 只写出已录的用于直播录制：点播下载的任务目录照样开始一次运行，核心报目录里不是直播录制，任务以失败停下、任务目录
+/// 留着。
+#[test]
+fn writing_recorded_content_of_a_download_fails_visibly() {
+    let dir = test_dir("write-recorded");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let id = create(
+        &rt,
+        &service,
+        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+    )
+    .id;
+    rt.block_on(first_segment(&mut events, id));
+    service.pause(id);
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Paused);
+
+    service.write_recorded(id).unwrap();
+    let status = rt.block_on(ended(&mut events, id, |_| {}));
+
+    assert!(matches!(status, Status::Failed(_)), "{status:?}");
+    assert_eq!(service.task(id).unwrap().status, status);
+    assert!(folder.join("index.hsdl").is_dir());
 }

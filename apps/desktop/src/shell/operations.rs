@@ -7,7 +7,7 @@ use gpui_kit::{AppContext as _, Context, Window};
 use hs_m3u8_app::{Status, TaskId};
 
 use super::Shell;
-use super::row::{Disk, Present};
+use super::row::{Disk, Present, Row};
 use crate::headers::HeadersEditor;
 use crate::rate::Rate;
 use crate::signals::Level;
@@ -47,7 +47,7 @@ impl Shell {
                 .detach();
             }
             // 放弃没做完的任务目录可能已删了一部分，读出来的不说明什么
-            Status::Running | Status::Discarding => {}
+            Status::Running | Status::DiscardUnfinished => {}
         }
     }
 
@@ -97,7 +97,36 @@ impl Shell {
             return;
         }
         row.resuming = true;
+        self.editing_headers = None;
         self.inspect(id, true, cx);
+        cx.notify();
+    }
+
+    /// 不再续录，只把直播录制已录的写成输出；退出中不开始。
+    pub(super) fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        let title = self.title(id);
+        if self.quitting {
+            self.notify(format!("正在退出，「{title}」没有写出"));
+            cx.notify();
+            return;
+        }
+        if !self.row(id).is_some_and(Row::idle) {
+            return;
+        }
+        self.editing_headers = None;
+        match self.service.write_recorded(id) {
+            Ok(()) => {
+                let row = self.row_mut(id).expect("上面刚找到这一行");
+                row.task.status = Status::Running;
+                row.progress = None;
+                row.writing_recorded = true;
+                row.forget_disk();
+                // 写出不联网，没有下载速度与剩余时间可估
+                row.rate = Rate::new(Instant::now(), None);
+                row.signal(Level::Info, "不再续录，写出已录的".to_owned());
+            }
+            Err(error) => self.notify(format!("写出「{title}」已录的失败：{error}")),
+        }
         cx.notify();
     }
 
@@ -127,6 +156,7 @@ impl Shell {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 row.task.status = Status::Running;
                 row.progress = None;
+                row.writing_recorded = false;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
@@ -169,8 +199,13 @@ impl Shell {
                     Ok(Err(error)) => vec![format!("放弃「{title}」失败：{error}")],
                     Err(join) => vec![format!("放弃「{title}」中途出错：{join}")],
                 };
+                // 没删干净的、超时的，服务里已记为放弃没做完：照服务里的状态改这一行
+                let status = this.service.task(id).map(|task| task.status);
                 if let Some(row) = this.row_mut(id) {
                     row.discarding = false;
+                    if let Ok(status) = status {
+                        row.task.status = status;
+                    }
                 }
                 if !problems.is_empty() && this.quitting {
                     this.cancel_quit("放弃没做干净，没有退出".to_owned());
@@ -214,7 +249,7 @@ impl Shell {
         let Some((id, editor)) = self.editing_headers.clone() else {
             return;
         };
-        let Some(headers) = editor.update(cx, |editor, cx| editor.take(window, cx)) else {
+        let Some(headers) = editor.update(cx, |editor, cx| editor.confirm(window, cx)) else {
             return;
         };
         match self.service.set_headers(id, headers.clone()) {

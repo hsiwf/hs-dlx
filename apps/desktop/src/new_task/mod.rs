@@ -212,7 +212,7 @@ impl NewTask {
     fn reprobe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(headers) = self
             .headers
-            .update(cx, |editor, cx| editor.take(window, cx))
+            .update(cx, |editor, cx| editor.confirm(window, cx))
         {
             self.probe(headers, window, cx);
         }
@@ -309,16 +309,16 @@ impl NewTask {
 
     /// 交出选择，由主窗口新建任务；请求头输入框里还没按回车的一条加不进去时不交，原因显示在输入框下面。
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.creating || !matches!(self.probing, Probing::Ready(_)) {
+        let Probing::Ready(probe) = &self.probing else {
+            return;
+        };
+        if self.creating {
             return;
         }
         let Some(headers) = self
             .headers
-            .update(cx, |editor, cx| editor.take(window, cx))
+            .update(cx, |editor, cx| editor.confirm(window, cx))
         else {
-            return;
-        };
-        let Probing::Ready(probe) = &self.probing else {
             return;
         };
         let preference = match &probe.master {

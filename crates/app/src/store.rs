@@ -44,7 +44,8 @@ fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
 /// - 任务目录单列（绝对路径；NULL 时任务没有自己的任务目录）。第 1 版的行按第 1 版的规则补算：没完成的取与输出同级的
 ///   `<主名>.hsdl`，已完成的为 NULL（任务目录已在完成时删掉）。补算出的任务目录相同（按 [`v2_path_key`] 比较）的一组
 ///   里，编号最小的留着它，其余的改为失败、任务目录为 NULL：放弃它们会删掉留着的那个已下的内容。
-/// - 失败的种类（[`crate::FailureKind`] 在存储里的写法），只在失败时有；第 1 版失败的行记为其余。
+/// - 失败的种类（[`crate::FailureKind`] 在存储里的写法，CHECK 列出全部写法），只在失败时有；第 1 版失败的行记为
+///   其余。
 /// - 点播的总片数，与完成时写出的结果（时长、字节数、视频的宽高）。
 fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
@@ -59,9 +60,15 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             hls_path TEXT,
             work_dir TEXT,
             live INTEGER NOT NULL CHECK (live IN (0, 1)),
-            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discarding')),
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
             error TEXT,
-            failure TEXT CHECK ((status = 'failed') = (failure IS NOT NULL)),
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'malformed',
+                                    'stalled', 'unsupported', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
             created_at INTEGER NOT NULL,
             total INTEGER CHECK (total >= 0),
             duration_ms INTEGER CHECK (duration_ms >= 0),
@@ -188,6 +195,8 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // 请求头里有明文的 Cookie、Authorization：删掉或换下来的内容随即覆盖，不留在空闲页里
+        conn.pragma_update(None, "secure_delete", true)?;
         restrict_to_owner(path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let mut store = Store {
@@ -379,7 +388,7 @@ pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(
             Some(failure.kind.code()),
         ),
         Status::Done => ("done", None, None),
-        Status::Discarding => ("discarding", None, None),
+        Status::DiscardUnfinished => ("discard-unfinished", None, None),
     };
     let changed = tx.execute(
         "UPDATE task SET status = ?2, error = ?3, failure = ?4 WHERE id = ?1",
@@ -495,7 +504,7 @@ impl Row {
                 message,
             }),
             ("done", None, None) => Status::Done,
-            ("discarding", None, None) => Status::Discarding,
+            ("discard-unfinished", None, None) => Status::DiscardUnfinished,
             _ => return Err(corrupt("状态")),
         };
         Ok(Task {
