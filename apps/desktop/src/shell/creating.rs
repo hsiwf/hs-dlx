@@ -90,14 +90,6 @@ impl Shell {
         self.new_task = Some((view, subscription));
     }
 
-    /// 把 `url` 填进粘贴栏并探测。
-    pub(super) fn probe_url(&mut self, url: &Url, window: &mut Window, cx: &mut Context<Self>) {
-        let text = url.to_string();
-        self.paste
-            .update(cx, |input, cx| input.set_value(text.clone(), window, cx));
-        self.probe(&text, window, cx);
-    }
-
     /// 按新建视图里的选择新建任务；退出中不新建。新建要查磁盘，在服务的运行时里做，期间新建视图显示正在开始。
     pub(super) fn create(
         &mut self,

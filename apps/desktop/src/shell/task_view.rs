@@ -464,7 +464,9 @@ impl Shell {
                     "probe-clipboard",
                     "探测",
                     Tone::Glow,
-                    cx.listener(move |this, _, window, cx| this.probe_url(&url, window, cx)),
+                    cx.listener(move |this, _, window, cx| {
+                        this.probe_text(url.as_str(), window, cx)
+                    }),
                 ))
         });
         div()

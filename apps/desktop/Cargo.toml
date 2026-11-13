@@ -15,6 +15,7 @@ fs4.workspace = true
 gpui-kit.workspace = true
 hs-m3u8-app = { path = "../../crates/app" }
 hs-m3u8-core = { path = "../../crates/core" }
+hs-m3u8-instance = { path = "../../crates/instance" }
 hs-m3u8-webview = { path = "../../crates/webview" }
 psl.workspace = true
 serde.workspace = true

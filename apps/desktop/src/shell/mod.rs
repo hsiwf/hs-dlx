@@ -24,6 +24,7 @@ use gpui_kit::{
 };
 use hs_m3u8_app::{Event, Events, Finished, Service, Status, TaskId};
 use hs_m3u8_core::{Stage, Url};
+use hs_m3u8_instance::{Handoff, Handoffs, Received};
 
 use self::row::Row;
 use crate::headers::HeadersEditor;
@@ -112,6 +113,8 @@ pub struct Shell {
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
     early: Vec<Event>,
     _events: Task<()>,
+    /// 收后打开的实例转交来的链接
+    _handoffs: Task<()>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
     _ticker: Task<()>,
@@ -120,12 +123,14 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// `link` 为启动参数里给的链接：有就填进粘贴栏并探测。
+    /// `link` 为启动参数里给的链接：有就填进粘贴栏并探测。`handoffs` 为后打开的实例转交来的（见 hs-m3u8-instance），
+    /// 收不了转交时为原因（提示一次，之后打开的实例各自报错）。
     pub fn new(
         service: Service,
         mut events: Events,
         folder: PathBuf,
         link: Option<String>,
+        handoffs: Result<Handoffs, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -176,6 +181,25 @@ impl Shell {
             this.update(cx, |shell, cx| shell.should_close(window, cx))
                 .unwrap_or(true)
         });
+        let handing = match handoffs {
+            Ok(mut handoffs) => cx.spawn_in(window, async move |this, cx| {
+                while let Some(received) = handoffs.recv().await {
+                    let alive = this.update_in(cx, |this, window, cx| {
+                        this.receive(received, window, cx);
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }),
+            Err(reason) => {
+                notices.push(Notice {
+                    id: notices.len() as u64,
+                    text: format!("再次打开应用时没法把链接交给这个窗口：{reason}"),
+                });
+                Task::ready(())
+            }
+        };
         let receiving = cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |this, cx| this.apply(event, cx)).is_err() {
@@ -218,6 +242,7 @@ impl Shell {
             creating: 0,
             early: Vec::new(),
             _events: receiving,
+            _handoffs: handing,
             free_space: None,
             _ticker: ticker,
             _free_space: Task::ready(()),
@@ -230,12 +255,31 @@ impl Shell {
         shell.watch_free_space(cx);
         shell.refresh_clipboard(cx);
         if let Some(link) = link {
-            shell
-                .paste
-                .update(cx, |input, cx| input.set_value(link.clone(), window, cx));
-            shell.probe(&link, window, cx);
+            shell.probe_text(&link, window, cx);
         }
         shell
+    }
+
+    /// 后打开的实例交来的：窗口到前台，有链接就探测；一次没收成的转交提示原因。
+    fn receive(&mut self, received: Received, window: &mut Window, cx: &mut Context<Self>) {
+        match received {
+            Ok(handoff) => {
+                cx.activate(true);
+                window.activate_window();
+                if let Handoff::Link(link) = handoff {
+                    self.probe_text(&link, window, cx);
+                }
+            }
+            Err(reason) => self.notify(format!("别的程序转交链接没成：{reason}")),
+        }
+        cx.notify();
+    }
+
+    /// 把 `text` 填进粘贴栏并探测。
+    pub(super) fn probe_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste
+            .update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        self.probe(text, window, cx);
     }
 
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {

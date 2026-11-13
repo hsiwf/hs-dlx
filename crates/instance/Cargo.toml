@@ -1,0 +1,21 @@
+[package]
+name = "hs-m3u8-instance"
+version.workspace = true
+description = "Single-instance handoff for the hs-m3u8 desktop app: later instances pass their link to the running one"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dirs.workspace = true
+interprocess = { version = "2.4.8", features = ["tokio"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+# 写命名管道的安全描述符（SDDL 是 UTF-16 字符串），与 interprocess 2.4.8 用的同一个大版本
+widestring = "1.2.1"
+
+[lints]
+workspace = true

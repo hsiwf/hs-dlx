@@ -79,7 +79,7 @@ impl Shell {
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::cyan_pale()))
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.probe_url(&url, window, cx)
+                                this.probe_text(url.as_str(), window, cx)
                             }))
                             .child("探测"),
                     )

@@ -112,26 +112,40 @@ fn main() {
                 .zip(default_folder())
                 .ok_or_else(|| Failure::new("启动失败", "找不到放应用数据或保存视频的目录"))
                 .and_then(|(path, folder)| {
-                    let store = Store::open(&path).map_err(|error| match error {
-                        hs_m3u8_app::Error::InUse(_) => Failure::new(
-                            "hs-m3u8 已经在运行",
-                            match &link {
-                                Some(link) => format!(
-                                    "同时只能开一个；链接没有交给它，到已经打开的那个窗口里粘贴：{link}"
-                                ),
-                                None => "同时只能开一个；切到已经打开的那个窗口即可".to_owned(),
-                            },
-                        ),
-                        error => Failure::new("启动失败", error.to_string()),
-                    })?;
+                    let store = match Store::open(&path) {
+                        Ok(store) => store,
+                        // 已经开着一个：把链接交给它（或请它到前台）就退出
+                        Err(hs_m3u8_app::Error::InUse(_)) => {
+                            return match hs_m3u8_instance::hand_over(&path, link.as_deref()) {
+                                Ok(()) => Ok(None),
+                                Err(reason) => Err(Failure::new(
+                                    "hs-m3u8 已经在运行",
+                                    match &link {
+                                        Some(link) => format!(
+                                            "同时只能开一个，链接没能交给它（{reason}）：到已经打开的那个窗口里粘贴 {link}"
+                                        ),
+                                        None => format!(
+                                            "同时只能开一个，没能请它到前台（{reason}）：切到已经打开的那个窗口即可"
+                                        ),
+                                    },
+                                )),
+                            };
+                        }
+                        Err(error) => return Err(Failure::new("启动失败", error.to_string())),
+                    };
+                    let handoffs = hs_m3u8_instance::listen(&path);
                     let (service, events) = Service::new(store, MAX_REQUESTS)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
-                    Ok((service, events, folder))
+                    Ok(Some((service, events, folder, handoffs)))
                 });
             let opened = match started {
-                Ok((service, events, folder)) => {
+                Ok(None) => {
+                    cx.quit();
+                    return;
+                }
+                Ok(Some((service, events, folder, handoffs))) => {
                     gpui_kit::open_window(options, cx, |window, cx| {
-                        cx.new(|cx| Shell::new(service, events, folder, link, window, cx))
+                        cx.new(|cx| Shell::new(service, events, folder, link, handoffs, window, cx))
                     })
                     .map(drop)
                 }
