@@ -60,12 +60,7 @@ impl Shell {
         // 直播录制（没完成的）画钟面
         let live = row.recording() && row.task.status != Status::Done;
         let ring = if live {
-            live_view::figure(
-                row,
-                &look,
-                row.recorded(),
-                row.task.status == Status::Running,
-            )
+            live_view::figure(row, &look)
         } else {
             ring_with_disc(
                 canvas(
@@ -234,7 +229,8 @@ impl Shell {
             .into_any_element()
         };
         match &row.task.status {
-            Status::Running if row.recording() => vec![
+            Status::Discarding => vec![discard(cx)],
+            Status::Running if row.stoppable() => vec![
                 ui::button(
                     "stop",
                     "停止并写出",

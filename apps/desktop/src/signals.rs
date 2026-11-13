@@ -116,12 +116,7 @@ pub fn between(before: Option<&Progress>, now: &Progress) -> Vec<(Level, String)
         };
         found.push((Level::Warn, text));
     }
-    // 直播：另起会话与缺片。缺片按本次运行计，新的运行（`before` 为 None）从 0 起
-    if let (Some(old), Some(new)) = (before.and_then(|b| b.session), now.session)
-        && new != old
-    {
-        found.push((Level::Warn, format!("来源接不上，另起会话 {}", new + 1)));
-    }
+    // 直播的缺片按本次运行计，新的运行（`before` 为 None）从 0 起；另起会话由钟面的时间线报（它也认得续录时的）
     let failed_before = before.map_or(0, |b| b.segments.failed);
     if now.segments.failed > failed_before {
         found.push((
@@ -271,13 +266,11 @@ mod tests {
         );
     }
 
-    /// 直播另起会话、本次运行新缺的片各报一次；新的运行（之前没有进度）不把编号当作变化。
+    /// 直播本次运行新缺的片各报一次；新的运行（之前没有进度）从 0 起算。
     #[test]
-    fn new_sessions_and_misses_are_reported() {
-        let mut before = progress(Stage::Recording, 10, 10);
-        before.session = Some(0);
+    fn misses_are_reported() {
+        let before = progress(Stage::Recording, 10, 10);
         let mut now = before.clone();
-        now.session = Some(1);
         now.segments.failed = 2;
         now.segments.expired = 45;
         let texts: Vec<String> = between(Some(&before), &now)
@@ -286,20 +279,9 @@ mod tests {
             .collect();
         assert_eq!(
             texts,
-            [
-                "来源接不上，另起会话 2",
-                "2 片取不到，录不回来",
-                "45 片在刷新前已滑出窗口，录不回来"
-            ]
+            ["2 片取不到，录不回来", "45 片在刷新前已滑出窗口，录不回来"]
         );
         assert_eq!(between(Some(&now), &now), []);
-        let mut resumed = progress(Stage::Recording, 10, 10);
-        resumed.session = Some(3);
-        assert!(
-            between(None, &resumed)
-                .iter()
-                .all(|(_, t)| !t.contains("会话"))
-        );
     }
 
     #[test]

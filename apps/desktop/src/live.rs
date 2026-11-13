@@ -1,78 +1,136 @@
-//! 直播钟面：一圈一小时，每格 15 秒。内圈是正在录的这一小时，外圈是上一小时；录到的格子按会话交替着色，缺片处是
-//! 加长的橙色格；录制中有一根红色指针指着录到的位置。时刻都按已录时长（第 0 条轨已完成分片的声明时长之和）算。
+//! 直播钟面：一圈一小时，每格 15 秒。内圈是正在录的这一小时，外圈是上一小时；录到的格子按会话交替着色（这次打开应用
+//! 以前录的不知道会话，用暗色），缺片处是加长的橙色格；录制中有一根红色指针指着录到的位置。时刻都按已录时长（第 0 条
+//! 轨已完成分片的声明时长之和）算。
 
-use std::f32::consts::{FRAC_PI_2, TAU};
 use std::time::Duration;
 
 use gpui_kit::{Bounds, Hsla, Pixels, Point, Window, fill, point, px, size};
 use hs_m3u8_core::Progress;
 
-use crate::ring::{Stroke, on_circle};
+use crate::ring::{Stroke, TESSELLATED, angle, on_circle};
 use crate::theme;
 
 /// 一圈的时长。
 pub const LAP: Duration = Duration::from_secs(3600);
 /// 一圈的格数：每格 15 秒。
 pub const TICKS: usize = 240;
-/// 外圈与内圈的半径（绘制区域边长为 [`crate::ring::AREA`]）。
+/// 外圈的半径（绘制区域边长为 [`crate::ring::AREA`]）。
 pub const OUTER: f32 = 181.;
+/// 内圈的半径。
 pub const INNER: f32 = 153.;
 /// 刻度的半长。
-const HALF: f32 = 7.;
+pub const HALF: f32 = 7.;
 /// 缺片格的半长：比普通格长，一眼能看到。
-const MISS_HALF: f32 = 10.;
+pub const MISS_HALF: f32 = 10.;
 /// 圆心红点的半径。
 const HUB: f32 = 7.;
+
+/// 相邻会话交替的颜色。
+pub fn session_colors() -> [Hsla; 2] {
+    [theme::cyan(), theme::session_alt()]
+}
 
 /// 这次打开应用以来看到的录制时间线：会话从哪里起、哪里缺了片。只在内存里，重开应用后从下一次进度重新记。
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Timeline {
-    /// 会话的起点（已录时长）与会话编号，按先后；第一项的起点为 0（之前录的都算作它）
+    /// 从哪里起有记录（这次打开应用以来第一次运行开始时、或第一次看到录制进度时的已录时长）；在它之前录的不知道会话与
+    /// 缺片。都还没有时为 None
+    pub since: Option<Duration>,
+    /// 会话的起点（已录时长）与会话编号，按先后；第一项的起点为 `since`
     pub sessions: Vec<(Duration, u32)>,
     /// 缺片：记下时的已录时长与片数，按先后
     pub misses: Vec<(Duration, usize)>,
-    /// 上一次进度里本次运行缺的片数（取不到的加滑出窗口的），算增量用；新的运行从 0 起
-    missed: usize,
+}
+
+/// 时间线上一处要说的事：同一位置的缺片与另起会话合在一起。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub at: Duration,
+    /// 缺的片数；没缺时为 0
+    pub missed: usize,
+    /// 从这里另起的会话编号
+    pub session: Option<u32>,
 }
 
 impl Timeline {
-    /// 记下一次直播进度：会话编号变了即另起一段，缺的片数多了即在当时的位置记一处缺片。
-    pub fn observe(&mut self, progress: &Progress) {
-        if let Some(session) = progress.session {
-            match self.sessions.last() {
-                None => self.sessions.push((Duration::ZERO, session)),
-                Some(&(_, current)) if current != session => {
-                    self.sessions.push((progress.duration, session));
+    /// 一次运行从已录时长 `start` 开始：还没有记录时从这里记起（这次运行录到的都看得到会话）。
+    pub fn begin(&mut self, start: Duration) {
+        self.since.get_or_insert(start);
+    }
+
+    /// 记下一次录制进度：缺的片数比 `before`（同一次运行的上一次进度，新的运行为 None）多的在当时的位置记一处缺片；
+    /// 会话编号与之前看到的不同即从这里另起一段。返回另起的会话编号。
+    pub fn observe(&mut self, before: Option<&Progress>, now: &Progress) -> Option<u32> {
+        let since = *self.since.get_or_insert(now.duration);
+        let missed = |p: &Progress| p.segments.failed + p.segments.expired;
+        let new = missed(now).saturating_sub(before.map_or(0, missed));
+        if new > 0 {
+            self.misses.push((now.duration, new));
+        }
+        let session = now.session?;
+        match self.sessions.last() {
+            None => {
+                self.sessions.push((since, session));
+                None
+            }
+            Some(&(_, current)) if current != session => {
+                self.sessions.push((now.duration, session));
+                Some(session)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// 已录时长 `at` 处的会话在 [`Timeline::sessions`] 里的下标；在有记录之前时为 None。
+    pub fn session_index(&self, at: Duration) -> Option<usize> {
+        self.sessions.iter().rposition(|&(start, _)| start <= at)
+    }
+
+    /// 已录时长 `at` 处的会话起点与编号；在有记录之前时为 None。
+    pub fn session_at(&self, at: Duration) -> Option<(Duration, u32)> {
+        self.session_index(at).map(|index| self.sessions[index])
+    }
+
+    /// 从 `from` 起的缺片与另起会话，按位置先后，同一位置的合成一处。
+    pub fn events(&self, from: Duration) -> Vec<Event> {
+        let mut events: Vec<Event> = Vec::new();
+        let missed = self.misses.iter().map(|&(at, count)| (at, count, None));
+        let restarted = self
+            .sessions
+            .iter()
+            .skip(1)
+            .map(|&(at, session)| (at, 0, Some(session)));
+        let mut all: Vec<_> = missed
+            .chain(restarted)
+            .filter(|&(at, ..)| at >= from)
+            .collect();
+        all.sort_by_key(|&(at, ..)| at);
+        for (at, count, session) in all {
+            match events.last_mut() {
+                Some(last) if last.at == at => {
+                    last.missed += count;
+                    last.session = last.session.or(session);
                 }
-                Some(_) => {}
+                _ => events.push(Event {
+                    at,
+                    missed: count,
+                    session,
+                }),
             }
         }
-        let missed = progress.segments.failed + progress.segments.expired;
-        // 少了说明是新的运行（核心按本次运行计）
-        if missed > self.missed {
-            self.misses.push((progress.duration, missed - self.missed));
-        }
-        self.missed = missed;
+        events
     }
+}
 
-    /// 已录时长 `at` 处的会话在 [`Timeline::sessions`] 里的下标；还没见过会话时为 0。
-    pub fn session_index(&self, at: Duration) -> usize {
-        self.sessions
-            .iter()
-            .rposition(|&(start, _)| start <= at)
-            .unwrap_or(0)
-    }
-
-    /// 已录时长 `at` 处的会话起点与编号；还没见过会话时为 None。
-    pub fn session_at(&self, at: Duration) -> Option<(Duration, u32)> {
-        self.sessions.get(self.session_index(at)).copied()
-    }
+/// 第 `lap` 圈的起点。
+pub fn lap_start(lap: u64) -> Duration {
+    Duration::from_secs(lap * LAP.as_secs())
 }
 
 /// 一圈里的位置：已录时长 `at` 落在第几圈、圈里的比例（0 到 1，从 12 点顺时针）。
 pub fn lap_of(at: Duration) -> (u64, f32) {
     let lap = at.as_secs() / LAP.as_secs();
-    let within = at.saturating_sub(LAP * u32::try_from(lap).unwrap_or(u32::MAX));
+    let within = at - lap_start(lap);
     (lap, within.as_secs_f32() / LAP.as_secs_f32())
 }
 
@@ -92,32 +150,37 @@ fn paint_lap(
     face: &Face<'_>,
     window: &mut Window,
 ) {
+    let colors = session_colors();
     let mut idle = Stroke::new(2., theme::line(), HALF);
-    let palette = [theme::cyan(), theme::written()];
-    let mut lit: Vec<Stroke> = palette
+    let mut unknown = Stroke::new(2., theme::cyan_dim(), HALF);
+    let mut lit: Vec<Stroke> = colors
         .iter()
         .map(|&color| Stroke::new(2., color, HALF))
         .collect();
-    let mut halos: Vec<Stroke> = palette
+    let mut halos: Vec<Stroke> = colors
         .iter()
         .map(|&color| Stroke::new(6., theme::alpha(color, 0.16), HALF + 1.))
         .collect();
-    let start = lap.map(|lap| LAP * u32::try_from(lap).unwrap_or(u32::MAX));
+    let start = lap.map(lap_start);
     for i in 0..TICKS {
-        let angle = i as f32 / TICKS as f32 * TAU - FRAC_PI_2;
+        let rad = angle(i as f32 / TICKS as f32);
         let at = start.map(|start| start + LAP / TICKS as u32 * i as u32);
         match at {
-            Some(at) if at < face.recorded => {
-                let k = face.timeline.session_index(at) % palette.len();
-                if face.recording {
-                    halos[k].tick(center, radius, angle);
+            Some(at) if at < face.recorded => match face.timeline.session_index(at) {
+                Some(index) => {
+                    let k = index % colors.len();
+                    if face.recording {
+                        halos[k].tick(center, radius, rad);
+                    }
+                    lit[k].tick(center, radius, rad);
                 }
-                lit[k].tick(center, radius, angle);
-            }
-            _ => idle.tick(center, radius, angle),
+                None => unknown.tick(center, radius, rad),
+            },
+            _ => idle.tick(center, radius, rad),
         }
     }
     idle.paint(window);
+    unknown.paint(window);
     for stroke in halos.into_iter().chain(lit) {
         stroke.paint(window);
     }
@@ -126,9 +189,9 @@ fn paint_lap(
         let mut miss = Stroke::new(3., theme::orange(), MISS_HALF);
         for &(at, _) in &face.timeline.misses {
             if at >= start && at < start + LAP {
-                let angle = lap_of(at).1 * TAU - FRAC_PI_2;
-                halo.tick(center, radius, angle);
-                miss.tick(center, radius, angle);
+                let rad = angle(lap_of(at).1);
+                halo.tick(center, radius, rad);
+                miss.tick(center, radius, rad);
             }
         }
         halo.paint(window);
@@ -145,13 +208,12 @@ pub fn paint(bounds: Bounds<Pixels>, face: &Face<'_>, window: &mut Window) {
     if !face.recording {
         return;
     }
-    let angle = within * TAU - FRAC_PI_2;
-    let tip = on_circle(center, INNER - HALF - 4., angle);
+    let tip = on_circle(center, INNER - HALF - 4., angle(within));
     for (width, color) in [(8., theme::alpha(theme::red(), 0.25)), (2., theme::red())] {
         let mut hand = gpui_kit::PathBuilder::stroke(px(width));
         hand.move_to(center);
         hand.line_to(tip);
-        window.paint_path(hand.build().expect(crate::ring::TESSELLATED), color);
+        window.paint_path(hand.build().expect(TESSELLATED), color);
     }
     let hub = Bounds::new(
         point(center.x - px(HUB), center.y - px(HUB)),
@@ -163,8 +225,8 @@ pub fn paint(bounds: Bounds<Pixels>, face: &Face<'_>, window: &mut Window) {
 /// 钟面四个刻度标记（00、15、30、45 分）相对圆心的位置：半径 `radius`、从 12 点顺时针。
 pub fn marks(radius: f32) -> [(&'static str, f32, f32); 4] {
     let at = |turn: f32| {
-        let angle = turn * TAU - FRAC_PI_2;
-        (radius * angle.cos(), radius * angle.sin())
+        let a = angle(turn);
+        (radius * a.cos(), radius * a.sin())
     };
     let [a, b, c, d] = [0., 0.25, 0.5, 0.75].map(at);
     [
@@ -175,20 +237,15 @@ pub fn marks(radius: f32) -> [(&'static str, f32, f32); 4] {
     ]
 }
 
-/// 颜色在钟面图例里的说法：会话下标为 `index` 的格子用的颜色。
-pub fn session_color(index: usize) -> Hsla {
-    [theme::cyan(), theme::written()][index % 2]
-}
-
 #[cfg(test)]
 mod tests {
     use hs_m3u8_core::SegmentCounts;
 
     use super::*;
 
-    fn progress(session: u32, minutes: u64, failed: usize, expired: usize) -> Progress {
+    fn progress(session: Option<u32>, minutes: u64, failed: usize, expired: usize) -> Progress {
         Progress {
-            session: Some(session),
+            session,
             duration: Duration::from_secs(minutes * 60),
             segments: SegmentCounts {
                 failed,
@@ -199,24 +256,53 @@ mod tests {
         }
     }
 
-    /// 会话变了另起一段；缺的片数多了在当时的位置记一处，新的运行（计数归零）从 0 起重新算增量。
+    fn minutes(m: u64) -> Duration {
+        Duration::from_secs(m * 60)
+    }
+
+    /// 从第一次看到的进度起记；缺片按上一次进度算增量（新的运行从 0 起），会话变了另起一段并返回编号。
     #[test]
     fn the_timeline_follows_sessions_and_misses() {
         let mut timeline = Timeline::default();
-        timeline.observe(&progress(0, 0, 0, 0));
-        timeline.observe(&progress(0, 30, 0, 0));
-        timeline.observe(&progress(1, 41, 0, 3));
-        timeline.observe(&progress(1, 50, 1, 3));
-        timeline.observe(&progress(1, 60, 0, 0));
-        timeline.observe(&progress(1, 61, 0, 2));
-        let minutes = |m: u64| Duration::from_secs(m * 60);
-        assert_eq!(timeline.sessions, [(minutes(0), 0), (minutes(41), 1)]);
+        let steps = [
+            (None, progress(None, 20, 0, 1)),
+            (Some(progress(None, 20, 0, 1)), progress(Some(2), 30, 0, 1)),
+            (
+                Some(progress(Some(2), 30, 0, 1)),
+                progress(Some(3), 41, 0, 4),
+            ),
+            // 新的运行：之前的计数不算，开头就有的 2 片照记
+            (None, progress(Some(3), 60, 0, 2)),
+        ];
+        let started: Vec<Option<u32>> = steps
+            .iter()
+            .map(|(before, now)| timeline.observe(before.as_ref(), now))
+            .collect();
+        assert_eq!(started, [None, None, Some(3), None]);
+        assert_eq!(timeline.since, Some(minutes(20)));
+        assert_eq!(timeline.sessions, [(minutes(20), 2), (minutes(41), 3)]);
         assert_eq!(
             timeline.misses,
-            [(minutes(41), 3), (minutes(50), 1), (minutes(61), 2)]
+            [(minutes(20), 1), (minutes(41), 3), (minutes(60), 2)]
         );
-        assert_eq!(timeline.session_index(minutes(40)), 0);
-        assert_eq!(timeline.session_at(minutes(45)), Some((minutes(41), 1)));
+        assert_eq!(timeline.session_index(minutes(10)), None);
+        assert_eq!(timeline.session_at(minutes(45)), Some((minutes(41), 3)));
+        // 同一位置的缺片与另起会话合成一处
+        assert_eq!(
+            timeline.events(minutes(30)),
+            [
+                Event {
+                    at: minutes(41),
+                    missed: 3,
+                    session: Some(3)
+                },
+                Event {
+                    at: minutes(60),
+                    missed: 2,
+                    session: None
+                },
+            ]
+        );
     }
 
     #[test]
@@ -226,5 +312,6 @@ mod tests {
         let (lap, within) = lap_of(Duration::from_secs(3600 + 45 * 60));
         assert_eq!(lap, 1);
         assert!((within - 0.75).abs() < 1e-6, "{within}");
+        assert_eq!(lap_start(2), Duration::from_secs(7200));
     }
 }

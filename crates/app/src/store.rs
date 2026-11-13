@@ -59,7 +59,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             hls_path TEXT,
             work_dir TEXT,
             live INTEGER NOT NULL CHECK (live IN (0, 1)),
-            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done')),
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discarding')),
             error TEXT,
             failure TEXT CHECK ((status = 'failed') = (failure IS NOT NULL)),
             created_at INTEGER NOT NULL,
@@ -236,9 +236,9 @@ impl Store {
 const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height";
 
-/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。任务目录与已有任务的输出或任务目录相同
-/// （按 [`naming::path_key`] 比较）时报 [`Error::WorkDirTaken`]：两个任务共用任务目录时，放弃其中一个会删掉另一个已下
-/// 的内容。
+/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录
+/// 相同（按 [`naming::path_key`] 比较）时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；
+/// 共用输出时，后写出的那个要到写出时才失败。
 pub fn insert(
     tx: &Transaction<'_>,
     spec: &TaskSpec,
@@ -252,8 +252,14 @@ pub fn insert(
             "任务目录不是绝对路径：{work_dir_text}"
         )));
     }
-    if taken_paths(tx)?.contains(&naming::path_key(&work_dir_text)) {
-        return Err(Error::WorkDirTaken(work_dir.to_path_buf()));
+    let taken = taken_paths(tx)?;
+    for path in [mp4.as_deref(), hls.as_deref(), Some(work_dir_text.as_str())]
+        .into_iter()
+        .flatten()
+    {
+        if taken.contains(&naming::path_key(path)) {
+            return Err(Error::PathTaken(path.into()));
+        }
     }
     tx.execute(
         "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status,
@@ -373,6 +379,7 @@ pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(
             Some(failure.kind.code()),
         ),
         Status::Done => ("done", None, None),
+        Status::Discarding => ("discarding", None, None),
     };
     let changed = tx.execute(
         "UPDATE task SET status = ?2, error = ?3, failure = ?4 WHERE id = ?1",
@@ -488,6 +495,7 @@ impl Row {
                 message,
             }),
             ("done", None, None) => Status::Done,
+            ("discarding", None, None) => Status::Discarding,
             _ => return Err(corrupt("状态")),
         };
         Ok(Task {
@@ -805,7 +813,7 @@ mod tests {
         let a = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
         assert!(matches!(
             add(&tx, OutputSpec::Hls("/m/A".into()), 2),
-            Err(Error::WorkDirTaken(path)) if path == Path::new("/m/A.hsdl")
+            Err(Error::PathTaken(path)) if path == Path::new("/m/A.hsdl")
         ));
         set_total(&tx, a, 664).unwrap();
         assert_eq!(get(&tx, a).unwrap().unwrap().total, Some(664));

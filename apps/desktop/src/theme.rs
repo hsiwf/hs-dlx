@@ -87,6 +87,11 @@ pub fn on_cyan() -> Hsla {
     rgb(0x04161A).into()
 }
 
+/// 直播钟面上相邻会话交替的第二种颜色（第一种是主色）
+pub fn session_alt() -> Hsla {
+    rgb(0xE8ECF5).into()
+}
+
 /// 写出阶段已写出的部分
 pub fn written() -> Hsla {
     rgb(0xE8ECF5).into()

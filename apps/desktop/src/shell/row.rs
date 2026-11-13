@@ -112,6 +112,11 @@ impl Row {
         Amount::of(self).map(|a| (a.done, a.bytes))
     }
 
+    /// 能停止并写出：在运行的直播录制（还在准备的也算：会话定下之前停止即结束，写出已录的）。点播停止不起作用，要暂停。
+    pub fn stoppable(&self) -> bool {
+        self.task.status == Status::Running && self.recording()
+    }
+
     /// 作废读到的任务目录内容（任务停下时：内容变了），之后发起的读才算数。
     pub fn forget_disk(&mut self) {
         self.disk = Disk::Unread;
@@ -234,9 +239,14 @@ pub fn failure_text(failure: &Failure) -> (String, &'static str) {
 
 pub fn look(row: &Row, now: Instant) -> Look {
     if row.discarding {
-        return discarding(row);
+        return discarding(row, "放弃中", "停下并删除任务目录");
     }
     match &row.task.status {
+        Status::Discarding => discarding(
+            row,
+            "放弃没做完",
+            "任务目录可能已删了一部分，再放弃一次即可",
+        ),
         Status::Running => running(row, Amount::of(row).unwrap_or_default(), now),
         Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
@@ -244,11 +254,11 @@ pub fn look(row: &Row, now: Instant) -> Look {
     }
 }
 
-/// 正在放弃：刻度按已有的内容、不发光，等它删完。
-fn discarding(row: &Row) -> Look {
+/// 正在放弃或放弃没做完：刻度按已有的内容、不发光；`state` 与 `line` 为状态与说明。
+fn discarding(row: &Row, state: &str, line: &str) -> Look {
     let (done, total) = Amount::of(row).map_or((0, 0), |a| (a.done, a.total));
     Look {
-        state: "放弃中".to_owned(),
+        state: state.to_owned(),
         color: theme::muted(),
         ticks: Ticks {
             color: theme::finished(),
@@ -256,7 +266,7 @@ fn discarding(row: &Row) -> Look {
             ..Ticks::of(total, done, false)
         },
         big: "…".to_owned(),
-        line: "停下并删除任务目录".to_owned(),
+        line: line.to_owned(),
         fraction: 0.0,
         orb: theme::finished(),
         short: "…".to_owned(),

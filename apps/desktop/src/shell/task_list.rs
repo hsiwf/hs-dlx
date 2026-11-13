@@ -11,13 +11,12 @@ use gpui_kit::{
 use super::Shell;
 use super::row::{Row, look};
 use crate::new_task::Phase;
-use crate::ui;
+use crate::{ring, theme, ui};
 
 /// 任务列表的宽度。
 const WIDTH: f32 = 300.;
 /// 窗口窄时任务列表最多收到的宽度。
 pub(super) const MIN_WIDTH: f32 = 240.;
-use crate::{ring, theme};
 
 /// 列表小环的边长与环宽。
 const ORB: f32 = 52.;

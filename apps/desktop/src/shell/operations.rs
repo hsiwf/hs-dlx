@@ -1,7 +1,7 @@
 //! 对一个任务的操作：读任务目录、继续、改请求头、放弃、从列表移除，与任务停下后的查看。
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{AppContext as _, Context, Window};
 use hs_m3u8_app::{Status, TaskId};
@@ -46,7 +46,8 @@ impl Shell {
                 })
                 .detach();
             }
-            Status::Running => {}
+            // 放弃没做完的任务目录可能已删了一部分，读出来的不说明什么
+            Status::Running | Status::Discarding => {}
         }
     }
 
@@ -114,9 +115,12 @@ impl Shell {
             self.notify(format!("正在退出，「{title}」没有继续"));
             return;
         }
-        let baseline = match &row.disk {
-            Disk::Read(saved) => Some(saved.as_ref().map_or(0, |s| s.segments)),
-            Disk::Unread | Disk::Unreadable(_) => None,
+        let (baseline, start) = match &row.disk {
+            Disk::Read(saved) => (
+                Some(saved.as_ref().map_or(0, |s| s.segments)),
+                Some(saved.as_ref().map_or(Duration::ZERO, |s| s.duration)),
+            ),
+            Disk::Unread | Disk::Unreadable(_) => (None, None),
         };
         match self.service.resume(id) {
             Ok(()) => {
@@ -124,6 +128,9 @@ impl Shell {
                 row.task.status = Status::Running;
                 row.progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
+                if let Some(start) = start {
+                    row.timeline.begin(start);
+                }
                 let text = match baseline {
                     Some(n) if n > 0 => format!("继续：任务目录里已有 {n} 片"),
                     _ => "继续".to_owned(),
@@ -179,7 +186,7 @@ impl Shell {
         .detach();
     }
 
-    /// 已完成的任务从列表移除：只删记录，输出归用户。
+    /// 从列表移除已完成的任务（输出归用户）与没有自己的任务目录的任务：只删记录。
     pub(super) fn forget(&mut self, id: TaskId, cx: &mut Context<Self>) {
         match self.service.forget(id) {
             Ok(()) => self.remove_row(id),

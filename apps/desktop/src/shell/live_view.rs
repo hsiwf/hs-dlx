@@ -7,14 +7,18 @@ use gpui_kit::{
     Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, canvas, div, px,
 };
 
+use hs_m3u8_app::Status;
+
 use super::row::{Look, Row};
 use crate::live::{self, Face};
-use crate::ring::AREA;
+use crate::ring::{AREA, angle};
 use crate::ui::{self, CAPTION_LINE, TEXT_LINE};
 use crate::{format, theme};
 
 /// 钟面上 00、15、30、45 分标记的半径。
 const MARK_RADIUS: f32 = 210.;
+/// 刻度标记一格的宽。
+const MARK_WIDTH: f32 = 24.;
 /// 圆心下方文字一栏的上边距（相对圆心）。
 const READOUT_TOP: f32 = 18.;
 /// 圆心下方文字一栏的宽：连同上下 4 的内边距，整栏落在内圈刻度里面（底边距圆心 110，那里刻度内沿的半宽约 96），
@@ -22,28 +26,33 @@ const READOUT_TOP: f32 = 18.;
 const READOUT_WIDTH: f32 = 168.;
 /// 最近一处缺片或另起会话的说明离外圈的距离。
 const NOTE_GAP: f32 = 14.;
+/// 说明的最大宽，超出的截断；说明整个留在钟面区域里，不伸进两侧的栏。
+const NOTE_MAX_WIDTH: f32 = 150.;
 
 /// 钟面：刻度、标记、圆心下方的状态与已录时长、最近一处缺片或另起会话的说明。
-pub(super) fn figure(row: &Row, look: &Look, recorded: Duration, recording: bool) -> Div {
-    let timeline = row.timeline.clone();
-    let painted = timeline.clone();
+pub(super) fn figure(row: &Row, look: &Look) -> Div {
+    let recorded = row.recorded();
+    let recording = row.task.status == Status::Running;
+    let painted = row.timeline.clone();
     let half = AREA / 2.;
     let marks = live::marks(MARK_RADIUS).map(|(text, x, y)| {
         div()
             .absolute()
-            .left(px(half + x - 12.))
+            .left(px(half + x - MARK_WIDTH / 2.))
             .top(px(half + y - CAPTION_LINE / 2.))
-            .w(px(24.))
+            .w(px(MARK_WIDTH))
             .text_center()
             .child(ui::num(ui::caption(text)))
     });
-    let session = timeline.session_at(recorded).map(|(start, session)| {
-        if start.is_zero() {
+    // 第三行：当前的会话；还不知道会话时，失败的写失败的说明，其余的不写（已录时长就在上面）
+    let third = match row.timeline.session_at(recorded) {
+        Some((start, session)) if Some(start) == row.timeline.since => {
             format!("会话 {}", session + 1)
-        } else {
-            format!("会话 {} · 自 {}", session + 1, format::clock(start))
         }
-    });
+        Some((start, session)) => format!("会话 {} · 自 {}", session + 1, format::clock(start)),
+        None if matches!(row.task.status, Status::Failed(_)) => look.line.clone(),
+        None => String::new(),
+    };
     div()
         .relative()
         .size(px(AREA))
@@ -95,43 +104,39 @@ pub(super) fn figure(row: &Row, look: &Look, recorded: Duration, recording: bool
                 ))
                 .child(ui::num(
                     div()
+                        .w_full()
                         .text_size(px(12.))
                         .line_height(px(CAPTION_LINE))
                         .text_color(theme::muted())
                         .text_center()
-                        .child(SharedString::from(
-                            session.unwrap_or_else(|| look.line.clone()),
-                        )),
+                        .truncate()
+                        .child(SharedString::from(third)),
                 )),
         )
-        .children(note(&timeline, recorded))
+        .children(note(&row.timeline, recorded))
 }
 
-/// 最近一处缺片或另起会话（只看钟面上画着的这两圈）的说明，贴在它在外圈上的位置旁边。
+/// 钟面上画着的两圈里最近一处缺片或另起会话的说明（同一位置的合成一句），贴在它在外圈上的位置旁边。
 fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
     let (lap, _) = live::lap_of(recorded);
-    let shown_from = live::LAP * u32::try_from(lap.saturating_sub(1)).unwrap_or(u32::MAX);
-    let missed = timeline
-        .misses
-        .iter()
-        .map(|&(at, count)| (at, format!("{} · 缺 {count} 片", format::clock(at))));
-    let restarted = timeline.sessions.iter().skip(1).map(|&(at, session)| {
-        (
-            at,
-            format!("{} · 另起会话 {}", format::clock(at), session + 1),
-        )
-    });
-    let (at, text) = missed
-        .chain(restarted)
-        .filter(|&(at, _)| at >= shown_from)
-        .max_by_key(|&(at, _)| at)?;
-    let angle = live::lap_of(at).1 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+    let event = timeline
+        .events(live::lap_start(lap.saturating_sub(1)))
+        .pop()?;
+    let mut parts = vec![format::clock(event.at)];
+    if event.missed > 0 {
+        parts.push(format!("缺 {} 片", event.missed));
+    }
+    if let Some(session) = event.session {
+        parts.push(format!("另起会话 {}", session + 1));
+    }
+    let rad = angle(live::lap_of(event.at).1);
     let radius = live::OUTER + NOTE_GAP;
     let half = AREA / 2.;
-    let (x, y) = (half + radius * angle.cos(), half + radius * angle.sin());
+    let (x, y) = (half + radius * rad.cos(), half + radius * rad.sin());
     let pill = div()
         .absolute()
         .top(px(y - TEXT_LINE / 2. - 4.))
+        .max_w(px(NOTE_MAX_WIDTH))
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
@@ -141,13 +146,13 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
         .text_size(px(12.))
         .line_height(px(TEXT_LINE))
         .text_color(theme::orange())
-        .whitespace_nowrap()
-        .child(ui::num(div().child(text)));
-    // 在圆心右边的往右伸，左边的往左伸，不压住钟面
+        .truncate()
+        .child(ui::num(div().child(parts.join(" · "))));
+    // 圆心右边的往右伸、左边的往左伸，都不出钟面区域
     Some(if x >= half {
-        pill.left(px(x))
+        pill.left(px(x.min(AREA - NOTE_MAX_WIDTH)))
     } else {
-        pill.right(px(AREA - x))
+        pill.right(px((AREA - x).min(AREA - NOTE_MAX_WIDTH)))
     })
 }
 
@@ -162,9 +167,28 @@ pub(super) fn summary(row: &Row) -> Div {
     let progress = row
         .progress
         .as_ref()
-        .filter(|_| row.task.status == hs_m3u8_app::Status::Running);
-    let missed: usize = row.timeline.misses.iter().map(|&(_, count)| count).sum();
-    let sessions = row.timeline.sessions.len();
+        .filter(|_| row.task.status == Status::Running);
+    let timeline = &row.timeline;
+    // 缺片只知道这次打开应用以来的：还没看到过录制进度时不知道
+    let missed = timeline.since.map_or_else(
+        || "—".to_owned(),
+        |_| match timeline
+            .misses
+            .iter()
+            .map(|&(_, count)| count)
+            .sum::<usize>()
+        {
+            0 => "无".to_owned(),
+            n => format!("{n} 片"),
+        },
+    );
+    let session = progress
+        .and_then(|p| p.session)
+        .or(timeline.sessions.last().map(|&(_, session)| session))
+        .map_or_else(
+            || "—".to_owned(),
+            |session| format!("第 {} 个", session + 1),
+        );
     let refresh = progress
         .and_then(|p| p.refresh_errors.iter().flatten().next())
         .map_or_else(
@@ -188,24 +212,27 @@ pub(super) fn summary(row: &Row) -> Div {
                     .child(value),
             ))
     };
-    // 只有一个会话时不提会话；有几个时按钟面上的两种颜色列出各自的会话
-    let sessions_legend: Vec<(Hsla, String)> = match row.timeline.sessions.as_slice() {
-        [] | [_] => vec![(live::session_color(0), "录到的".to_owned())],
-        all => (0..2)
+    // 只有一个会话时不提会话；有几个时按钟面上交替的颜色列出各自的会话，每种最多列三个
+    let colors = live::session_colors();
+    let mut sessions_legend: Vec<(Hsla, String)> = match timeline.sessions.as_slice() {
+        [] | [_] => vec![(colors[0], "录到的".to_owned())],
+        all => (0..colors.len())
             .map(|k| {
                 let numbers: Vec<String> = all
                     .iter()
                     .skip(k)
-                    .step_by(2)
+                    .step_by(colors.len())
                     .map(|&(_, session)| (session + 1).to_string())
                     .collect();
-                (
-                    live::session_color(k),
-                    format!("会话 {}", numbers.join("、")),
-                )
+                let more = if numbers.len() > 3 { "…" } else { "" };
+                let shown = numbers[..numbers.len().min(3)].join("、");
+                (colors[k], format!("会话 {shown}{more}"))
             })
             .collect(),
     };
+    if timeline.since.is_some_and(|since| since > Duration::ZERO) {
+        sessions_legend.push((theme::cyan_dim(), "这次打开应用以前录的".to_owned()));
+    }
     let legend = |color: Hsla, half: f32, text: String| {
         div()
             .flex()
@@ -240,22 +267,8 @@ pub(super) fn summary(row: &Row) -> Div {
                 .grid_cols(2)
                 .gap(px(12.))
                 .child(stat("已录", recorded))
-                .child(stat(
-                    "缺失",
-                    if missed == 0 {
-                        "无".to_owned()
-                    } else {
-                        format!("{missed} 片")
-                    },
-                ))
-                .child(stat(
-                    "会话",
-                    if sessions == 0 {
-                        "—".to_owned()
-                    } else {
-                        sessions.to_string()
-                    },
-                ))
+                .child(stat("本次打开以来缺失", missed))
+                .child(stat("会话", session))
                 .child(
                     stat("刷新", refresh).when(refresh_failed, |s| s.text_color(theme::orange())),
                 ),
@@ -268,11 +281,11 @@ pub(super) fn summary(row: &Row) -> Div {
                 .children(
                     sessions_legend
                         .into_iter()
-                        .map(|(color, text)| legend(color, 8., text)),
+                        .map(|(color, text)| legend(color, live::HALF, text)),
                 )
                 .child(legend(
                     theme::orange(),
-                    10.,
+                    live::MISS_HALF,
                     "缺片（取不到或刷新前已滑出窗口）".to_owned(),
                 )),
         )

@@ -1,6 +1,6 @@
 //! 新建：探测链接、开新建视图、新建任务并把结果交回发起它的视图。
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
 use hs_m3u8_app::{Draft, Event};
@@ -113,7 +113,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let id = task.id;
-        self.rows.push(Row::new(task, Instant::now()));
+        let mut row = Row::new(task, Instant::now());
+        row.timeline.begin(Duration::ZERO);
+        self.rows.push(row);
         let (early, rest) = std::mem::take(&mut self.early)
             .into_iter()
             .partition(|event| matches!(event, Event::Ended { id: at, .. } if *at == id));

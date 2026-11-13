@@ -2,7 +2,6 @@
 
 use gpui_kit::{Context, PromptButton, PromptLevel, Window};
 use hs_m3u8_app::Status;
-use hs_m3u8_core::Stage;
 
 use super::Shell;
 use super::row::Row;
@@ -47,10 +46,7 @@ impl Shell {
             // 已在等任务停下；右上角的提示里可以立即退出
             return false;
         }
-        let recording = self
-            .rows
-            .iter()
-            .any(|r| r.task.status == Status::Running && is_recording(r));
+        let recording = self.rows.iter().any(Row::stoppable);
         // 回车选第一项，放能撤回的「暂停」；「取消」是取消按钮，Esc 即它
         let mut answers = vec![PromptButton::new("全部暂停并退出")];
         if recording {
@@ -85,7 +81,7 @@ impl Shell {
                     if row.task.status != Status::Running {
                         continue;
                     }
-                    if stop_recordings && is_recording(row) {
+                    if stop_recordings && row.stoppable() {
                         this.service.stop(row.task.id);
                     } else {
                         this.service.pause(row.task.id);
@@ -117,11 +113,4 @@ impl Shell {
             )),
         }
     }
-}
-
-/// 正在录制：只有到了录制阶段的才能停止并写出，其余的停止不起作用，要暂停。
-pub(super) fn is_recording(row: &Row) -> bool {
-    row.progress
-        .as_ref()
-        .is_some_and(|p| p.stage == Stage::Recording)
 }

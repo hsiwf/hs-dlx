@@ -96,7 +96,8 @@ impl Ending {
 struct Shared {
     engine: Engine,
     store: Mutex<Store>,
-    /// 关闭了（[`Service::close`]）：不再开始任务。在 `store` 锁内置上与查看，关闭之后开始的任务不会漏取消
+    /// 关闭了（[`Service::close`]）：不再开始任务。在 `store` 锁内置上与查看（释放服务时独占，不用锁），关闭之后开始的
+    /// 任务不会漏取消
     closed: AtomicBool,
     /// 运行中的任务；登记与查询放弃中都在 `store` 锁内，继续与放弃不会交错
     running: Mutex<HashMap<TaskId, Running>>,
@@ -287,7 +288,8 @@ impl Service {
         }
     }
 
-    /// 放弃任务：在运行就先取消并等它停下，再删掉任务目录（见 [`Engine::discard`]）与存储里的记录；返回留下的东西。
+    /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::Discarding`]，再删掉任务目录（见 [`Engine::discard`]）
+    /// 与存储里的记录；返回留下的东西。
     /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
     /// 30 秒内做不完报 [`Error::TimedOut`]（之后再放弃从做到的地方接着做）。做完之前任务记为正在放弃，继续与移除都报
     /// [`Error::Discarding`]，再放弃一次同样报这个错误。返回的句柄在任何执行器上都可等待。
@@ -359,6 +361,8 @@ async fn run_discard(
         // 运行登记释放时先置为 true 再丢弃发送端，等到值或发送端已丢弃都说明任务已停下
         let _stopped = stopped.wait_for(|done| *done).await;
     }
+    // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
+    shared.write(|tx| store::set_status(tx, id, &Status::Discarding))?;
     let leftovers = match shared.get(id)?.work_dir {
         // 放弃超时时这个 future 被丢弃，核心在步与步之间停下，再放弃时从做到的地方接着做
         Some(work_dir) => {
@@ -453,17 +457,24 @@ impl Shared {
                 draft.folder.display()
             )));
         }
+        // 规整成与核心算任务目录时相同的写法（去掉 `.` 与重复的分隔符），取名查的与插入时比较的才是同一个路径
+        let folder = std::path::absolute(&draft.folder).map_err(|cause| Error::Io {
+            action: "规整",
+            path: draft.folder.clone(),
+            cause,
+        })?;
         let preference = StoredPreference::try_from(&draft.preference)?;
         let title = naming::title_of(&draft.url);
-        // 取名与插入之间别的新建可能插入了同一个主名的任务，插入时报 WorkDirTaken，就重新取名；每重来一次存储里就多了
-        // 一个别的任务，不会一直重来
+        // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
+        // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
         loop {
             let taken = {
                 let mut store = lock(&self.store);
                 let tx = store.transaction()?;
                 store::taken_paths(&tx)?
             };
-            let (folder, title, kind) = (draft.folder.clone(), title.clone(), draft.output);
+            let seen = taken.clone();
+            let (folder, title, kind) = (folder.clone(), title.clone(), draft.output);
             let naming = tokio::task::spawn_blocking(move || {
                 naming::output_for(&folder, &title, kind, &taken)
             });
@@ -484,7 +495,8 @@ impl Shared {
                 live: draft.live,
             };
             match self.insert_and_start(&spec, work_dir, created_at) {
-                Err(Error::WorkDirTaken(_)) => {}
+                Err(Error::PathTaken(path))
+                    if !seen.contains(&naming::path_key(&path.to_string_lossy())) => {}
                 result => return result,
             }
         }
@@ -529,8 +541,10 @@ impl Shared {
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
         let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
-        if task.status == Status::Done {
-            return Err(Error::AlreadyDone(id));
+        match task.status {
+            Status::Done => return Err(Error::AlreadyDone(id)),
+            Status::Discarding => return Err(Error::DiscardUnfinished(id)),
+            Status::Running | Status::Paused | Status::Failed(_) => {}
         }
         let request = request(&task)?;
         store::set_status(&tx, id, &Status::Running)?;
@@ -619,7 +633,7 @@ impl Shared {
                 Ok(output) => output.live.is_none(),
                 Err(_) => {
                     matches!(last.stage, Stage::Downloading | Stage::Writing)
-                        && !(live && forwarded.recorded)
+                        && !(live && (forwarded.recorded || last.session.is_some()))
                 }
             };
             let total = if vod && last.segments.total > 0 {

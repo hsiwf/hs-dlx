@@ -9,11 +9,11 @@ use hs_m3u8_app::{OutputKind, title_of};
 use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, duration_of};
+use crate::ui::{self, Tone};
+use crate::{format, theme};
 
 /// 选项栏的宽度。
 const OPTION_WIDTH: f32 = 320.;
-use crate::ui::{self, Tone};
-use crate::{format, theme};
 
 impl NewTask {
     pub(super) fn render_side(&self, cx: &mut Context<Self>) -> Div {

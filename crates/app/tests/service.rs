@@ -431,7 +431,8 @@ fn a_create_that_cannot_commit_leaves_nothing() {
     assert!(!folder.join("index.hsdl").exists());
 }
 
-/// 任务目录里有不是本库写的文件时放弃删不干净：任务留在列表里、报出留下的东西；拿走那个文件后再放弃即删掉。
+/// 任务目录里有不是本库写的文件时放弃删不干净：任务留在列表里、记为放弃没做完（不能继续）、报出留下的东西；拿走那个
+/// 文件后再放弃即删掉。
 #[test]
 fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
     let dir = test_dir("discard-left");
@@ -453,10 +454,44 @@ fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
 
     let left = rt.block_on(service.discard(id)).unwrap();
     assert!(matches!(left, Err(Error::WorkDirLeft { .. })), "{left:?}");
-    assert_eq!(service.tasks().unwrap().len(), 1);
+    // 放弃没做完：任务留着、记为放弃没做完，不能继续
+    assert_eq!(service.tasks().unwrap()[0].status, Status::Discarding);
+    assert!(matches!(
+        service.resume(id),
+        Err(Error::DiscardUnfinished(_))
+    ));
 
     std::fs::remove_file(&foreign).unwrap();
     assert_eq!(rt.block_on(service.discard(id)).unwrap().unwrap(), []);
     assert!(service.tasks().unwrap().is_empty());
     assert!(!folder.join("index.hsdl").exists());
+}
+
+/// 同一地址同时新建两次（取名都在插入之前）：插入时后一个撞上前一个占用的路径，重新取名，两个各用各的输出。保存目录的
+/// 写法不规整（带 `.`）也照样认出已有任务占用的路径。
+#[test]
+fn concurrent_creates_get_separate_outputs() {
+    let dir = test_dir("concurrent");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let (service, _events) = service(&dir.join("tasks.sqlite"));
+    let url = server.base.join("index.m3u8").unwrap();
+
+    let first = service.create(draft(url.clone(), folder.clone()), 1);
+    let second = service.create(draft(url.clone(), folder.join(".")), 1);
+    let (first, second) = rt.block_on(async { (first.await, second.await) });
+    let (first, second) = (first.unwrap().unwrap(), second.unwrap().unwrap());
+    let mut outputs = vec![first.spec.output, second.spec.output];
+    outputs.sort_by_key(|output| format!("{output:?}"));
+    assert_eq!(
+        outputs,
+        [
+            OutputSpec::Mp4(folder.join("index 2.mp4")),
+            OutputSpec::Mp4(folder.join("index.mp4")),
+        ]
+    );
+    for id in [first.id, second.id] {
+        rt.block_on(service.discard(id)).unwrap().unwrap();
+    }
 }

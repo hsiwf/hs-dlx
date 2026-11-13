@@ -53,9 +53,12 @@ pub enum Error {
     /// 服务已关闭（[`crate::Service::close`]），不再开始任务
     #[error("正在退出，不再开始任务")]
     Closed,
-    /// 新任务的任务目录与存储里已有的任务相同
-    #[error("任务目录已被另一个任务使用：{}", .0.display())]
-    WorkDirTaken(std::path::PathBuf),
+    /// 新任务的输出或任务目录与存储里已有任务的输出或任务目录相同
+    #[error("路径已被另一个任务使用：{}", .0.display())]
+    PathTaken(std::path::PathBuf),
+    /// 放弃没做完（中途出错、超时或应用退出），任务目录可能已删了一部分：不能继续，只能再放弃
+    #[error("{0}的放弃没做完，只能再放弃")]
+    DiscardUnfinished(TaskId),
     /// 任务存储已被另一个运行中的应用打开；两个应用同时改同一份任务会互相覆盖状态
     #[error("任务存储已被另一个运行中的 hs-m3u8 打开：{}", .0.display())]
     InUse(std::path::PathBuf),

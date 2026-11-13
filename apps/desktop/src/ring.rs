@@ -1,4 +1,5 @@
-//! 环的画法：中央的刻度环（任务的分片、待机）与列表里的小进度环。都以绘制区域的中心为圆心，从 12 点方向顺时针。
+//! 环的画法：中央的刻度环（任务的分片、待机）与列表里的小进度环；刻度、角度与圆上的点也给直播钟面（[`crate::live`]）
+//! 用。都以绘制区域的中心为圆心，从 12 点方向顺时针。
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -94,23 +95,23 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
     let mut retry_halo = Stroke::new(10., theme::alpha(theme::orange(), 0.3), RETRY_HALF + 2.);
     let mut retry = Stroke::new(3., theme::orange(), RETRY_HALF);
     for i in 0..ticks.count {
-        let angle = i as f32 / ticks.count as f32 * TAU - FRAC_PI_2;
+        let rad = angle(i as f32 / ticks.count as f32);
         if i < ticks.written {
-            written_halo.tick(center, radius, angle);
-            written.tick(center, radius, angle);
+            written_halo.tick(center, radius, rad);
+            written.tick(center, radius, rad);
         } else if i < ticks.lit {
             if ticks.glow {
-                halo_wide.tick(center, radius, angle);
-                halo_near.tick(center, radius, angle);
+                halo_wide.tick(center, radius, rad);
+                halo_near.tick(center, radius, rad);
             }
-            lit.tick(center, radius, angle);
+            lit.tick(center, radius, rad);
         } else if i == ticks.lit && ticks.retrying {
-            retry_halo.tick(center, radius, angle);
-            retry.tick(center, radius, angle);
+            retry_halo.tick(center, radius, rad);
+            retry.tick(center, radius, rad);
         } else if i < ticks.lit + ticks.active {
-            active.tick(center, radius, angle);
+            active.tick(center, radius, rad);
         } else {
-            idle.tick(center, radius, angle);
+            idle.tick(center, radius, rad);
         }
     }
     for stroke in [
@@ -135,21 +136,21 @@ pub fn paint_standby(bounds: Bounds<Pixels>, radius: f32, window: &mut Window) {
     let center = bounds.center();
     let mut idle = Stroke::new(2., theme::line(), HALF);
     for i in 0..COUNT - TAIL {
-        idle.tick(center, radius, i as f32 / COUNT as f32 * TAU - FRAC_PI_2);
+        idle.tick(center, radius, angle(i as f32 / COUNT as f32));
     }
     idle.paint(window);
     // 越接近 12 点越亮，最前面的一格带光晕
     for k in 0..TAIL {
         let i = COUNT - TAIL + k;
-        let angle = i as f32 / COUNT as f32 * TAU - FRAC_PI_2;
+        let rad = angle(i as f32 / COUNT as f32);
         let strength = (k + 1) as f32 / TAIL as f32;
         if k == TAIL - 1 {
             let mut halo = Stroke::new(6., theme::alpha(theme::cyan(), 0.3), HALF + 1.);
-            halo.tick(center, radius, angle);
+            halo.tick(center, radius, rad);
             halo.paint(window);
         }
         let mut tick = Stroke::new(2., theme::alpha(theme::cyan(), strength.powf(1.6)), HALF);
-        tick.tick(center, radius, angle);
+        tick.tick(center, radius, rad);
         tick.paint(window);
     }
 }
@@ -186,7 +187,7 @@ fn arc(
     let mut path = PathBuilder::stroke(px(width));
     for step in 0..=steps {
         let turn = from + step as f32 / steps as f32 * span;
-        let at = on_circle(center, radius, turn * TAU - FRAC_PI_2);
+        let at = on_circle(center, radius, angle(turn));
         if step == 0 {
             path.move_to(at);
         } else {
@@ -196,8 +197,13 @@ fn arc(
     path.build().expect(TESSELLATED)
 }
 
-/// 刻度与圆弧都是不自交的折线，顶点最多几千个，远低于曲面细分的 u16 索引上限，细分不会失败。
-pub(crate) const TESSELLATED: &str = "刻度与圆弧的折线曲面细分失败";
+/// 刻度、圆弧与钟面指针都是不自交的折线，顶点最多几千个，远低于曲面细分的 u16 索引上限，细分不会失败。
+pub(crate) const TESSELLATED: &str = "环上的折线曲面细分失败";
+
+/// 整圈为 1 的比例 `turn`（从 12 点顺时针）换成弧度（0 为 3 点方向）。
+pub(crate) fn angle(turn: f32) -> f32 {
+    turn * TAU - FRAC_PI_2
+}
 
 pub(crate) fn on_circle(center: Point<Pixels>, radius: f32, angle: f32) -> Point<Pixels> {
     let (sin, cos) = angle.sin_cos();

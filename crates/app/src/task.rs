@@ -86,6 +86,8 @@ pub enum Status {
     Failed(Failure),
     /// 已写出输出
     Done,
+    /// 放弃了而没做完（中途出错、超时或应用退出）：任务目录可能已删了一部分，不能继续，只能再放弃
+    Discarding,
 }
 
 /// 存储里的一个任务。

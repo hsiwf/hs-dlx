@@ -38,7 +38,7 @@ impl Shell {
                 .pr(px(14.))
                 .text_size(px(12.))
                 .text_color(theme::muted())
-                .child(phase.short())
+                .child(phase.label())
                 .into_any_element(),
             // 粘贴栏空着时按了也没东西可探测，不抢眼
             None => ui::button(

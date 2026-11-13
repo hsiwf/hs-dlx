@@ -47,16 +47,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// 粘贴栏右侧的状态。
-    pub fn short(self) -> &'static str {
-        match self {
-            Phase::Probing => "正在探测",
-            Phase::Ready => "探测完成",
-            Phase::Failed => "探测失败",
-        }
-    }
-
-    /// 任务列表里新任务一项的说明。
+    /// 粘贴栏右侧与任务列表里新任务一项的说明。
     pub fn label(self) -> &'static str {
         match self {
             Phase::Probing => "正在探测",

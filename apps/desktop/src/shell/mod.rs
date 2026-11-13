@@ -22,7 +22,7 @@ use gpui_kit::{
     Subscription, Task, Window, div, px,
 };
 use hs_m3u8_app::{Event, Events, Finished, Service, Status, TaskId};
-use hs_m3u8_core::Url;
+use hs_m3u8_core::{Stage, Url};
 
 use self::row::Row;
 use crate::headers::HeadersEditor;
@@ -211,8 +211,11 @@ impl Shell {
                     for (level, text) in crate::signals::between(row.progress.as_ref(), &progress) {
                         row.signal(level, text);
                     }
-                    if progress.session.is_some() {
-                        row.timeline.observe(&progress);
+                    if progress.stage == Stage::Recording
+                        && let Some(session) =
+                            row.timeline.observe(row.progress.as_ref(), &progress)
+                    {
+                        row.signal(Level::Warn, format!("来源接不上，另起会话 {}", session + 1));
                     }
                     row.progress = Some(*progress);
                 }
@@ -375,7 +378,9 @@ fn ended_signal(
         ),
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),
-        Status::Running => unreachable!("任务服务只在任务停下后发结束事件"),
+        Status::Running | Status::Discarding => {
+            unreachable!("任务服务只在任务停下后发结束事件，停下的状态不会是运行中或放弃没做完")
+        }
     }
 }
 
