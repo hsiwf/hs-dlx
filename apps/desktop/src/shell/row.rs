@@ -8,6 +8,7 @@ use gpui_kit::Hsla;
 use hs_m3u8_app::{Finished, OutputSpec, Status, Task};
 use hs_m3u8_core::{Progress, Saved, Stage};
 
+use crate::live::Timeline;
 use crate::rate::Rate;
 use crate::ring::Ticks;
 use crate::signals::{self, Level, Signal};
@@ -49,6 +50,8 @@ pub struct Row {
     pub resuming: bool,
     /// 正在放弃：操作都不可用
     pub discarding: bool,
+    /// 直播录制这次打开应用以来的时间线（钟面用）
+    pub timeline: Timeline,
 }
 
 impl Row {
@@ -85,6 +88,7 @@ impl Row {
             file_name,
             resuming: false,
             discarding: false,
+            timeline: Timeline::default(),
         }
     }
 
@@ -96,6 +100,16 @@ impl Row {
     /// 能不能操作：正在继续或放弃时不能。
     pub fn idle(&self) -> bool {
         !self.resuming && !self.discarding
+    }
+
+    /// 已录（直播）或已下（点播）的第 0 条轨时长：运行中按进度，停下的按任务目录里读到的；都没有时为 0。
+    pub fn recorded(&self) -> Duration {
+        Amount::of(self).map_or(Duration::ZERO, |a| a.duration)
+    }
+
+    /// 已完成的片数与字节数，来源同 [`Row::recorded`]；都没有时为 None。
+    pub fn completed(&self) -> Option<(usize, u64)> {
+        Amount::of(self).map(|a| (a.done, a.bytes))
     }
 
     /// 作废读到的任务目录内容（任务停下时：内容变了），之后发起的读才算数。

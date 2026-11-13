@@ -186,12 +186,17 @@ impl NewTask {
         );
 
         let picked = master.map(|m| &m.variants[self.variant]);
+        let verb = if probe.live {
+            "开始录制"
+        } else {
+            "开始下载"
+        };
         let headline = if self.creating {
             "正在开始…".to_owned()
         } else {
             picked.map_or_else(
-                || "开始下载".to_owned(),
-                |v| format!("开始下载 · {}", format::variant(v)),
+                || verb.to_owned(),
+                |v| format!("{verb} · {}", format::variant(v)),
             )
         };
         let detail: Vec<String> = [

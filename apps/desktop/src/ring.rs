@@ -53,14 +53,14 @@ impl Ticks {
 }
 
 /// 一类刻度共用一条路径：线宽、颜色与半长。
-struct Stroke {
+pub(crate) struct Stroke {
     path: PathBuilder,
     color: Hsla,
     half: f32,
 }
 
 impl Stroke {
-    fn new(width: f32, color: Hsla, half: f32) -> Stroke {
+    pub(crate) fn new(width: f32, color: Hsla, half: f32) -> Stroke {
         Stroke {
             path: PathBuilder::stroke(px(width)),
             color,
@@ -68,14 +68,15 @@ impl Stroke {
         }
     }
 
-    fn tick(&mut self, center: Point<Pixels>, radius: f32, angle: f32) {
+    /// 以半径 `radius` 的环为中线、在角度 `angle`（弧度，0 为 3 点方向）处加一格。
+    pub(crate) fn tick(&mut self, center: Point<Pixels>, radius: f32, angle: f32) {
         self.path
             .move_to(on_circle(center, radius - self.half, angle));
         self.path
             .line_to(on_circle(center, radius + self.half, angle));
     }
 
-    fn paint(self, window: &mut Window) {
+    pub(crate) fn paint(self, window: &mut Window) {
         window.paint_path(self.path.build().expect(TESSELLATED), self.color);
     }
 }
@@ -196,9 +197,9 @@ fn arc(
 }
 
 /// 刻度与圆弧都是不自交的折线，顶点最多几千个，远低于曲面细分的 u16 索引上限，细分不会失败。
-const TESSELLATED: &str = "刻度与圆弧的折线曲面细分失败";
+pub(crate) const TESSELLATED: &str = "刻度与圆弧的折线曲面细分失败";
 
-fn on_circle(center: Point<Pixels>, radius: f32, angle: f32) -> Point<Pixels> {
+pub(crate) fn on_circle(center: Point<Pixels>, radius: f32, angle: f32) -> Point<Pixels> {
     let (sin, cos) = angle.sin_cos();
     point(center.x + px(radius * cos), center.y + px(radius * sin))
 }

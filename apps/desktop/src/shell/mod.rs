@@ -2,6 +2,7 @@
 //! 的信号；底部是粘贴栏；右上角是要用户关掉的提示。这里管状态与事件；新建、对任务的操作、退出与各块的画法在子模块里。
 
 mod creating;
+mod live_view;
 mod notices;
 mod operations;
 mod paste_bar;
@@ -205,6 +206,9 @@ impl Shell {
                         .update(Instant::now(), progress.received, progress.segments.done);
                     for (level, text) in crate::signals::between(row.progress.as_ref(), &progress) {
                         row.signal(level, text);
+                    }
+                    if progress.session.is_some() {
+                        row.timeline.observe(&progress);
                     }
                     row.progress = Some(*progress);
                 }

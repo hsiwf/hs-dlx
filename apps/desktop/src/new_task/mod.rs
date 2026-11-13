@@ -59,7 +59,7 @@ impl Phase {
     pub fn label(self) -> &'static str {
         match self {
             Phase::Probing => "正在探测",
-            Phase::Ready => "探测完成 · 挑一档开始",
+            Phase::Ready => "探测完成",
             Phase::Failed => "探测失败",
         }
     }

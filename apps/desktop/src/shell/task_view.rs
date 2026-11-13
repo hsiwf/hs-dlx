@@ -10,8 +10,8 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
-use super::Shell;
 use super::row::{Row, look};
+use super::{Shell, live_view};
 use crate::ring;
 use crate::signals::{Level, Signal};
 use crate::theme;
@@ -57,49 +57,62 @@ impl Shell {
     ) -> (Div, Div) {
         let look = look(row, now);
         let ticks = look.ticks;
-        let ring = ring_with_disc(
-            canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| ring::paint_ticks(bounds, ring::RADIUS, &ticks, window),
+        // 直播录制（没完成的）画钟面
+        let live = row.recording() && row.task.status != Status::Done;
+        let ring = if live {
+            live_view::figure(
+                row,
+                &look,
+                row.recorded(),
+                row.task.status == Status::Running,
             )
-            .absolute()
-            .size_full()
-            .into_any_element(),
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(look.color)
-                        .child(look.state),
+        } else {
+            ring_with_disc(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
+                    },
                 )
-                .child(ui::num(
-                    div()
-                        .text_size(px(64.))
-                        .line_height(px(64.))
-                        .font_weight(FontWeight::BOLD)
-                        .child(look.big),
-                ))
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_center()
-                        .line_clamp(2)
-                        .child(row.task.spec.title.clone()),
-                )
-                .child(ui::num(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::muted())
-                        .text_center()
-                        .line_clamp(3)
-                        .child(SharedString::from(look.line)),
-                )),
-        );
+                .absolute()
+                .size_full()
+                .into_any_element(),
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(look.color)
+                            .child(look.state),
+                    )
+                    .child(ui::num(
+                        div()
+                            .text_size(px(64.))
+                            .line_height(px(64.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(look.big),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_center()
+                            .line_clamp(2)
+                            .child(row.task.spec.title.clone()),
+                    )
+                    .child(ui::num(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::muted())
+                            .text_center()
+                            .line_clamp(3)
+                            .child(SharedString::from(look.line)),
+                    )),
+            )
+        };
         // 中间一栏至少放得下中央刻度环：窗口窄时先收两侧的栏
         let main = div()
             .flex_1()
@@ -130,6 +143,7 @@ impl Shell {
             .gap(px(12.))
             .py(px(8.))
             .pr(px(8.))
+            .children(live.then(|| live_view::summary(row)))
             .child(ui::caption("信号"))
             .child(
                 div()
