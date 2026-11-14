@@ -14,14 +14,13 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, NoReturn
 
-from hs_m3u8 import FfmpegScript, ffmpeg_script
+from hs_m3u8 import FfmpegScript, cargo, ffmpeg_script
 
 ROOT = Path(__file__).resolve().parent.parent
 SUPPLIED = ROOT / "third_party/crate-licenses"
@@ -135,11 +134,6 @@ class Crate:
     def label(self) -> str:
         """名字与版本。"""
         return f"{self.name} {self.version}"
-
-
-def cargo(*args: str) -> str:
-    """运行 cargo，返回标准输出；cargo 的报错照常输出到 stderr，失败时抛 CalledProcessError。"""
-    return subprocess.run(["cargo", *args], cwd=ROOT, stdout=subprocess.PIPE, text=True, check=True).stdout
 
 
 def release_targets() -> list[str]:

@@ -29,15 +29,14 @@ class FfmpegScript(NamedTuple):
         return f"{self.repository}/blob/{self.commit}/third_party/ffmpeg/build.sh"
 
 
+def cargo(*args: str) -> str:
+    """在仓库根目录运行 cargo，返回按 UTF-8 解码的标准输出（不随系统的区域编码）；失败时抛 CalledProcessError。"""
+    return subprocess.run(["cargo", *args], cwd=ROOT, stdout=subprocess.PIPE, encoding="utf-8", check=True).stdout
+
+
 def ffmpeg_script() -> FfmpegScript:
     """取构建脚本；工作区不是恰好依赖一个以 git rev 固定的 hs-m3u8-core、或那个提交里没有这个脚本时失败。"""
-    output = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked"],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        text=True,
-        check=True,
-    ).stdout
+    output = cargo("metadata", "--format-version", "1", "--locked")
     packages = [package for package in json.loads(output)["packages"] if package["name"] == PACKAGE]
     if len(packages) != 1:
         message = f"Cargo.lock 里的 {PACKAGE} 有 {len(packages)} 个，应为 1 个"

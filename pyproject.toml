@@ -47,7 +47,6 @@ ignore = [
 # 测试用 assert 断言；测试函数的名字即说明
 "tests/scripts/**" = ["S101", "D103"]
 # 运行 PATH 里的 cargo（与 Makefile 一样），参数是写死的与 deny.toml 里的平台
-"scripts/licenses.py" = ["S603", "S607"]
 "scripts/hs_m3u8.py" = ["S603", "S607"]
 
 [tool.mypy]
