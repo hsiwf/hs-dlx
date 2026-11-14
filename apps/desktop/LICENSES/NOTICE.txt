@@ -1,0 +1,24 @@
+hs-m3u8 按 MIT 许可证发布，见 LICENSE.txt。由 scripts/licenses.py 生成。
+
+hs-m3u8 桌面应用静态链接或随带了以下软件：
+
+1. FFmpeg 9.0.2（https://ffmpeg.org），按 GNU Lesser General Public License（LGPL）2.1 或更高版本授权，全文见
+   FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见本项目源码里的
+   third_party/ffmpeg/build.sh。对应的源码包 ffmpeg-9.0.2.tar.xz 可从 https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz 取得，SHA-256 为
+   8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e。
+
+   换用修改过的 FFmpeg：按 build.sh 里的 configure 参数编译修改过的 FFmpeg 源码并安装到某个目录，再在本项目源码目录
+   里以 FFMPEG_DIR=<该目录> cargo build --release -p hs-m3u8-desktop 重新构建桌面应用。
+
+2. Rust crate，各自的许可证见 THIRD-PARTY-RUST.txt；Rust 标准库按 MIT 或 Apache-2.0 授权
+   （https://github.com/rust-lang/rust）。
+   其中按 Mozilla Public License 2.0 授权、源码未作修改的：
+   - option-ext 0.2.0：源码见 https://github.com/soc/option-ext.git 与 https://crates.io/crates/option-ext/0.2.0
+
+3. 网页嵌入层（本项目源码的 crates/webview）有一部分改写自 gpui-webview 0.9.1（© Longbridge，
+   https://github.com/longbridge/gpui-kit），按 Apache License 2.0 授权，全文见 gpui-webview-LICENSE-APACHE.txt。
+   改写过的文件为 crates/webview/src/lib.rs 与 crates/webview/src/linux.rs：改为依赖官方 wry，只留不用窗口合成时
+   用到的部分。
+
+4. Space Grotesk 字体（© The Space Grotesk Project Authors，https://github.com/floriankarsten/space-grotesk），按 SIL
+   Open Font License 1.1 授权，全文见 OFL.txt。
