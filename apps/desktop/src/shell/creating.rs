@@ -9,8 +9,8 @@ use hs_m3u8_core::Url;
 use super::row::Row;
 use super::{Page, Shell};
 use crate::links;
-use crate::new_task::{Link, NewTask, NewTaskEvent};
-use crate::sniff::{SniffEvent, SniffView};
+use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
+use crate::sniff::{SniffEvent, SniffView, Verdict};
 
 impl Shell {
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -29,22 +29,26 @@ impl Shell {
                 url,
                 title: None,
                 headers: Vec::new(),
+                probe: None,
             },
+            false,
             window,
             cx,
         );
     }
 
-    /// 打开新建页探测 `link`（已开着的换成这个）。
+    /// 打开新建页探测 `link`（已开着的换成这个）；`from_sniff` 为嗅探页里找到的流（关掉时回到嗅探页），否则为粘贴、
+    /// 启动参数或转交来的。
     pub(super) fn open_new_task(
         &mut self,
         link: Link,
+        from_sniff: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (service, folder, home) =
             (self.service.clone(), self.folder.clone(), self.home.clone());
-        let view = cx.new(|cx| NewTask::new(service, link, folder, home, window, cx));
+        let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, home, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -54,23 +58,19 @@ impl Shell {
                         this.create(view.clone(), (**draft).clone(), window, cx)
                     }
                     NewTaskEvent::Dismissed => {
-                        let back = match this.page {
-                            Page::NewTask {
-                                from_sniff: true, ..
-                            } if this.sniff.is_some() => Page::Sniff,
+                        let back = match (&this.page, &this.sniff) {
+                            (
+                                Page::NewTask {
+                                    from_sniff: true, ..
+                                },
+                                Some((sniff, _)),
+                            ) => Page::Sniff(sniff.clone()),
                             _ => Page::Task,
                         };
                         this.show(back, cx);
                     }
-                    // 用户还在粘贴栏里打别的链接时不抢焦点：只在粘贴栏里还是这个链接、或焦点不在粘贴栏时给
-                    NewTaskEvent::Ready => {
-                        let typing = this.paste.read(cx).focus_handle(cx).is_focused(window);
-                        let same = links::http_url(&this.paste.read(cx).value())
-                            .is_some_and(|url| &url == view.read(cx).url());
-                        if !typing || same {
-                            view.update(cx, |view, cx| view.focus(window, cx));
-                        }
-                    }
+                    NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
+                    NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     NewTaskEvent::FolderChanged(folder) => {
                         this.folder = folder.clone();
@@ -80,19 +80,104 @@ impl Shell {
                 cx.notify();
             },
         );
-        let from_sniff = match &self.page {
-            Page::Sniff => true,
-            Page::NewTask { from_sniff, .. } => *from_sniff,
-            Page::Task => false,
-        };
+        let ready = view.read(cx).phase() == Phase::Ready;
         self.show(
             Page::NewTask {
-                view,
+                view: view.clone(),
                 _subscription: subscription,
                 from_sniff,
+                checking: None,
             },
             cx,
         );
+        if ready {
+            self.focus_new_task(&view, window, cx);
+        }
+    }
+
+    /// 新建页探测好了：把键盘焦点给它；用户还在粘贴栏里打别的链接时不抢，只在粘贴栏里还是这个链接、或焦点不在粘贴栏
+    /// 时给。
+    fn focus_new_task(
+        &mut self,
+        view: &Entity<NewTask>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let typing = self.paste.read(cx).focus_handle(cx).is_focused(window);
+        let same = links::http_url(&self.paste.read(cx).value())
+            .is_some_and(|url| &url == view.read(cx).url());
+        if !typing || same {
+            view.update(cx, |view, cx| view.focus(window, cx));
+        }
+    }
+
+    /// 新建页 `view` 第一次探测取到的不是播放列表：粘贴来的、地址也不像播放列表的，在后台的网页里打开它，网页引擎
+    /// 认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
+    fn check_page(&mut self, view: &Entity<NewTask>, window: &mut Window, cx: &mut Context<Self>) {
+        let url = view.read(cx).url().clone();
+        let Page::NewTask {
+            view: shown,
+            from_sniff: false,
+            checking,
+            ..
+        } = &mut self.page
+        else {
+            return;
+        };
+        if shown != view || links::stream_url(url.as_str()).is_some() {
+            return;
+        }
+        let service = self.service.clone();
+        let sniff = cx.new(|cx| SniffView::new(service, url, window, cx));
+        let subscription = cx.subscribe_in(
+            &sniff,
+            window,
+            |this: &mut Self, sniff, event: &SniffEvent, window, cx| {
+                if let SniffEvent::Decided = event {
+                    this.checked_page(sniff, window, cx);
+                }
+            },
+        );
+        *checking = Some((sniff.clone(), subscription));
+        view.update(cx, |view, cx| view.opening_page(cx));
+        // 建不出网页时一开始就有结论
+        self.checked_page(&sniff, window, cx);
+    }
+
+    /// 后台的网页 `sniff` 有了是不是网页的结论：是网页就换到嗅探页，否则在新建页的失败下面写明。新建页已换走、或用户
+    /// 已改了请求头重新探测的，不再需要它。
+    fn checked_page(
+        &mut self,
+        sniff: &Entity<SniffView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Page::NewTask { view, checking, .. } = &mut self.page else {
+            return;
+        };
+        if checking
+            .as_ref()
+            .is_none_or(|(checked, _)| checked != sniff)
+        {
+            return;
+        }
+        if !view.read(cx).is_opening_page() {
+            *checking = None;
+            return;
+        }
+        let note = match sniff.read(cx).verdict() {
+            Verdict::Pending => return,
+            Verdict::Page => None,
+            Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
+            Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
+            Verdict::Broken(reason) => Some(format!("在网页里也打不开：{reason}")),
+        };
+        *checking = None;
+        match note {
+            Some(note) => view.update(cx, |view, cx| view.not_a_page(note, cx)),
+            None => self.adopt_sniff(sniff.clone(), window, cx),
+        }
+        cx.notify();
     }
 
     /// 按新建视图里的选择新建任务；退出中不新建。新建要查磁盘，在服务的运行时里做，期间新建视图显示正在开始。
@@ -103,7 +188,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.quitting {
+        if self.quitting() {
             view.update(cx, |view, cx| {
                 view.failed("正在退出，不开始新任务".to_owned(), cx)
             });
@@ -166,7 +251,7 @@ impl Shell {
         for event in early {
             self.apply(event, cx);
         }
-        if self.quitting {
+        if self.quitting() {
             self.service.pause(id);
         }
         if self.showing(view) {
@@ -184,7 +269,7 @@ impl Shell {
         error: String,
         cx: &mut Context<Self>,
     ) {
-        if self.quitting {
+        if self.quitting() {
             self.cancel_quit("有新建没成，没有退出".to_owned());
         }
         if self.showing(view) {
@@ -207,22 +292,34 @@ impl Shell {
     fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
         let service = self.service.clone();
         let view = cx.new(|cx| SniffView::new(service, url, window, cx));
+        self.adopt_sniff(view, window, cx);
+    }
+
+    /// 让 `view` 成为嗅探页（已开着的换成它）并显示。
+    fn adopt_sniff(
+        &mut self,
+        view: Entity<SniffView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(
             &view,
             window,
-            |this: &mut Self, _, event: &SniffEvent, window, cx| {
+            |this: &mut Self, view, event: &SniffEvent, window, cx| {
                 match event {
-                    SniffEvent::Probe(link) => this.open_new_task(link.clone(), window, cx),
+                    SniffEvent::Open(link) => this.open_new_task(link.clone(), true, window, cx),
                     SniffEvent::Dismissed => {
-                        this.show(Page::Task, cx);
+                        if matches!(&this.page, Page::Sniff(shown) if shown == view) {
+                            this.show(Page::Task, cx);
+                        }
                         this.sniff = None;
                     }
-                    SniffEvent::PageToggled => {}
+                    SniffEvent::PageToggled | SniffEvent::Decided => {}
                 }
                 cx.notify();
             },
         );
-        self.sniff = Some((view, subscription));
-        self.show(Page::Sniff, cx);
+        self.sniff = Some((view.clone(), subscription));
+        self.show(Page::Sniff(view), cx);
     }
 }

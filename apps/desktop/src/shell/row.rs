@@ -270,10 +270,7 @@ fn failure_text(failure: &Failure) -> (String, &'static str) {
             ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")
         }
         FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
-        FailureKind::Unrecoverable => (
-            "!".into(),
-            "照原样再试也一样，原因见右边的信号；改请求头后可以再试",
-        ),
+        FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见右边的信号"),
         FailureKind::Other => ("!".into(), "原因见右边的信号"),
     }
 }

@@ -1,29 +1,34 @@
-//! 注入网页各层框架的脚本与它发回的消息。脚本找 HLS 播放列表的地址、数请求；发回的内容来自网页，按不可信数据校验，
-//! 认不出的丢掉。页面的地址与标题不经脚本，由网页引擎报（见嗅探页）。
+//! 注入网页的脚本与它发回的消息。脚本找 HLS 播放列表的地址、报顶层文档的类型；发回的内容来自网页，按不可信
+//! 数据校验，认不出的丢掉。页面的地址与标题、发消息的框架不经脚本，由网页引擎报（见嗅探页）。
 
 use hs_m3u8_core::Url;
 use serde::Deserialize;
 
 use crate::links::http_url;
 
-/// 注入网页的脚本（Windows 上只注入顶层框架：WebView2 只给顶层框架发消息的通道）。
+/// 注入网页的脚本。
 ///
+/// - 在哪些框架里跑：WebKit（macOS、Linux）上每一层框架都直接经引擎的 `ipc` 消息通道发（不经别的框架转发，嵌入它的
+///   页面截不到）；别的引擎（WebView2）上 wry 把脚本注入每一层框架，而只有顶层框架发得回来，脚本在子框架里直接退出。
+///   简化：WebView2 上找不到嵌入框架里的流，接上它按框架发消息的接口（`ICoreWebView2Frame2::WebMessageReceived`）
+///   并实测后去掉这一限制。
 /// - 播放列表：fetch 与 XHR 的响应类型是 HLS 播放列表（`application/vnd.apple.mpegurl` 之类）的，与地址路径以
 ///   `.m3u8` 结尾的请求（含资源加载记录与 video、source 元素上的），每个地址只报一次。
-/// - 请求数：资源加载记录的条数，每秒最多报一次；框架按脚本随机取的编号区分。
-/// - 发回 JSON（见 [`Report`]），附上本框架的 origin：WebKit 上每一层框架都直接经引擎的 `ipc` 消息通道发（不经别的
-///   框架转发，嵌入它的页面截不到），别的引擎经 wry 的 `window.ipc`。
+/// - 文档类型：顶层框架在文档建出时报一次 `document.contentType`。
+/// - 发回 JSON（见 [`Report`]）。发送出的任何错都不抛进页面：脚本改写了页面的 fetch 与 XHR，抛出的异常会成为页面
+///   自己的请求失败。
 pub const SCRIPT: &str = r#"
 (function () {
   if (window.__hsM3u8Sniff) return;
   Object.defineProperty(window, '__hsM3u8Sniff', { value: true });
-  var frame = Math.random().toString(36).slice(2);
   var handlers = window.webkit && window.webkit.messageHandlers;
-  var channel = handlers && handlers.ipc ? handlers.ipc : window.ipc;
+  var webkit = handlers && handlers.ipc;
+  if (!webkit && window !== window.top) return;
+  var channel = webkit || window.ipc;
   var send = function (message) {
-    message.origin = location.origin;
-    channel.postMessage(JSON.stringify(message));
+    try { channel.postMessage(JSON.stringify(message)); } catch (e) {}
   };
+  if (window === window.top) send({ kind: 'document', type: document.contentType });
   var playlist = /^\s*(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(x-)?mpegurl)\s*(;|$)/i;
   var named = function (raw) {
     var url;
@@ -33,7 +38,8 @@ pub const SCRIPT: &str = r#"
   };
   var seen = new Set();
   var found = function (raw) {
-    var url = new URL(String(raw), location.href).href;
+    var url;
+    try { url = new URL(String(raw), location.href).href; } catch (e) { return; }
     if (seen.has(url)) return;
     seen.add(url);
     send({ kind: 'stream', url: url, agent: navigator.userAgent });
@@ -59,10 +65,8 @@ pub const SCRIPT: &str = r#"
     });
     return open0.apply(this, arguments);
   };
-  var requests = 0, reported = -1;
   new PerformanceObserver(function (list) {
     list.getEntries().forEach(function (entry) {
-      requests += 1;
       if (named(entry.name)) found(entry.name);
     });
   }).observe({ type: 'resource', buffered: true });
@@ -71,31 +75,22 @@ pub const SCRIPT: &str = r#"
       var src = media.currentSrc || media.src;
       if (src && named(src)) found(src);
     });
-    if (requests !== reported) {
-      reported = requests;
-      send({ kind: 'requests', frame: frame, count: requests });
-    }
   }, 1000);
 })();
 "#;
 
 /// 一条消息最长多少字节：页面能发任意多、任意长的消息，超过的不收。
 pub const MAX_MESSAGE: usize = 16 * 1024;
-/// User-Agent、框架编号与网页标题最长多少字符，超出的截掉。
+/// User-Agent、文档类型与网页标题最长多少字符，超出的截掉。
 pub const MAX_TEXT: usize = 300;
 
 /// 脚本发回、校验过的一条消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Report {
-    /// 找到一个播放列表的地址：`origin` 为它所在框架的 origin（不是 http(s) 的为 None，如沙箱里的框架），`agent` 为
-    /// 网页的 User-Agent
-    Stream {
-        url: Url,
-        origin: Option<Url>,
-        agent: String,
-    },
-    /// 框架 `frame`（脚本随机取的编号）到现在发出的请求数
-    Requests { frame: String, count: u32 },
+    /// 找到一个播放列表的地址；`agent` 为网页的 User-Agent
+    Stream { url: Url, agent: String },
+    /// 顶层文档的类型（MIME，如 `text/html`）
+    Document { content_type: String },
 }
 
 /// 消息的原样内容，未校验。
@@ -104,12 +99,11 @@ pub enum Report {
 enum Raw {
     Stream {
         url: String,
-        origin: String,
         agent: String,
     },
-    Requests {
-        frame: String,
-        count: u32,
+    Document {
+        #[serde(rename = "type")]
+        content_type: String,
     },
 }
 
@@ -119,14 +113,12 @@ pub fn parse(message: &str) -> Option<Report> {
         return None;
     }
     Some(match serde_json::from_str(message).ok()? {
-        Raw::Stream { url, origin, agent } => Report::Stream {
+        Raw::Stream { url, agent } => Report::Stream {
             url: http_url(&url)?,
-            origin: http_url(&origin),
             agent: clip(&agent),
         },
-        Raw::Requests { frame, count } => Report::Requests {
-            frame: clip(&frame),
-            count,
+        Raw::Document { content_type } => Report::Document {
+            content_type: clip(&content_type),
         },
     })
 }
@@ -146,35 +138,36 @@ mod tests {
     #[test]
     fn reports_are_checked_before_use() {
         let stream = r#"{"kind":"stream","url":"https://cdn.example/a/playlist?id=3",
-            "origin":"https://video.example","agent":"Mozilla/5.0"}"#;
+            "agent":"Mozilla/5.0"}"#;
         assert_eq!(
             parse(stream),
             Some(Report::Stream {
                 url: Url::parse("https://cdn.example/a/playlist?id=3").unwrap(),
-                origin: Some(Url::parse("https://video.example").unwrap()),
                 agent: "Mozilla/5.0".into(),
             })
         );
-        // 沙箱里的框架 origin 为 null：照收，不带 Referer
-        let sandboxed = r#"{"kind":"stream","url":"https://a/x.m3u8","origin":"null","agent":""}"#;
-        assert!(matches!(
-            parse(sandboxed),
-            Some(Report::Stream { origin: None, .. })
-        ));
+        assert_eq!(
+            parse(r#"{"kind":"document","type":"text/html"}"#),
+            Some(Report::Document {
+                content_type: "text/html".into()
+            })
+        );
         // 不是 http(s)、认不出的种类、太长的都不要
         assert_eq!(
-            parse(r#"{"kind":"stream","url":"javascript:alert(1)","origin":"null","agent":""}"#),
+            parse(r#"{"kind":"stream","url":"javascript:alert(1)","agent":""}"#),
             None
         );
         assert_eq!(parse(r#"{"kind":"run","command":"rm"}"#), None);
         assert_eq!(parse(&"x".repeat(MAX_MESSAGE + 1)), None);
-        let requests = format!(
-            r#"{{"kind":"requests","frame":"{}\u0007","count":3}}"#,
+        // 控制字符去掉、过长的截短
+        let long = format!(
+            r#"{{"kind":"document","type":"{}\u0007"}}"#,
             "长".repeat(400)
         );
-        let Some(Report::Requests { frame, count }) = parse(&requests) else {
-            panic!("请求数消息应认得");
+        let Some(Report::Document { content_type }) = parse(&long) else {
+            panic!("文档类型消息应认得");
         };
-        assert_eq!((frame.chars().count(), count), (MAX_TEXT, 3));
+        assert_eq!(content_type.chars().count(), MAX_TEXT);
+        assert!(!content_type.contains('\u{7}'));
     }
 }

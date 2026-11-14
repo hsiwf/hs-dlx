@@ -1,7 +1,7 @@
-//! 由网页引擎暂停或静音网页里的视频与音频。
+//! 由网页引擎让网页里的视频与音频不出声：macOS 上暂停，Windows、Linux 上静音。
 
 #[cfg(target_os = "macos")]
-pub(crate) fn suspend(webview: &wry::WebView, suspended: bool) -> Result<(), String> {
+pub(crate) fn silence(webview: &wry::WebView, silenced: bool) -> Result<(), String> {
     use objc2::runtime::NSObjectProtocol as _;
     use objc2::sel;
     use wry::WebViewExtMacOS as _;
@@ -12,21 +12,21 @@ pub(crate) fn suspend(webview: &wry::WebView, suspended: bool) -> Result<(), Str
         return Err("这个系统版本的网页引擎不能暂停播放".to_owned());
     }
     // SAFETY: 在界面线程上调（WKWebView 只能在主线程上用），网页视图此刻有效，上面已确认它认得这个方法；不要完成回调。
-    unsafe { webview.setAllMediaPlaybackSuspended_completionHandler(suspended, None) };
+    unsafe { webview.setAllMediaPlaybackSuspended_completionHandler(silenced, None) };
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn suspend(webview: &wry::WebView, suspended: bool) -> Result<(), String> {
+pub(crate) fn silence(webview: &wry::WebView, silenced: bool) -> Result<(), String> {
     use webkit2gtk::WebViewExt as _;
     use wry::WebViewExtUnix as _;
 
-    webview.webview().set_is_muted(suspended);
+    webview.webview().set_is_muted(silenced);
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn suspend(webview: &wry::WebView, suspended: bool) -> Result<(), String> {
+pub(crate) fn silence(webview: &wry::WebView, silenced: bool) -> Result<(), String> {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_8;
     use windows::core::Interface as _;
     use wry::WebViewExtWindows as _;
@@ -36,5 +36,5 @@ pub(crate) fn suspend(webview: &wry::WebView, suspended: bool) -> Result<(), Str
         .cast::<ICoreWebView2_8>()
         .map_err(|error| format!("网页引擎太旧，不能静音：{error}"))?;
     // SAFETY: 在界面线程上调（WebView2 只能在建它的线程上用），网页视图此刻有效。
-    unsafe { core.SetIsMuted(suspended) }.map_err(|error| format!("网页没能静音：{error}"))
+    unsafe { core.SetIsMuted(silenced) }.map_err(|error| format!("网页没能静音：{error}"))
 }

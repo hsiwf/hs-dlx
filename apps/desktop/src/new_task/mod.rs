@@ -1,5 +1,6 @@
-//! 新建任务：带着请求头探测地址，每档清晰度画成一个同心环（越粗码率越高，引线连到右侧的标签），点环或用方向键
-//! 选中，再选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新探测；请求经哪个代理写在选项栏里。
+//! 新建任务：带着请求头探测地址（或用嗅探页已探测好的结果），每档清晰度画成一个同心环（越粗码率越高，引线连到右侧
+//! 的标签），点环或用方向键选中，再选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新探测；取到的不是播放列表
+//! 时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在选项栏里。
 
 mod rings;
 mod side;
@@ -16,13 +17,13 @@ use gpui_kit::{
     IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
     Task, Window, div, px,
 };
-use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, task_title};
+use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, ProxySource, Source, Url};
 
+use crate::format;
 use crate::headers::HeadersEditor;
 use crate::ui::{BOTTOM, GAP};
-use crate::{format, links};
 
 /// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
 const OPTION_MIN_WIDTH: f32 = 260.;
@@ -39,6 +40,8 @@ pub struct Link {
     pub title: Option<String>,
     /// 探测与下载时带的请求头
     pub headers: Vec<(String, String)>,
+    /// 已带着这些请求头探测好的结果（嗅探页后台探测的）：新建页不再探测；None 时新建页自己探测
+    pub probe: Option<Box<Probe>>,
 }
 
 /// 新建任务视图发给外面的事件。
@@ -50,7 +53,9 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 地址取到的不是播放列表、地址也不像播放列表（多为放着播放器的网页）：到网页里找视频流
+    /// 第一次探测（不是改了请求头重新探测）取到的不是播放列表：由外面决定要不要看它是不是网页
+    NotAPlaylist,
+    /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
 }
 
@@ -117,6 +122,12 @@ pub struct NewTask {
     /// 交给服务的网页标题（见 [`Link::title`]）
     page_title: Option<String>,
     probing: Probing,
+    /// 外面正在网页引擎里打开地址，看它是不是网页（探测失败的说明先不显示）
+    opening_page: bool,
+    /// 外面看过之后的说明（如网页引擎认出它是视频文件），写在失败的说明下面
+    page_note: Option<String>,
+    /// 从嗅探页来的流：失败页上不再给「在网页里找视频流」
+    from_sniff: bool,
     /// 选中的变体在 `MasterInfo::variants` 里的下标；来源是媒体播放列表时不用
     variant: usize,
     /// 选中的音频在 `MasterInfo::audio` 里的下标；None 为来源的默认
@@ -144,9 +155,11 @@ pub struct NewTask {
 impl EventEmitter<NewTaskEvent> for NewTask {}
 
 impl NewTask {
+    /// 打开 `link` 的新建页；`from_sniff` 为从嗅探页来的。
     pub fn new(
         service: Rc<Service>,
         link: Link,
+        from_sniff: bool,
         folder: PathBuf,
         home: Option<PathBuf>,
         window: &mut Window,
@@ -156,6 +169,7 @@ impl NewTask {
             url,
             title: page_title,
             headers,
+            probe,
         } = link;
         let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
         // 读系统代理要调操作系统的接口，在后台读
@@ -177,6 +191,9 @@ impl NewTask {
             page_title,
             url,
             probing: Probing::Running,
+            opening_page: false,
+            page_note: None,
+            from_sniff,
             variant: 0,
             audio: None,
             hovered: None,
@@ -192,49 +209,74 @@ impl NewTask {
             _route: route,
             _probe: Task::ready(()),
         };
-        view.probe(headers, cx);
+        match probe {
+            Some(probe) => view.probed(Probing::Ready(probe)),
+            None => view.probe(headers, true, cx),
+        }
         view
     }
 
-    /// 带着请求头 `headers` 探测（之前的探测结果作废）。
-    fn probe(&mut self, headers: Vec<(String, String)>, cx: &mut Context<Self>) {
+    /// 带着请求头 `headers` 探测（之前的探测结果作废）；`first` 为打开时的那一次。
+    fn probe(&mut self, headers: Vec<(String, String)>, first: bool, cx: &mut Context<Self>) {
         let mut source = Source::new(self.url.clone());
         source.http.headers = headers;
         let handle = self.service.probe(source);
         self.probing = Probing::Running;
-        let page_like = links::stream_url(self.url.as_str()).is_none();
+        self.opening_page = false;
+        self.page_note = None;
         self._probe = cx.spawn(async move |this, cx| {
-            let probing = match handle.await {
-                Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
-                // 取到的不是播放列表、地址也不像播放列表：多半是放着播放器的网页，转去网页里找视频流
-                Ok(Err(error)) if page_like && is_not_playlist(&error) => {
-                    // 视图在探测期间被关掉时不再需要结果
-                    let _closed = this.update(cx, |this, cx| {
-                        cx.emit(NewTaskEvent::Sniff(this.url.clone()))
-                    });
-                    return;
-                }
-                Ok(Err(error)) => Probing::Failed(Failure::of(&error)),
-                Err(join) => Probing::Failed(Failure {
-                    kind: FailureKind::Other,
-                    message: format!("探测中途出错：{join}"),
-                }),
+            let (probing, not_page) = match handle.await {
+                Ok(Ok(probe)) => (Probing::Ready(Box::new(probe)), false),
+                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), not_a_playlist(&error)),
+                Err(join) => (
+                    Probing::Failed(Failure {
+                        kind: FailureKind::Other,
+                        message: format!("探测中途出错：{join}"),
+                    }),
+                    false,
+                ),
             };
             // 视图在探测期间被关掉时不再需要结果
             let _closed = this.update(cx, |this, cx| {
-                if let Probing::Ready(probe) = &probing
-                    && let Some(master) = &probe.master
-                {
-                    this.variant = master.selected.variant.index;
-                    this.audio = master.selected.audio.as_ref().map(|a| a.index);
-                }
-                if matches!(probing, Probing::Ready(_)) {
+                let ready = matches!(probing, Probing::Ready(_));
+                this.probed(probing);
+                if ready {
                     cx.emit(NewTaskEvent::Ready);
+                } else if first && not_page {
+                    cx.emit(NewTaskEvent::NotAPlaylist);
                 }
-                this.probing = probing;
                 cx.notify();
             });
         });
+        cx.notify();
+    }
+
+    /// 探测有了结果：成了的选中来源默认的变体与音频。
+    fn probed(&mut self, probing: Probing) {
+        if let Probing::Ready(probe) = &probing
+            && let Some(master) = &probe.master
+        {
+            self.variant = master.selected.variant.index;
+            self.audio = master.selected.audio.as_ref().map(|a| a.index);
+        }
+        self.probing = probing;
+    }
+
+    /// 外面开始在网页引擎里打开地址、看它是不是网页：探测失败的说明先不显示。
+    pub fn opening_page(&mut self, cx: &mut Context<Self>) {
+        self.opening_page = true;
+        cx.notify();
+    }
+
+    /// 外面正在网页引擎里打开地址（[`NewTask::opening_page`] 之后，没有重新探测）。
+    pub fn is_opening_page(&self) -> bool {
+        self.opening_page
+    }
+
+    /// 外面看过了、不是网页（或打不开）：显示探测失败的说明，`note` 写在下面。
+    pub fn not_a_page(&mut self, note: String, cx: &mut Context<Self>) {
+        self.opening_page = false;
+        self.page_note = Some(note);
         cx.notify();
     }
 
@@ -244,7 +286,7 @@ impl NewTask {
             .headers
             .update(cx, |editor, cx| editor.confirm(window, cx))
         {
-            self.probe(headers, cx);
+            self.probe(headers, false, cx);
         }
     }
 
@@ -255,6 +297,7 @@ impl NewTask {
     pub fn phase(&self) -> Phase {
         match self.probing {
             Probing::Running => Phase::Probing,
+            Probing::Failed(_) if self.opening_page => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
             Probing::Ready(_) => Phase::Ready,
         }
@@ -422,16 +465,7 @@ impl Render for NewTask {
     }
 }
 
-/// 探测的错误是取到的内容不是播放列表（没有 `#EXTM3U`），如网页、视频文件。
-fn is_not_playlist(error: &hs_m3u8_core::Error) -> bool {
-    matches!(
-        error,
-        hs_m3u8_core::Error::Playlist { cause, .. }
-            if **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist
-    )
-}
-
-/// 探测结果的说明（不含主机）：时长（直播不写）、几档清晰度与最高的宽高、几条另外的音轨、是否直播。
+/// 探测结果的说明（不含主机）：时长（直播不写）、几档清晰度、几条另外的音轨、是否直播。
 pub fn describe(probe: &Probe) -> Vec<String> {
     let mut parts = Vec::new();
     if !probe.live {

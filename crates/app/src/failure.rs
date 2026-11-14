@@ -24,6 +24,15 @@ impl Failure {
     }
 }
 
+/// 探测或下载取到的不是播放列表（没有 `#EXTM3U`）：网页、视频文件之类。是哪一层（来源本身，还是主播放列表里的变体）
+/// 取到的看错误里的地址。
+pub fn not_a_playlist(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Playlist { cause, .. } if **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist
+    )
+}
+
 /// 失败的种类：调用方据此决定怎么提示、能不能重试、该不该先改请求头或换输出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
@@ -192,6 +201,26 @@ impl FailureKind {
         }
     }
 
+    /// 改了请求头再跑可能有不同结果：失败出在请求上（被拒、错误页、网络、停滞），或还没跑出结果（没有可写出的，接着
+    /// 录制）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占与其余再试也一样的，与请求头无关。
+    pub fn headers_matter(self) -> bool {
+        match self {
+            FailureKind::Status(_)
+            | FailureKind::Malformed
+            | FailureKind::Network
+            | FailureKind::Stalled
+            | FailureKind::NothingToWrite
+            | FailureKind::Other => true,
+            FailureKind::Certificate
+            | FailureKind::Disk
+            | FailureKind::OutputTaken
+            | FailureKind::SourceChanged
+            | FailureKind::Mp4Unsupported
+            | FailureKind::Unsupported
+            | FailureKind::Unrecoverable => false,
+        }
+    }
+
     /// 多半要先改请求头（补上 Referer、Cookie、Authorization）：被服务器拒绝，或取到的是错误页、登录页。
     pub fn headers_may_help(self) -> bool {
         matches!(
@@ -295,6 +324,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_page_is_not_a_playlist() {
+        let playlist = |cause| CoreError::Playlist {
+            url: Box::new(Url::parse("https://a.example/watch").unwrap()),
+            cause: Box::new(cause),
+        };
+        assert!(not_a_playlist(&playlist(
+            hs_m3u8_core::hls::Malformed::NotAPlaylist
+        )));
+        assert!(!not_a_playlist(&playlist(
+            hs_m3u8_core::hls::Malformed::Empty
+        )));
+        assert!(!not_a_playlist(&http(HttpErrorKind::Status(403))));
+    }
+
     /// 分片里包着的 403、直播刷新一直 403 都按状态码；其余按种类。
     #[test]
     fn errors_are_classified_through_their_causes() {
@@ -332,6 +376,7 @@ mod tests {
         assert!(FailureKind::Malformed.headers_may_help());
         assert!(FailureKind::Status(403).headers_may_help());
         assert!(!FailureKind::Network.headers_may_help());
+        assert!(!FailureKind::Unrecoverable.headers_matter());
         let unaligned = CoreError::WorkDir {
             path: PathBuf::from("/m/a.hsdl"),
             problem: WorkDirProblem::Unaligned { track: 1 },

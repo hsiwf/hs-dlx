@@ -23,8 +23,8 @@ pub(super) enum Action {
 pub(super) struct Plan {
     /// 最该先做的排第一，各不相同
     pub actions: Vec<Action>,
-    /// 改请求头保存后接着续传续录。只保存的：只写出已录的（不联网）、放不进 MP4 的（要先换输出），与失败同请求头无关
-    /// 的（证书、不支持、来源变了、本机磁盘、保存位置被占）
+    /// 改请求头保存后接着续传续录。只保存的：只写出已录的（不联网），失败与请求头无关的（见
+    /// [`FailureKind::headers_matter`]）
     pub resume_after_headers: bool,
 }
 
@@ -34,7 +34,7 @@ pub(super) struct Plan {
 /// - 再跑一次：选了只写出的写出，其余续传续录；没有可写出的改为续录。
 /// - 被拒或取到错误页的，先改请求头；放不进 MP4 的，先改存本地 HLS，此前再跑只会同样失败。
 /// - 直播接不上之前录的、来源已没有（404/410）或停滞的，先写出已录的：续录多半不成。
-/// - 再试也一样的不给再跑；改了请求头可能不一样（被拒、错误页、重定向），保存后接着跑。
+/// - 再试也一样的不给再跑；改了请求头可能不一样的（[`FailureKind::headers_matter`]），保存后接着跑。
 /// - 直播停着时都能写出已录的，选了只写出的也能改回续录；任何停着的任务都能改请求头。
 pub(super) fn stopped_plan(
     failure: Option<FailureKind>,
@@ -89,20 +89,10 @@ pub(super) fn stopped_plan(
     if failure == Some(FailureKind::OutputTaken) {
         add(Action::OpenFolder);
     }
-    let headers_matter = !matches!(
-        failure,
-        Some(
-            FailureKind::Certificate
-                | FailureKind::Unsupported
-                | FailureKind::Mp4Unsupported
-                | FailureKind::SourceChanged
-                | FailureKind::Disk
-                | FailureKind::OutputTaken
-        )
-    );
     Plan {
         actions,
-        resume_after_headers: headers_matter && rerun == Action::Resume,
+        resume_after_headers: failure.is_none_or(FailureKind::headers_matter)
+            && rerun == Action::Resume,
     }
 }
 
@@ -148,10 +138,10 @@ mod tests {
             actions(Some(FailureKind::OutputTaken), false, false),
             [Resume, EditHeaders, OpenFolder]
         );
-        // 再试也一样的点播：只剩改请求头（放弃另给），改了请求头保存后重试
+        // 再试也一样的点播：只剩改请求头（放弃另给），改了请求头也只保存
         let stuck = stopped_plan(Some(FailureKind::Unrecoverable), false, false, false);
         assert_eq!(stuck.actions, [EditHeaders]);
-        assert!(stuck.resume_after_headers);
+        assert!(!stuck.resume_after_headers);
     }
 
     #[test]

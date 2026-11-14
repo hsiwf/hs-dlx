@@ -69,14 +69,26 @@ fn free_space(folder: &std::path::Path) -> Result<u64, String> {
 enum Page {
     /// 选中的任务；没有任务时为待机页
     Task,
-    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页
+    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页；`checking`
+    /// 为第一次探测取到的不是播放列表时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
     NewTask {
         view: Entity<NewTask>,
         _subscription: Subscription,
         from_sniff: bool,
+        checking: Option<(Entity<SniffView>, Subscription)>,
     },
-    /// 网页里的视频流（[`Shell::sniff`] 此时有值）；网页显示着时占满主体，不显示任务列表
-    Sniff,
+    /// 网页里的视频流（即 [`Shell::sniff`] 里的视图）；网页显示着时占满主体，不显示任务列表
+    Sniff(Entity<SniffView>),
+}
+
+/// 退出进行到哪一步。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quit {
+    Staying,
+    /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
+    Waiting,
+    /// 退出已不可撤回（已向系统发出退出）：不再接手转交来的链接
+    Leaving,
 }
 
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
@@ -91,7 +103,7 @@ pub struct Shell {
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
     page: Page,
-    /// 嗅探页与对它的订阅：关掉之前一直留着，不显示时网页藏起来、停止播放，任务列表里有一项可以回去
+    /// 嗅探页与对它的订阅：关掉之前一直留着（不显示时网页藏起来、不出声），任务列表里有一项可以回去
     sniff: Option<(Entity<SniffView>, Subscription)>,
     paste: Entity<InputState>,
     /// 新建任务默认保存到的目录；新建时换过就记住，到应用退出
@@ -107,8 +119,8 @@ pub struct Shell {
     confirm_discard: Option<TaskId>,
     /// 正在改请求头的停着的任务与编辑框
     editing_headers: Option<(TaskId, Entity<HeadersEditor>)>,
-    /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行
-    quitting: bool,
+    /// 退出到了哪一步
+    quit: Quit,
     /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
     creating: usize,
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
@@ -182,6 +194,7 @@ impl Shell {
             this.update(cx, |shell, cx| shell.should_close(window, cx))
                 .unwrap_or(true)
         });
+
         let handing = match handoffs {
             Ok(mut handoffs) => cx.spawn_in(window, async move |this, cx| {
                 while let Some(received) = handoffs.recv().await {
@@ -238,7 +251,7 @@ impl Shell {
             clipboard: None,
             confirm_discard: None,
             editing_headers: None,
-            quitting: false,
+            quit: Quit::Staying,
             creating: 0,
             early: Vec::new(),
             _events: receiving,
@@ -260,14 +273,16 @@ impl Shell {
         shell
     }
 
-    /// 再次打开应用时转交来的：窗口到前台，退出中的不再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次
-    /// 没收成的转交提示原因。
+    /// 再次打开应用时转交来的：已决定退出时不接手（交来的一方告诉用户没交过去）；否则接手，窗口到前台，等着退出的不
+    /// 再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次没收成的转交提示原因。
     fn receive(&mut self, received: Received, window: &mut Window, cx: &mut Context<Self>) {
         match received {
-            Ok(handoff) => {
+            Ok(_) if self.quit == Quit::Leaving => {}
+            Ok(delivery) => {
+                let handoff = delivery.accept();
                 cx.activate(true);
                 window.activate_window();
-                if self.quitting {
+                if self.quitting() {
                     self.cancel_quit("再次打开了应用，没有退出".to_owned());
                 }
                 if let Handoff::Link(link) = handoff {
@@ -352,7 +367,7 @@ impl Shell {
                     "新建任务时存储写不进，任务已取消，但留下了不在任何任务名下的 {}：{reason}",
                     paths.join("、")
                 ));
-                if self.quitting {
+                if self.quitting() {
                     self.cancel_quit("有要处理的东西，没有退出".to_owned());
                 }
             }
@@ -388,7 +403,7 @@ impl Shell {
             }
             row.forget_disk();
         }
-        if self.quitting && (failed || !problems.is_empty()) {
+        if self.quitting() && (failed || !problems.is_empty()) {
             self.cancel_quit(format!("「{title}」停下时有要处理的，没有退出"));
         }
         for text in problems {
@@ -502,23 +517,20 @@ impl Shell {
         self.show(Page::Task, cx);
     }
 
-    /// 换到 `page`（原来的新建页随之释放）；离开嗅探页时把网页藏起来、停止播放（原生视图不随 GPUI 的画面消失），回到
-    /// 嗅探页时恢复播放。
+    /// 换到 `page`（原来的新建页随之释放）；告诉离开与换上的嗅探视图（见 [`SniffView::set_on_screen`]）。
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
-        let (was, will) = (
-            matches!(self.page, Page::Sniff),
-            matches!(page, Page::Sniff),
-        );
-        if was != will
-            && let Some((sniff, _)) = &self.sniff
-        {
-            sniff.update(cx, |sniff, cx| {
-                if will {
-                    sniff.reveal(cx);
-                } else {
-                    sniff.hide(cx);
-                }
-            });
+        let sniff_of = |page: &Page| match page {
+            Page::Sniff(view) => Some(view.clone()),
+            Page::Task | Page::NewTask { .. } => None,
+        };
+        let (was, will) = (sniff_of(&self.page), sniff_of(&page));
+        if was != will {
+            if let Some(was) = was {
+                was.update(cx, |sniff, cx| sniff.set_on_screen(false, cx));
+            }
+            if let Some(will) = will {
+                will.update(cx, |sniff, cx| sniff.set_on_screen(true, cx));
+            }
         }
         self.page = page;
         cx.notify();
@@ -528,7 +540,7 @@ impl Shell {
     fn new_task(&self) -> Option<&Entity<NewTask>> {
         match &self.page {
             Page::NewTask { view, .. } => Some(view),
-            Page::Task | Page::Sniff => None,
+            Page::Task | Page::Sniff(_) => None,
         }
     }
 }
@@ -561,20 +573,13 @@ impl Render for Shell {
         let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
         let listed = !self.rows.is_empty() || self.new_task().is_some() || self.sniff.is_some();
         // 网页显示着时占满主体，不显示任务列表
-        let page_shown = matches!(self.page, Page::Sniff)
-            && self
-                .sniff
-                .as_ref()
-                .is_some_and(|(sniff, _)| sniff.read(cx).page_shown());
+        let page_shown = matches!(&self.page, Page::Sniff(sniff) if sniff.read(cx).page_shown());
         if !page_shown && listed {
             body = body.child(self.render_list(now, cx));
         }
         body = match &self.page {
             Page::NewTask { view, .. } => body.child(view.clone()),
-            Page::Sniff => {
-                let (view, _) = self.sniff.as_ref().expect("嗅探页显示时嗅探视图在");
-                body.child(view.clone())
-            }
+            Page::Sniff(view) => body.child(view.clone()),
             Page::Task => match self.selected_row() {
                 Some(row) => {
                     let (main, aside) = self.render_task(row, now, cx);

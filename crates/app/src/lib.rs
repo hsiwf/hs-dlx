@@ -9,7 +9,7 @@ mod store;
 mod task;
 
 pub use error::Error;
-pub use failure::{Failure, FailureKind};
+pub use failure::{Failure, FailureKind, not_a_playlist};
 pub use naming::{task_title, title_of};
 pub use preference::StoredPreference;
 pub use service::{Event, Events, Service};

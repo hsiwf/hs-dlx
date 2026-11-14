@@ -120,10 +120,10 @@ impl WebView {
         (!reasons.is_empty()).then(|| reasons.join("；"))
     }
 
-    /// 暂停（`suspended`）或恢复网页里全部的视频与音频，由网页引擎做，页面自己的脚本挡不住：网页不显示时不出声。
-    /// macOS 上暂停期间页面也播不了；Windows 上为静音；Linux 上为静音。做不到时为原因。
-    pub fn suspend_media(&self, suspended: bool) -> Result<(), String> {
-        media::suspend(&self.webview, suspended)
+    /// 让网页里全部的视频与音频不出声（`silenced`）或恢复，由网页引擎做，页面自己的脚本挡不住：macOS 上为暂停，期间
+    /// 页面也播不了；Windows、Linux 上为静音，视频照常播放、下载。做不到时为原因。
+    pub fn silence_media(&self, silenced: bool) -> Result<(), String> {
+        media::silence(&self.webview, silenced)
     }
 
     /// 藏起网页（页面照旧留着）：所在的视图不再显示时调，下次画出来时重新摆出来。

@@ -21,7 +21,7 @@ use rusqlite::Transaction;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
@@ -197,11 +197,13 @@ impl Service {
         self.flush()
     }
 
-    /// 探测来源；返回的句柄在任何执行器上都可等待，丢弃它不取消探测。
-    pub fn probe(&self, source: Source) -> JoinHandle<Result<Probe, hs_m3u8_core::Error>> {
+    /// 探测来源；返回的句柄在任何执行器上都可等待，释放它即取消探测（连同在途的请求）。
+    pub fn probe(&self, source: Source) -> AbortOnDropHandle<Result<Probe, hs_m3u8_core::Error>> {
         let engine = self.shared.engine.clone();
-        self.runtime()
-            .spawn(async move { engine.probe(&source).await })
+        AbortOnDropHandle::new(
+            self.runtime()
+                .spawn(async move { engine.probe(&source).await }),
+        )
     }
 
     /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里，

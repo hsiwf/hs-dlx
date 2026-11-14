@@ -1,5 +1,5 @@
 //! 新建页右边的选项栏：标题与摘要、清晰度之外的选择（音轨、输出、保存位置、请求头）、请求经哪里走与开始按钮；
-//! 探测失败时为失败原因与能做的事（改请求头重新探测、重新探测）。
+//! 探测失败时为失败原因与能做的事（改请求头重新探测、重新探测、在网页里找视频流）。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -45,20 +45,21 @@ impl NewTask {
                     .child(ui::num(ui::caption(self.summary(&host)))),
             );
         match &self.probing {
-            Probing::Running => side.child(div().flex_1()).child(ui::button(
-                "cancel",
-                "取消",
-                Tone::Ghost,
-                cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
-            )),
+            Probing::Running => side.child(div().flex_1()).child(self.cancel_button(cx)),
+            Probing::Failed(_) if self.opening_page => side
+                .child(ui::caption("取到的不是播放列表，正在网页里打开看看…"))
+                .child(div().flex_1())
+                .child(self.cancel_button(cx)),
             Probing::Failed(failure) => {
-                // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测
+                // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的
+                // 还可以在网页里打开它找视频流
                 let headers = failure.kind.headers_may_help();
                 let again = headers || failure.kind.retry_helps();
                 side.child(
                     ui::card(theme::error_edge())
                         .child(SharedString::from(failure.message.clone())),
                 )
+                .children(self.page_note.clone().map(ui::caption))
                 .children(self.route_line())
                 .when(headers, |side| {
                     side.child(
@@ -74,6 +75,7 @@ impl NewTask {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(10.))
                         .when(again, |row| {
                             row.child(ui::button(
@@ -87,6 +89,17 @@ impl NewTask {
                                 cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
                             ))
                         })
+                        .when(!self.from_sniff, |row| {
+                            let url = self.url.clone();
+                            row.child(ui::button(
+                                "sniff",
+                                "在网页里找视频流",
+                                Tone::Plain,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(NewTaskEvent::Sniff(url.clone()))
+                                }),
+                            ))
+                        })
                         .child(ui::button(
                             "dismiss",
                             "返回",
@@ -97,6 +110,15 @@ impl NewTask {
             }
             Probing::Ready(probe) => self.ready_side(side, probe, cx),
         }
+    }
+
+    fn cancel_button(&self, cx: &mut Context<Self>) -> gpui_kit::Stateful<Div> {
+        ui::button(
+            "cancel",
+            "取消",
+            Tone::Ghost,
+            cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
+        )
     }
 
     /// 「网络」一行：这个地址的请求经哪个代理或为什么直连；还没读到系统代理时为 None。

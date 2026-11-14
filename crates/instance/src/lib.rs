@@ -7,8 +7,8 @@
 //!   核对对端的用户就是任务存储文件的属主。
 //! - Windows：管道只许属主与 SYSTEM 访问；管道名带 128 位随机数、只记在本用户的数据目录里，别的用户猜不到，抢不先建。
 //!
-//! 协议：4 字节大端长度 + UTF-8 链接（长度 0 为只到前台），链接最长 64 KiB；主实例交给界面后回 1 个字节 1。连接与
-//! 一次转交的读写各限 2 秒。
+//! 协议：4 字节大端长度 + UTF-8 链接（长度 0 为只到前台），链接最长 64 KiB；界面接手后主实例回 1 个字节 1，界面不接
+//! 手（如已在退出）时不回、关掉连接。连接、读写与等界面接手各限 2 秒。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,12 +17,14 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::tokio::{Listener, Stream};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// 链接最长多少字节：带签名参数的地址可达数 KB，再长的不是链接。
 const MAX_LINK: u32 = 64 * 1024;
 /// 连上主实例、一次转交的读写，各最多多久：对端不说话时不让双方一直等。
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 主实例等界面接手最多多久：界面线程卡住（如退出时等任务停下）时让交出的一方及时报没交过去。
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 收连接出错后隔多久再收：出错多为进程的文件描述符用尽，立即重试只会空转。
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// 主实例收下时回的字节。
@@ -37,8 +39,25 @@ pub enum Handoff {
     Link(String),
 }
 
+/// 交来的一次转交。界面接手（[`Delivery::accept`]）后才给交出的一方回确认；释放它而不接手时，交出的一方报没交过去
+/// （由它把链接告诉用户）。
+#[derive(Debug)]
+pub struct Delivery {
+    handoff: Handoff,
+    accepted: oneshot::Sender<()>,
+}
+
+impl Delivery {
+    /// 接手：给交出的一方回确认（交来之后 2 秒才接手的，对端已报没交过去）。
+    pub fn accept(self) -> Handoff {
+        // 收转交的一方已不等（超时、连接断了）时没有谁要这个确认
+        let _gone = self.accepted.send(());
+        self.handoff
+    }
+}
+
 /// 主实例收到的：交来的，或一次没收成的转交的原因（对端不是本用户、超时、内容太长或不是 UTF-8、收连接出错）。
-pub type Received = Result<Handoff, String>;
+pub type Received = Result<Delivery, String>;
 
 /// 主实例收转交的接收端，在任何执行器上都可等待。
 pub type Handoffs = mpsc::UnboundedReceiver<Received>;
@@ -86,9 +105,9 @@ pub fn listen(store: &Path) -> Result<Handoffs, String> {
     Ok(receiver)
 }
 
-/// 再次打开的实例把 `link` 交给主实例（None 时只请它到前台）：`store` 为主实例打开着的任务存储文件。主实例回了确认
-/// 才算交过去；链接为空或太长、读不出主实例的地址、连不上（主实例刚退出或还没开始收）、对端不是本用户、超时或主
-/// 实例拒收时为原因。
+/// 再次打开的实例把 `link` 交给主实例（None 时只请它到前台）：`store` 为主实例打开着的任务存储文件。主实例的界面接手
+/// 后回了确认才算交过去；链接为空或太长、读不出主实例的地址、连不上（主实例已退出或还没开始收）、对端不是本用户、
+/// 超时或界面没接手时为原因。
 pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), String> {
     let message = match link {
         Some("") => return Err("链接是空的".to_owned()),
@@ -120,14 +139,16 @@ pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), String> {
             stream.flush().await?;
             stream.read_u8().await
         };
-        match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
+        // 对端读、等界面接手、回确认都有各自的时限，这里等它们加起来
+        let waited = EXCHANGE_TIMEOUT * 2 + ACCEPT_TIMEOUT;
+        match tokio::time::timeout(waited, exchange).await {
             Ok(Ok(ACCEPTED)) => Ok(()),
             Ok(Ok(other)) => Err(format!("已经打开的那个回了认不出的确认 {other}")),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err("已经打开的那个没有接手（可能正在退出）".to_owned())
+            }
             Ok(Err(error)) => Err(format!("交给已经打开的那个时出错：{error}")),
-            Err(_) => Err(format!(
-                "已经打开的那个 {} 秒没有回应",
-                EXCHANGE_TIMEOUT.as_secs()
-            )),
+            Err(_) => Err(format!("已经打开的那个 {} 秒没有回应", waited.as_secs())),
         }
     })
 }
@@ -140,7 +161,8 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 /// 记主实例地址的文件：存储文件旁的 `<存储文件名>.instance`。
-fn record_path(store: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn record_path(store: &Path) -> PathBuf {
     let mut path = store.as_os_str().to_owned();
     path.push(".instance");
     PathBuf::from(path)
@@ -294,8 +316,8 @@ impl Endpoint {
         Ok(())
     }
 
-    /// 收一次转交：核对对端、读出链接、交给界面、回确认。交给界面之前出的错为 Err；交给界面之后回确认没成的也报出来
-    /// （界面已收下，对端会以为没交过去）。
+    /// 收一次转交：核对对端、读出链接、交给界面，界面接手后回确认。交给界面之前出的错为 Err；界面接手后回确认没成的
+    /// 也报出来（界面已接手，对端会以为没交过去）。界面没接手（释放了、超时）时不回确认，对端照常报没交过去。
     async fn serve(
         &self,
         stream: Stream,
@@ -329,8 +351,15 @@ impl Endpoint {
         } else {
             Handoff::Link(text)
         };
-        if sender.send(Ok(handoff)).is_err() {
+        let (accepted, acceptance) = oneshot::channel();
+        if sender.send(Ok(Delivery { handoff, accepted })).is_err() {
             // 界面已经关了：不回确认，对端照常报没交过去
+            return Ok(());
+        }
+        if !matches!(
+            tokio::time::timeout(ACCEPT_TIMEOUT, acceptance).await,
+            Ok(Ok(()))
+        ) {
             return Ok(());
         }
         let confirm = async {

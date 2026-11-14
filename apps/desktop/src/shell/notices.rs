@@ -2,7 +2,7 @@
 
 use gpui_kit::{Context, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
 
-use super::Shell;
+use super::{Quit, Shell};
 use crate::theme;
 use crate::ui::{self, PAD, TITLE_HEIGHT, Tone};
 
@@ -12,7 +12,7 @@ const SHOWN: usize = 4;
 
 impl Shell {
     pub(super) fn render_notices(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let quitting = self.quitting.then(|| {
+        let quitting = (self.quit == Quit::Waiting).then(|| {
             ui::card(theme::edge())
                 .flex()
                 .flex_col()
@@ -26,14 +26,14 @@ impl Shell {
                             "quit-now",
                             "立即退出",
                             Tone::Plain,
-                            cx.listener(|_, _, _, cx| cx.quit()),
+                            cx.listener(|this, _, _, cx| this.leave(cx)),
                         ))
                         .child(ui::button(
                             "stay",
                             "不退出了",
                             Tone::Ghost,
                             cx.listener(|this, _, _, cx| {
-                                this.quitting = false;
+                                this.quit = Quit::Staying;
                                 cx.notify();
                             }),
                         )),

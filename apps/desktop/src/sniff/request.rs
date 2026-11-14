@@ -6,13 +6,11 @@ use hs_m3u8_webview::cookies::Cookie;
 /// 一条流与它的来历。
 pub struct Found<'a> {
     pub stream: &'a Url,
-    /// 报它的框架的地址，网页引擎给的；认不出是哪个框架时为 None
+    /// 报它的框架的地址，网页引擎给的；认不出是哪个框架（Linux）或框架不是 http(s) 的（about:blank、srcdoc）时为 None
     pub frame: Option<&'a Url>,
-    /// 报它的框架自报的 origin（网页能伪造）；不是 http(s) 的为 None
-    pub origin: Option<&'a Url>,
     /// 网页的 User-Agent，为空时不带
     pub agent: &'a str,
-    /// 顶层页面的地址，网页引擎给的；不是 http(s) 的为 None
+    /// 找到这条流时已显示的顶层页面的地址，网页引擎给的；不是 http(s) 的为 None
     pub top: Option<&'a Url>,
     /// 网页引擎里会发往这条流的 Cookie
     pub cookies: Vec<Cookie>,
@@ -29,15 +27,15 @@ pub struct Headers {
 /// 探测 `found.stream` 要带的请求头，都按核心的规则校验过：
 ///
 /// - Referer：报它的框架的网站（origin，浏览器跨站时的默认做法；核心会把它发给分片与 key 所在的每个主机，完整的页面
-///   地址里常有会话参数）。框架的地址先取网页引擎给的，认不出框架时取它自报的；不是 http(s)，或从 https 页面请求
-///   http 的流时不带。
+///   地址里常有会话参数），认不出框架时为顶层页面的网站。只用网页引擎给的地址，网页自己说的一概不用（能伪造成别的
+///   站点）；不是 http(s)，或从 https 页面请求 http 的流时不带。
 /// - User-Agent：网页的。
 /// - Cookie：流与顶层页面同一站点、且报它的框架（网页引擎认得出的）也与流同一站点时全带；否则只带跨站也带的
 ///   （[`Cookie::cross_site`]）。别的站点的框架（如广告）能报任意地址，不能借它带上这个站点的登录 Cookie。放不进请求
 ///   头的跳过，计入 [`Headers::skipped`]。
 pub fn headers_for(found: &Found<'_>) -> Result<Headers, String> {
     let mut headers = Vec::new();
-    if let Some(origin) = found.frame.or(found.origin)
+    if let Some(origin) = found.frame.or(found.top)
         && !(origin.scheme() == "https" && found.stream.scheme() == "http")
     {
         headers.push((
@@ -108,7 +106,6 @@ mod tests {
         Found {
             stream,
             frame,
-            origin: None,
             agent: "",
             top,
             cookies: vec![
@@ -140,6 +137,14 @@ mod tests {
                 ("User-Agent".to_owned(), "UA".to_owned()),
             ]
         );
+        // 认不出框架时为顶层页面的网站
+        let top = url("https://www.video.example/list");
+        let made = headers_for(&Found {
+            cookies: Vec::new(),
+            ..found(&stream, None, Some(&top))
+        })
+        .unwrap();
+        assert_eq!(made.headers[0].1, "https://www.video.example/");
         // 从 https 页面请求 http 的流不带
         let plain = url("http://cdn.video.example/a/index.m3u8");
         let made = headers_for(&Found {

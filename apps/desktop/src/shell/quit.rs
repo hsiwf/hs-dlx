@@ -3,8 +3,8 @@
 use gpui_kit::{Context, PromptButton, PromptLevel, Window};
 use hs_m3u8_app::Status;
 
-use super::Shell;
 use super::row::Row;
+use super::{Quit, Shell};
 
 impl Shell {
     /// 有任务在运行、继续、放弃或新建：退出要等它们。
@@ -34,16 +34,17 @@ impl Shell {
                 &[PromptButton::new("仍然退出"), PromptButton::cancel("取消")],
                 cx,
             );
-            cx.spawn(async move |_, cx| {
+            cx.spawn(async move |this, cx| {
                 if let Ok(0) = answer.await {
-                    cx.update(|cx| cx.quit());
+                    // 提示框开着期间视图已不在时，应用已在退出
+                    let _closed = this.update(cx, |this, cx| this.leave(cx));
                 }
             })
             .detach();
             return false;
         }
-        if self.quitting {
-            // 已在等任务停下；右上角的提示里可以立即退出
+        if self.quitting() {
+            // 已在等任务停下或已决定退出；右上角的提示里可以立即退出
             return false;
         }
         let recording = self.rows.iter().any(Row::stoppable);
@@ -76,7 +77,7 @@ impl Shell {
             let stop_recordings = recording && choice == 1;
             // 提示框开着期间视图已不在时没有要做的
             let _closed = this.update(cx, |this, cx| {
-                this.quitting = true;
+                this.quit = Quit::Waiting;
                 for row in &this.rows {
                     if row.task.status != Status::Running {
                         continue;
@@ -95,19 +96,32 @@ impl Shell {
         false
     }
 
-    /// 不退出了：失败与没删干净的东西留给用户看；`why` 写进提示。
+    /// 在退出（等任务停下或已决定退出）：不开始新的运行。
+    pub(super) fn quitting(&self) -> bool {
+        self.quit != Quit::Staying
+    }
+
+    /// 不退出了：失败与没删干净的东西留给用户看；`why` 写进提示。已决定退出的照常退出。
     pub(super) fn cancel_quit(&mut self, why: String) {
-        self.quitting = false;
+        if self.quit == Quit::Waiting {
+            self.quit = Quit::Staying;
+        }
         self.notify(why);
+    }
+
+    /// 退出，不再撤回。
+    pub(super) fn leave(&mut self, cx: &mut Context<Self>) {
+        self.quit = Quit::Leaving;
+        cx.quit();
     }
 
     /// 选了退出、任务都停下（继续、放弃与新建也做完）时，把没写进存储的状态补写进去后退出；补写不进时不退出。
     pub(super) fn quit_if_idle(&mut self, cx: &mut Context<Self>) {
-        if !self.quitting || self.busy() > 0 {
+        if self.quit != Quit::Waiting || self.busy() > 0 {
             return;
         }
         match self.service.flush() {
-            Ok(()) => cx.quit(),
+            Ok(()) => self.leave(cx),
             Err(error) => self.cancel_quit(format!(
                 "有任务的状态没能写进存储（{error}），没有退出；再关窗口时可以选择仍然退出"
             )),

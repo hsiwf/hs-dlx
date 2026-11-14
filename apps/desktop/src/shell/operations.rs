@@ -86,7 +86,7 @@ impl Shell {
 
     /// 继续：先读出任务目录里已有的，作本次运行的起点，再开始；读的期间这一行不能再操作。
     pub(super) fn resume(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        if self.quitting {
+        if self.quitting() {
             self.notify("正在退出，不再继续任务".to_owned());
             cx.notify();
             return;
@@ -106,7 +106,7 @@ impl Shell {
     /// 不再续录，只把直播录制已录的写成输出；退出中不开始。
     pub(super) fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) {
         let title = self.title(id);
-        if self.quitting {
+        if self.quitting() {
             self.notify(format!("正在退出，「{title}」没有写出"));
             cx.notify();
             return;
@@ -135,7 +135,7 @@ impl Shell {
     /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。
     pub(super) fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) {
         let title = self.title(id);
-        if self.quitting {
+        if self.quitting() {
             self.notify(format!("正在退出，「{title}」没有改存本地 HLS"));
             cx.notify();
             return;
@@ -163,7 +163,7 @@ impl Shell {
 
     pub(super) fn resume_now(&mut self, id: TaskId) {
         let title = self.title(id);
-        let quitting = self.quitting;
+        let quitting = self.quitting();
         let Some(row) = self.row_mut(id) else {
             return;
         };
@@ -248,7 +248,7 @@ impl Shell {
                 if let Some(row) = this.row_mut(id) {
                     row.discarding = false;
                 }
-                if !problems.is_empty() && this.quitting {
+                if !problems.is_empty() && this.quitting() {
                     this.cancel_quit("放弃没做干净，没有退出".to_owned());
                 }
                 for text in problems {

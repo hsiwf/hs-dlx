@@ -12,8 +12,8 @@ pub fn http_url(text: &str) -> Option<Url> {
         .filter(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-/// `text` 是路径以 `.m3u8` 结尾的 http(s) 链接时为它：看着像 HLS 播放列表（剪贴板里的提示、探测失败时先做什么，
-/// 只按地址猜；不是这样的地址也可能是播放列表）。
+/// `text` 是路径以 `.m3u8` 结尾的 http(s) 链接时为它：看着像 HLS 播放列表（剪贴板里的提示、取到的不是播放列表时要不要
+/// 看它是不是网页，只按地址猜；不是这样的地址也可能是播放列表）。
 pub fn stream_url(text: &str) -> Option<Url> {
     http_url(text).filter(|url| url.path().to_ascii_lowercase().ends_with(".m3u8"))
 }
