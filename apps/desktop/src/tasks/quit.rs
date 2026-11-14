@@ -22,9 +22,11 @@ pub enum Departure {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Quit {
     Staying,
-    /// 正在问要不要退出（提示框开着）：再来的请求不再问。`reopened` 为期间再次打开过应用（接手了转交），选了退出也
-    /// 不退出；`quit_requested` 为问的是关窗、期间又要退出应用（托盘、程序坞、注销），答完要按退出应用再问
+    /// 正在问要不要退出（提示框开着）：再来的请求不再问。`app` 为问的是退出应用（不是关窗）；`reopened` 为期间再次
+    /// 打开过应用（接手了转交），选了退出也不退出；`quit_requested` 为问的是关窗、期间又要退出应用（托盘、程序坞、
+    /// 注销），答完要按退出应用再问
     Asking {
+        app: bool,
         reopened: bool,
         quit_requested: bool,
     },
@@ -77,17 +79,24 @@ impl Tasks {
         }
     }
 
-    /// 开始问要不要退出（窗口里的提示框开着）。
-    pub fn ask(&mut self) {
+    /// 开始问要不要退出（窗口里的提示框开着）；`app` 为问的是退出应用（不是关窗）。
+    pub fn ask(&mut self, app: bool) {
         self.quit = Quit::Asking {
+            app,
             reopened: false,
             quit_requested: false,
         };
     }
 
-    /// 正在问时又要退出应用：记下，答完按退出应用再问（见 [`Quit::Asking`]）。没在问时什么也不做。
+    /// 正在问关窗时又要退出应用：记下，答完按退出应用再问（见 [`Quit::Asking`]）。问的已是退出应用时，这次的答复
+    /// 就是答复；没在问时什么也不做。
     pub fn request_quit_while_asking(&mut self) {
-        if let Quit::Asking { quit_requested, .. } = &mut self.quit {
+        if let Quit::Asking {
+            app: false,
+            quit_requested,
+            ..
+        } = &mut self.quit
+        {
             *quit_requested = true;
         }
     }

@@ -1,6 +1,7 @@
 //! 托盘图标（macOS 菜单栏、Windows 通知区域、Linux 的 StatusNotifierItem）：一个环，空闲时是应用的标志，在下点播时
 //! 按它们的平均进度走，在录直播时中间加一个实心点；macOS 在图标旁写百分比与 REC。菜单与悬停提示里是进行中的数量与
-//! 速度、要处理的失败；菜单里还有待看的提示（点了打开窗口）、打开窗口与退出。Windows、Linux 上左键点图标即打开窗口。
+//! 速度、要处理的失败（有时点了打开窗口）；菜单里还有待看的提示（点了打开窗口）、打开窗口与退出。Windows、Linux 上
+//! 左键点图标即打开窗口。
 //!
 //! Linux 上桌面没有托盘宿主（如没装扩展的 GNOME）时图标建得起却看不见，所以它不是回到窗口的唯一入口：再次打开应用
 //! 也会回到窗口（见 hs-m3u8-instance）。
@@ -18,6 +19,9 @@ use crate::{format, theme};
 
 /// 两次刷新托盘之间至少隔多久：进度每秒变好几次，菜单栏重画与 D-Bus 往返都不必跟这么快。
 const REFRESH: Duration = Duration::from_secs(1);
+/// 推给系统出错后第一次重试等多久，之后每次翻倍、最多等 [`RETRY_MAX`]：出错多在系统托盘重启的那一会儿。
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
 /// 图标的边长（像素）：macOS 菜单栏高 22 点，按 2 倍屏画；别处系统再缩放。
 #[cfg(target_os = "macos")]
 const ICON: u32 = 44;
@@ -37,6 +41,8 @@ struct Shown {
     percent: Option<u8>,
     recording: bool,
     status: String,
+    /// 有失败了、等处理的任务：状态那一行可点，点了打开窗口
+    failed: bool,
     notices: usize,
 }
 
@@ -62,6 +68,10 @@ pub struct Tray {
     pending: Option<Task<()>>,
     /// 出错已提示、还没恢复：再出错不再提示
     reported: bool,
+    /// 出错后下一次重试等多久；没出错时为 [`RETRY_FIRST`]
+    retry_after: Duration,
+    /// 出错后到点重推的那一次，推成了即释放
+    retry: Option<Task<()>>,
     _actions: Task<()>,
     _tasks: Subscription,
 }
@@ -111,7 +121,11 @@ impl Tray {
         // 不在时（应用正在退出）丢掉即可
         let (sender, mut actions) = mpsc::unbounded_channel();
         let (open_ids, quit_id) = (
-            [opening.id().clone(), notices.id().clone()],
+            [
+                opening.id().clone(),
+                notices.id().clone(),
+                status.id().clone(),
+            ],
             quitting.id().clone(),
         );
         let menu_sender = sender.clone();
@@ -159,6 +173,8 @@ impl Tray {
                 refreshed_at: None,
                 pending: None,
                 reported: false,
+                retry_after: RETRY_FIRST,
+                retry: None,
                 _actions: handling,
                 _tasks: observing,
             };
@@ -191,8 +207,8 @@ impl Tray {
         }));
     }
 
-    /// 按此刻的任务刷新图标、标题、提示与菜单。推给系统出错时（如 Windows 资源管理器重启的那一会儿）下次整份重推，
-    /// 原因提示一次，恢复之后再出错再提示。
+    /// 按此刻的任务刷新图标、标题、提示与菜单。推给系统出错时（如 Windows 资源管理器重启的那一会儿）原因提示一次，
+    /// 按退避自己到点整份重推（不等任务再有变化），直到推成；恢复之后再出错再提示。
     fn refresh(&mut self, tasks: &Entity<Tasks>, cx: &mut Context<Self>) {
         self.refreshed_at = Some(Instant::now());
         let read = tasks.read(cx);
@@ -208,12 +224,15 @@ impl Tray {
                 .map(|progress| (progress.clamp(0., 1.) * 100.).floor() as u8),
             recording: activity.recording,
             status,
+            failed: activity.failed > 0,
             notices: read.notices().len(),
         };
         match self.apply(&shown) {
             Ok(()) => {
                 self.shown = Some(shown);
                 self.reported = false;
+                self.retry_after = RETRY_FIRST;
+                self.retry = None;
             }
             Err(error) => {
                 self.shown = None;
@@ -223,6 +242,14 @@ impl Tray {
                         tasks.tell(format!("托盘图标没能更新：{error}"), cx)
                     });
                 }
+                let wait = self.retry_after;
+                self.retry_after = (wait * 2).min(RETRY_MAX);
+                let tasks = tasks.clone();
+                self.retry = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    // 托盘已随应用释放时不再重推
+                    let _gone = this.update(cx, |tray, cx| tray.refresh(&tasks, cx));
+                }));
             }
         }
     }
@@ -251,6 +278,7 @@ impl Tray {
         }
         if was.is_none_or(|was| was.status != shown.status) {
             self.status.set_text(&shown.status);
+            self.status.set_enabled(shown.failed);
             self.icon
                 .set_tooltip(Some(format!("hs-m3u8 · {}", shown.status)))
                 .map_err(|error| error.to_string())?;
