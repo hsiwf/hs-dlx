@@ -9,7 +9,6 @@ use gpui_kit::{
     Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
-use hs_m3u8_app::Status;
 
 use super::{Page, Shell};
 use crate::tasks::Tasks;
@@ -36,19 +35,7 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let running: Vec<_> = tasks
-            .rows()
-            .iter()
-            .filter(|r| r.task.status == Status::Running)
-            .collect();
-        let activity = (!running.is_empty()).then(|| {
-            let speed: f64 = running.iter().map(|r| r.rate.bytes_per_second(now)).sum();
-            format!(
-                "{} 个进行中 · ↓ {}/s",
-                running.len(),
-                format::bytes(speed as u64)
-            )
-        });
+        let activity = tasks.activity(now).summary();
         // 可用空间：不足或读不出时标橙色，只标这一段
         let space = tasks.free_space().map(|free| match free {
             Ok(bytes) => (

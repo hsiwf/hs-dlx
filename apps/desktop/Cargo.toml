@@ -23,6 +23,9 @@ psl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+# 托盘图标：0.x 近一年有两次不兼容升级，精确锁定；Linux 用 ksni 后端（StatusNotifierItem，纯 Rust 的 D-Bus），不要
+# 默认的 GTK 与 libappindicator
+tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"] }
 url.workspace = true
 wry.workspace = true
 

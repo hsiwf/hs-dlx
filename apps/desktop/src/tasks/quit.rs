@@ -46,6 +46,15 @@ impl Tasks {
         matches!(self.quit, Quit::Waiting | Quit::Leaving)
     }
 
+    /// 退出不用问：已决定退出，或没在问、没在等、没有要等的任务且状态都已写进存储（补写在这里做）。
+    pub fn quits_without_asking(&self) -> bool {
+        match self.quit {
+            Quit::Leaving => true,
+            Quit::Asking { .. } | Quit::Waiting => false,
+            Quit::Staying => self.busy() == 0 && self.service.flush().is_ok(),
+        }
+    }
+
     /// 把没写进存储的任务状态补写进去。
     pub fn flush(&self) -> Result<(), hs_m3u8_app::Error> {
         self.service.flush()

@@ -13,6 +13,8 @@ mod task_list;
 mod task_view;
 mod title_bar;
 
+pub use self::quit::Leave;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -30,7 +32,7 @@ use crate::new_task;
 use crate::new_task::NewTask;
 use crate::settings::{SettingsEvent, SettingsView};
 use crate::sniff::SniffView;
-use crate::tasks::{Row, Tasks, TasksEvent};
+use crate::tasks::{Quit, Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 
@@ -120,25 +122,28 @@ impl Shell {
             }
         });
         let changed = cx.observe(&tasks, |_, _, cx| cx.notify());
-        let handed = cx.subscribe_in(
-            &tasks,
-            window,
-            |this: &mut Self, _, event: &TasksEvent, window, cx| match event {
-                TasksEvent::HandedOver(handoff) => this.handed_over(handoff.clone(), window, cx),
-            },
-        );
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            // 视图已不在时没有要保护的任务
-            this.update(cx, |shell, cx| shell.should_close(window, cx))
-                .unwrap_or(true)
-        });
-        #[cfg(target_os = "macos")]
-        if let Err(error) = quit::ask_before_terminate(window, cx) {
-            tasks.update(cx, |tasks, _| {
-                tasks.notify(format!("从程序坞退出、注销时不会先问：{error}"))
+            // 视图已不在时没有要问的
+            let Some(shell) = this.upgrade() else {
+                return true;
+            };
+            let close = shell.update(cx, |shell, cx| {
+                shell.should_leave(Leave::Window, window, cx)
             });
-        }
+            if close {
+                // 没有要等的：关窗即退出，等窗口关掉之后再发出，不在关窗的回调里退出
+                let tasks = shell.read(cx).tasks.clone();
+                cx.defer(move |cx| {
+                    tasks.update(cx, |tasks, cx| {
+                        if tasks.quit() != Quit::Leaving {
+                            tasks.leave(cx);
+                        }
+                    })
+                });
+            }
+            close
+        });
         let mut shell = Shell {
             tasks,
             selected: None,
@@ -150,7 +155,7 @@ impl Shell {
             clipboard: None,
             confirm_discard: None,
             editing_headers: None,
-            _subscriptions: vec![typed, activated, changed, handed],
+            _subscriptions: vec![typed, activated, changed],
         };
         shell.refresh_clipboard(cx);
         if let Some(link) = link {
@@ -159,10 +164,8 @@ impl Shell {
         shell
     }
 
-    /// 再次打开应用时转交来的（已接手）：窗口到前台；有链接就探测，新建页开着时不替换它，只填进粘贴栏。
-    fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
-        cx.activate(true);
-        window.activate_window();
+    /// 再次打开应用时转交来的（已接手，窗口已在前台）：有链接就探测，新建页开着时不替换它，只填进粘贴栏。
+    pub fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
         if let Handoff::Link(link) = handoff {
             if self.new_task().is_some() {
                 self.paste

@@ -1,10 +1,11 @@
-//! 桌面应用的入口：打开任务存储、启动任务服务、开主窗口；任务存储已被开着的应用占着时，把启动参数里的链接转交给它
-//! 后退出（见 hs-m3u8-instance）。
+//! 桌面应用的入口：打开任务存储、启动任务服务、建托盘、开主窗口；任务存储已被开着的应用占着时，把启动参数里的链接
+//! 转交给它后退出（见 hs-m3u8-instance）。关掉主窗口不退出（任务可以在后台继续），退出由主窗口的询问或托盘发出。
 
 mod format;
 mod headers;
 mod links;
 mod live;
+mod main_window;
 mod new_task;
 mod rate;
 mod ring;
@@ -15,6 +16,7 @@ mod signals;
 mod sniff;
 mod tasks;
 mod theme;
+mod tray;
 mod ui;
 mod wait;
 
@@ -24,14 +26,14 @@ use std::path::PathBuf;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AppContext as _, Bounds, FontWeight, ParentElement as _, Render, SharedString, Styled as _,
-    TitlebarOptions, WindowBounds, WindowOptions, div, point, px, size,
+    AppContext as _, Bounds, FontWeight, ParentElement as _, QuitMode, Render, SharedString,
+    Styled as _, WindowBounds, WindowOptions, div, px, size,
 };
 use hs_m3u8_app::{Service, Store};
 use hs_m3u8_instance::HandOverError;
 
-use crate::shell::{MIN_HEIGHT, MIN_WIDTH, Shell};
 use crate::tasks::Tasks;
+use crate::tray::Tray;
 use crate::ui::{PAD, TITLE_HEIGHT};
 
 /// 全部任务合计同时最多多少个请求（见 `Engine::new`）。
@@ -56,24 +58,6 @@ fn default_folder() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
-/// 主窗口：标题栏透明，顶栏由应用自己画（红绿灯嵌在顶栏里）。
-fn window_options(cx: &gpui_kit::App) -> WindowOptions {
-    WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(1440.), px(900.)),
-            cx,
-        ))),
-        window_min_size: Some(size(px(MIN_WIDTH), px(MIN_HEIGHT))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("hs-m3u8".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(20.), px(TITLE_HEIGHT / 2. - 6.))),
-        }),
-        ..TitleBar::window_options()
-    }
-}
-
 /// 打开平台。Linux 上有 X11（含 Wayland 会话里的 XWayland）时只用它：嗅探页的网页只能嵌进 X11 窗口；没有时照默认选，
 /// 嗅探页打开时说明原因。
 fn application() -> gpui_kit::Application {
@@ -92,26 +76,19 @@ fn main() {
         report(info);
         std::process::abort();
     }));
-    // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调由主窗口登记）
+    // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调见 main_window）
     #[cfg(target_os = "macos")]
     hs_m3u8_macos::install();
-    application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(|cx| {
+    let app = application().with_assets(gpui_kit::assets::Assets);
+    // 点程序坞里的图标：回到窗口（关着时重新打开）
+    app.on_reopen(main_window::reopen);
+    app.run(|cx| {
             gpui_kit::init(cx);
             cx.text_system()
                 .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
                 .expect("随应用打包的字体是有效的 TrueType 文件");
             // 输入框等组件跟着窗口的深色底
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            // 主窗口关掉即退出；有任务在运行时关窗前先问（见 Shell）
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let options = window_options(cx);
             // 第一个参数为要探测的链接：从终端或别的程序把链接交给应用。不是 UTF-8 的照原样换成替换字符，粘贴栏里
             // 会提示它不是链接
             let link = std::env::args_os()
@@ -161,20 +138,36 @@ fn main() {
                         .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
                     Ok(Some((service, events, folder, handoffs)))
                 });
-            let opened = match started {
-                Ok(None) => {
-                    cx.quit();
-                    return;
-                }
+            match started {
+                Ok(None) => cx.quit(),
                 Ok(Some((service, events, folder, handoffs))) => {
-                    let tasks =
-                        cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
-                    gpui_kit::open_window(options, cx, |window, cx| {
-                        cx.new(|cx| Shell::new(tasks, link, window, cx))
-                    })
-                    .map(drop)
+                    // 关掉主窗口不退出：有任务在跑时可以在后台继续，退出都经询问（见 Shell::should_leave）
+                    cx.set_quit_mode(QuitMode::Explicit);
+                    let tasks = cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
+                    main_window::install(tasks.clone(), cx);
+                    let mut problems = Vec::new();
+                    #[cfg(target_os = "macos")]
+                    if let Err(error) = main_window::ask_before_terminate(cx) {
+                        problems.push(format!("从程序坞退出、注销时不会先问：{error}"));
+                    }
+                    if let Err(reason) =
+                        Tray::install(tasks.clone(), main_window::reopen, main_window::quit, cx)
+                    {
+                        problems.push(format!(
+                            "{reason}：关掉窗口让任务在后台继续后，再次打开应用回到窗口"
+                        ));
+                    }
+                    tasks.update(cx, |tasks, _| {
+                        for problem in problems {
+                            tasks.notify(problem);
+                        }
+                    });
+                    main_window::show(link, cx)
+                        .expect("任务状态刚装上")
+                        .expect("开不了窗口");
                 }
                 Err(failure) => {
+                    cx.set_quit_mode(QuitMode::LastWindowClosed);
                     let options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                             None,
@@ -182,12 +175,12 @@ fn main() {
                             cx,
                         ))),
                         window_min_size: None,
-                        ..window_options(cx)
+                        ..main_window::options(cx)
                     };
-                    gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| failure)).map(drop)
+                    gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| failure))
+                        .expect("开不了窗口");
                 }
-            };
-            opened.expect("开不了窗口");
+            }
         });
 }
 

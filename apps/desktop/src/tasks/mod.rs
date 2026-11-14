@@ -44,6 +44,30 @@ pub enum TasksEvent {
     HandedOver(Handoff),
 }
 
+/// 此刻在运行的任务合起来的样子（顶栏与托盘用）。
+pub struct Activity {
+    pub running: usize,
+    /// 合计下载速度（字节每秒）
+    pub speed: f64,
+    /// 在下的点播的平均进度（0 到 1）；没有在下的点播时为 None
+    pub progress: Option<f32>,
+    /// 有在录的直播
+    pub recording: bool,
+}
+
+impl Activity {
+    /// 「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
+    pub fn summary(&self) -> Option<String> {
+        (self.running > 0).then(|| {
+            format!(
+                "{} 个进行中 · ↓ {}/s",
+                self.running,
+                crate::format::bytes(self.speed as u64)
+            )
+        })
+    }
+}
+
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
 pub struct Notice {
     pub id: u64,
@@ -336,6 +360,30 @@ impl Tasks {
                 cx.background_executor().timer(FREE_SPACE_INTERVAL).await;
             }
         });
+    }
+
+    /// 此刻在运行的任务合起来的样子；速度按 `now` 时的时间窗算。
+    pub fn activity(&self, now: Instant) -> Activity {
+        let running: Vec<&Row> = self
+            .rows
+            .iter()
+            .filter(|row| row.task.status == Status::Running)
+            .collect();
+        let downloading: Vec<f32> = running
+            .iter()
+            .filter(|row| !row.recording())
+            .map(|row| look(row, now).fraction)
+            .collect();
+        Activity {
+            running: running.len(),
+            speed: running
+                .iter()
+                .map(|row| row.rate.bytes_per_second(now))
+                .sum(),
+            progress: (!downloading.is_empty())
+                .then(|| downloading.iter().sum::<f32>() / downloading.len() as f32),
+            recording: running.iter().any(|row| row.recording()),
+        }
     }
 
     pub fn service(&self) -> &Rc<Service> {
