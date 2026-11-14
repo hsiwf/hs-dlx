@@ -52,7 +52,7 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
    提交 `chore: 发版 vX.Y.Z`。版本号改了而更新日志里没有这一节时，检查里的测试就会失败。
 3. 从 `dev` 向 `main` 提 PR，标题写 `release: vX.Y.Z <一句话概括>`。检查通过后合并。
 4. `main` 收到推送后 `.github/workflows/release.yml` 接手：
-   - 这次推送已被后来的推送超过（`main` 又前进了，或重跑了一次旧的运行）时不发，由最新提交的那次运行发。
+   - 这个版本号已被 `main` 上后来的推送改掉（含重跑一次旧的运行）时不发，免得发出旧版本并标成最新。
    - 核对版本号：`vX.Y.Z` 标签已有对应的公开 Release 时到此为止，不发版；标签在而没有公开的 Release 时失败，要人看。
    - 确认更新日志里有这个版本的一节，再由 `desktop.yml` 在三个平台上打安装包：`.dmg`（Apple 芯片）、`-setup.exe`
      （x64）、`.deb`（amd64）。

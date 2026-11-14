@@ -1,6 +1,7 @@
 """发版用到的两项，由 .github/workflows/release.yml 调用。
 
-`python3 scripts/release.py version`：打印 Cargo.toml 里 [workspace.package] 的 version（形如 X.Y.Z）。
+`python3 scripts/release.py version [Cargo.toml 的路径]`：打印工作区的 [workspace.package] version（形如 X.Y.Z），
+不给路径时读仓库根目录的。
 `python3 scripts/release.py notes X.Y.Z`：打印 CHANGELOG.md 里 `## [X.Y.Z]` 一节的内容，作为 GitHub Release 的描述。没有
 这一节、或它是空的时失败：不发没有描述的版本。
 """
@@ -16,8 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 # 版本一节的标题：`## [X.Y.Z]`，后面可跟 ` - YYYY-MM-DD`
 SECTION = re.compile(r"## \[(?P<version>[^\]]+)\](?: - \d{4}-\d{2}-\d{2})?\s*")
-# 代码块的开头与结尾（CommonMark）：至多 3 个空格缩进，3 个以上的 ` 或 ~；结尾只能有这一串，且不短于开头
-FENCE_OPEN = re.compile(r" {0,3}(?P<mark>`{3,}|~{3,})")
+# 代码块的开头与结尾（CommonMark）：至多 3 个空格缩进，3 个以上的 ` 或 ~；` 开头的这一行后面不能再有 `（否则是行内
+# 代码）；结尾只能有这一串，且不短于开头
+FENCE_OPEN = re.compile(r" {0,3}(?:(?P<backticks>`{3,})[^`]*|(?P<tildes>~{3,}).*)")
 FENCE_CLOSE = re.compile(r" {0,3}(?P<mark>`{3,}|~{3,})\s*")
 
 
@@ -64,8 +66,9 @@ def closes(line: str, fence: str) -> bool:
 def markdown_lines(changelog: str) -> Iterator[tuple[bool, str]]:
     """逐行给出（是不是二级标题，去掉 HTML 注释后的行）。
 
-    代码块里的行原样给出，不算标题，也不去注释；整行都是注释的行不给出。到末尾仍有没闭合的代码块或 HTML 注释时失败。
-    行内代码里的 `<!--` 也按注释开头算。
+    代码块（含开头那一行）原样给出，不算标题，也不去注释；整行都是注释的行不给出。到末尾仍有没闭合的代码块或 HTML 注释
+    时失败。只认顶层的代码块：列表项、引用里的代码块按普通行处理（会去掉其中的注释）；行内代码里的 `<!--` 也按注释
+    开头算。
     """
     fence: str | None = None
     in_comment = False
@@ -75,15 +78,16 @@ def markdown_lines(changelog: str) -> Iterator[tuple[bool, str]]:
                 fence = None
             yield False, raw
             continue
+        opening = None if in_comment else FENCE_OPEN.fullmatch(raw)
+        if opening is not None:
+            fence = opening["backticks"] or opening["tildes"]
+            yield False, raw
+            continue
         commented = in_comment or "<!--" in raw
         line, in_comment = strip_comments(raw, in_comment=in_comment)
         if commented and not line.strip():
             continue
-        heading = line.startswith("## ")
-        opening = None if heading else FENCE_OPEN.match(line)
-        if opening is not None:
-            fence = opening["mark"]
-        yield heading, line
+        yield line.startswith("## "), line
     if fence is not None:
         message = f"更新日志末尾还有没闭合的代码块（{fence}）"
         raise SystemExit(message)
@@ -122,11 +126,13 @@ def main(argv: list[str]) -> None:
     match argv:
         case ["version"]:
             sys.stdout.write(f"{version()}\n")
+        case ["version", manifest]:
+            sys.stdout.write(f"{version(Path(manifest))}\n")
         case ["notes", wanted]:
             changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
             sys.stdout.write(f"{notes(changelog, wanted)}\n")
         case _:
-            message = "用法：release.py version，或 release.py notes X.Y.Z"
+            message = "用法：release.py version [Cargo.toml 的路径]，或 release.py notes X.Y.Z"
             raise SystemExit(message)
 
 

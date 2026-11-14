@@ -75,6 +75,16 @@ def test_notes_drops_comment_only_lines_and_inline_comments() -> None:
     assert notes(changelog, "0.1.0") == "- 修复崩溃"
 
 
+def test_notes_takes_inline_triple_backticks_as_text() -> None:
+    changelog = "## [0.2.0]\n```rust``` 现在高亮\n\n## [0.1.0]\n\n```sh\nx\n```\n"
+    assert notes(changelog, "0.2.0") == "```rust``` 现在高亮"
+
+
+def test_notes_keeps_a_comment_on_the_fence_line() -> None:
+    changelog = "## [0.1.0]\n```sh <!-- c\nx\n```\n- b\n"
+    assert notes(changelog, "0.1.0") == "```sh <!-- c\nx\n```\n- b"
+
+
 def manifest(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "Cargo.toml"
     path.write_text(text, encoding="utf-8")

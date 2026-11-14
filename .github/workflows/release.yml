@@ -20,8 +20,9 @@ defaults:
   run:
     shell: bash
 
-# 同一时刻只跑一次，其余排队（最多 100 个，文档不保证先后次序）。每次运行只在它的提交仍是 main 的最新提交时发版：
-# 被后来的推送超过的运行（含重跑一次旧的运行）什么也不发，由最新提交的那次运行发，免得在旧提交上发出版本并标成最新
+# 同一时刻只跑一次，其余排队（最多 100 个，文档不保证先后次序）。每次运行只在它的版本号仍是 main 最新提交上的版本号
+# 时发版：版本已被后来的推送改掉（含重跑一次旧的运行）就不发，免得发出一个旧版本并标成最新。版本号没变时照常发，
+# 之后那几次推送的运行看到标签已在、跳过
 concurrency:
   group: release
   cancel-in-progress: false
@@ -48,9 +49,11 @@ jobs:
           version=$(python3 scripts/release.py version)
           tag="v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          tip=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
-          if [ "$tip" != "$GITHUB_SHA" ]; then
-            echo "main 已前进到 $tip，由那次推送的运行处理，这次不发版"
+          gh api "repos/$GH_REPO/contents/Cargo.toml?ref=main" -H "Accept: application/vnd.github.raw+json" \
+            > "$RUNNER_TEMP/main-Cargo.toml"
+          latest=$(python3 scripts/release.py version "$RUNNER_TEMP/main-Cargo.toml")
+          if [ "$latest" != "$version" ]; then
+            echo "main 上的版本号已是 $latest，$tag 被取代，不发版"
             echo "release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -102,14 +105,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # 打包期间 main 又前进了：这次不发，由最新提交的那次运行发（它在排队，等这次结束才开始）。标签已在则是这个
-      # 版本已发过，却仍走到了这里，失败
-      - name: 仍是 main 的最新提交、标签仍不存在
+      # 打包期间 main 上的版本号又被改了：这个版本被取代，不发。标签已在则是这个版本已发过，却仍走到了这里，失败
+      - name: 版本号仍是 main 上的、标签仍不存在
         id: gate
         run: |
-          tip=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
-          if [ "$tip" != "$GITHUB_SHA" ]; then
-            echo "main 已前进到 $tip，由那次推送的运行发版，这次不发"
+          gh api "repos/$GH_REPO/contents/Cargo.toml?ref=main" -H "Accept: application/vnd.github.raw+json" \
+            > "$RUNNER_TEMP/main-Cargo.toml"
+          latest=$(python3 scripts/release.py version "$RUNNER_TEMP/main-Cargo.toml")
+          if [ "$latest" != "$VERSION" ]; then
+            echo "main 上的版本号已是 $latest，$TAG 被取代，不发"
             echo "go=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
