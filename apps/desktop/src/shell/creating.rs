@@ -205,7 +205,8 @@ impl Shell {
 
     /// 在嗅探页里打开网页 `url`（已开着的换成这个）。
     fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| SniffView::new(url, window, cx));
+        let service = self.service.clone();
+        let view = cx.new(|cx| SniffView::new(service, url, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -216,6 +217,7 @@ impl Shell {
                         this.show(Page::Task, cx);
                         this.sniff = None;
                     }
+                    SniffEvent::PageToggled => {}
                 }
                 cx.notify();
             },

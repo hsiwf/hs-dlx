@@ -75,7 +75,7 @@ enum Page {
         _subscription: Subscription,
         from_sniff: bool,
     },
-    /// 嗅探页（[`Shell::sniff`] 此时有值），占满主体，不显示任务列表
+    /// 网页里的视频流（[`Shell::sniff`] 此时有值）；网页显示着时占满主体，不显示任务列表
     Sniff,
 }
 
@@ -560,7 +560,13 @@ impl Render for Shell {
         let now = Instant::now();
         let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
         let listed = !self.rows.is_empty() || self.new_task().is_some() || self.sniff.is_some();
-        if !matches!(self.page, Page::Sniff) && listed {
+        // 网页显示着时占满主体，不显示任务列表
+        let page_shown = matches!(self.page, Page::Sniff)
+            && self
+                .sniff
+                .as_ref()
+                .is_some_and(|(sniff, _)| sniff.read(cx).page_shown());
+        if !page_shown && listed {
             body = body.child(self.render_list(now, cx));
         }
         body = match &self.page {

@@ -1,5 +1,4 @@
-//! 左边的任务列表：每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，嗅探页开着（没显示）时有一项回到
-//! 网页。
+//! 左边的任务列表：每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，在网页里找视频流时有网页那一项。
 
 use std::time::Instant;
 
@@ -29,9 +28,11 @@ impl Shell {
             .new_task()
             .map(|view| new_task_item(view.read(cx).phase()));
         let dim = self.new_task().is_some();
+        let on = matches!(self.page, Page::Sniff);
         let sniff = self.sniff.as_ref().map(|(view, _)| {
-            let title = view.read(cx).page_title();
-            sniff_item(title, dim, cx)
+            let view = view.read(cx);
+            let (title, found) = (view.page_title(), view.found_count());
+            sniff_item(title, found, on, dim, cx)
         });
         let orbs: Vec<_> = self
             .rows
@@ -135,16 +136,26 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
         ))
 }
 
-/// 回到嗅探页的一项：两个同心实线环（与嗅探页里流前面的一样），写网页的标题。
-fn sniff_item(title: Option<String>, dim: bool, cx: &mut Context<Shell>) -> Stateful<Div> {
-    ui::list_item("sniff", false)
+/// 网页里的视频流那一项：两个同心实线环（与列表里每条流前面的一样），写网页的标题与找到了几条；`on` 为正显示着。
+fn sniff_item(
+    title: Option<String>,
+    found: usize,
+    on: bool,
+    dim: bool,
+    cx: &mut Context<Shell>,
+) -> Stateful<Div> {
+    ui::list_item("sniff", on)
         .when(dim, |item| item.opacity(0.55))
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| this.show(Page::Sniff, cx)))
         .child(ui::rings(ORB, ORB_WIDTH, 20.))
         .child(two_lines(
             title.unwrap_or_else(|| "网页".to_owned()),
-            "在网页里找视频流".to_owned(),
+            if found == 0 {
+                "网页 · 正在找视频流".to_owned()
+            } else {
+                format!("网页 · 找到 {found} 条视频流")
+            },
         ))
 }
 

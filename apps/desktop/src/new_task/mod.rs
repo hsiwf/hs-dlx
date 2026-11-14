@@ -22,6 +22,7 @@ use hs_m3u8_core::{Probe, ProxySource, Source, Url};
 
 use crate::headers::HeadersEditor;
 use crate::ui::{BOTTOM, GAP};
+use crate::{format, links};
 
 /// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
 const OPTION_MIN_WIDTH: f32 = 260.;
@@ -49,7 +50,7 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 地址取到的不是 HLS（多为网页）：在嗅探页里打开它，找页面里的视频流
+    /// 地址取到的不是播放列表、地址也不像播放列表（多为放着播放器的网页）：到网页里找视频流
     Sniff(Url),
 }
 
@@ -201,9 +202,18 @@ impl NewTask {
         source.http.headers = headers;
         let handle = self.service.probe(source);
         self.probing = Probing::Running;
+        let page_like = links::stream_url(self.url.as_str()).is_none();
         self._probe = cx.spawn(async move |this, cx| {
             let probing = match handle.await {
                 Ok(Ok(probe)) => Probing::Ready(Box::new(probe)),
+                // 取到的不是播放列表、地址也不像播放列表：多半是放着播放器的网页，转去网页里找视频流
+                Ok(Err(error)) if page_like && is_not_playlist(&error) => {
+                    // 视图在探测期间被关掉时不再需要结果
+                    let _closed = this.update(cx, |this, cx| {
+                        cx.emit(NewTaskEvent::Sniff(this.url.clone()))
+                    });
+                    return;
+                }
                 Ok(Err(error)) => Probing::Failed(Failure::of(&error)),
                 Err(join) => Probing::Failed(Failure {
                     kind: FailureKind::Other,
@@ -410,6 +420,37 @@ impl Render for NewTask {
             )
             .child(side)
     }
+}
+
+/// 探测的错误是取到的内容不是播放列表（没有 `#EXTM3U`），如网页、视频文件。
+fn is_not_playlist(error: &hs_m3u8_core::Error) -> bool {
+    matches!(
+        error,
+        hs_m3u8_core::Error::Playlist { cause, .. }
+            if **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist
+    )
+}
+
+/// 探测结果的说明（不含主机）：时长（直播不写）、几档清晰度与最高的宽高、几条另外的音轨、是否直播。
+pub fn describe(probe: &Probe) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !probe.live {
+        parts.push(format::clock(duration_of(probe)));
+    }
+    match &probe.master {
+        Some(master) => {
+            parts.push(format!("{} 档清晰度", master.variants.len()));
+            let audio = master.audio.iter().filter(|audio| audio.separate).count();
+            if audio > 0 {
+                parts.push(format!("{audio} 条音轨"));
+            }
+        }
+        None => parts.push("单一清晰度".to_owned()),
+    }
+    if probe.live {
+        parts.push("直播".to_owned());
+    }
+    parts
 }
 
 /// 第 0 条轨（所选变体或来源本身）的时长；直播为当前窗口的。
