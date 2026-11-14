@@ -60,6 +60,21 @@ def test_repository_changelog_has_the_current_version() -> None:
     assert notes(changelog, version())
 
 
+def test_notes_fails_on_an_unclosed_code_block() -> None:
+    with pytest.raises(SystemExit, match="代码块"):
+        notes("## [0.2.0]\n\n```sh\nx\n\n## [0.1.0]\n\n- 旧的\n", "0.2.0")
+
+
+def test_notes_closes_a_code_block_only_with_the_same_fence() -> None:
+    changelog = "## [0.2.0]\n\n````md\n~~~\n```\n## 不是标题\n<!-- 原样保留 -->\n````\n\n## [0.1.0]\n- 旧的\n"
+    assert notes(changelog, "0.2.0") == "````md\n~~~\n```\n## 不是标题\n<!-- 原样保留 -->\n````"
+
+
+def test_notes_drops_comment_only_lines_and_inline_comments() -> None:
+    changelog = "## [0.1.0]\n\n<!--\n提示\n-->\n- 修复<!-- 内部 -->崩溃\n"
+    assert notes(changelog, "0.1.0") == "- 修复崩溃"
+
+
 def manifest(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "Cargo.toml"
     path.write_text(text, encoding="utf-8")
