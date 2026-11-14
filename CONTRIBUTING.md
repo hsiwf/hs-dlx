@@ -37,27 +37,31 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
 ## 分支
 
 - `dev`：日常开发。直接提交，或从 `dev` 拉分支再提 PR 回 `dev`。推送与 PR 都跑检查。
-- `main`：发布线，只接受来自 `dev` 的 PR，三个平台的检查都通过才能合并。合并时选「Create a merge commit」，不用
-  squash 或 rebase：`main` 与 `dev` 的历史保持一致，下一次从 `dev` 提 PR 时不会出现重复的提交。
+- `main`：发布线，只接受来自 `dev` 的 PR。分支保护要求走 PR、三个平台的检查都通过，管理员也不能直接推送。仓库只
+  开了 merge commit 一种合并方式：`main` 与 `dev` 的历史保持一致，下一次从 `dev` 提 PR 时不会出现重复的提交。
 
 提交信息写成 `<type>: <描述>`，type 为 `feat`、`fix`、`refactor`、`docs`、`test`、`chore`、`perf`、`ci`。
 
 ## 发版
 
-版本号只写在 `Cargo.toml` 的 `[workspace.package] version` 一处，形如 `X.Y.Z`。
+版本号只写在 `Cargo.toml` 的 `[workspace.package] version` 一处，形如 `X.Y.Z`；每个版本的说明写在 `CHANGELOG.md`。
 
-1. 在 `dev` 上改版本号，运行 `cargo update --workspace` 让 `Cargo.lock` 跟上（打包用 `--locked` 构建，锁文件没跟上会失败），
-   提交 `chore: 版本号改为 X.Y.Z`。
-2. 从 `dev` 向 `main` 提 PR，标题写 `release: vX.Y.Z <一句话概括>`，正文按模板写好「## 发布说明」：这一节原样成为
-   GitHub Release 的描述，写给用户看。
-3. 检查通过后合并。`.github/workflows/release.yml` 接手：
-   - 核对版本号，读出发布说明；`vX.Y.Z` 标签已存在（这个 PR 没改版本号）时到此为止，不发版。
-   - 由 `desktop.yml` 在三个平台上打安装包：`.dmg`（Apple 芯片）、`-setup.exe`（x64）、`.deb`（amd64）。
-   - 全部成功后建 Release：先建草稿、上传安装包与 `SHA256SUMS`，再公开；公开时 GitHub 在合并提交上打 `vX.Y.Z` 标签。
-4. 任一步失败时没有公开的 Release、也没有标签：修好原因后在 Actions 里对这次运行点「Re-run failed jobs」，上一次
-   留下的草稿会先删掉。原因要改代码时，在 `dev` 上修好、再提一个 PR 合并即可（版本号不变，标签仍不存在，照常发版）。
+1. 平时把面向使用者的变更写进 `CHANGELOG.md` 的 `## [Unreleased]`。
+2. 发版时在 `dev` 上：把 `[Unreleased]` 下的内容移到新的一节 `## [X.Y.Z] - YYYY-MM-DD`（写给用户看，这一节原样成为
+   GitHub Release 的描述）；改版本号并运行 `cargo update --workspace` 让 `Cargo.lock` 跟上（打包用 `--locked` 构建）；
+   提交 `chore: 发版 vX.Y.Z`。版本号改了而更新日志里没有这一节时，检查里的测试就会失败。
+3. 从 `dev` 向 `main` 提 PR，标题写 `release: vX.Y.Z <一句话概括>`。检查通过后合并。
+4. `main` 收到推送后 `.github/workflows/release.yml` 接手：
+   - 核对版本号：`vX.Y.Z` 标签已有对应的公开 Release 时到此为止，不发版；标签在而没有公开的 Release 时失败，要人看。
+   - 确认更新日志里有这个版本的一节，再由 `desktop.yml` 在三个平台上打安装包：`.dmg`（Apple 芯片）、`-setup.exe`
+     （x64）、`.deb`（amd64）。
+   - 全部成功后建 Release：先建草稿、上传安装包与 `SHA256SUMS`，再公开；公开时 GitHub 在这个提交上打 `vX.Y.Z` 标签。
+5. 任一步失败时没有公开的 Release、也没有标签：
+   - 外部原因（网络、GitHub 故障）：在 Actions 里对这次运行点「Re-run failed jobs」，上一次留下的草稿会先删掉。
+   - 要改代码或更新日志：在 `dev` 上修好，再提一个 PR 合并。新的推送读到的版本号仍没有标签，照常发版，说明取自
+     那次提交里的 `CHANGELOG.md`。
 
-没改版本号的 PR 合并进 `main` 不发版，「## 发布说明」留空即可。
+没改版本号的 PR 合并进 `main` 时，标签已在，不发版。
 
 安装包没有签名与公证；签名需要开发者账号，到时在 `desktop.yml` 里加。
 

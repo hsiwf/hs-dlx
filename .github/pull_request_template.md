@@ -6,17 +6,7 @@
 
 <!-- 跑了哪些检查与实测、结果如何。例如：make check 通过；macOS 上实测暂停后继续 -->
 
-## 发布说明
-
 <!--
-dev 合并进 main 且改了 Cargo.toml 的 [workspace.package] version 时，这一节原样成为 GitHub Release 的描述：写给
-用户看，不写实现细节与内部文件名。没改版本号的 PR 留空即可（不发版）；改了版本号而这一节是空的，发版失败。
-
-写法示例：
-
-### 新功能
-- 磁力链接与种子文件下载
-
-### 修复
-- 暂停后再继续，直播录制不再另起一段
+发版 PR（dev → main 且改了版本号）：CHANGELOG.md 里要有 `## [X.Y.Z] - YYYY-MM-DD` 一节，合并后它原样成为 GitHub
+Release 的描述。标题写成 `release: vX.Y.Z <一句话概括>`。
 -->

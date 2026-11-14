@@ -20,6 +20,7 @@
   <a href="#路线图">路线图</a> ·
   <a href="#技术栈与结构">技术栈与结构</a> ·
   <a href="#从源码构建">从源码构建</a> ·
+  <a href="CHANGELOG.md">更新日志</a> ·
   <a href="CONTRIBUTING.md">参与开发</a>
 </p>
 

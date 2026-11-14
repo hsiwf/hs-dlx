@@ -1,48 +1,63 @@
-"""scripts/release.py：从 PR 正文取发布说明、读工作区版本号。"""
+"""scripts/release.py：从更新日志取某个版本的发布说明、读工作区版本号。"""
 
 from pathlib import Path
 
 import pytest
 
-from release import notes, version
+from release import ROOT, notes, version
 
-BODY = """## 改动
+CHANGELOG = """# 更新日志
 
-改了什么。
+<!-- 新条目先写进 [Unreleased]，发版时改成版本号与日期 -->
 
-## 发布说明
+## [Unreleased]
 
-<!-- 填写提示 -->
+## [0.2.0] - 2026-12-01
 
 ### 新功能
 - 磁力下载
 
-### 修复
-- 暂停后再继续不再从头下载
+```sh
+## 这一行在代码块里，不是标题
+```
 
-## 验证
+## [0.1.0] - 2026-11-15
 
-make check 通过
+- 首个预览版
 """
 
 
-def test_notes_takes_the_section_up_to_the_next_heading() -> None:
-    assert notes(BODY) == "### 新功能\n- 磁力下载\n\n### 修复\n- 暂停后再继续不再从头下载"
+def test_notes_takes_the_version_section_and_skips_code_blocks() -> None:
+    assert notes(CHANGELOG, "0.2.0") == "### 新功能\n- 磁力下载\n\n```sh\n## 这一行在代码块里，不是标题\n```"
 
 
-def test_notes_reads_crlf_bodies_and_the_last_section() -> None:
-    body = "## 改动\r\n\r\n略\r\n\r\n## 发布说明\r\n\r\n- 修复崩溃\r\n"
-    assert notes(body) == "- 修复崩溃"
+def test_notes_reads_the_last_section_and_crlf() -> None:
+    assert notes(CHANGELOG.replace("\n", "\r\n"), "0.1.0") == "- 首个预览版"
 
 
-def test_notes_without_the_section_fails() -> None:
-    with pytest.raises(SystemExit, match="没有"):
-        notes("## 改动\n\n略\n")
+def test_notes_without_the_version_fails() -> None:
+    with pytest.raises(SystemExit, match="实有 0 个"):
+        notes(CHANGELOG, "0.3.0")
 
 
-def test_notes_with_only_comments_fails() -> None:
+def test_notes_with_a_duplicated_version_fails() -> None:
+    with pytest.raises(SystemExit, match="实有 2 个"):
+        notes(CHANGELOG + "\n## [0.1.0]\n\n- 又一节\n", "0.1.0")
+
+
+def test_notes_with_an_empty_section_fails() -> None:
     with pytest.raises(SystemExit, match="空的"):
-        notes("## 发布说明\n\n<!--\n写法示例：\n### 新功能\n-->\n\n## 验证\n")
+        notes("## [0.1.0] - 2026-11-15\n\n<!-- 还没写 -->\n\n## [0.0.9]\n- 旧的\n", "0.1.0")
+
+
+def test_notes_with_an_unclosed_comment_fails() -> None:
+    with pytest.raises(SystemExit, match="没闭合"):
+        notes("## [0.1.0]\n\n- 修复\n<!-- 忘了闭合\n", "0.1.0")
+
+
+def test_repository_changelog_has_the_current_version() -> None:
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert notes(changelog, version())
 
 
 def manifest(tmp_path: Path, text: str) -> Path:
