@@ -1,12 +1,9 @@
-//! 新建：探测链接、开新建视图、新建任务并把结果交回发起它的视图。
-
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+//! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Focusable as _, Window};
-use hs_m3u8_app::{Draft, Event};
+use hs_m3u8_app::Draft;
 use hs_m3u8_core::Url;
 
-use super::row::Row;
 use super::{Page, Shell};
 use crate::links;
 use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
@@ -46,8 +43,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (service, folder, home) =
-            (self.service.clone(), self.folder.clone(), self.home.clone());
+        let tasks = self.tasks.read(cx);
+        let (service, folder, home) = (
+            tasks.service().clone(),
+            tasks.folder().clone(),
+            self.home.clone(),
+        );
         let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, home, window, cx));
         let subscription = cx.subscribe_in(
             &view,
@@ -75,10 +76,14 @@ impl Shell {
                     NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     NewTaskEvent::FolderChanged(folder) => {
-                        if let Err(error) = this.service.set_folder(folder) {
-                            this.notify(format!("新的保存位置没能记下，下次打开时不在：{error}"));
-                        }
-                        this.folder_changed(folder.clone(), cx);
+                        this.tasks.update(cx, |tasks, cx| {
+                            if let Err(error) = tasks.service().set_folder(folder) {
+                                tasks.notify(format!(
+                                    "新的保存位置没能记下，下次打开时不在：{error}"
+                                ));
+                            }
+                            tasks.set_folder(folder.clone(), cx);
+                        });
                     }
                 }
                 cx.notify();
@@ -131,7 +136,7 @@ impl Shell {
         if shown != view || links::stream_url(url.as_str()).is_some() {
             return;
         }
-        let service = self.service.clone();
+        let service = self.tasks.read(cx).service().clone();
         let sniff = cx.new(|cx| SniffView::new(service, url, window, cx));
         let subscription = cx.subscribe_in(
             &sniff,
@@ -188,7 +193,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// 按新建视图里的选择新建任务；退出中不新建。新建要查磁盘，在服务的运行时里做，期间新建视图显示正在开始。
+    /// 按新建视图里的选择新建任务；退出中不新建。新建期间新建视图显示正在开始；建成时新建视图还开着（用户没切走）
+    /// 就关掉它、选中新任务、清空粘贴栏，失败时写在它上面，已切走时提示。
     pub(super) fn create(
         &mut self,
         view: Entity<NewTask>,
@@ -196,99 +202,49 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.quitting() {
-            view.update(cx, |view, cx| {
-                view.failed("正在退出，不开始新任务".to_owned(), cx)
-            });
-            return;
-        }
-        let created_at = match SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())
-        {
-            Some(seconds) => seconds,
-            None => {
-                view.update(cx, |view, cx| {
-                    view.failed("系统时钟早于 1970 年，记不了任务的创建时间".to_owned(), cx)
-                });
+        let created = match self.tasks.update(cx, |tasks, cx| tasks.create(draft, cx)) {
+            Ok(created) => created,
+            Err(reason) => {
+                view.update(cx, |view, cx| view.failed(reason, cx));
                 return;
             }
         };
         view.update(cx, |view, cx| view.creating(cx));
-        self.creating += 1;
-        let handle = self.service.create(draft, created_at);
+        let tasks = self.tasks.clone();
+        let shown = hs_m3u8_core::bare_url(view.read(cx).url()).to_string();
         cx.spawn_in(window, async move |this, cx| {
-            let result = handle.await;
-            // 等待期间窗口关掉时不再需要结果；任务照常在服务里开始，下次打开时在列表里
-            let _closed = this.update_in(cx, |this, window, cx| {
-                this.creating -= 1;
-                match result {
-                    Ok(Ok(task)) => this.started(&view, task, window, cx),
-                    Ok(Err(error)) => this.create_failed(&view, error.to_string(), cx),
-                    Err(join) => this.create_failed(&view, format!("新建中途出错：{join}"), cx),
-                }
-                // 没有在途的新建了，留着的结束事件都不属于将要加进来的行（是已移除的行的）
-                if this.creating == 0 {
-                    this.early.clear();
-                }
-                this.quit_if_idle(cx);
-                cx.notify();
-            });
+            // 发送端在 Tasks 收尾时一定发出，只在应用退出时随它释放
+            let Ok(result) = created.await else {
+                return;
+            };
+            let failure = result.as_ref().err().cloned();
+            let closed = this
+                .update_in(cx, |this, window, cx| {
+                    match result {
+                        Ok(id) if this.showing(&view) => {
+                            this.selected = Some(id);
+                            this.show(Page::Task, cx);
+                            this.paste
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                        Ok(_) => {}
+                        Err(error) if this.showing(&view) => {
+                            view.update(cx, |view, cx| view.failed(error, cx))
+                        }
+                        Err(error) => this.notify(format!("新建 {shown} 失败：{error}"), cx),
+                    }
+                    cx.notify();
+                })
+                .is_err();
+            // 等待期间窗口关掉了：建成的已在列表里，失败改为提示
+            if closed && let Some(error) = failure {
+                tasks.update(cx, |tasks, cx| {
+                    tasks.notify(format!("新建 {shown} 失败：{error}"));
+                    cx.notify();
+                });
+            }
         })
         .detach();
-    }
-
-    /// 新建视图 `view` 发起的任务建成了：加进列表。`view` 还开着（用户没切走）时关掉它、选中新任务、清空粘贴栏；
-    /// 选了退出的随即暂停。
-    pub(super) fn started(
-        &mut self,
-        view: &Entity<NewTask>,
-        task: hs_m3u8_app::Task,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let id = task.id;
-        let mut row = Row::new(task, Instant::now());
-        row.timeline.begin(Duration::ZERO);
-        self.rows.push(row);
-        let (early, rest) = std::mem::take(&mut self.early)
-            .into_iter()
-            .partition(|event| matches!(event, Event::Ended { id: at, .. } if *at == id));
-        self.early = rest;
-        for event in early {
-            self.apply(event, cx);
-        }
-        if self.quitting() {
-            self.service.pause(id);
-        }
-        if self.showing(view) {
-            self.selected = Some(id);
-            self.show(Page::Task, cx);
-            self.paste
-                .update(cx, |input, cx| input.set_value("", window, cx));
-        }
-    }
-
-    /// 新建失败：`view` 还开着时写在它上面，否则（用户已切走）提示；退出中的不退出，留给用户看。
-    pub(super) fn create_failed(
-        &mut self,
-        view: &Entity<NewTask>,
-        error: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.quitting() {
-            self.cancel_quit("有新建没成，没有退出".to_owned());
-        }
-        if self.showing(view) {
-            view.update(cx, |view, cx| view.failed(error, cx));
-        } else {
-            let url = view.read(cx).url().clone();
-            self.notify(format!(
-                "新建 {} 失败：{error}",
-                hs_m3u8_core::bare_url(&url)
-            ));
-        }
     }
 
     /// 正显示着的新建视图是 `view`。
@@ -298,7 +254,7 @@ impl Shell {
 
     /// 在嗅探页里打开网页 `url`（已开着的换成这个）。
     fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
-        let service = self.service.clone();
+        let service = self.tasks.read(cx).service().clone();
         let view = cx.new(|cx| SniffView::new(service, url, window, cx));
         self.adopt_sniff(view, window, cx);
     }

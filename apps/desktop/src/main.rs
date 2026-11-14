@@ -13,6 +13,7 @@ mod settings;
 mod shell;
 mod signals;
 mod sniff;
+mod tasks;
 mod theme;
 mod ui;
 mod wait;
@@ -30,6 +31,7 @@ use hs_m3u8_app::{Service, Store};
 use hs_m3u8_instance::HandOverError;
 
 use crate::shell::{MIN_HEIGHT, MIN_WIDTH, Shell};
+use crate::tasks::Tasks;
 use crate::ui::{PAD, TITLE_HEIGHT};
 
 /// 全部任务合计同时最多多少个请求（见 `Engine::new`）。
@@ -165,8 +167,10 @@ fn main() {
                     return;
                 }
                 Ok(Some((service, events, folder, handoffs))) => {
+                    let tasks =
+                        cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
                     gpui_kit::open_window(options, cx, |window, cx| {
-                        cx.new(|cx| Shell::new(service, events, folder, link, handoffs, window, cx))
+                        cx.new(|cx| Shell::new(tasks, link, window, cx))
                     })
                     .map(drop)
                 }

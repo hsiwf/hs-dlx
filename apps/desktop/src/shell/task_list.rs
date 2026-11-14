@@ -8,9 +8,9 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
 
-use super::row::{Row, look};
 use super::{Page, Shell};
 use crate::new_task::Phase;
+use crate::tasks::{Row, Tasks, look};
 use crate::{ring, theme, ui};
 
 /// 任务列表的宽度。
@@ -23,7 +23,12 @@ const ORB: f32 = 52.;
 const ORB_WIDTH: f32 = 5.;
 
 impl Shell {
-    pub(super) fn render_list(&self, now: Instant, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_list(
+        &self,
+        tasks: &Tasks,
+        now: Instant,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let new_task = self
             .new_task()
             .map(|view| new_task_item(view.read(cx).phase()));
@@ -34,11 +39,12 @@ impl Shell {
             let (title, found) = (read.page_title(), read.found_count());
             sniff_item(title, found, on, dim, cx)
         });
-        let orbs: Vec<_> = self
-            .rows
+        let selected = self.selected_row(tasks).map(|row| row.task.id);
+        let orbs: Vec<_> = tasks
+            .rows()
             .iter()
             .rev()
-            .map(|row| self.render_orb(row, dim, now, cx))
+            .map(|row| self.render_orb(row, selected, dim, now, cx))
             .collect();
         div()
             .id("tasks")
@@ -55,16 +61,18 @@ impl Shell {
             .children(orbs)
     }
 
+    /// `selected` 为选中的任务（见 [`Shell::selected_row`]）。
     fn render_orb(
         &self,
         row: &Row,
+        selected: Option<hs_m3u8_app::TaskId>,
         dim: bool,
         now: Instant,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Stateful<Div> {
         let id = row.task.id;
         let look = look(row, now);
-        let on = self.selected == Some(id) && matches!(self.page, Page::Task);
+        let on = selected == Some(id) && matches!(self.page, Page::Task);
         let (fraction, color) = (look.fraction, look.orb);
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.55))
@@ -142,7 +150,7 @@ fn sniff_item(
     found: usize,
     on: bool,
     dim: bool,
-    cx: &mut Context<Shell>,
+    cx: &Context<Shell>,
 ) -> Stateful<Div> {
     ui::list_item("sniff", on)
         .when(dim, |item| item.opacity(0.55))

@@ -12,6 +12,7 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 
 use super::{Page, Shell};
+use crate::tasks::Tasks;
 use crate::ui::{self, TITLE_HEIGHT};
 use crate::{format, ring, theme};
 
@@ -29,9 +30,14 @@ const LOW_SPACE: u64 = 1 << 30;
 const SETTINGS: f32 = 36.;
 
 impl Shell {
-    pub(super) fn render_header(&self, now: Instant, cx: &mut Context<Self>) -> impl IntoElement {
-        let running: Vec<_> = self
-            .rows
+    pub(super) fn render_header(
+        &self,
+        tasks: &Tasks,
+        now: Instant,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let running: Vec<_> = tasks
+            .rows()
             .iter()
             .filter(|r| r.task.status == Status::Running)
             .collect();
@@ -44,7 +50,7 @@ impl Shell {
             )
         });
         // 可用空间：不足或读不出时标橙色，只标这一段
-        let space = self.free_space.as_ref().map(|free| match free {
+        let space = tasks.free_space().map(|free| match free {
             Ok(bytes) => (
                 format!("可用 {}", format::bytes(*bytes)),
                 *bytes < LOW_SPACE,
@@ -108,7 +114,7 @@ impl Shell {
     }
 
     /// 设置的按钮：齿轮，设置页开着时发光。
-    fn settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn settings_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let on = matches!(self.page, Page::Settings { .. });
         div()
             .id("settings")

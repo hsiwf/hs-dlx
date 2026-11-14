@@ -9,6 +9,7 @@ use hs_m3u8_core::bare_url;
 
 use super::{Page, Shell};
 use crate::links::http_url;
+use crate::tasks::Tasks;
 use crate::theme;
 use crate::ui::{self, CAPTION_LINE, TEXT_LINE, Tone};
 
@@ -26,7 +27,7 @@ pub(super) const HEIGHT: f32 =
 const PILL_MAX_WIDTH: f32 = 880.;
 
 impl Shell {
-    pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_footer(&self, tasks: &Tasks, cx: &Context<Self>) -> impl IntoElement {
         let value = self.paste.read(cx).value();
         let typed = http_url(&value);
         let probing = self.new_task().and_then(|view| {
@@ -57,7 +58,7 @@ impl Shell {
             .into_any_element(),
         };
         // 待机页已经把剪贴板里的链接放在正中，别处只在粘贴栏空着时提一句
-        let standby = matches!(self.page, Page::Task) && self.selected_row().is_none();
+        let standby = matches!(self.page, Page::Task) && self.selected_row(tasks).is_none();
         let new_task = self.new_task().is_some();
         let hint = self
             .clipboard

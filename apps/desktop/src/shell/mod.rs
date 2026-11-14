@@ -1,5 +1,6 @@
 //! 主窗口：顶栏；左边一列任务小环；中间是选中任务的刻度环（新建时换成同心环，没有任务时是待机环）；右边是这个任务
-//! 的信号；底部是粘贴栏；右上角是要用户关掉的提示。这里管状态与事件；新建、对任务的操作、退出与各块的画法在子模块里。
+//! 的信号；底部是粘贴栏；右上角是要用户关掉的提示。任务的状态在 [`crate::tasks`] 里，这里管这个窗口自己的状态与
+//! 事件；新建、对任务的操作、退出时的询问与各块的画法在子模块里。
 
 mod creating;
 mod live_view;
@@ -8,35 +9,30 @@ mod operations;
 mod paste_bar;
 mod plan;
 mod quit;
-mod row;
 mod task_list;
 mod task_view;
 mod title_bar;
 
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Task, Window, div, px,
+    Subscription, Window, div, px,
 };
-use hs_m3u8_app::{Event, Events, Finished, Service, Status, TaskId};
-use hs_m3u8_core::{Stage, Url};
-use hs_m3u8_instance::{Handoff, Handoffs, Received};
+use hs_m3u8_app::TaskId;
+use hs_m3u8_instance::Handoff;
 
-use self::row::Row;
 use crate::headers::HeadersEditor;
 use crate::links;
 use crate::new_task;
 use crate::new_task::NewTask;
 use crate::settings::{SettingsEvent, SettingsView};
-use crate::signals::Level;
 use crate::sniff::SniffView;
+use crate::tasks::{Row, Tasks, TasksEvent};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
-use crate::wait::within;
 
 /// 窗口的最小宽：放得下列表收到最窄时、最宽的一个视图（待机页没有列表，比它们窄）。
 pub const MIN_WIDTH: f32 =
@@ -48,23 +44,6 @@ pub const MIN_HEIGHT: f32 = TITLE_HEIGHT
         new_task::MIN_HEIGHT,
     )
     + paste_bar::HEIGHT;
-
-/// 多久读一次保存目录所在盘的可用空间。
-const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// 读一次可用空间最多等多久：网络盘掉线时读会卡住。
-const FREE_SPACE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// 保存目录 `folder` 所在盘对本用户可用的字节数；目录不在（被删、所在的盘没接上）或读不出时为原因（顶栏照原样显示）。
-fn free_space(folder: &std::path::Path) -> Result<u64, String> {
-    match folder.try_exists() {
-        Ok(true) => {
-            fs4::available_space(folder).map_err(|error| format!("读不出可用空间：{error}"))
-        }
-        Ok(false) => Err("保存目录不在".to_owned()),
-        Err(error) => Err(format!("读不出可用空间：{error}")),
-    }
-}
 
 /// 主体显示的页。
 enum Page {
@@ -88,90 +67,36 @@ enum Page {
     Sniff(Entity<SniffView>),
 }
 
-/// 退出进行到哪一步。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Quit {
-    Staying,
-    /// 正在问要不要退出（提示框开着）：再来的退出请求不再问；`reopened` 为期间再次打开过应用（接手了转交），选了
-    /// 退出也不退出
-    Asking {
-        reopened: bool,
-    },
-    /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
-    Waiting,
-    /// 退出已不可撤回（已向系统发出退出）：不再接手转交来的链接
-    Leaving,
-}
-
-/// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
-struct Notice {
-    id: u64,
-    text: String,
-}
-
+/// 主窗口的视图：任务状态在 [`Tasks`] 里，这里是这个窗口自己的（选中哪个任务、显示哪一页、粘贴栏、嗅探页）。
 pub struct Shell {
-    service: Rc<Service>,
-    rows: Vec<Row>,
+    tasks: Entity<Tasks>,
+    /// 选中的任务；不在列表里（已移除）或没选过时为最新的一个，见 [`Shell::selected_row`]
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
     page: Page,
     /// 嗅探页与对它的订阅：关掉之前一直留着（不显示时网页藏起来、不出声），任务列表里有一项可以回去
     sniff: Option<(Entity<SniffView>, Subscription)>,
     paste: Entity<InputState>,
-    /// 新建任务默认保存到的目录；新建时换过就记住，到应用退出
-    folder: PathBuf,
     home: Option<PathBuf>,
     /// 粘贴栏里的内容不能探测的原因；再探测或改了内容时清掉
     input_error: Option<String>,
-    notices: Vec<Notice>,
-    next_notice: u64,
     /// 剪贴板里一条还没下过、也不在探测中的 m3u8 链接
-    clipboard: Option<Url>,
+    clipboard: Option<hs_m3u8_core::Url>,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
     confirm_discard: Option<TaskId>,
     /// 正在改请求头的停着的任务与编辑框
     editing_headers: Option<(TaskId, Entity<HeadersEditor>)>,
-    /// 退出到了哪一步
-    quit: Quit,
-    /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
-    creating: usize,
-    /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
-    early: Vec<Event>,
-    _events: Task<()>,
-    /// 收后打开的实例转交来的链接
-    _handoffs: Task<()>,
-    /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
-    free_space: Option<Result<u64, String>>,
-    _ticker: Task<()>,
-    _free_space: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Shell {
-    /// `link` 为启动参数里给的链接：有就填进粘贴栏并探测。`handoffs` 为后打开的实例转交来的（见 hs-m3u8-instance），
-    /// 收不了转交时为原因（提示一次，之后打开的实例各自报错）。
+    /// `link` 为启动参数里给的链接：有就填进粘贴栏并探测。
     pub fn new(
-        service: Service,
-        mut events: Events,
-        folder: PathBuf,
+        tasks: Entity<Tasks>,
         link: Option<String>,
-        handoffs: Result<Handoffs, String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let service = Rc::new(service);
-        let now = Instant::now();
-        let mut notices = Vec::new();
-        let rows: Vec<Row> = match service.tasks() {
-            Ok(tasks) => tasks.into_iter().map(|task| Row::new(task, now)).collect(),
-            Err(error) => {
-                notices.push(Notice {
-                    id: 0,
-                    text: format!("读不出任务列表：{error}"),
-                });
-                Vec::new()
-            }
-        };
         let paste = cx.new(|cx| InputState::new(window, cx).placeholder("粘贴链接，回车探测"));
         paste.update(cx, |input, cx| input.focus(window, cx));
         let typed = cx.subscribe_in(
@@ -189,17 +114,19 @@ impl Shell {
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         );
-        // 应用真要退出了（问过之后，或不经询问的退出，如别的平台注销）：停下所有任务、补写状态（最多等 2 秒）
-        let quitting = cx.on_app_quit(|this: &mut Self, _| {
-            // 没有窗口能显示了；补写不进的下次打开时按暂停处理（见 Service::close）
-            let _unsaved = this.service.close();
-            async {}
-        });
         let activated = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.refresh_clipboard(cx);
             }
         });
+        let changed = cx.observe(&tasks, |_, _, cx| cx.notify());
+        let handed = cx.subscribe_in(
+            &tasks,
+            window,
+            |this: &mut Self, _, event: &TasksEvent, window, cx| match event {
+                TasksEvent::HandedOver(handoff) => this.handed_over(handoff.clone(), window, cx),
+            },
+        );
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             // 视图已不在时没有要保护的任务
@@ -208,82 +135,23 @@ impl Shell {
         });
         #[cfg(target_os = "macos")]
         if let Err(error) = quit::ask_before_terminate(window, cx) {
-            notices.push(Notice {
-                id: notices.len() as u64,
-                text: format!("从程序坞退出、注销时不会先问：{error}"),
+            tasks.update(cx, |tasks, _| {
+                tasks.notify(format!("从程序坞退出、注销时不会先问：{error}"))
             });
         }
-        let handing = match handoffs {
-            Ok(mut handoffs) => cx.spawn_in(window, async move |this, cx| {
-                while let Some(received) = handoffs.recv().await {
-                    let alive = this.update_in(cx, |this, window, cx| {
-                        this.receive(received, window, cx);
-                    });
-                    if alive.is_err() {
-                        break;
-                    }
-                }
-            }),
-            Err(reason) => {
-                notices.push(Notice {
-                    id: notices.len() as u64,
-                    text: format!("收不了再次打开应用时转交的链接：{reason}"),
-                });
-                Task::ready(())
-            }
-        };
-        let receiving = cx.spawn(async move |this, cx| {
-            while let Some(event) = events.recv().await {
-                if this.update(cx, |this, cx| this.apply(event, cx)).is_err() {
-                    break;
-                }
-            }
-        });
-        // 速度按时间窗算，没有新进度时也要随时间降下来：有任务在运行时每秒重画一次
-        let ticker = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let alive = this.update(cx, |this, cx| {
-                    if this.rows.iter().any(|r| r.task.status == Status::Running) {
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
-        let selected = rows.last().map(|r| r.task.id);
         let mut shell = Shell {
-            service,
-            rows,
-            selected,
+            tasks,
+            selected: None,
             page: Page::Task,
             sniff: None,
             paste,
-            folder,
             home: dirs::home_dir(),
             input_error: None,
-            next_notice: notices.len() as u64,
-            notices,
             clipboard: None,
             confirm_discard: None,
             editing_headers: None,
-            quit: Quit::Staying,
-            creating: 0,
-            early: Vec::new(),
-            _events: receiving,
-            _handoffs: handing,
-            free_space: None,
-            _ticker: ticker,
-            _free_space: Task::ready(()),
-            _subscriptions: vec![typed, activated, quitting],
+            _subscriptions: vec![typed, activated, changed, handed],
         };
-        let ids: Vec<TaskId> = shell.rows.iter().map(|r| r.task.id).collect();
-        for id in ids {
-            shell.after_stop(id, cx);
-        }
-        shell.watch_free_space(cx);
         shell.refresh_clipboard(cx);
         if let Some(link) = link {
             shell.probe_text(&link, window, cx);
@@ -291,38 +159,22 @@ impl Shell {
         shell
     }
 
-    /// 再次打开应用时转交来的：已决定退出时不接手（交来的一方告诉用户正在退出）；否则接手，窗口到前台，等着退出的、
-    /// 正在问要不要退出的不再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次没收成的转交提示原因。
-    fn receive(&mut self, received: Received, window: &mut Window, cx: &mut Context<Self>) {
-        match received {
-            Ok(delivery) if self.quit == Quit::Leaving => delivery.refuse_leaving(),
-            Ok(delivery) => {
-                // 交出的一方已不等（界面 2 秒没接手）时它已把链接告诉用户，这里不再处理
-                let Some(handoff) = delivery.accept() else {
-                    return;
-                };
-                if let Quit::Asking { reopened } = &mut self.quit {
-                    *reopened = true;
-                }
-                cx.activate(true);
-                window.activate_window();
-                if self.quitting() {
-                    self.cancel_quit("再次打开了应用，没有退出".to_owned());
-                }
-                if let Handoff::Link(link) = handoff {
-                    if self.new_task().is_some() {
-                        self.paste
-                            .update(cx, |input, cx| input.set_value(link, window, cx));
-                        self.notify(
-                            "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
-                                .to_owned(),
-                        );
-                    } else {
-                        self.probe_text(&link, window, cx);
-                    }
-                }
+    /// 再次打开应用时转交来的（已接手）：窗口到前台；有链接就探测，新建页开着时不替换它，只填进粘贴栏。
+    fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
+        if let Handoff::Link(link) = handoff {
+            if self.new_task().is_some() {
+                self.paste
+                    .update(cx, |input, cx| input.set_value(link, window, cx));
+                self.notify(
+                    "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
+                        .to_owned(),
+                    cx,
+                );
+            } else {
+                self.probe_text(&link, window, cx);
             }
-            Err(reason) => self.notify(format!("再次打开应用时转交的链接没收到：{reason}")),
         }
         cx.notify();
     }
@@ -334,191 +186,19 @@ impl Shell {
         self.probe(text, window, cx);
     }
 
-    fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
-        if let Event::Ended { id, .. } = &event
-            && self.creating > 0
-            && self.row(*id).is_none()
-        {
-            self.early.push(event);
-            return;
-        }
-        match event {
-            Event::Progress { id, progress } => {
-                if let Some(row) = self.row_mut(id) {
-                    row.rate
-                        .update(Instant::now(), progress.received, progress.segments.done);
-                    for (level, text) in crate::signals::between(row.progress.as_ref(), &progress) {
-                        row.signal(level, text);
-                    }
-                    if progress.stage == Stage::Recording
-                        && let Some(session) =
-                            row.timeline.observe(row.progress.as_ref(), &progress)
-                    {
-                        row.signal(Level::Warn, format!("来源接不上，另起会话 {}", session + 1));
-                    }
-                    row.progress = Some(*progress);
-                }
-            }
-            Event::Ended {
-                id,
-                status,
-                result,
-                total,
-                leftovers,
-                unsaved,
-            } => {
-                let title = self.title(id);
-                let mut problems: Vec<String> = leftovers
-                    .iter()
-                    .map(|leftover| format!("「{title}」完成时没删掉：{leftover}"))
-                    .collect();
-                if let Some(error) = unsaved {
-                    problems.push(format!(
-                        "「{title}」已停下，但状态没能写进存储（{error}），之后每次写存储时会再写"
-                    ));
-                }
-                self.ended(id, status, result, total, problems, cx);
-            }
-            Event::TotalUnsaved { id, error } => {
-                let title = self.title(id);
-                self.notify(format!(
-                    "没能记下「{title}」的总片数：{error}；任务照常下载，停下时再记"
-                ));
-            }
-            Event::Orphaned { paths, reason } => {
-                let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                self.notify(format!(
-                    "新建任务时存储写不进，任务已取消，但留下了不在任何任务名下的 {}：{reason}",
-                    paths.join("、")
-                ));
-                if self.quitting() {
-                    self.cancel_quit("有要处理的东西，没有退出".to_owned());
-                }
-            }
-        }
-        cx.notify();
+    /// 选中的一行：选过的还在列表里时为它，否则为最新的一行；没有任务时为 None。
+    fn selected_row<'a>(&self, tasks: &'a Tasks) -> Option<&'a Row> {
+        self.selected
+            .and_then(|id| tasks.row(id))
+            .or_else(|| tasks.rows().last())
     }
 
-    /// 任务停下：改状态、总片数与结果，写信号，作废之前读到的任务目录内容后重读（或查输出）；`problems` 为要用户
-    /// 看的提示（没删掉的东西、状态没写进存储）。退出中遇到失败或要提示的就不退出，留给用户看。
-    fn ended(
-        &mut self,
-        id: TaskId,
-        status: Status,
-        result: Option<Finished>,
-        total: Option<usize>,
-        problems: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let title = self.title(id);
-        let failed = matches!(status, Status::Failed(_));
-        if let Some(row) = self.row_mut(id) {
-            // 放弃时任务先停下，这时的「暂停」不是用户要的，不写
-            if !row.discarding {
-                let (level, text) = ended_signal(&status, &row.task.spec.output, result.as_ref());
-                row.signal(level, text);
-            }
-            row.task.status = status;
-            if result.is_some() {
-                row.task.result = result;
-            }
-            if total.is_some() {
-                row.task.total = total;
-            }
-            row.forget_disk();
-        }
-        if self.quitting() && (failed || !problems.is_empty()) {
-            self.cancel_quit(format!("「{title}」停下时有要处理的，没有退出"));
-        }
-        for text in problems {
-            self.notify(text);
-        }
-        self.after_stop(id, cx);
-        self.quit_if_idle(cx);
-    }
-
-    /// （重新）开始读保存目录所在盘的可用空间：在后台读，每 10 秒一次。一次读超过 3 秒就先报超时，等它读完再接着
-    /// 按间隔读，不叠着发起新的；换了保存目录时调一次，立即按新目录读。
-    fn watch_free_space(&mut self, cx: &mut Context<Self>) {
-        let folder = self.folder.clone();
-        self._free_space = cx.spawn(async move |this, cx| {
-            loop {
-                let target = folder.clone();
-                let mut read = std::pin::pin!(
-                    cx.background_executor()
-                        .spawn(async move { free_space(&target) })
-                );
-                let early = within(
-                    read.as_mut(),
-                    cx.background_executor().timer(FREE_SPACE_TIMEOUT),
-                )
-                .await;
-                let value = match early {
-                    Some(value) => value,
-                    None => {
-                        let late = Err(format!(
-                            "可用空间读了 {} 秒没有结果",
-                            FREE_SPACE_TIMEOUT.as_secs()
-                        ));
-                        let alive = this.update(cx, |this, cx| {
-                            this.free_space = Some(late);
-                            cx.notify();
-                        });
-                        if alive.is_err() {
-                            break;
-                        }
-                        read.await
-                    }
-                };
-                let alive = this.update(cx, |this, cx| {
-                    this.free_space = Some(value);
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    break;
-                }
-                cx.background_executor().timer(FREE_SPACE_INTERVAL).await;
-            }
+    /// 加一条要用户关掉的提示。
+    fn notify(&mut self, text: String, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |tasks, cx| {
+            tasks.notify(text);
+            cx.notify();
         });
-    }
-
-    fn row(&self, id: TaskId) -> Option<&Row> {
-        self.rows.iter().find(|row| row.task.id == id)
-    }
-
-    fn row_mut(&mut self, id: TaskId) -> Option<&mut Row> {
-        self.rows.iter_mut().find(|row| row.task.id == id)
-    }
-
-    fn selected_row(&self) -> Option<&Row> {
-        self.selected.and_then(|id| self.row(id))
-    }
-
-    /// 从列表里去掉一行；选中的是它时改选最新的一行。
-    fn remove_row(&mut self, id: TaskId) {
-        self.rows.retain(|row| row.task.id != id);
-        if self.selected == Some(id) {
-            self.selected = self.rows.last().map(|r| r.task.id);
-        }
-    }
-
-    /// 列表里的名字；行已不在（放弃做完）时写编号。
-    fn title(&self, id: TaskId) -> String {
-        self.row(id)
-            .map_or_else(|| id.to_string(), |r| r.task.spec.title.clone())
-    }
-
-    fn notify(&mut self, text: String) {
-        self.notices.push(Notice {
-            id: self.next_notice,
-            text,
-        });
-        self.next_notice += 1;
-    }
-
-    fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.notices.retain(|n| n.id != id);
-        cx.notify();
     }
 
     /// 重读剪贴板：是 http(s) 的 m3u8 链接、不是已有任务也不在探测中时记下，供一键探测。
@@ -528,8 +208,10 @@ impl Shell {
             .and_then(|item| item.text())
             .and_then(|text| links::stream_url(&text));
         let probing = self.new_task().map(|view| view.read(cx).url().clone());
+        let tasks = self.tasks.read(cx);
         self.clipboard = found.filter(|url| {
-            !self.rows.iter().any(|row| &row.task.spec.url == url) && probing.as_ref() != Some(url)
+            !tasks.rows().iter().any(|row| &row.task.spec.url == url)
+                && probing.as_ref() != Some(url)
         });
         cx.notify();
     }
@@ -566,21 +248,23 @@ impl Shell {
             self.show(Page::Task, cx);
             return;
         }
-        let proxy = match self.service.settings() {
+        let tasks = self.tasks.read(cx);
+        let (service, folder) = (tasks.service().clone(), tasks.folder().clone());
+        let proxy = match service.settings() {
             Ok(settings) => settings.proxy,
             Err(error) => {
-                self.notify(format!("读不出设置：{error}"));
-                cx.notify();
+                self.notify(format!("读不出设置：{error}"), cx);
                 return;
             }
         };
-        let (service, folder, home) =
-            (self.service.clone(), self.folder.clone(), self.home.clone());
+        let home = self.home.clone();
         let view = cx.new(|cx| SettingsView::new(service, folder, home, proxy, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
                 SettingsEvent::Dismissed => this.show(Page::Task, cx),
-                SettingsEvent::FolderChanged(folder) => this.folder_changed(folder.clone(), cx),
+                SettingsEvent::FolderChanged(folder) => this
+                    .tasks
+                    .update(cx, |tasks, cx| tasks.set_folder(folder.clone(), cx)),
             }
             cx.notify();
         });
@@ -591,12 +275,6 @@ impl Shell {
             },
             cx,
         );
-    }
-
-    /// 新建任务默认保存到的目录换了（已存进设置）：按新目录读可用空间。
-    fn folder_changed(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
-        self.folder = folder;
-        self.watch_free_space(cx);
     }
 
     /// 换到嗅探页（[`Shell::sniff`] 里的视图）；嗅探页已关时什么也不做（旧帧上的点击）。
@@ -615,43 +293,23 @@ impl Shell {
     }
 }
 
-/// 任务停下时的信号。
-fn ended_signal(
-    status: &Status,
-    output: &hs_m3u8_app::OutputSpec,
-    result: Option<&Finished>,
-) -> (Level, String) {
-    match status {
-        Status::Done => (
-            Level::Info,
-            result.map_or_else(
-                || "完成".to_owned(),
-                |r| format!("写出 {}", row::finished_text(output, r)),
-            ),
-        ),
-        Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
-        Status::Failed(failure) => (Level::Error, failure.message.clone()),
-        Status::Running | Status::DiscardUnfinished => {
-            unreachable!("任务服务只在任务停下后发结束事件，停下的状态不会是运行中或放弃没做完")
-        }
-    }
-}
-
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
+        let cx = &*cx;
+        let tasks = self.tasks.read(cx);
         let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
-        let listed = !self.rows.is_empty() || self.new_task().is_some() || self.sniff.is_some();
+        let listed = !tasks.rows().is_empty() || self.new_task().is_some() || self.sniff.is_some();
         // 网页显示着时占满主体，不显示任务列表
         let page_shown = matches!(&self.page, Page::Sniff(sniff) if sniff.read(cx).page_shown());
         if !page_shown && listed {
-            body = body.child(self.render_list(now, cx));
+            body = body.child(self.render_list(tasks, now, cx));
         }
         body = match &self.page {
             Page::NewTask { view, .. } => body.child(view.clone()),
             Page::Sniff(view) => body.child(view.clone()),
             Page::Settings { view, .. } => body.child(view.clone()),
-            Page::Task => match self.selected_row() {
+            Page::Task => match self.selected_row(tasks) {
                 Some(row) => {
                     let (main, aside) = self.render_task(row, now, cx);
                     body.child(main).child(aside)
@@ -667,9 +325,9 @@ impl Render for Shell {
             .bg(theme::ground())
             .text_color(theme::text())
             .text_size(px(14.))
-            .child(self.render_header(now, cx))
+            .child(self.render_header(tasks, now, cx))
             .child(body)
-            .child(self.render_footer(cx))
-            .child(self.render_notices(cx))
+            .child(self.render_footer(tasks, cx))
+            .child(self.render_notices(tasks, cx))
     }
 }

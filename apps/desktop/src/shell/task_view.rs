@@ -10,11 +10,11 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
-use super::plan::{Action, Plan, resume_label, stopped_plan};
-use super::row::{Row, look};
+use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::ring;
 use crate::signals::{Level, Signal};
+use crate::tasks::{Row, look, resume_label};
 use crate::theme;
 use crate::ui::{self, BOTTOM, BUTTON_HEIGHT, CAPTION_LINE, GAP, TEXT_LINE, Tone, max};
 
@@ -50,12 +50,7 @@ pub(super) const STANDBY_MIN_HEIGHT: f32 = ring::AREA
 
 impl Shell {
     /// 中间一栏与右边的信号栏。
-    pub(super) fn render_task(
-        &self,
-        row: &Row,
-        now: Instant,
-        cx: &mut Context<Self>,
-    ) -> (Div, Div) {
+    pub(super) fn render_task(&self, row: &Row, now: Instant, cx: &Context<Self>) -> (Div, Div) {
         let look = look(row, now);
         let ticks = look.ticks;
         // 直播录制（没完成的）画钟面
@@ -158,7 +153,7 @@ impl Shell {
     }
 
     /// 正在改这个任务的请求头时，信号栏上方的编辑卡片。
-    fn headers_card(&self, row: &Row, cx: &mut Context<Self>) -> Option<Div> {
+    fn headers_card(&self, row: &Row, cx: &Context<Self>) -> Option<Div> {
         let (_, editor) = self
             .editing_headers
             .as_ref()
@@ -225,7 +220,7 @@ impl Shell {
         &self,
         row: &Row,
         discard: AnyElement,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         let id = row.task.id;
         let failure = match &row.task.status {
@@ -291,13 +286,13 @@ impl Shell {
         actions
     }
 
-    fn actions(&self, row: &Row, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn actions(&self, row: &Row, cx: &Context<Self>) -> Vec<AnyElement> {
         if !row.idle() {
             return Vec::new();
         }
         let id = row.task.id;
         let confirming = self.confirm_discard == Some(id);
-        let discard = |cx: &mut Context<Self>| {
+        let discard = |cx: &Context<Self>| {
             ui::button(
                 "discard",
                 if confirming {
@@ -313,12 +308,12 @@ impl Shell {
             })
             .into_any_element()
         };
-        let pause = |cx: &mut Context<Self>| {
+        let pause = |cx: &Context<Self>| {
             ui::button(
                 "pause",
                 "暂停",
                 Tone::Plain,
-                cx.listener(move |this, _, _, _| this.service.pause(id)),
+                cx.listener(move |this, _, _, cx| this.tasks.read(cx).pause(id)),
             )
             .into_any_element()
         };
@@ -330,7 +325,7 @@ impl Shell {
                     "停止并写出",
                     Tone::Rec,
                     cx.listener(move |this, _, _, cx| {
-                        this.service.stop(id);
+                        this.tasks.read(cx).stop(id);
                         cx.notify();
                     }),
                 )
@@ -345,7 +340,9 @@ impl Shell {
                     "forget",
                     "从列表移除",
                     Tone::Plain,
-                    cx.listener(move |this, _, _, cx| this.forget(id, cx)),
+                    cx.listener(move |this, _, _, cx| {
+                        this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
+                    }),
                 )
                 .into_any_element(),
             ],
@@ -381,7 +378,9 @@ impl Shell {
                         "forget",
                         "从列表移除",
                         Tone::Ghost,
-                        cx.listener(move |this, _, _, cx| this.forget(id, cx)),
+                        cx.listener(move |this, _, _, cx| {
+                            this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
+                        }),
                     )
                     .into_any_element(),
                 );
@@ -391,7 +390,7 @@ impl Shell {
     }
 
     /// 没有任务也没在新建时：待机的刻度环；剪贴板里有链接时放在环下面，一键探测。
-    pub(super) fn render_standby(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_standby(&self, cx: &Context<Self>) -> impl IntoElement {
         let ring = ring_with_disc(
             canvas(
                 |_, _, _| {},

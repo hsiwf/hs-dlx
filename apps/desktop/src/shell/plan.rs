@@ -12,7 +12,7 @@ pub(super) enum Action {
     WriteRecorded,
     /// 改存本地 HLS 再跑（点播续传，直播只写出）
     SwitchToHls,
-    /// 照新建时的请求续传、续录（叫法见 [`resume_label`]）
+    /// 照新建时的请求续传、续录（叫法见 [`crate::tasks::resume_label`]）
     Resume,
     /// 打开保存目录：占着输出路径的东西就在里面
     OpenFolder,
@@ -93,15 +93,6 @@ pub(super) fn stopped_plan(
         actions,
         resume_after_headers: failure.is_none_or(FailureKind::headers_can_change_outcome)
             && rerun == Action::Resume,
-    }
-}
-
-/// [`Action::Resume`] 的叫法：选了只写出的改回续录叫继续录制，失败的叫重试，暂停的叫继续。
-pub(super) fn resume_label(failed: bool, write_only: bool) -> &'static str {
-    match (write_only, failed) {
-        (true, _) => "继续录制",
-        (false, true) => "重试",
-        (false, false) => "继续",
     }
 }
 

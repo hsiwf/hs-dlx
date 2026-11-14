@@ -9,9 +9,9 @@ use gpui_kit::{
 
 use hs_m3u8_app::Status;
 
-use super::row::{Look, Row};
 use crate::live::{self, Face};
 use crate::ring::{AREA, angle};
+use crate::tasks::{Look, Row};
 use crate::ui::{self, CAPTION_LINE, TEXT_LINE};
 use crate::{format, theme};
 
