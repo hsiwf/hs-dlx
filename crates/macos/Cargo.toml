@@ -1,0 +1,23 @@
+[package]
+name = "hs-m3u8-macos"
+version.workspace = true
+description = "macOS application hooks the hs-m3u8 desktop app needs and GPUI does not expose"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 与 wry 0.57.2、gpui-pre-macos 0.3.12 用的同一版
+objc2 = "0.6.5"
+thiserror.workspace = true
+
+# 这个 crate 给 GPUI 注册的 Objective-C 类加方法，只能用 unsafe，所以不沿用工作区禁止 unsafe 的规则；其余 crate 照旧
+# 禁止。每个 unsafe 块都要写明为什么成立。
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"

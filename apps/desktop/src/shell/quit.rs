@@ -17,9 +17,26 @@ impl Shell {
                 .count()
     }
 
+    /// 系统要退出应用（程序坞、注销、关机，或 [`Shell::leave`] 发出的）：已决定退出的照常退出；否则同关窗
+    /// （[`Shell::should_close`]），要问时取消这次退出（注销、关机随之取消），把窗口带到前面问，问完再退出。
+    pub(super) fn should_terminate(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.quit == Quit::Leaving {
+            return true;
+        }
+        let quit = self.should_close(window, cx);
+        if !quit {
+            cx.activate(true);
+            window.activate_window();
+        }
+        quit
+    }
+
     /// 关窗前：有任务在运行时问一句。选了退出就暂停（或停止录制并写出）它们，等都停下再退出。
-    /// 没有任务在运行时先把没写进存储的状态补写进去，补写不进时问要不要仍然退出。
+    /// 没有任务在运行时先把没写进存储的状态补写进去，补写不进时问要不要仍然退出。正在问时不再问。
     pub(super) fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.quit == Quit::Asking {
+            return false;
+        }
         let busy = self.busy();
         if busy == 0 {
             let Err(error) = self.service.flush() else {
@@ -34,11 +51,17 @@ impl Shell {
                 &[PromptButton::new("仍然退出"), PromptButton::cancel("取消")],
                 cx,
             );
+            self.quit = Quit::Asking;
             cx.spawn(async move |this, cx| {
-                if let Ok(0) = answer.await {
-                    // 提示框开着期间视图已不在时，应用已在退出
-                    let _closed = this.update(cx, |this, cx| this.leave(cx));
-                }
+                let leave = matches!(answer.await, Ok(0));
+                // 提示框开着期间视图已不在时，应用已在退出
+                let _closed = this.update(cx, |this, cx| {
+                    if leave {
+                        this.leave(cx);
+                    } else {
+                        this.quit = Quit::Staying;
+                    }
+                });
             })
             .detach();
             return false;
@@ -67,16 +90,16 @@ impl Shell {
             &answers,
             cx,
         );
+        self.quit = Quit::Asking;
         cx.spawn(async move |this, cx| {
-            let Ok(choice) = answer.await else {
-                return;
-            };
-            if choice == cancel {
-                return;
-            }
-            let stop_recordings = recording && choice == 1;
+            let choice = answer.await.ok().filter(|&choice| choice != cancel);
             // 提示框开着期间视图已不在时没有要做的
             let _closed = this.update(cx, |this, cx| {
+                let Some(choice) = choice else {
+                    this.quit = Quit::Staying;
+                    return;
+                };
+                let stop_recordings = recording && choice == 1;
                 this.quit = Quit::Waiting;
                 for row in &this.rows {
                     if row.task.status != Status::Running {
@@ -98,7 +121,7 @@ impl Shell {
 
     /// 在退出（等任务停下或已决定退出）：不开始新的运行。
     pub(super) fn quitting(&self) -> bool {
-        self.quit != Quit::Staying
+        matches!(self.quit, Quit::Waiting | Quit::Leaving)
     }
 
     /// 不退出了：失败与没删干净的东西留给用户看；`why` 写进提示。已决定退出的照常退出。

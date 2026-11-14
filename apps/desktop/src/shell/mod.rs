@@ -85,6 +85,8 @@ enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Quit {
     Staying,
+    /// 正在问要不要退出（提示框开着）：再来的退出请求不再问
+    Asking,
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
     Waiting,
     /// 退出已不可撤回（已向系统发出退出）：不再接手转交来的链接
@@ -177,7 +179,7 @@ impl Shell {
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         );
-        // 从程序坞或菜单退出不经关窗：停下所有任务、补写状态（最多等 2 秒），退出已不可撤回
+        // 应用真要退出了（问过之后，或不经询问的退出，如别的平台注销）：停下所有任务、补写状态（最多等 2 秒）
         let quitting = cx.on_app_quit(|this: &mut Self, _| {
             // 没有窗口能显示了；补写不进的下次打开时按暂停处理（见 Service::close）
             let _unsaved = this.service.close();
@@ -194,7 +196,13 @@ impl Shell {
             this.update(cx, |shell, cx| shell.should_close(window, cx))
                 .unwrap_or(true)
         });
-
+        #[cfg(target_os = "macos")]
+        if let Err(error) = shell_asks_before_terminate(window, cx) {
+            notices.push(Notice {
+                id: notices.len() as u64,
+                text: format!("从程序坞退出、注销时不会先问：{error}"),
+            });
+        }
         let handing = match handoffs {
             Ok(mut handoffs) => cx.spawn_in(window, async move |this, cx| {
                 while let Some(received) = handoffs.recv().await {
@@ -543,6 +551,28 @@ impl Shell {
             Page::Task | Page::Sniff(_) => None,
         }
     }
+}
+
+/// 系统要退出应用（程序坞、注销、关机）时先问外壳（见 [`Shell::should_terminate`]）。窗口已关（关窗即退出的那一次）
+/// 时照常退出。
+#[cfg(target_os = "macos")]
+fn shell_asks_before_terminate(
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) -> Result<(), hs_m3u8_macos::Error> {
+    let (this, handle, mut app) = (
+        cx.entity().downgrade(),
+        window.window_handle(),
+        cx.to_async(),
+    );
+    hs_m3u8_macos::ask_before_terminate(move || {
+        handle
+            .update(&mut app, |_, window, cx| {
+                this.update(cx, |shell, cx| shell.should_terminate(window, cx))
+            })
+            .and_then(|answer| answer)
+            .unwrap_or(true)
+    })
 }
 
 /// 任务停下时的信号。
