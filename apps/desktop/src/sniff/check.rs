@@ -125,12 +125,16 @@ async fn run(
     };
     let mut source = Source::new(target.stream.clone());
     source.http.headers.clone_from(&made.headers);
-    // 超时即释放句柄、取消探测
-    let probing = std::pin::pin!(service.probe(source));
     let failed = |reason| Check::Failed {
         reason,
         headers: Some(made.headers.clone()),
     };
+    let probing = match service.probe(source) {
+        Ok(probing) => probing,
+        Err(error) => return (failed(error.to_string()), made.skipped),
+    };
+    // 超时即释放句柄、取消探测
+    let probing = std::pin::pin!(probing);
     let check = match within(probing, executor.timer(PROBE_TIMEOUT)).await {
         Some(Ok(Ok(probe))) => Check::Ready {
             summary: new_task::describe(&probe).join(" · "),

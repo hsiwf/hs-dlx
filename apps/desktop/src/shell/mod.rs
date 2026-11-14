@@ -31,6 +31,7 @@ use crate::headers::HeadersEditor;
 use crate::links;
 use crate::new_task;
 use crate::new_task::NewTask;
+use crate::settings::{SettingsEvent, SettingsView};
 use crate::signals::Level;
 use crate::sniff::SniffView;
 use crate::theme;
@@ -76,6 +77,11 @@ enum Page {
         _subscription: Subscription,
         from_sniff: bool,
         page_check: Option<(Entity<SniffView>, Subscription)>,
+    },
+    /// 设置页：视图与对它的订阅，离开时一起释放
+    Settings {
+        view: Entity<SettingsView>,
+        _subscription: Subscription,
     },
     /// 网页里的视频流：只经 [`Shell::show_sniff`] 换上，视图即 [`Shell::sniff`] 里的；网页显示着时占满主体，不显示任务
     /// 列表
@@ -539,7 +545,7 @@ impl Shell {
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
         let sniff_of = |page: &Page| match page {
             Page::Sniff(view) => Some(view.clone()),
-            Page::Task | Page::NewTask { .. } => None,
+            Page::Task | Page::NewTask { .. } | Page::Settings { .. } => None,
         };
         let (was, will) = (sniff_of(&self.page), sniff_of(&page));
         if was != will {
@@ -554,6 +560,45 @@ impl Shell {
         cx.notify();
     }
 
+    /// 打开设置页；已开着时关上。读不出设置时提示原因。
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.page, Page::Settings { .. }) {
+            self.show(Page::Task, cx);
+            return;
+        }
+        let proxy = match self.service.settings() {
+            Ok(settings) => settings.proxy,
+            Err(error) => {
+                self.notify(format!("读不出设置：{error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let (service, folder, home) =
+            (self.service.clone(), self.folder.clone(), self.home.clone());
+        let view = cx.new(|cx| SettingsView::new(service, folder, home, proxy, window, cx));
+        let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
+            match event {
+                SettingsEvent::Dismissed => this.show(Page::Task, cx),
+                SettingsEvent::FolderChanged(folder) => this.folder_changed(folder.clone(), cx),
+            }
+            cx.notify();
+        });
+        self.show(
+            Page::Settings {
+                view,
+                _subscription: subscription,
+            },
+            cx,
+        );
+    }
+
+    /// 新建任务默认保存到的目录换了（已存进设置）：按新目录读可用空间。
+    fn folder_changed(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+        self.folder = folder;
+        self.watch_free_space(cx);
+    }
+
     /// 换到嗅探页（[`Shell::sniff`] 里的视图）；嗅探页已关时什么也不做（旧帧上的点击）。
     fn show_sniff(&mut self, cx: &mut Context<Self>) {
         if let Some((view, _)) = &self.sniff {
@@ -565,7 +610,7 @@ impl Shell {
     fn new_task(&self) -> Option<&Entity<NewTask>> {
         match &self.page {
             Page::NewTask { view, .. } => Some(view),
-            Page::Task | Page::Sniff(_) => None,
+            Page::Task | Page::Sniff(_) | Page::Settings { .. } => None,
         }
     }
 }
@@ -605,6 +650,7 @@ impl Render for Shell {
         body = match &self.page {
             Page::NewTask { view, .. } => body.child(view.clone()),
             Page::Sniff(view) => body.child(view.clone()),
+            Page::Settings { view, .. } => body.child(view.clone()),
             Page::Task => match self.selected_row() {
                 Some(row) => {
                     let (main, aside) = self.render_task(row, now, cx);
@@ -621,7 +667,7 @@ impl Render for Shell {
             .bg(theme::ground())
             .text_color(theme::text())
             .text_size(px(14.))
-            .child(self.render_header(now))
+            .child(self.render_header(now, cx))
             .child(body)
             .child(self.render_footer(cx))
             .child(self.render_notices(cx))

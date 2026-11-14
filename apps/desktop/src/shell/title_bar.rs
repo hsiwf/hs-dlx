@@ -3,11 +3,15 @@
 use std::time::Instant;
 
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::{Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{FontWeight, IntoElement, ParentElement as _, Styled as _, canvas, div, px};
+use gpui_kit::{
+    Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, canvas, div, px,
+};
 use hs_m3u8_app::Status;
 
-use super::Shell;
+use super::{Page, Shell};
 use crate::ui::{self, TITLE_HEIGHT};
 use crate::{format, ring, theme};
 
@@ -21,9 +25,11 @@ const LOGO_GAP: f32 = 10.;
 const STATUS_MARGIN: f32 = 28.;
 /// 可用空间少于这么多时标成橙色：约 10 Mbps 的视频再下十几分钟就满。
 const LOW_SPACE: u64 = 1 << 30;
+/// 设置按钮的边长。
+const SETTINGS: f32 = 36.;
 
 impl Shell {
-    pub(super) fn render_header(&self, now: Instant) -> impl IntoElement {
+    pub(super) fn render_header(&self, now: Instant, cx: &mut Context<Self>) -> impl IntoElement {
         let running: Vec<_> = self
             .rows
             .iter()
@@ -78,19 +84,56 @@ impl Shell {
                             .child("hs-m3u8"),
                     ),
             )
-            .child(ui::num(
+            .child(
                 div()
                     .pr(px(STATUS_MARGIN))
                     .flex()
-                    .gap(px(6.))
-                    .text_size(px(13.))
-                    .text_color(theme::muted())
-                    .children(activity)
-                    .children(space.map(|(text, warn)| {
+                    .items_center()
+                    .gap(px(14.))
+                    .child(ui::num(
                         div()
-                            .when(warn, |s| s.text_color(theme::orange()))
-                            .child(text)
-                    })),
-            ))
+                            .flex()
+                            .gap(px(6.))
+                            .text_size(px(13.))
+                            .text_color(theme::muted())
+                            .children(activity)
+                            .children(space.map(|(text, warn)| {
+                                div()
+                                    .when(warn, |s| s.text_color(theme::orange()))
+                                    .child(text)
+                            })),
+                    ))
+                    .child(self.settings_button(cx)),
+            )
+    }
+
+    /// 设置的按钮：齿轮，设置页开着时发光。
+    fn settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = matches!(self.page, Page::Settings { .. });
+        div()
+            .id("settings")
+            .size(px(SETTINGS))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_1()
+            .cursor_pointer()
+            .map(|button| {
+                if on {
+                    button
+                        .border_color(theme::edge())
+                        .bg(theme::selected())
+                        .text_color(theme::cyan())
+                        .shadow(ui::glow(theme::cyan(), 14., 0.25))
+                } else {
+                    button
+                        .border_color(gpui_kit::transparent_black())
+                        .text_color(theme::muted())
+                        .hover(|s| s.bg(theme::raised()))
+                }
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)))
+            .child(Icon::new(IconName::Settings).size(px(18.)))
     }
 }

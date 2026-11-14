@@ -571,3 +571,86 @@ fn a_paused_task_can_switch_to_local_hls() {
     assert!(folder.join("index").join("index.m3u8").is_file());
     assert!(!folder.join("index.mp4").exists());
 }
+
+/// 只回 403 的 HTTP 代理：记下经它的请求行。
+async fn refusing_proxy() -> (Url, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                log.lock().unwrap().push(line.trim_end().to_owned());
+                // 读完请求头再回
+                loop {
+                    let mut header = String::new();
+                    if stream.read_line(&mut header).await.unwrap() <= 2 {
+                        break;
+                    }
+                }
+                stream
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    (url, seen)
+}
+
+/// 设置里的代理用于探测与之后开始的任务，重开后还在；用不了的代理地址存不进。
+#[test]
+fn the_proxy_setting_applies_to_probes_and_new_tasks() {
+    let dir = test_dir("proxy");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let (proxy, seen) = rt.block_on(refusing_proxy());
+    let playlist = server.base.join("index.m3u8").unwrap();
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+
+    assert!(matches!(
+        service.set_proxy(&hs_m3u8_core::Proxy::Url(
+            Url::parse("ftp://127.0.0.1:21").unwrap()
+        )),
+        Err(Error::InvalidInput(_))
+    ));
+    service
+        .set_proxy(&hs_m3u8_core::Proxy::Url(proxy.clone()))
+        .unwrap();
+    // 探测经代理：代理拒绝
+    let probed = rt.block_on(
+        service
+            .probe(hs_m3u8_core::Source::new(playlist.clone()))
+            .unwrap(),
+    );
+    assert!(probed.unwrap().is_err());
+    assert_eq!(seen.lock().unwrap().len(), 1, "{:?}", seen.lock().unwrap());
+    assert!(seen.lock().unwrap()[0].contains(playlist.as_str()));
+    // 开始的任务也经代理
+    let task = create(&rt, &service, draft(playlist.clone(), dir.join("out")));
+    let status = rt.block_on(ended(&mut events, task.id, |_| {}));
+    assert!(
+        matches!(&status, Status::Failed(f) if f.kind == FailureKind::Status(403)),
+        "{status:?}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    drop(service);
+
+    // 重开后照旧；改为直连后不再经代理
+    let (service, _events) = self::service(&dir.join("tasks.sqlite"));
+    assert!(service.settings().unwrap().proxy == hs_m3u8_core::Proxy::Url(proxy));
+    service.set_proxy(&hs_m3u8_core::Proxy::Direct).unwrap();
+    let probed = rt.block_on(service.probe(hs_m3u8_core::Source::new(playlist)).unwrap());
+    assert!(probed.unwrap().is_ok());
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}

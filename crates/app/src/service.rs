@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -15,7 +15,7 @@ use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output,
-    OutputOptions, Probe, Progress, Saved, Source, Stage, Unsettled, check_option_header,
+    OutputOptions, Probe, Progress, Proxy, Saved, Source, Stage, Unsettled, check_option_header,
 };
 use rusqlite::Transaction;
 use tokio::runtime::Runtime;
@@ -25,7 +25,9 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
-use crate::{Draft, Error, Failure, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming};
+use crate::{
+    Draft, Error, Failure, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec, naming,
+};
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -197,13 +199,53 @@ impl Service {
         self.flush()
     }
 
-    /// 探测来源；返回的句柄在任何执行器上都可等待，释放它即取消探测（连同在途的请求）。
-    pub fn probe(&self, source: Source) -> AbortOnDropHandle<Result<Probe, hs_m3u8_core::Error>> {
+    /// 设置。
+    pub fn settings(&self) -> Result<Settings, Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::settings(&tx)
+    }
+
+    /// 记下新建任务默认保存到的目录；不是绝对路径时报 [`Error::InvalidInput`]。
+    pub fn set_folder(&self, folder: &Path) -> Result<(), Error> {
+        if !folder.is_absolute() {
+            return Err(Error::InvalidInput(format!(
+                "保存目录要是绝对路径：{}",
+                folder.display()
+            )));
+        }
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_folder(&tx, folder)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 记下代理：之后的探测与开始的任务照它，已在运行的任务不变。指定的代理地址用不了（协议不是 http、https、socks4、
+    /// socks4a、socks5、socks5h，或没有主机）时报 [`Error::InvalidInput`]。
+    pub fn set_proxy(&self, proxy: &Proxy) -> Result<(), Error> {
+        if let Proxy::Url(url) = proxy {
+            Proxy::check_url(url).map_err(|error| Error::InvalidInput(error.to_string()))?;
+        }
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_proxy(&tx, proxy)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 探测来源，经设置里的代理（`source.http.proxy` 照设置换掉）；返回的句柄在任何执行器上都可等待，释放它即取消
+    /// 探测（连同在途的请求）。读不出设置时为原因。
+    pub fn probe(
+        &self,
+        mut source: Source,
+    ) -> Result<AbortOnDropHandle<Result<Probe, hs_m3u8_core::Error>>, Error> {
+        source.http.proxy = self.settings()?.proxy;
         let engine = self.shared.engine.clone();
-        AbortOnDropHandle::new(
+        Ok(AbortOnDropHandle::new(
             self.runtime()
                 .spawn(async move { engine.probe(&source).await }),
-        )
+        ))
     }
 
     /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里，
@@ -573,7 +615,8 @@ impl Shared {
         let applied = self.apply_unsaved(&tx)?;
         let id = store::insert(&tx, spec, &work_dir, created_at)?;
         let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
-        let job = self.engine.start(request(&task)?)?;
+        let proxy = store::settings(&tx)?.proxy;
+        let job = self.engine.start(request(&task, proxy)?)?;
         if let Err(error) = self.commit(tx, applied) {
             drop(store);
             self.abandon(job, work_dir);
@@ -594,7 +637,10 @@ impl Shared {
         let applied = self.apply_unsaved(&tx)?;
         let mut task = self.stopped(&tx, id)?;
         let job = match run {
-            Run::Resume => self.engine.start(request(&task)?)?,
+            Run::Resume => {
+                let proxy = store::settings(&tx)?.proxy;
+                self.engine.start(request(&task, proxy)?)?
+            }
             Run::WriteRecorded => self.engine.merge_recorded(output_options(&task)?)?,
         };
         task.status = Status::Running;
@@ -830,13 +876,14 @@ fn save_ending(tx: &Transaction<'_>, id: TaskId, ending: &Ending) -> Result<(), 
     Ok(())
 }
 
-/// 照任务建请求：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是直播时不开录制，来源是直播就
-/// 报 [`hs_m3u8_core::Error::LiveNotEnabled`]。
-fn request(task: &Task) -> Result<JobRequest, Error> {
+/// 照任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是
+/// 直播时不开录制，来源是直播就报 [`hs_m3u8_core::Error::LiveNotEnabled`]。
+fn request(task: &Task, proxy: Proxy) -> Result<JobRequest, Error> {
     let spec = &task.spec;
     let mut source = Source::new(spec.url.clone());
     source.preference = Preference::from(&spec.preference);
     source.http.headers.clone_from(&spec.headers);
+    source.http.proxy = proxy;
     let mut request = JobRequest::new(source, output_options(task)?);
     if !spec.live {
         request.live = None;

@@ -8,16 +8,23 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
+use hs_m3u8_core::Proxy;
+
 use crate::preference::StoredPreference;
 use crate::{
-    Error, Failure, FailureKind, Finished, OutputSpec, Status, Task, TaskId, TaskSpec, naming,
+    Error, Failure, FailureKind, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec,
+    naming, settings,
 };
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 2] = [create_task_table, rebuild_with_work_dir_and_result];
+const MIGRATIONS: [Migration; 3] = [
+    create_task_table,
+    rebuild_with_work_dir_and_result,
+    create_settings_table,
+];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
@@ -143,6 +150,20 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
             }
         }
     }
+    Ok(())
+}
+
+/// 第 3 版：设置（[`crate::Settings`]）只有一行，编号固定为 1；保存目录为 NULL 时没设过，代理的写法见
+/// [`crate::settings::proxy_code`]。
+fn create_settings_table(tx: &Transaction<'_>) -> Result<(), Error> {
+    tx.execute_batch(
+        "CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            folder TEXT,
+            proxy TEXT NOT NULL DEFAULT 'system' CHECK (proxy IN ('system', 'direct') OR proxy GLOB 'url:?*')
+        ) STRICT;
+        INSERT INTO settings (id) VALUES (1);",
+    )?;
     Ok(())
 }
 
@@ -600,6 +621,46 @@ fn utf8(path: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::InvalidInput(format!("路径不是 UTF-8：{}", path.display())))
 }
 
+/// 读出设置；保存目录不是绝对路径、代理认不出时报 [`Error::Corrupt`]。
+pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
+    let (folder, proxy): (Option<String>, String) = tx.query_row(
+        "SELECT folder, proxy FROM settings WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let folder = folder
+        .map(PathBuf::from)
+        .map(|folder| {
+            folder
+                .is_absolute()
+                .then_some(folder)
+                .ok_or_else(|| Error::Corrupt("设置里的保存目录".to_owned()))
+        })
+        .transpose()?;
+    Ok(Settings {
+        folder,
+        proxy: settings::parse_proxy(&proxy)?,
+    })
+}
+
+/// 记下新建任务默认保存到的目录 `folder`（绝对路径，调用方已核对）；不是 UTF-8 时报 [`Error::InvalidInput`]。
+pub fn set_folder(tx: &Transaction<'_>, folder: &Path) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET folder = ?1 WHERE id = 1",
+        params![utf8(folder)?],
+    )?;
+    Ok(())
+}
+
+/// 记下代理（调用方已核对能用）。
+pub fn set_proxy(tx: &Transaction<'_>, proxy: &Proxy) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET proxy = ?1 WHERE id = 1",
+        params![settings::proxy_code(proxy)],
+    )?;
+    Ok(())
+}
+
 /// 输出在表里的三列：种类与两个路径。
 fn output_columns(
     output: &OutputSpec,
@@ -856,9 +917,29 @@ mod tests {
         delete(&tx, last).unwrap();
         let next = add(&tx, OutputSpec::Mp4("/m/e.mp4".into()), 2).unwrap();
         assert_eq!(next.0, last.0 + 1);
+        // 迁移来的存储有一份没设过的设置
+        assert!(settings(&tx).unwrap() == Settings::default());
         drop(tx);
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 设置读回写入的值；不是本应用写的代理写法由表拦下。
+    #[test]
+    fn settings_round_trip() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        assert!(settings(&tx).unwrap() == Settings::default());
+        set_folder(&tx, Path::new("/m/影片")).unwrap();
+        let proxy = Proxy::Url(hs_m3u8_core::Url::parse("http://127.0.0.1:7890").unwrap());
+        set_proxy(&tx, &proxy).unwrap();
+        let read = settings(&tx).unwrap();
+        assert_eq!(read.folder.as_deref(), Some(Path::new("/m/影片")));
+        assert!(read.proxy == proxy);
+        assert!(
+            tx.execute("UPDATE settings SET proxy = 'pac' WHERE id = 1", [])
+                .is_err()
+        );
     }
 
     /// 同一份存储同时只能被一个进程（这里是同一进程里的第二个连接）打开；先打开的释放后才能再开。

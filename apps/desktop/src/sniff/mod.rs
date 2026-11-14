@@ -80,6 +80,8 @@ pub struct SniffView {
     load: Load,
     /// 当前页面的故障（导航没成、网页进程退出）：要刷新才回来
     failure: Option<String>,
+    /// 网页没照设置里的代理走、照系统代理的原因（见 [`crate::route::web_proxy`]）
+    proxy_note: Option<String>,
     judge: Judge,
     found: Vec<Found>,
     /// 列表满了之后又找到的条数
@@ -156,7 +158,14 @@ impl SniffView {
                     });
                 }
             });
-        let builder = builder.with_url(url.as_str());
+        let (proxy, proxy_note) = match service
+            .settings()
+            .map_err(|error| error.to_string())
+            .and_then(|settings| crate::route::web_proxy(&settings.proxy))
+        {
+            Ok(proxy) => (proxy, None),
+            Err(reason) => (hs_m3u8_webview::WebProxy::System, Some(reason)),
+        };
         let failed = {
             let inbox = inbox.clone();
             move |failure| {
@@ -166,7 +175,7 @@ impl SniffView {
                 });
             }
         };
-        let webview = WebView::build(builder, failed, window, cx)
+        let webview = WebView::build(builder, url.as_str(), &proxy, failed, window, cx)
             .map(|webview| cx.new(|_| webview))
             .map_err(|error| format!("建不出网页：{error}"));
         let engine = cx.spawn(async move |this, cx| {
@@ -225,6 +234,7 @@ impl SniffView {
                 since: Instant::now(),
             },
             failure: None,
+            proxy_note,
             judge,
             found: Vec::new(),
             overflow: 0,

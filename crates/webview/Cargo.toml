@@ -12,13 +12,14 @@ publish = false
 gpui-kit.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 url.workspace = true
-wry.workspace = true
+# mac-proxy：macOS 上给网页设代理（14 起；别的平台上不起作用）
+wry = { workspace = true, features = ["mac-proxy"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 与 wry 0.57.2 用的同一版：取网页引擎的 Cookie 存储
 block2 = "0.6.2"
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDate", "NSHTTPCookie", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDate", "NSHTTPCookie", "NSKeyValueCoding", "NSProcessInfo", "NSString"] }
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKHTTPCookieStore", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

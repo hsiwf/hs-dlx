@@ -10,9 +10,11 @@ pub mod cookies;
 mod failure;
 
 pub use failure::Failure;
+pub use proxy::{WebProxy, supported};
 #[cfg(target_os = "linux")]
 mod linux;
 mod media;
+mod proxy;
 
 /// wry 的网页消息（`with_ipc_handler` 收到的）是哪个框架发的：macOS 上为那个框架的地址；Windows 上只有顶层框架能发，
 /// 为顶层页面的地址；Linux 上 wry 给的总是顶层页面的地址、认不出是哪个框架发的，为 None。地址由网页引擎给出，页面
@@ -69,17 +71,24 @@ impl Drop for WebView {
 }
 
 impl WebView {
-    /// 按 `builder` 在 `window` 里建网页，做好各平台 wry 要的准备；网页出了 wry 不报的故障（见 [`Failure`]）时在界面
-    /// 线程上调 `on_failure`。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland 窗口报错；GTK 在这里初始化，有网页期间
-    /// 由 GPUI 驱动它的主循环。
+    /// 按 `builder`（不带地址）在 `window` 里建网页，做好各平台 wry 要的准备，设好代理 `proxy` 后加载 `url`；网页出了
+    /// wry 不报的故障（见 [`Failure`]）时在界面线程上调 `on_failure`。`proxy` 要是这个平台支持的（[`supported`]），
+    /// 否则是调用方的缺陷，中止。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland 窗口报错；GTK 在这里初始化，有网页
+    /// 期间由 GPUI 驱动它的主循环。
     pub fn build(
         builder: wry::WebViewBuilder,
+        url: &str,
+        proxy: &WebProxy,
         on_failure: impl Fn(Failure) + 'static,
         window: &mut Window,
         cx: &mut App,
     ) -> wry::Result<Self> {
+        if let Err(reason) = supported(proxy) {
+            panic!("调用方要先确认网页代理受支持：{reason}");
+        }
         let report: failure::Report = Rc::new(on_failure);
         let builder = failure::before_build(builder, &report);
+        let builder = proxy::before_build(builder, proxy);
         #[cfg(target_os = "linux")]
         let (webview, gtk) = {
             let parent = linux::X11Parent::new(window)?;
@@ -89,6 +98,8 @@ impl WebView {
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build_as_child(&*window)?;
         failure::after_build(&webview, &report)?;
+        proxy::after_build(&webview, proxy);
+        webview.load_url(url)?;
         // 第一次布局之前先不占地方
         webview.set_bounds(Rect::default())?;
         #[cfg(target_os = "linux")]

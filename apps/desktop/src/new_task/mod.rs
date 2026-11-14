@@ -19,10 +19,11 @@ use gpui_kit::{
 };
 use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
-use hs_m3u8_core::{Probe, ProxySource, Source, Url};
+use hs_m3u8_core::{Probe, Source, Url};
 
 use crate::format;
 use crate::headers::HeadersEditor;
+use crate::route::Route;
 use crate::ui::{BOTTOM, GAP};
 
 /// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
@@ -74,36 +75,6 @@ impl Phase {
             Phase::Probing => "正在探测",
             Phase::Ready => "探测完成",
             Phase::Failed => "探测失败",
-        }
-    }
-}
-
-/// 请求经哪里走。任务都用系统代理设置（核心的默认 [`hs_m3u8_core::Proxy::System`]，应用不改它），这里照同一份设置读。
-enum Route {
-    /// 经这个代理（已去掉凭据的写法）与读到它的地方
-    Proxy(String, &'static str),
-    /// 直连，值为原因
-    Direct(&'static str),
-    /// 系统代理设置用不了或读不出，值为原因；任务开始时同样会失败
-    Broken(String),
-}
-
-impl Route {
-    fn of(url: &Url) -> Route {
-        match hs_m3u8_core::system_proxy() {
-            Ok(Some(system)) => match system.proxy_for(url) {
-                Some(proxy) => Route::Proxy(
-                    hs_m3u8_core::bare_url(proxy),
-                    match system.source {
-                        ProxySource::Environment => "环境变量",
-                        ProxySource::MacOs => "系统设置",
-                        ProxySource::Windows => "Internet 选项",
-                    },
-                ),
-                None => Route::Direct("这个地址不经代理"),
-            },
-            Ok(None) => Route::Direct("系统没设代理"),
-            Err(error) => Route::Broken(error.to_string()),
         }
     }
 }
@@ -183,9 +154,10 @@ impl NewTask {
         let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
         // 读系统代理要调操作系统的接口，在后台读
         let target = url.clone();
+        let proxy = service.settings().map(|settings| settings.proxy);
         let reading = cx
             .background_executor()
-            .spawn(async move { Route::of(&target) });
+            .spawn(async move { Route::of(&target, proxy) });
         let route = cx.spawn(async move |this, cx| {
             let route = reading.await;
             // 视图在读的期间被关掉时不再需要结果
@@ -228,9 +200,19 @@ impl NewTask {
     fn probe(&mut self, headers: Vec<(String, String)>, first: bool, cx: &mut Context<Self>) {
         let mut source = Source::new(self.url.clone());
         source.http.headers = headers;
-        let handle = self.service.probe(source);
-        self.probing = Probing::Running;
         self.page_check = PageCheck::Idle;
+        let handle = match self.service.probe(source) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.probing = Probing::Failed(Failure {
+                    kind: FailureKind::Other,
+                    message: error.to_string(),
+                });
+                cx.notify();
+                return;
+            }
+        };
+        self.probing = Probing::Running;
         self._probe = cx.spawn(async move |this, cx| {
             let (probing, not_page) = match handle.await {
                 Ok(Ok(probe)) => (Probing::Ready(Box::new(probe)), false),

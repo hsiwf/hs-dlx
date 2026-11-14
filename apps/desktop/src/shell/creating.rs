@@ -75,8 +75,10 @@ impl Shell {
                     NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     NewTaskEvent::FolderChanged(folder) => {
-                        this.folder = folder.clone();
-                        this.watch_free_space(cx);
+                        if let Err(error) = this.service.set_folder(folder) {
+                            this.notify(format!("新的保存位置没能记下，下次打开时不在：{error}"));
+                        }
+                        this.folder_changed(folder.clone(), cx);
                     }
                 }
                 cx.notify();

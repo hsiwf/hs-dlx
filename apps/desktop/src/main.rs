@@ -8,6 +8,8 @@ mod live;
 mod new_task;
 mod rate;
 mod ring;
+mod route;
+mod settings;
 mod shell;
 mod signals;
 mod sniff;
@@ -45,7 +47,7 @@ fn store_path() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join("hs-m3u8").join("tasks.sqlite"))
 }
 
-/// 新建任务默认保存到哪：影片目录，没有时下载目录，再没有时主目录。
+/// 设置里没有保存位置时，新建任务默认保存到哪：影片目录，没有时下载目录，再没有时主目录。
 fn default_folder() -> Option<PathBuf> {
     dirs::video_dir()
         .or_else(dirs::download_dir)
@@ -114,9 +116,8 @@ fn main() {
                 .nth(1)
                 .map(|arg| arg.to_string_lossy().into_owned());
             let started = store_path()
-                .zip(default_folder())
-                .ok_or_else(|| Failure::new("启动失败", "找不到放应用数据或保存视频的目录"))
-                .and_then(|(path, folder)| {
+                .ok_or_else(|| Failure::new("启动失败", "找不到放应用数据的目录"))
+                .and_then(|path| {
                     let store = match Store::open(&path) {
                         Ok(store) => store,
                         // 已经开着一个：把链接交给它（或请它到前台）就退出
@@ -150,6 +151,12 @@ fn main() {
                     let handoffs = hs_m3u8_instance::listen(&path);
                     let (service, events) = Service::new(store, MAX_REQUESTS)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
+                    let folder = service
+                        .settings()
+                        .map_err(|error| Failure::new("启动失败", error.to_string()))?
+                        .folder
+                        .or_else(default_folder)
+                        .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
                     Ok(Some((service, events, folder, handoffs)))
                 });
             let opened = match started {
