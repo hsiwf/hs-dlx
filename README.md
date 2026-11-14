@@ -1,20 +1,166 @@
-# hs-dlx
+<p align="center">
+  <img src="apps/desktop/assets/icons/128@2x.png" width="112" alt="hs-dlx">
+</p>
 
-桌面下载器（macOS、Windows、Linux）。现在下载 HLS（m3u8）：点播与直播录制、在网页里找视频流、断点续传，输出 MP4
-或本地 HLS；HLS 的部分用 [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库。
+<h1 align="center">hs-dlx</h1>
 
-## 构建
+<p align="center">以视频为中心的桌面下载器：贴一个地址或网页，挑清晰度，下点播、录直播。</p>
 
-要 Rust（版本见 rust-toolchain.toml）、[uv](https://docs.astral.sh/uv/)（仓库里的 Python 脚本用），Linux 上另要
-WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包（见 .github/workflows/check.yml）。
+<p align="center">
+  <a href="https://github.com/x-haose/hs-dlx/releases/latest"><img src="https://img.shields.io/github/v/release/x-haose/hs-dlx?style=flat-square&label=release" alt="Release"></a>
+  <a href="https://github.com/x-haose/hs-dlx/actions/workflows/check.yml"><img src="https://img.shields.io/github/actions/workflow/status/x-haose/hs-dlx/check.yml?branch=main&style=flat-square&label=check" alt="check"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-555?style=flat-square" alt="macOS | Windows | Linux">
+  <img src="https://img.shields.io/badge/Rust-GPUI-dea584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT"></a>
+</p>
+
+<p align="center">
+  <a href="#下载安装">下载安装</a> ·
+  <a href="#功能">功能</a> ·
+  <a href="#路线图">路线图</a> ·
+  <a href="#技术栈与结构">技术栈与结构</a> ·
+  <a href="#从源码构建">从源码构建</a> ·
+  <a href="CHANGELOG.md">更新日志</a> ·
+  <a href="CONTRIBUTING.md">参与开发</a>
+</p>
+
+<p align="center">
+  <img src=".github/screenshots/new-task.png" alt="探测出五档清晰度，在同心环上选一档">
+</p>
+
+hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不是 Electron，也不是套在网页里的壳。现在专注 HLS（m3u8）：
+点播与直播录制、在网页里找视频流、断点续传，输出 MP4 或可直接播放的本地 HLS。下载引擎是
+[hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库。接下来会加入磁力、云离线、站点解析与边下边播，见[路线图](#路线图)。
+
+<table>
+  <tr>
+    <td width="50%"><img src=".github/screenshots/downloading.png" alt="下载中：进度环、速度、剩余时间与分片数"></td>
+    <td width="50%"><img src=".github/screenshots/finished.png" alt="下载完成：时长、大小、画面与事件记录"></td>
+  </tr>
+  <tr>
+    <td align="center">下载中</td>
+    <td align="center">完成</td>
+  </tr>
+</table>
+
+## 下载安装
+
+到 [Releases](https://github.com/x-haose/hs-dlx/releases/latest) 下载对应平台的安装包：
+
+| 平台 | 安装包 | 要求 |
+|---|---|---|
+| macOS | `hs-dlx_<版本>_aarch64.dmg` | macOS 11 及以上，Apple 芯片 |
+| Windows | `hs-dlx_<版本>_x64-setup.exe` | Windows 10 / 11 x64；装在当前用户下，不要管理员。嗅探页用系统的 WebView2 |
+| Linux | `hs-dlx_<版本>_amd64.deb` | 在 Ubuntu 24.04 上构建；依赖 WebKitGTK 4.1、GTK 3 |
+
+安装包没有代码签名，第一次打开时：
+
+- **macOS**：提示「已损坏」或「无法验证开发者」时，把应用拖进「应用程序」后执行
+  `xattr -dr com.apple.quarantine /Applications/hs-dlx.app`。
+- **Windows**：SmartScreen 拦下时点「更多信息 → 仍要运行」。
+- **Linux**：`sudo apt install ./hs-dlx_<版本>_amd64.deb`。托盘图标走 StatusNotifierItem，纯 GNOME 要装
+  AppIndicator 扩展才显示。
+
+每个版本附 `SHA256SUMS`，下载后可校验：`shasum -a 256 -c SHA256SUMS --ignore-missing`。
+
+## 功能
+
+**下载 HLS**
+
+- 粘贴 m3u8 地址即探测：几档清晰度与码率、音轨、时长、预估大小；同心环上 ↑ ↓ 换档，回车开始。
+- 点播与直播录制。TS 与 fMP4 分片、AES-128 加密、独立音轨都支持；合并成 MP4 不重新编码，也可以存成可直接播放的本地
+  HLS，或两者都要。
+- 断点续传：暂停、退出应用、断网后都能接着下，只补缺的分片。
+- 直播录制的钟面按时间显示录到了哪些时段、哪里缺了；随时停止并写出已录的部分，不联网也能写出。
+
+**在网页里找视频流**
+
+- 粘贴的是网页地址时，在后台打开网页找出里面的视频流，标好清晰度、时长与是否直播。
+- 要登录、或要点了播放才加载的网页，打开网页弄好后，找到的流会列出来。
+- 下载时带上网页存下的 Cookie 与来源地址，按同站与 SameSite 规则决定带哪些。
+
+**网络与出错**
+
+- 代理：跟随系统、直连，或指定 HTTP、HTTPS、SOCKS 代理；嗅探页的网页走同一个出口。
+- 请求头：新建时可加；遇到 401、403 时改请求头后重试。
+- 失败按种类说明原因与能做的事：改请求头再试、改存本地 HLS、写出已录的、稍后重试。
+
+**桌面集成**
+
+- 关窗后在托盘里继续下载；任务都停下前退出会先问。
+- 单实例：从别处再打开带链接的 hs-dlx，链接交给已打开的窗口。
+- 顶栏显示保存目录所在盘的可用空间。
+
+**不支持**
+
+- DRM 保护的内容（Widevine、PlayReady、FairPlay 等）：遇到即明确报错，不会尝试绕过。
+
+## 路线图
+
+方向是围绕视频做深：找得到、下得完、马上能看。顺序如下，完成一项发一个版本。
+
+| | 内容 |
+|---|---|
+| 1 | **HTTP 分段下载**：多连接动态分段、续传，识别 `thunder://` 等链接 |
+| 2 | **磁力与种子**：基于 libtorrent；DHT、uTP、协议加密、端口映射、IPv6；判断「能不能下完」、慢时逐项诊断、做种策略 |
+| 3 | **边下边播**：按播放位置优先下载需要的块 |
+| 4 | **云离线**：用你自己的 115、迅雷云盘、PikPak 账号把磁力交给云端下载，再高速拉回本地并校验 |
+| 5 | **站点解析**：接入 yt-dlp 解析视频网站，下载仍由 hs-dlx 自己的引擎完成 |
+| 6 | **DASH**：点播与直播 |
+| 7 | **HTTP-FLV 直播录制**：断线重连、缺口记录 |
+| 8 | **浏览器扩展**、兼容 aria2 的 JSON-RPC 接口 |
+
+## 技术栈与结构
+
+| 层 | 用的什么 |
+|---|---|
+| 界面 | [GPUI](https://gpui.rs/)（经 gpui-kit），GPU 直接绘制 |
+| 嵌入网页 | [wry](https://github.com/tauri-apps/wry)：macOS 用 WKWebView，Windows 用 WebView2，Linux 用 WebKitGTK |
+| 下载引擎 | [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库（Rust、tokio） |
+| 合并 MP4 | 静态链接的精简 FFmpeg，只做转封装，不需要另装 |
+| 存储 | SQLite（随应用编译） |
+| 打包 | cargo-packager：dmg、NSIS、deb |
+
+```mermaid
+flowchart TD
+    desktop["apps/desktop<br/>GPUI 界面"]
+    app["crates/app<br/>任务存储与生命周期，不依赖界面"]
+    webview["crates/webview<br/>嵌入网页与 Cookie"]
+    relay["crates/relay<br/>网页的本地代理中转"]
+    instance["crates/instance<br/>单实例与链接转交"]
+    macos["crates/macos<br/>macOS 应用钩子"]
+    core["hs-m3u8-core<br/>HLS 引擎"]
+    desktop --> app
+    desktop --> webview
+    desktop --> relay
+    desktop --> instance
+    desktop --> macos
+    app --> core
+```
+
+依赖只朝箭头方向：`crates/app` 不认识任何界面框架，各平台 crate 互不依赖、只由界面组合。这些规则由
+`scripts/check_deps.sh` 在检查里强制。
+
+## 从源码构建
+
+要 Rust（版本见 `rust-toolchain.toml`）与 [uv](https://docs.astral.sh/uv/)；Linux 上另要 WebKitGTK 4.1、GTK 3、xkbcommon
+与 fontconfig 的开发包。
 
 ```sh
-make ffmpeg          # 用 hs-m3u8 的构建脚本编译静态链接的精简 FFmpeg，装到 third_party/ffmpeg/dist
-cargo run -p hs-dlx
-make check           # 全部检查（要 cargo-deny 与 cargo-llvm-cov，版本见 check.yml）
-make package         # 本机平台的安装包（要 cargo-packager，版本见 desktop.yml）
+make ffmpeg          # 编译静态链接的精简 FFmpeg（只需一次）
+cargo run -p hs-dlx  # 运行
+make check           # 全部检查
+make package         # 本机平台的安装包
 ```
+
+各平台的准备、检查项、分支与发版流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 使用须知
+
+请只下载你有权下载的内容，并遵守所在地的法律与网站的服务条款。hs-dlx 不提供任何资源，也不内置资源搜索。路线图中的云离线
+以第三方客户端的方式接入，用的是你自己的账号，与这些服务没有关联。
 
 ## 许可证
 
-MIT，见 LICENSE。安装包里静态链接与随带的第三方软件的声明见 apps/desktop/LICENSES。
+[MIT](LICENSE)。安装包里静态链接与随带的第三方软件（含 LGPL-2.1 的 FFmpeg）的声明见
+[apps/desktop/LICENSES](apps/desktop/LICENSES)，装好后在设置页的「第三方声明」里也能打开。

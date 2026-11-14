@@ -1,0 +1,166 @@
+name: release
+
+# 发版：main 每收到一次推送（合并了一个 PR），看工作区版本号（Cargo.toml 的 [workspace.package] version）有没有
+# v<版本> 标签：有就跳过，没有就发版。所以「合并一个 PR」与「发一个版本」是同一条路径，发版只需改版本号并在
+# CHANGELOG.md 写好这个版本的一节。
+#
+# 顺序：先核对版本号与更新日志，再由 desktop.yml 打三个平台的安装包，全部成功后建 GitHub Release：先建草稿、安装包
+# 与 SHA256SUMS 传齐后才公开，公开时 GitHub 在这个提交上打 v<版本> 标签。任一步失败时没有公开的 Release、也没有
+# 标签：在 Actions 里重跑失败的作业（读的是同一个提交，上一次留下的同名草稿先删掉），或在 dev 上修好再合并一次
+# （新的推送照常发这个版本）。
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# 带上 pipefail（不写 shell 时 Linux 上是 bash -e，管道前半段失败不会让这一步失败）
+defaults:
+  run:
+    shell: bash
+
+# 同一时刻只跑一次，其余排队（最多 100 个，文档不保证先后次序）。每次运行只在它的版本号仍是 main 最新提交上的版本号
+# 时发版：版本已被后来的推送改掉（含重跑一次旧的运行）就不发，免得发出一个旧版本并标成最新。版本号没变时照常发，
+# 之后那几次推送的运行看到标签已在、跳过
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # git ls-remote --exit-code：有这个引用为 0，没有为 2，其余是查询本身失败。标签在而没有公开的 Release 时失败：
+      # 那是手动打的标签，或发版没走完，要人看
+      - name: 版本号与是否发版
+        id: version
+        run: |
+          version=$(python3 scripts/release.py version)
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          gh api "repos/$GH_REPO/contents/Cargo.toml?ref=main" -H "Accept: application/vnd.github.raw+json" \
+            > "$RUNNER_TEMP/main-Cargo.toml"
+          latest=$(python3 scripts/release.py version "$RUNNER_TEMP/main-Cargo.toml")
+          if [ "$latest" != "$version" ]; then
+            echo "main 上的版本号已是 $latest，$tag 被取代，不发版"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then status=0; else status=$?; fi
+          case $status in
+            0)
+              if ! gh api "repos/$GH_REPO/releases/tags/$tag" --jq .html_url; then
+                echo "::error::$tag 标签存在，但没有公开的 Release"
+                exit 1
+              fi
+              echo "$tag 已发布，不发版"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              ;;
+            2)
+              echo "发布 $tag"
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::查询远端标签失败（退出码 $status）"
+              exit 1
+              ;;
+          esac
+
+      # 打包前先确认有发布说明，免得白打三个平台的包
+      - name: 更新日志里有这个版本
+        if: steps.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 scripts/release.py notes "$VERSION"
+
+  package:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/desktop.yml
+    with:
+      ref: ${{ github.sha }}
+
+  publish:
+    needs: [plan, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: v${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # 打包期间 main 上的版本号又被改了：这个版本被取代，不发。标签已在则是这个版本已发过，却仍走到了这里，失败
+      - name: 版本号仍是 main 上的、标签仍不存在
+        id: gate
+        run: |
+          gh api "repos/$GH_REPO/contents/Cargo.toml?ref=main" -H "Accept: application/vnd.github.raw+json" \
+            > "$RUNNER_TEMP/main-Cargo.toml"
+          latest=$(python3 scripts/release.py version "$RUNNER_TEMP/main-Cargo.toml")
+          if [ "$latest" != "$VERSION" ]; then
+            echo "main 上的版本号已是 $latest，$TAG 被取代，不发"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then status=0; else status=$?; fi
+          case $status in
+            0) echo "::error::$TAG 已存在"; exit 1 ;;
+            2) echo "go=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::查询远端标签失败（退出码 $status）"; exit 1 ;;
+          esac
+
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: hs-dlx-*
+          merge-multiple: true
+          path: dist
+
+      # 三个平台各一个安装包，少了就是打包产物的名字或格式变了
+      - name: 校验和
+        if: steps.gate.outputs.go == 'true'
+        working-directory: dist
+        run: |
+          count=$(find . -maxdepth 1 -type f | wc -l)
+          if [ "$count" -ne 3 ]; then echo "::error::安装包应为 3 个，实有 $count 个"; ls -la; exit 1; fi
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 发布说明
+        if: steps.gate.outputs.go == 'true'
+        run: python3 scripts/release.py notes "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: 删掉上一次没发完留下的草稿
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          ids=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")
+          for id in $ids; do gh api -X DELETE "repos/$GH_REPO/releases/$id"; done
+
+      - name: 建草稿并上传安装包
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          gh release create "$TAG" dist/* --draft --target "$GITHUB_SHA" --title "hs-dlx $TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      # 草稿按标签查不到（REST 的按标签查询只返回公开的），按列表找回它的 id
+      - name: 公开
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          ids=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")
+          if [ "$(printf '%s\n' "$ids" | grep -c .)" -ne 1 ]; then echo "::error::$TAG 的草稿应为 1 个：$ids"; exit 1; fi
+          gh api -X PATCH "repos/$GH_REPO/releases/$ids" -F draft=false --jq .html_url

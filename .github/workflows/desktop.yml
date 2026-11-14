@@ -1,10 +1,18 @@
 name: desktop
 
 # 桌面应用的安装包：macOS 出 .dmg，Windows 出 NSIS 安装程序，Linux 出 deb（配置见 apps/desktop/Cargo.toml 的
-# package.metadata.packager），作为本次运行的构建产物上传。没有签名与公证。不出 AppImage：它会带上打包机器的
-# WebKitGTK，而 WebKitGTK 按编译时写死的路径起辅助进程，在别的发行版上网页起不来。
+# package.metadata.packager），作为本次运行的构建产物上传，名为 hs-dlx-<系统>-<架构>。没有签名与公证。不出 AppImage：
+# 它会带上打包机器的 WebKitGTK，而 WebKitGTK 按编译时写死的路径起辅助进程，在别的发行版上网页起不来。
 on:
+  # 手动试打包：打所选分支的最新提交
   workflow_dispatch:
+  # release.yml 发版时调用
+  workflow_call:
+    inputs:
+      ref:
+        description: 要打包的提交
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -26,7 +34,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
+      # 手动触发时 inputs.ref 为空，取所选分支
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: MSVC 环境（Windows）
         if: runner.os == 'Windows'
