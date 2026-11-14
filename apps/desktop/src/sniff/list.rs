@@ -6,7 +6,7 @@ use gpui_kit::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::title_of;
+use hs_dlx_app::title_of;
 use hs_m3u8_core::Url;
 
 use super::found::{Check, Found};

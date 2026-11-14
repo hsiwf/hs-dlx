@@ -1,5 +1,5 @@
 [package]
-name = "hs-m3u8-app"
+name = "hs-dlx-app"
 version.workspace = true
 description = "Desktop application domain: task storage, task lifecycle and throttled progress over hs-m3u8-core, without any UI framework"
 edition.workspace = true

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::Context;
-use hs_m3u8_app::{Draft, Event, Status, TaskId};
+use hs_dlx_app::{Draft, Event, Status, TaskId};
 use tokio::sync::oneshot;
 
 use super::Tasks;
@@ -72,7 +72,7 @@ impl Tasks {
     }
 
     /// 新建的任务建成了：加进列表，处理新建期间先到的结束事件；选了退出的随即暂停。
-    fn started(&mut self, task: hs_m3u8_app::Task, cx: &mut Context<Self>) -> TaskId {
+    fn started(&mut self, task: hs_dlx_app::Task, cx: &mut Context<Self>) -> TaskId {
         let id = task.id;
         let mut row = Row::new(task, Instant::now());
         row.timeline.begin(Duration::ZERO);

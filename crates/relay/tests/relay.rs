@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use hs_m3u8_relay::{Relay, Report, Route, Target, Upstream};
+use hs_dlx_relay::{Relay, Report, Route, Target, Upstream};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;

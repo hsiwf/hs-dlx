@@ -5,9 +5,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{BackgroundExecutor, Context};
-use hs_m3u8_app::{Failure, Service};
+use hs_dlx_app::{Failure, Service};
+use hs_dlx_webview::cookies::{Cookie, cookies_for};
 use hs_m3u8_core::{Source, Url};
-use hs_m3u8_webview::cookies::{Cookie, cookies_for};
 
 use super::found::Check;
 use super::{SniffView, request};

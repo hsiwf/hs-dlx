@@ -50,7 +50,7 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// 在 127.0.0.1 的一个空闲端口上开始中转，每条连接照 `route` 走，连不过去时调 `report`；在名为 hs-m3u8-relay 的
+    /// 在 127.0.0.1 的一个空闲端口上开始中转，每条连接照 `route` 走，连不过去时调 `report`；在名为 hs-dlx-relay 的
     /// 后台线程上跑。建不起监听时为原因。
     pub fn start(route: Route, report: Report) -> Result<Relay, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -71,7 +71,7 @@ impl Relay {
             .port();
         let (stop, stopped) = oneshot::channel();
         let thread = std::thread::Builder::new()
-            .name("hs-m3u8-relay".to_owned())
+            .name("hs-dlx-relay".to_owned())
             .spawn(move || {
                 runtime.block_on(async move {
                     tokio::select! {

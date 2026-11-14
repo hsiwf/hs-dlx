@@ -1,4 +1,4 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、版本与第三方声明。改了即存进任务存储（见 [`hs_m3u8_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
 use std::path::PathBuf;
@@ -269,8 +269,8 @@ impl SettingsView {
             .children(line)
             .children(self.proxy_error.clone().map(ui::error_text))
             .child(ui::caption(
-                match hs_m3u8_webview::custom_proxy_supported() {
-                    Ok(()) if hs_m3u8_webview::PROXY_FIXED_FOR_PROCESS => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要重启应用".to_owned(),
+                match hs_dlx_webview::custom_proxy_supported() {
+                    Ok(()) if hs_dlx_webview::PROXY_FIXED_FOR_PROCESS => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要重启应用".to_owned(),
                     Ok(()) => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要把它们都关掉再开".to_owned(),
                     Err(reason) => format!(
                         "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
@@ -327,7 +327,7 @@ impl Render for SettingsView {
                         .child(ui::num(
                             div()
                                 .text_size(px(15.))
-                                .child(concat!("hs-m3u8 ", env!("CARGO_PKG_VERSION"))),
+                                .child(concat!("hs-dlx ", env!("CARGO_PKG_VERSION"))),
                         ))
                         .child(ui::button(
                             "settings-notices",

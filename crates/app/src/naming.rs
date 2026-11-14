@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn stems_skip_names_on_disk_and_in_the_store() {
-        let dir = std::env::temp_dir().join(format!("hs-m3u8-app-naming-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hs-dlx-app-naming-{}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }

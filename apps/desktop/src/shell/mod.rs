@@ -24,8 +24,8 @@ use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
     Subscription, Task, Window, div, px,
 };
-use hs_m3u8_app::TaskId;
-use hs_m3u8_instance::Handoff;
+use hs_dlx_app::TaskId;
+use hs_dlx_instance::Handoff;
 
 use crate::dial;
 use crate::dock::{Dock, DockEvent};

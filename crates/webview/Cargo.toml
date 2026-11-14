@@ -1,5 +1,5 @@
 [package]
-name = "hs-m3u8-webview"
+name = "hs-dlx-webview"
 version.workspace = true
 description = "Native web views (wry) embedded in GPUI windows, with the web engine's cookie store"
 edition.workspace = true

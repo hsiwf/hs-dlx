@@ -60,7 +60,7 @@ pub enum Error {
     #[error("{0}的放弃没做完，只能再放弃")]
     DiscardUnfinished(TaskId),
     /// 任务存储已被另一个运行中的应用打开；两个应用同时改同一份任务会互相覆盖状态
-    #[error("任务存储已被另一个运行中的 hs-m3u8 打开：{}", .0.display())]
+    #[error("任务存储已被另一个运行中的 hs-dlx 打开：{}", .0.display())]
     InUse(std::path::PathBuf),
     /// 核心库报的错误
     #[error(transparent)]

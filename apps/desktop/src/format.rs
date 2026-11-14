@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use hs_m3u8_app::FailureKind;
+use hs_dlx_app::FailureKind;
 use hs_m3u8_core::VariantInfo;
 
 /// 在运行的任务数 `running` 与合计速度 `speed`（字节每秒）：「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。

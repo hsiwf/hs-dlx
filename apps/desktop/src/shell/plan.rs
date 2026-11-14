@@ -1,7 +1,7 @@
 //! 停着（暂停或失败）的任务能做什么、先做什么：按失败的种类、是否直播、是否选了只写出已录的决定。放弃总在最后，
 //! 不在这里。
 
-use hs_m3u8_app::FailureKind;
+use hs_dlx_app::FailureKind;
 
 /// 停着的任务能做的一件事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub(super) struct Plan {
 }
 
 /// 停着的任务的操作。`failure` 为失败的种类（暂停的为 None），`live` 为直播录制，`write_only` 为选了只写出已录的
-/// （[`hs_m3u8_app::Task::write_only`]），`editing` 为正在改请求头（那时编辑卡片里有保存的按钮，这里不再给改请求头）。
+/// （[`hs_dlx_app::Task::write_only`]），`editing` 为正在改请求头（那时编辑卡片里有保存的按钮，这里不再给改请求头）。
 ///
 /// - 再跑一次：选了只写出的写出，其余续传续录；没有可写出的改为续录。
 /// - 被拒或取到错误页的，先改请求头；放不进 MP4 的，先改存本地 HLS，此前再跑只会同样失败。

@@ -1,7 +1,7 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_m3u8_app::{Failure, Status};
+use hs_dlx_app::{Failure, Status};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -284,7 +284,7 @@ fn running(row: &Row, amount: Amount) -> Look {
 mod tests {
     use std::time::Duration;
 
-    use hs_m3u8_app::{Failure, FailureKind, Finished, Status};
+    use hs_dlx_app::{Failure, FailureKind, Finished, Status};
     use hs_m3u8_core::{FileCount, Progress, SegmentCounts, Stage, Writing};
 
     use super::look;

@@ -18,7 +18,7 @@ use gpui_kit::{
     IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
     Task, Window, div, px,
 };
-use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
+use hs_dlx_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, Source, Url};
 
@@ -38,7 +38,7 @@ pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT, ui::CAPTION_LINE);
 #[derive(Clone)]
 pub struct Link {
     pub url: Url,
-    /// 视频所在网页的标题，任务照它取名（见 [`hs_m3u8_app::task_title`]）；没有时由地址得出
+    /// 视频所在网页的标题，任务照它取名（见 [`hs_dlx_app::task_title`]）；没有时由地址得出
     pub title: Option<String>,
     /// 探测与下载时带的请求头
     pub headers: Vec<(String, String)>,

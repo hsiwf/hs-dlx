@@ -2,7 +2,7 @@
 
 声明有 NOTICE.txt、THIRD-PARTY-RUST.txt 与随带的许可证全文的副本（本项目、FFmpeg、字体、gpui-webview）。
 
-THIRD-PARTY-RUST.txt 收录桌面应用（hs-m3u8-desktop）在各发布平台（deny.toml 的 `[graph] targets`）上依赖的 Rust crate：
+THIRD-PARTY-RUST.txt 收录桌面应用（hs-dlx）在各发布平台（deny.toml 的 `[graph] targets`）上依赖的 Rust crate：
 按 `cargo tree` 解析特性后的正常依赖，过程宏与工作区成员不算。各 crate 根目录里的许可证文件原样收录，内容相同的只收
 一份。收录的文件要对得上 crate 声明的许可证表达式：每个子句（可任选其一的几种许可证）至少有一种的原文在里面（按
 LICENSE_MARKS 里各许可证条款的特征认）；包里的对不上时，加上 third_party/crate-licenses/<名字>-<版本>/ 下的再认，仍
@@ -32,7 +32,7 @@ class Product(NamedTuple):
     out: Path
 
 
-DESKTOP = Product("hs-m3u8-desktop", ROOT / "apps/desktop/LICENSES")
+DESKTOP = Product("hs-dlx", ROOT / "apps/desktop/LICENSES")
 # crate 根目录里算作许可证文件的名字（不区分大小写）
 LICENSE_FILE = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense)", re.IGNORECASE)
 # SPDX 的许可证标识符（含 LicenseRef-…）
@@ -375,7 +375,7 @@ def ffmpeg_section() -> str:
    {sha256}。
 
    换用修改过的 FFmpeg：按 build.sh 里的 configure 参数编译修改过的 FFmpeg 源码并安装到某个目录，再在本项目源码目录
-   里以 FFMPEG_DIR=<该目录> cargo build --release -p hs-m3u8-desktop 重新构建。
+   里以 FFMPEG_DIR=<该目录> cargo build --release -p hs-dlx 重新构建。
 """
 
 
@@ -387,9 +387,9 @@ def desktop_notice(crates: list[Crate]) -> str:
         for crate in mpl_crates(crates)
     )
     mpl_part = f"\n   其中按 Mozilla Public License 2.0 授权、源码未作修改的：{mpl}" if mpl else ""
-    return f"""hs-m3u8 按 MIT 许可证发布，见 LICENSE.txt。由 scripts/licenses.py 生成。
+    return f"""hs-dlx 按 MIT 许可证发布，见 LICENSE.txt。由 scripts/licenses.py 生成。
 
-hs-m3u8 桌面应用静态链接或随带了以下软件：
+hs-dlx 桌面应用静态链接或随带了以下软件：
 
 {ffmpeg}
 2. Rust crate，各自的许可证见 THIRD-PARTY-RUST.txt；Rust 标准库按 MIT 或 Apache-2.0 授权
@@ -422,7 +422,7 @@ def main() -> int:
     out = DESKTOP.out
     expected = {
         out / "NOTICE.txt": desktop_notice(desktop),
-        out / "THIRD-PARTY-RUST.txt": third_party("hs-m3u8 桌面应用", desktop),
+        out / "THIRD-PARTY-RUST.txt": third_party("hs-dlx 桌面应用", desktop),
         out / "LICENSE.txt": read_text(ROOT / "LICENSE"),
         out / "FFmpeg-LGPL-2.1.txt": read_text(ROOT / "third_party/ffmpeg/LGPL-2.1.txt"),
         out / "OFL.txt": read_text(ROOT / "apps/desktop/assets/fonts/OFL.txt"),

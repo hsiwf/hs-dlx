@@ -6,7 +6,7 @@ use gpui_kit::{
     MouseButton, ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled,
     canvas, div, px,
 };
-use hs_m3u8_app::Failure;
+use hs_dlx_app::Failure;
 use hs_m3u8_core::{Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, duration_of};

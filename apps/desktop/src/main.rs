@@ -1,5 +1,5 @@
 //! 桌面应用的入口：打开任务存储、启动任务服务、建托盘、开主窗口；任务存储已被开着的应用占着时，把启动参数里的链接
-//! 转交给它后退出（见 hs-m3u8-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
+//! 转交给它后退出（见 hs-dlx-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
 //! main_window）。
 
 mod dial;
@@ -33,8 +33,8 @@ use gpui_kit::{
     AppContext as _, Bounds, FontWeight, ParentElement as _, QuitMode, Render, SharedString,
     Styled as _, WindowBounds, WindowOptions, div, px, size,
 };
-use hs_m3u8_app::{Service, Store};
-use hs_m3u8_instance::HandOverError;
+use hs_dlx_app::{Service, Store};
+use hs_dlx_instance::HandOverError;
 
 use crate::tasks::Tasks;
 use crate::tray::Tray;
@@ -50,9 +50,9 @@ const FONTS: [&[u8]; 3] = [
     include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf"),
 ];
 
-/// 任务存储的位置：系统给应用放数据的目录（macOS 为 ~/Library/Application Support）下的 hs-m3u8/tasks.sqlite。
+/// 任务存储的位置：系统给应用放数据的目录（macOS 为 ~/Library/Application Support）下的 hs-dlx/tasks.sqlite。
 fn store_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|dir| dir.join("hs-m3u8").join("tasks.sqlite"))
+    dirs::data_dir().map(|dir| dir.join("hs-dlx").join("tasks.sqlite"))
 }
 
 /// 设置里没有保存位置时，新建任务默认保存到哪：影片目录，没有时下载目录，再没有时主目录。
@@ -82,7 +82,7 @@ fn main() {
     }));
     // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调见 main_window）
     #[cfg(target_os = "macos")]
-    hs_m3u8_macos::install();
+    hs_dlx_macos::install();
     let app = application().with_assets(gpui_kit::assets::Assets);
     // 点程序坞里的图标：回到窗口（关着时重新打开）
     app.on_reopen(main_window::reopen);
@@ -104,11 +104,11 @@ fn main() {
                     let store = match Store::open(&path) {
                         Ok(store) => store,
                         // 已经开着一个：把链接交给它（或请它到前台）就退出
-                        Err(hs_m3u8_app::Error::InUse(_)) => {
-                            return match hs_m3u8_instance::hand_over(&path, link.as_deref()) {
+                        Err(hs_dlx_app::Error::InUse(_)) => {
+                            return match hs_dlx_instance::hand_over(&path, link.as_deref()) {
                                 Ok(()) => Ok(None),
                                 Err(HandOverError::Leaving) => Err(Failure::new(
-                                    "hs-m3u8 正在退出",
+                                    "hs-dlx 正在退出",
                                     match &link {
                                         Some(link) => {
                                             format!("等它退出后再打开这个链接：{link}")
@@ -117,7 +117,7 @@ fn main() {
                                     },
                                 )),
                                 Err(HandOverError::Failed(reason)) => Err(Failure::new(
-                                    "hs-m3u8 已经在运行",
+                                    "hs-dlx 已经在运行",
                                     match &link {
                                         Some(link) => format!(
                                             "同时只能开一个，链接没能交给它（{reason}）：到已经打开的那个窗口里粘贴 {link}"
@@ -131,7 +131,7 @@ fn main() {
                         }
                         Err(error) => return Err(Failure::new("启动失败", error.to_string())),
                     };
-                    let handoffs = hs_m3u8_instance::listen(&path);
+                    let handoffs = hs_dlx_instance::listen(&path);
                     let (service, events) = Service::new(store, MAX_REQUESTS)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
                     let folder = service

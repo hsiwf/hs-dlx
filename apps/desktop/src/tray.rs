@@ -4,7 +4,7 @@
 //! 退出。Windows、Linux 上左键点图标即打开窗口。
 //!
 //! Linux 上桌面没有托盘宿主（如没装扩展的 GNOME）时图标建得起却看不见，所以它不是回到窗口的唯一入口：再次打开应用
-//! 也会回到窗口（见 hs-m3u8-instance）。
+//! 也会回到窗口（见 hs-dlx-instance）。
 
 use std::time::{Duration, Instant};
 
@@ -92,8 +92,8 @@ impl Tray {
     ) -> Result<(), String> {
         let status = MenuItem::new("", false, None);
         let notices = MenuItem::new("", true, None);
-        let opening = MenuItem::new("打开 hs-m3u8", true, None);
-        let quitting = MenuItem::new("退出 hs-m3u8", true, None);
+        let opening = MenuItem::new("打开 hs-dlx", true, None);
+        let quitting = MenuItem::new("退出 hs-dlx", true, None);
         let menu = Menu::new();
         menu.append_items(&[
             &status,
@@ -111,7 +111,7 @@ impl Tray {
         let builder = TrayIconBuilder::new().with_icon(logo);
         let icon = builder
             .with_menu(Box::new(menu.clone()))
-            .with_tooltip("hs-m3u8")
+            .with_tooltip("hs-dlx")
             // macOS 上点图标照例弹菜单；别处左键打开窗口、右键弹菜单
             .with_menu_on_left_click(cfg!(target_os = "macos"))
             .build()
@@ -280,7 +280,7 @@ impl Tray {
             self.status.set_text(&shown.status);
             self.status.set_enabled(shown.failed);
             self.icon
-                .set_tooltip(Some(format!("hs-m3u8 · {}", shown.status)))
+                .set_tooltip(Some(format!("hs-dlx · {}", shown.status)))
                 .map_err(|error| error.to_string())?;
         }
         if was.is_none_or(|was| was.notices != shown.notices) {

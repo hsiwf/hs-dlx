@@ -74,7 +74,7 @@ impl Shell {
                         div()
                             .text_size(px(15.))
                             .font_weight(FontWeight::BOLD)
-                            .child("hs-m3u8"),
+                            .child("hs-dlx"),
                     ),
             )
             .child(

@@ -5,18 +5,18 @@ set -euo pipefail
 
 # 每行：<包> <不得依赖的包>...，含传递依赖
 rules=(
-  "hs-m3u8-app gpui-kit gpui-pre wry hs-m3u8-webview hs-m3u8-instance hs-m3u8-macos hs-m3u8-relay"
-  # 桌面应用的平台 crate 互不依赖，只由 hs-m3u8-desktop 组合
-  "hs-m3u8-webview hs-m3u8-core hs-m3u8-app hs-m3u8-instance hs-m3u8-macos hs-m3u8-relay"
-  "hs-m3u8-instance hs-m3u8-core hs-m3u8-app gpui-kit gpui-pre wry hs-m3u8-webview hs-m3u8-macos hs-m3u8-relay"
-  "hs-m3u8-macos hs-m3u8-core hs-m3u8-app gpui-kit gpui-pre wry hs-m3u8-webview hs-m3u8-instance hs-m3u8-relay"
-  "hs-m3u8-relay hs-m3u8-core hs-m3u8-app gpui-kit gpui-pre wry hs-m3u8-webview hs-m3u8-instance hs-m3u8-macos"
+  "hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-relay"
+  # 桌面应用的平台 crate 互不依赖，只由 hs-dlx 组合
+  "hs-dlx-webview hs-m3u8-core hs-dlx-app hs-dlx-instance hs-dlx-macos hs-dlx-relay"
+  "hs-dlx-instance hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-macos hs-dlx-relay"
+  "hs-dlx-macos hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-relay"
+  "hs-dlx-relay hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos"
 )
 
 # 每行：<包> <不得直接依赖的包>...：只经由 core 的再导出（core::hls、core::remux）使用
 direct_rules=(
-  "hs-m3u8-app hs-m3u8-hls hs-m3u8-remux hs-m3u8-sysproxy"
-  "hs-m3u8-desktop hs-m3u8-hls hs-m3u8-remux hs-m3u8-sysproxy"
+  "hs-dlx-app hs-m3u8-hls hs-m3u8-remux hs-m3u8-sysproxy"
+  "hs-dlx hs-m3u8-hls hs-m3u8-remux hs-m3u8-sysproxy"
 )
 
 tree() {

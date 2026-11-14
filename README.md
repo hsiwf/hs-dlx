@@ -10,7 +10,7 @@ WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包（见 .github/work
 
 ```sh
 make ffmpeg          # 编译静态链接的精简 FFmpeg，装到 third_party/ffmpeg/dist
-cargo run -p hs-m3u8-desktop
+cargo run -p hs-dlx
 make check           # 全部检查（要 cargo-deny 与 cargo-llvm-cov，版本见 check.yml）
 make package         # 本机平台的安装包（要 cargo-packager，版本见 desktop.yml）
 ```

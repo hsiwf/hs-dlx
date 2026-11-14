@@ -79,7 +79,7 @@ impl Shell {
     fn render_orb(
         &self,
         row: &Row,
-        selected: Option<hs_m3u8_app::TaskId>,
+        selected: Option<hs_dlx_app::TaskId>,
         dim: bool,
         cx: &Context<Self>,
     ) -> Stateful<Div> {

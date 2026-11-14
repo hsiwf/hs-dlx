@@ -6,7 +6,7 @@ use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Entity, Global, TitlebarOptions, WeakEntity,
     Window, WindowBounds, WindowOptions, point, px, size,
 };
-use hs_m3u8_instance::Handoff;
+use hs_dlx_instance::Handoff;
 
 use crate::shell::{Leave, MIN_HEIGHT, MIN_WIDTH, Shell};
 use crate::tasks::{Departure, Quit, Tasks, TasksEvent};
@@ -31,7 +31,7 @@ pub fn options(cx: &App) -> WindowOptions {
         ))),
         window_min_size: Some(size(px(MIN_WIDTH), px(MIN_HEIGHT))),
         titlebar: Some(TitlebarOptions {
-            title: Some("hs-m3u8".into()),
+            title: Some("hs-dlx".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(20.), px(TITLE_HEIGHT / 2. - 6.))),
         }),
@@ -206,15 +206,15 @@ pub fn quit(cx: &mut App) {
 /// macOS 的程序坞、菜单、注销、关机要退出时先问（见 [`may_quit`]）：要问时先不答复，问完、等完由
 /// [`Tasks::leave`] 或 [`Tasks::stay`] 答复，注销、关机随之接着进行或取消。启动时没装上询问的方法时为原因。
 #[cfg(target_os = "macos")]
-pub fn ask_before_terminate(cx: &mut App) -> Result<(), hs_m3u8_macos::Error> {
+pub fn ask_before_terminate(cx: &mut App) -> Result<(), hs_dlx_macos::Error> {
     let app = cx.to_async();
     // 系统在主线程的事件循环里调，不在 GPUI 持有应用状态时：GPUI 的退出是异步发出的
-    hs_m3u8_macos::ask_before_terminate(move || {
+    hs_dlx_macos::ask_before_terminate(move || {
         app.update(|cx| {
             if may_quit(cx) {
-                hs_m3u8_macos::Reply::Now
+                hs_dlx_macos::Reply::Now
             } else {
-                hs_m3u8_macos::Reply::Later
+                hs_dlx_macos::Reply::Later
             }
         })
     })

@@ -1,9 +1,9 @@
-//! 单实例：同一份任务存储同时只由一个进程打开（存储旁的锁文件，见 hs-m3u8-app 的 `Store::open`），打开它的是主实例。
+//! 单实例：同一份任务存储同时只由一个进程打开（存储旁的锁文件，见 hs-dlx-app 的 `Store::open`），打开它的是主实例。
 //! 主实例在本机套接字（Unix 为域套接字，Windows 为命名管道）上收再次打开应用时转交的链接，并把这个地址记在存储旁的
 //! `<存储文件名>.instance` 里；再次打开的实例照这个文件连上去交出它的链接（没有时只请主实例到前台），收到确认后退出。
 //!
 //! 只有本用户能交：
-//! - Unix：套接字放在运行时目录（`XDG_RUNTIME_DIR`，没有时为临时目录）下只有本用户能进的 `hs-m3u8` 目录里，双方都
+//! - Unix：套接字放在运行时目录（`XDG_RUNTIME_DIR`，没有时为临时目录）下只有本用户能进的 `hs-dlx` 目录里，双方都
 //!   核对对端的用户就是任务存储文件的属主。
 //! - Windows：管道只许属主与 SYSTEM 访问；管道名带 128 位随机数、只记在本用户的数据目录里，别的用户猜不到，抢不先建。
 //!
@@ -96,7 +96,7 @@ pub type Received = Result<Delivery, String>;
 /// 主实例收转交的接收端，在任何执行器上都可等待。
 pub type Handoffs = mpsc::UnboundedReceiver<Received>;
 
-/// 主实例开始收转交：`store` 为它已打开（持锁）的任务存储文件。建好监听、记下地址后返回；在名为 hs-m3u8-instance 的
+/// 主实例开始收转交：`store` 为它已打开（持锁）的任务存储文件。建好监听、记下地址后返回；在名为 hs-dlx-instance 的
 /// 后台线程上收，交给返回的接收端，一次只收一个。接收端释放后，线程在下一次有连接时退出，否则随进程结束。建不起
 /// 监听或记不下地址时为原因：再次打开的实例交不过来，各自报错。
 pub fn listen(store: &Path) -> Result<Handoffs, String> {
@@ -105,7 +105,7 @@ pub fn listen(store: &Path) -> Result<Handoffs, String> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let record = record_path(store);
     std::thread::Builder::new()
-        .name("hs-m3u8-instance".to_owned())
+        .name("hs-dlx-instance".to_owned())
         .spawn(move || {
             // 下面给 ready 的发送都发生在 listen 返回之前（它在等这一条），接收端一定还在
             let runtime = match runtime() {
@@ -230,7 +230,7 @@ impl Endpoint {
             getrandom::fill(&mut random).map_err(|error| format!("取不到随机数：{error}"))?;
             let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
             Ok(Endpoint {
-                path: PathBuf::from(format!(r"\\.\pipe\hs-m3u8-{key:016x}-{name}")),
+                path: PathBuf::from(format!(r"\\.\pipe\hs-dlx-{key:016x}-{name}")),
             })
         }
     }
@@ -418,14 +418,14 @@ fn owner_of(store: &Path) -> Result<u32, String> {
         .map_err(|error| format!("读不出任务存储 {}：{error}", store.display()))
 }
 
-/// 放套接字的目录：运行时目录（没有时为临时目录）下的 `hs-m3u8`，没有时建为 0700。已有的要属于 `owner`、别人进不去，
+/// 放套接字的目录：运行时目录（没有时为临时目录）下的 `hs-dlx`，没有时建为 0700。已有的要属于 `owner`、别人进不去，
 /// 否则为原因：别人建的目录里的套接字可能被换掉。
 #[cfg(unix)]
 fn private_dir(owner: u32) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     let dir = dirs::runtime_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("hs-m3u8");
+        .join("hs-dlx");
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}

@@ -128,7 +128,7 @@ impl Service {
         tx.commit()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_name("hs-m3u8-engine")
+            .thread_name("hs-dlx-engine")
             .build()
             .map_err(|cause| Error::Io {
                 action: "启动",

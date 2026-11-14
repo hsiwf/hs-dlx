@@ -64,7 +64,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hs-m3u8-${{ runner.os }}-${{ runner.arch }}
+          name: hs-dlx-${{ runner.os }}-${{ runner.arch }}
           if-no-files-found: error
           path: |
             target/release/*.dmg

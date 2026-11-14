@@ -23,9 +23,9 @@ use gpui_kit::{
     AppContext as _, Context, Entity, EventEmitter, Focusable as _, IntoElement,
     ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
 };
-use hs_m3u8_app::Service;
+use hs_dlx_app::Service;
+use hs_dlx_webview::WebView;
 use hs_m3u8_core::Url;
-use hs_m3u8_webview::WebView;
 
 use self::found::{Check, Found};
 use self::inbox::{Engine, Inbox};
@@ -134,7 +134,7 @@ impl SniffView {
             .with_ipc_handler({
                 let inbox = inbox.clone();
                 move |request| {
-                    let frame = hs_m3u8_webview::ipc_frame(&request);
+                    let frame = hs_dlx_webview::ipc_frame(&request);
                     let body = request.into_body();
                     inbox.offer(Engine::Message { body, frame });
                 }
@@ -176,8 +176,8 @@ impl SniffView {
             let inbox = inbox.clone();
             move |failure| {
                 inbox.offer(match failure {
-                    hs_m3u8_webview::Failure::LoadFailed(reason) => Engine::LoadFailed(reason),
-                    hs_m3u8_webview::Failure::ProcessGone => Engine::Crashed,
+                    hs_dlx_webview::Failure::LoadFailed(reason) => Engine::LoadFailed(reason),
+                    hs_dlx_webview::Failure::ProcessGone => Engine::Crashed,
                 });
             }
         };

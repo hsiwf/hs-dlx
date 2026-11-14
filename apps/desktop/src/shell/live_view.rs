@@ -6,7 +6,7 @@ use gpui_kit::{
     Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, canvas, div, px,
 };
 
-use hs_m3u8_app::Status;
+use hs_dlx_app::Status;
 
 use super::look::Look;
 use crate::live::{self, Face};

@@ -72,7 +72,7 @@ rs_cov: ffmpeg_present
 	@cargo llvm-cov --version >/dev/null 2>&1 || { echo "缺少 cargo-llvm-cov，版本见 .github/workflows/check.yml"; exit 1; }
 	# 源码改动后旧的插桩产物会混进统计，先清掉
 	cargo llvm-cov clean --workspace
-	cargo llvm-cov -p hs-m3u8-app --fail-under-lines 80 --summary-only
+	cargo llvm-cov -p hs-dlx-app --fail-under-lines 80 --summary-only
 
 # 装好的 FFmpeg 须是当前的构建脚本装的（标记文件是装它的脚本的副本）：改了组件而本地没重新构建时在这里失败
 FFMPEG_MARKER := $(FFMPEG_DIST)/.hs-m3u8-ffmpeg

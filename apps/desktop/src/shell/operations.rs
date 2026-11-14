@@ -2,7 +2,7 @@
 //! 请求头编辑框的开关）。
 
 use gpui_kit::{AppContext as _, Context, Window};
-use hs_m3u8_app::TaskId;
+use hs_dlx_app::TaskId;
 
 use super::Shell;
 use crate::headers::HeadersEditor;

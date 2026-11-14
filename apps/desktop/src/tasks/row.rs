@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
-use hs_m3u8_app::{Finished, OutputSpec, Status, Task};
+use hs_dlx_app::{Finished, OutputSpec, Status, Task};
 use hs_m3u8_core::{FileCount, Progress, Saved, Stage};
 
 use crate::format;
@@ -266,7 +266,7 @@ pub fn finished_text(output: &OutputSpec, result: &Finished) -> String {
 /// 测试用的行与任务目录里的内容。
 #[cfg(test)]
 pub mod sample {
-    use hs_m3u8_app::{OutputSpec, Status, StoredPreference, Task, TaskId, TaskSpec};
+    use hs_dlx_app::{OutputSpec, Status, StoredPreference, Task, TaskId, TaskSpec};
     use hs_m3u8_core::Saved;
     use hs_m3u8_core::hls::Preference;
     use std::time::{Duration, Instant};
@@ -306,7 +306,7 @@ pub mod sample {
 
 #[cfg(test)]
 mod tests {
-    use hs_m3u8_app::Status;
+    use hs_dlx_app::Status;
     use hs_m3u8_core::{Progress, Stage};
 
     use super::sample::row;

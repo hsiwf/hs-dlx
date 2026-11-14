@@ -1,7 +1,7 @@
 //! 退出进行到哪一步：问（窗口里的提示框）之后等任务停下、补写状态再退出；期间出了要用户看的事就不退出。
 
 use gpui_kit::Context;
-use hs_m3u8_app::Status;
+use hs_dlx_app::Status;
 
 use super::Tasks;
 use super::row::Row;
@@ -13,7 +13,7 @@ pub enum Departure {
     /// 已在问或在等任务停下：这次不再问
     Underway,
     /// 没有要等的任务，但有任务的状态写不进存储：问要不要仍然退出
-    Unsaved(hs_m3u8_app::Error),
+    Unsaved(hs_dlx_app::Error),
     /// 有 `busy` 个任务没停下；`recording` 为其中有在录的直播
     Busy { busy: usize, recording: bool },
 }
@@ -158,14 +158,14 @@ impl Tasks {
     pub fn stay(&mut self) {
         self.quit = Quit::Staying;
         #[cfg(target_os = "macos")]
-        hs_m3u8_macos::reply_to_terminate(false);
+        hs_dlx_macos::reply_to_terminate(false);
     }
 
     /// 退出，不再撤回：有在等答复的系统退出请求时答复它（注销、关机接着进行），否则发出退出。
     pub fn leave(&mut self, cx: &mut Context<Self>) {
         self.quit = Quit::Leaving;
         #[cfg(target_os = "macos")]
-        if hs_m3u8_macos::reply_to_terminate(true) {
+        if hs_dlx_macos::reply_to_terminate(true) {
             return;
         }
         cx.quit();

@@ -7,7 +7,7 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::{OutputSpec, Status};
+use hs_dlx_app::{OutputSpec, Status};
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};

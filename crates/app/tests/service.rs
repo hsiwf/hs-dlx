@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
-use hs_m3u8_app::{
+use hs_dlx_app::{
     Draft, Error, Event, FailureKind, OutputKind, OutputSpec, Service, Status, Store, TaskId,
 };
 use hs_m3u8_core::Url;
@@ -118,7 +118,7 @@ fn draft(url: Url, folder: PathBuf) -> Draft {
 }
 
 /// 新建任务并等它存进存储。
-fn create(rt: &Runtime, service: &Service, draft: Draft) -> hs_m3u8_app::Task {
+fn create(rt: &Runtime, service: &Service, draft: Draft) -> hs_dlx_app::Task {
     rt.block_on(service.create(draft, 1)).unwrap().unwrap()
 }
 

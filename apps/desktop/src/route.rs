@@ -1,4 +1,4 @@
-//! 任务的请求经哪里走（显示用）：照设置里的代理（[`hs_m3u8_app::Settings::proxy`]），跟随系统时照系统代理设置读，
+//! 任务的请求经哪里走（显示用）：照设置里的代理（[`hs_dlx_app::Settings::proxy`]），跟随系统时照系统代理设置读，
 //! 与任务实际走的相同。读系统代理要调操作系统的接口，在后台调。嗅探页的网页见 [`crate::web_route`]。
 
 use hs_m3u8_core::{Proxy, ProxySource, SystemProxy, Url, bare_url};

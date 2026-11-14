@@ -1,7 +1,7 @@
 [package]
-name = "hs-m3u8-macos"
+name = "hs-dlx-macos"
 version.workspace = true
-description = "macOS application hooks the hs-m3u8 desktop app needs and GPUI does not expose"
+description = "macOS application hooks the hs-dlx desktop app needs and GPUI does not expose"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

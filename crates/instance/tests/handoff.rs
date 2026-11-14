@@ -5,9 +5,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use hs_m3u8_instance::{
-    Delivery, HandOverError, Handoff, Handoffs, hand_over, listen, record_path,
-};
+use hs_dlx_instance::{Delivery, HandOverError, Handoff, Handoffs, hand_over, listen, record_path};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericFilePath, Stream};
 
@@ -96,7 +94,7 @@ fn a_store_without_a_running_instance_cannot_be_reached() {
         path
     };
     #[cfg(windows)]
-    let missing = PathBuf::from(r"\\.\pipe\hs-m3u8-test-gone");
+    let missing = PathBuf::from(r"\\.\pipe\hs-dlx-test-gone");
     std::fs::write(record_path(&gone), missing.to_str().unwrap()).unwrap();
     let started = Instant::now();
     assert!(hand_over(&gone, None).is_err());

@@ -11,9 +11,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter, Subscription, Task};
-use hs_m3u8_app::{Event, Events, Finished, Service, Status, TaskId};
+use hs_dlx_app::{Event, Events, Finished, Service, Status, TaskId};
+use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
-use hs_m3u8_instance::{Handoff, Handoffs, Received};
 
 pub use self::operations::resume_label;
 pub use self::quit::{Asked, Departure, Quit};
@@ -94,7 +94,7 @@ pub struct Tasks {
 impl EventEmitter<TasksEvent> for Tasks {}
 
 impl Tasks {
-    /// `handoffs` 为后打开的实例转交来的（见 hs-m3u8-instance），收不了转交时为原因（提示一次，之后打开的实例各自
+    /// `handoffs` 为后打开的实例转交来的（见 hs-dlx-instance），收不了转交时为原因（提示一次，之后打开的实例各自
     /// 报错）。
     pub fn new(
         service: Service,
@@ -461,7 +461,7 @@ impl Tasks {
 /// 任务停下时的信号。
 fn ended_signal(
     status: &Status,
-    output: &hs_m3u8_app::OutputSpec,
+    output: &hs_dlx_app::OutputSpec,
     result: Option<&Finished>,
 ) -> (Level, String) {
     match status {

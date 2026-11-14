@@ -1,7 +1,7 @@
 [package]
-name = "hs-m3u8-desktop"
+name = "hs-dlx"
 version.workspace = true
-description = "Desktop application for hs-m3u8, built with GPUI"
+description = "Desktop downloader built with GPUI"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,12 +13,12 @@ chrono.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 gpui-kit.workspace = true
-hs-m3u8-app = { path = "../../crates/app" }
+hs-dlx-app = { path = "../../crates/app" }
 hs-m3u8-core.workspace = true
-hs-m3u8-instance = { path = "../../crates/instance" }
-hs-m3u8-macos = { path = "../../crates/macos" }
-hs-m3u8-relay = { path = "../../crates/relay" }
-hs-m3u8-webview = { path = "../../crates/webview" }
+hs-dlx-instance = { path = "../../crates/instance" }
+hs-dlx-macos = { path = "../../crates/macos" }
+hs-dlx-relay = { path = "../../crates/relay" }
+hs-dlx-webview = { path = "../../crates/webview" }
 psl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,12 +40,12 @@ workspace = true
 # 当前用户下，不要管理员），Linux 出 deb（按平台指定格式，见 Makefile 的 PACKAGE_FORMATS）。第三方声明当作资源放进去（各平台的位置见
 # settings.rs 的 installed_notices）
 [package.metadata.packager]
-product-name = "hs-m3u8"
-identifier = "io.github.x-haose.hs-m3u8"
+product-name = "hs-dlx"
+identifier = "io.github.x-haose.hs-dlx"
 description = "HLS（m3u8）视频下载器：点播、直播录制、在网页里找视频流"
-before-packaging-command = "cargo build --release --locked -p hs-m3u8-desktop"
+before-packaging-command = "cargo build --release --locked -p hs-dlx"
 out-dir = "../../target/release"
-binaries = [{ path = "hs-m3u8-desktop", main = true }]
+binaries = [{ path = "hs-dlx", main = true }]
 icons = [
   "assets/icons/32.png",
   "assets/icons/32@2x.png",

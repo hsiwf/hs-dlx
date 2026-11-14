@@ -5,7 +5,7 @@
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
-use hs_m3u8_app::{Failure, OutputKind};
+use hs_dlx_app::{Failure, OutputKind};
 use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, duration_of};

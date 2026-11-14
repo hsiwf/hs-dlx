@@ -1,7 +1,7 @@
 [package]
-name = "hs-m3u8-instance"
+name = "hs-dlx-instance"
 version.workspace = true
-description = "Single-instance handoff for the hs-m3u8 desktop app: later instances pass their link to the running one"
+description = "Single-instance handoff for the hs-dlx desktop app: later instances pass their link to the running one"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

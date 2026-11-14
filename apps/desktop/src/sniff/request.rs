@@ -1,7 +1,7 @@
 //! 探测嗅探到的流时带的请求头：Cookie 照浏览器在这个请求里会带的给，Referer 只给网站。
 
+use hs_dlx_webview::cookies::Cookie;
 use hs_m3u8_core::{Url, check_option_header};
-use hs_m3u8_webview::cookies::Cookie;
 
 /// 要探测的一条流与它的来历。
 pub struct Stream {
