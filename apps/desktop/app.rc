@@ -1,0 +1,2 @@
+// Windows 的资源：资源号 1 的图标是程序文件、窗口与任务栏的图标（GPUI 按资源号 1 载入窗口图标）
+1 ICON "assets/icons/icon.ico"

@@ -29,11 +29,16 @@ tray-icon = { version = "=0.26.1", default-features = false, features = ["ksni"]
 url.workspace = true
 wry.workspace = true
 
+# 把 Windows 的图标资源（app.rc）编进程序：资源号 1 的图标是程序文件、窗口与任务栏的图标（GPUI 按它载入）
+[build-dependencies]
+embed-resource = "=3.0.12"
+
 [lints]
 workspace = true
 
-# 安装包（cargo-packager 0.11.8）：macOS 出 .app 与 .dmg，Windows 出 NSIS 安装程序（装在当前用户下，不要管理员），
-# Linux 出 deb 与 AppImage。第三方声明当作资源放进去（各平台的位置见 settings.rs 的 installed_notices）
+# 安装包（cargo-packager，版本见 .github/workflows/desktop.yml）：macOS 出 .app 与 .dmg，Windows 出 NSIS 安装程序（装在
+# 当前用户下，不要管理员），Linux 出 deb（CI 只打这些，见 desktop.yml）。第三方声明当作资源放进去（各平台的位置见
+# settings.rs 的 installed_notices）
 [package.metadata.packager]
 product-name = "hs-m3u8"
 identifier = "io.github.x-haose.hs-m3u8"
@@ -53,8 +58,12 @@ icons = [
 ]
 resources = [{ src = "LICENSES", target = "LICENSES" }]
 
+# 与 third_party/ffmpeg/build.sh 的 MACOSX_DEPLOYMENT_TARGET 一致：随带的 FFmpeg 按它编译
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
+
+[package.metadata.packager.nsis]
+installer-icon = "assets/icons/icon.ico"
 
 [package.metadata.packager.deb]
 # 网页嵌入（WebKitGTK）与窗口（GTK、xkbcommon）用到的系统库
