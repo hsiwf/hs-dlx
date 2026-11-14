@@ -31,3 +31,31 @@ wry.workspace = true
 
 [lints]
 workspace = true
+
+# 安装包（cargo-packager 0.11.8）：macOS 出 .app 与 .dmg，Windows 出 NSIS 安装程序（装在当前用户下，不要管理员），
+# Linux 出 deb 与 AppImage。第三方声明当作资源放进去（各平台的位置见 settings.rs 的 installed_notices）
+[package.metadata.packager]
+product-name = "hs-m3u8"
+identifier = "io.github.x-haose.hs-m3u8"
+description = "HLS（m3u8）视频下载器：点播、直播录制、在网页里找视频流"
+before-packaging-command = "cargo build --release --locked -p hs-m3u8-desktop"
+out-dir = "../../target/release"
+binaries = [{ path = "hs-m3u8-desktop", main = true }]
+icons = [
+  "assets/icons/32.png",
+  "assets/icons/32@2x.png",
+  "assets/icons/128.png",
+  "assets/icons/128@2x.png",
+  "assets/icons/256.png",
+  "assets/icons/256@2x.png",
+  "assets/icons/512.png",
+  "assets/icons/512@2x.png",
+]
+resources = [{ src = "LICENSES", target = "LICENSES" }]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+
+[package.metadata.packager.deb]
+# 网页嵌入（WebKitGTK）与窗口（GTK、xkbcommon）用到的系统库
+depends = ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libxkbcommon-x11-0"]

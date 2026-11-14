@@ -50,6 +50,8 @@ pub struct SettingsView {
     folder_error: Option<String>,
     /// 代理最近一次没存进去的原因
     proxy_error: Option<String>,
+    /// 第三方声明打不开的原因
+    notices_error: Option<String>,
     _system: Task<()>,
     _typed: Subscription,
 }
@@ -101,6 +103,7 @@ impl SettingsView {
             system: None,
             folder_error: None,
             proxy_error: None,
+            notices_error: None,
             _system: system,
             _typed: typed,
         }
@@ -140,6 +143,18 @@ impl SettingsView {
                 self.proxy_error = Some(error.to_string());
             }
         }
+    }
+
+    /// 在访达（资源管理器、文件管理器）里打开随安装包附上的第三方声明目录；不是从安装包运行时写明原因。
+    fn open_notices(&mut self, cx: &mut Context<Self>) {
+        match installed_notices() {
+            Ok(folder) => {
+                self.notices_error = None;
+                cx.open_with_system(&folder);
+            }
+            Err(reason) => self.notices_error = Some(reason),
+        }
+        cx.notify();
     }
 
     fn change_folder(&mut self, cx: &mut Context<Self>) {
@@ -291,11 +306,26 @@ impl Render for SettingsView {
                     cx.listener(|this, _, _, cx| this.change_folder(cx)),
                 )),
         );
-        let about = section("关于").child(ui::num(
-            div()
-                .text_size(px(15.))
-                .child(concat!("hs-m3u8 ", env!("CARGO_PKG_VERSION"))),
-        ));
+        let about = section("关于")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(ui::num(
+                        div()
+                            .text_size(px(15.))
+                            .child(concat!("hs-m3u8 ", env!("CARGO_PKG_VERSION"))),
+                    ))
+                    .child(ui::button(
+                        "settings-notices",
+                        "第三方声明",
+                        Tone::Plain,
+                        cx.listener(|this, _, _, cx| this.open_notices(cx)),
+                    )),
+            )
+            .children(self.notices_error.clone().map(ui::error_text));
         div()
             .flex_1()
             .min_w_0()
@@ -336,6 +366,27 @@ impl Render for SettingsView {
                     .child(self.render_proxy(cx))
                     .child(about),
             )
+    }
+}
+
+/// 随安装包附上的第三方声明目录（打包时由 cargo-packager 当作资源放进，见 apps/desktop/Cargo.toml）：macOS 在
+/// `.app/Contents/Resources/LICENSES`，Windows 在程序旁的 `LICENSES`，Linux 在 `/usr/lib/<程序名>/LICENSES`（AppImage 里
+/// 同样相对程序）。找不到（从源码直接运行）时为原因。
+fn installed_notices() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("找不到程序所在的位置：{error}"))?;
+    let beside = exe.parent().ok_or("程序没有所在的目录")?;
+    let folder = if cfg!(target_os = "macos") {
+        beside.join("../Resources/LICENSES")
+    } else if cfg!(target_os = "windows") {
+        beside.join("LICENSES")
+    } else {
+        let name = exe.file_name().ok_or("程序没有文件名")?;
+        beside.join("../lib").join(name).join("LICENSES")
+    };
+    if folder.join("NOTICE.txt").is_file() {
+        Ok(folder)
+    } else {
+        Err("这不是安装包里的程序，第三方声明在源码的 apps/desktop/LICENSES 下".to_owned())
     }
 }
 

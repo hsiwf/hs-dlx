@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151A26"/>
+      <stop offset="1" stop-color="#07080C"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <!-- 点亮的部分：顺时针 72%（周长 2π·236 ≈ 1482.8，画 1067.6）；用在下面转过 -90° 的组里，起点即正上方 -->
+    <mask id="lit">
+      <circle cx="512" cy="512" r="236" fill="none" stroke="#fff" stroke-width="160"
+              stroke-dasharray="1067.6 1482.8"/>
+    </mask>
+  </defs>
+  <!-- macOS 图标网格：824 见方的圆角方块居中，四周留 100 -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#ground)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="185.5" fill="none" stroke="#2A3346" stroke-width="1"/>
+  <!-- 60 格刻度（每格 24.71：刻度 15、空 9.71），起点对准正上方 -->
+  <g transform="rotate(-90 512 512)">
+    <circle cx="512" cy="512" r="236" fill="none" stroke="#1E2534" stroke-width="96"
+            stroke-dasharray="15 9.713" stroke-dashoffset="7.5"/>
+    <g mask="url(#lit)">
+      <circle cx="512" cy="512" r="236" fill="none" stroke="#5BE7F5" stroke-width="96"
+              stroke-dasharray="15 9.713" stroke-dashoffset="7.5" filter="url(#glow)" opacity="0.6"/>
+      <circle cx="512" cy="512" r="236" fill="none" stroke="#5BE7F5" stroke-width="96"
+              stroke-dasharray="15 9.713" stroke-dashoffset="7.5"/>
+    </g>
+  </g>
+</svg>
