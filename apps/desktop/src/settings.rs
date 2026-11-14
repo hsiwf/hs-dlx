@@ -5,20 +5,22 @@ use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
-    AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, Styled as _, Subscription, Task, Window, div,
-    px,
+    AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Window, div, px,
 };
 use hs_m3u8_core::{Proxy, Url};
 
 use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme;
-use crate::ui::{self, BOTTOM, Tone};
+use crate::ui::{self, FIELD_HEIGHT, Tone};
 use crate::web_route::WebRoute;
 
-/// 设置一栏的最大宽度。
-const MAX_WIDTH: f32 = 640.;
+/// 设置各行的最大宽度。
+const MAX_WIDTH: f32 = 720.;
+/// 每行左边名字一栏的宽。
+const LABEL_WIDTH: f32 = 160.;
 /// 指定代理时输入框里的示例。
 const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
 
@@ -209,17 +211,14 @@ impl SettingsView {
                 cx.listener(move |this, _, _, cx| this.pick(mode, cx)),
             )
         };
+        let now = |value: String| ui::reads(Vec::new(), Some(("现在".into(), value.into())));
         let line = match self.mode {
             Mode::System => self.system.as_ref().map(|route| match route {
-                Route::Proxy(proxy, source) => ui::num(
-                    div()
-                        .text_size(px(13.))
-                        .child(format!("经代理 {proxy}（{source}）")),
-                ),
-                Route::Direct(why) => div().text_size(px(13.)).child(format!("直连 · {why}")),
+                Route::Proxy(proxy, source) => now(format!("经 {proxy}（{source}）")),
+                Route::Direct(why) => now(format!("直连 · {why}")),
                 Route::Broken(why) => ui::error_text(why.clone()),
             }),
-            Mode::Direct => Some(div().text_size(px(13.)).child("不经任何代理")),
+            Mode::Direct => Some(now("不经任何代理".to_owned())),
             Mode::Custom => Some(
                 div()
                     .flex()
@@ -234,13 +233,13 @@ impl SettingsView {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .h(px(ui::BUTTON_HEIGHT))
+                                    .h(px(FIELD_HEIGHT))
                                     .px(px(6.))
                                     .flex()
                                     .items_center()
-                                    .rounded(px(12.))
+                                    .rounded(px(10.))
                                     .border_1()
-                                    .border_color(theme::edge())
+                                    .border_color(theme::ring_idle())
                                     .bg(theme::ground())
                                     .text_size(px(13.))
                                     .child(Input::new(&self.address).appearance(false)),
@@ -258,8 +257,14 @@ impl SettingsView {
                     .children(unsaved.map(ui::caption)),
             ),
         };
-        section("代理")
-            .child(
+        row(
+            "代理",
+            Some("探测、下载与嗅探页的网页经哪里出去"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
                 div()
                     .flex()
                     .flex_wrap()
@@ -277,94 +282,108 @@ impl SettingsView {
                         "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
                     ),
                 },
-            ))
+            )),
+        )
     }
 }
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let folder = section("保存到").child(
+        let folder = row(
+            "保存到",
+            Some("新建任务默认存到这里，每个任务可以另选"),
             div()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
                 .gap(px(12.))
-                .child(ui::num(
+                .child(
                     div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(15.))
-                        .child(crate::format::path(
-                            self.tasks.read(cx).folder(),
-                            self.home.as_deref(),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            ui::field(crate::format::path(
+                                self.tasks.read(cx).folder(),
+                                self.home.as_deref(),
+                            ))
+                            .flex_1(),
+                        )
+                        .child(ui::button(
+                            "settings-folder",
+                            "更改",
+                            Tone::Plain,
+                            cx.listener(|this, _, _, cx| this.change_folder(cx)),
                         )),
-                ))
-                .child(ui::button(
-                    "settings-folder",
-                    "更改",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.change_folder(cx)),
-                )),
+                )
+                .children(self.folder_error.clone().map(ui::error_text)),
         );
-        let about = section("关于")
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.))
-                    .child(ui::num(
-                        div()
-                            .text_size(px(15.))
-                            .child(concat!("hs-m3u8 ", env!("CARGO_PKG_VERSION"))),
-                    ))
-                    .child(ui::button(
-                        "settings-notices",
-                        "第三方声明",
-                        Tone::Plain,
-                        cx.listener(|this, _, _, cx| this.open_notices(cx)),
-                    )),
-            )
-            .children(self.notices_error.clone().map(ui::error_text));
-        div()
+        let about = row(
+            "关于",
+            None,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .child(ui::num(
+                            div()
+                                .text_size(px(15.))
+                                .child(concat!("hs-m3u8 ", env!("CARGO_PKG_VERSION"))),
+                        ))
+                        .child(ui::button(
+                            "settings-notices",
+                            "第三方声明",
+                            Tone::Plain,
+                            cx.listener(|this, _, _, cx| this.open_notices(cx)),
+                        )),
+                )
+                .children(self.notices_error.clone().map(ui::error_text)),
+        );
+        ui::deck()
             .flex_1()
             .min_w_0()
-            .flex()
-            .justify_center()
-            .pt(px(8.))
-            .pb(px(BOTTOM))
+            .child(ui::page_head(
+                None,
+                "设置",
+                None,
+                [ui::button(
+                    "close-settings",
+                    "关闭",
+                    Tone::Ghost,
+                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)),
+                )
+                .into_any_element()],
+            ))
             .child(
                 div()
+                    .id("settings")
                     .flex_1()
-                    .max_w(px(MAX_WIDTH))
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
-                    .flex_col()
-                    .gap(px(16.))
+                    .justify_center()
+                    .px(px(24.))
+                    .pt(px(8.))
+                    .pb(px(24.))
                     .child(
                         div()
+                            .flex_1()
+                            .max_w(px(MAX_WIDTH))
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(12.))
-                            .px(px(4.))
-                            .pb(px(6.))
+                            .flex_col()
+                            .child(folder.border_b_1().border_color(theme::hairline()))
                             .child(
-                                div()
-                                    .text_size(px(20.))
-                                    .line_height(px(28.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("设置"),
+                                self.render_proxy(cx)
+                                    .border_b_1()
+                                    .border_color(theme::hairline()),
                             )
-                            .child(ui::button(
-                                "close-settings",
-                                "关闭",
-                                Tone::Ghost,
-                                cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)),
-                            )),
-                    )
-                    .child(folder.children(self.folder_error.clone().map(ui::error_text)))
-                    .child(self.render_proxy(cx))
-                    .child(about),
+                            .child(about),
+                    ),
             )
     }
 }
@@ -399,17 +418,27 @@ fn mode_of(proxy: &Proxy) -> Mode {
     }
 }
 
-/// 一节：深色底、圆角，上面是小标题。
-fn section(title: &'static str) -> Div {
+/// 一行：左边是名字与它管什么（`about`），右边是 `content`。
+fn row(title: &'static str, about: Option<&'static str>, content: Div) -> Div {
     div()
         .flex()
-        .flex_col()
-        .gap(px(12.))
-        .px(px(22.))
-        .py(px(20.))
-        .rounded(px(18.))
-        .bg(theme::panel())
-        .border_1()
-        .border_color(theme::line())
-        .child(ui::caption(title))
+        .gap(px(24.))
+        .py(px(22.))
+        .child(
+            div()
+                .w(px(LABEL_WIDTH))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .children(about.map(|about| {
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(ui::CAPTION_LINE))
+                        .text_color(theme::faint())
+                        .child(about)
+                })),
+        )
+        .child(content.flex_1().min_w_0())
 }

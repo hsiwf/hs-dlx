@@ -1,6 +1,6 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
-use gpui_kit::{AppContext as _, Context, Entity, Focusable as _, Window};
+use gpui_kit::{AppContext as _, Context, Entity, Window};
 use hs_m3u8_app::Draft;
 use hs_m3u8_core::Url;
 
@@ -12,11 +12,11 @@ use crate::sniff::{SniffEvent, SniffView, Verdict};
 impl Shell {
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(url) = links::http_url(text) else {
-            self.input_error = Some(links::NOT_HTTP.to_owned());
-            cx.notify();
+            self.dock
+                .update(cx, |dock, cx| dock.refuse(links::NOT_HTTP.to_owned(), cx));
             return;
         };
-        self.input_error = None;
+        self.dock.update(cx, |dock, cx| dock.accepted(cx));
         self.confirm_discard = None;
         if self.clipboard.as_ref() == Some(&url) {
             self.clipboard = None;
@@ -44,12 +44,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let tasks = self.tasks.read(cx);
-        let (service, folder, home) = (
-            tasks.service().clone(),
-            tasks.folder().clone(),
-            self.home.clone(),
-        );
-        let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, home, window, cx));
+        let (service, folder) = (tasks.service().clone(), tasks.folder().clone());
+        let dock = self.dock.clone();
+        let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, dock, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -114,9 +111,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let typing = self.paste.read(cx).focus_handle(cx).is_focused(window);
-        let same = links::http_url(&self.paste.read(cx).value())
-            .is_some_and(|url| &url == view.read(cx).url());
+        let dock = self.dock.read(cx);
+        let typing = dock.typing(window, cx);
+        let same = links::http_url(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
         if !typing || same {
             view.update(cx, |view, cx| view.focus(window, cx));
         }
@@ -227,8 +224,8 @@ impl Shell {
                         Ok(id) if this.showing(&view) => {
                             this.selected = Some(id);
                             this.show(Page::Task, cx);
-                            this.paste
-                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            this.dock
+                                .update(cx, |dock, cx| dock.set_text(String::new(), window, cx));
                         }
                         Ok(_) => {}
                         Err(error) if this.showing(&view) => {

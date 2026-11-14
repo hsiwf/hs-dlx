@@ -18,7 +18,7 @@ impl Route {
     pub fn of(url: &Url, proxy: Result<Proxy, impl ToString>) -> Route {
         match proxy {
             Err(error) => Route::Broken(error.to_string()),
-            Ok(Proxy::Direct) => Route::Direct("设置为直连"),
+            Ok(Proxy::Direct) => Route::Direct("按设置"),
             Ok(Proxy::Url(proxy)) => Route::Proxy(bare_url(&proxy), "设置"),
             Ok(Proxy::System) => match hs_m3u8_core::system_proxy() {
                 Ok(Some(system)) => match system.proxy_for(url) {

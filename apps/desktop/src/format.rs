@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use hs_m3u8_app::FailureKind;
 use hs_m3u8_core::VariantInfo;
 
 /// 在运行的任务数与合计速度（「2 个进行中 · ↓ 18.4 MB/s」）；没有在运行的任务时为 None。
@@ -87,6 +88,46 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
+    }
+}
+
+/// 失败在表盘上的大字与说明：大字为状态码或种类，说明写这类失败多半是怎么回事（完整的错误另外列出）。
+pub fn failure(kind: FailureKind) -> (String, &'static str) {
+    match kind {
+        FailureKind::Status(code @ (401 | 403)) => (
+            code.to_string(),
+            "服务器拒绝了请求，多要带上来源页的 Referer 或 Cookie",
+        ),
+        FailureKind::Status(code @ (404 | 410)) => {
+            (code.to_string(), "服务器上已没有这个地址，多为链接过期")
+        }
+        FailureKind::Status(code) => (code.to_string(), "服务器没有正常回应"),
+        FailureKind::Network => (
+            "网络".into(),
+            "连不上服务器或传输中断，检查网络或代理后重试",
+        ),
+        FailureKind::Certificate => ("证书".into(), "服务器的证书不受信任"),
+        FailureKind::Disk => ("磁盘".into(), "读写本机的文件出错，或读不到所在的盘"),
+        FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
+        FailureKind::SourceChanged => (
+            "不符".into(),
+            "来源与已下载的接不上：点播只能重新下载，直播可以写出已录的",
+        ),
+        FailureKind::Malformed => (
+            "内容".into(),
+            "取到的不是视频该有的内容，多为错误页或登录页，常要补 Cookie",
+        ),
+        FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
+        FailureKind::Mp4Unsupported => (
+            "不兼容".into(),
+            "内容放不进 MP4：改存本地 HLS，已下的照样用",
+        ),
+        FailureKind::NothingToWrite => {
+            ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")
+        }
+        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
+        FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见错误信息"),
+        FailureKind::Other => ("!".into(), "原因见错误信息"),
     }
 }
 

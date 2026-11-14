@@ -16,16 +16,16 @@ use crate::ui::{self, TITLE_HEIGHT};
 use crate::{format, ring, theme};
 
 /// 标志的小环（画到 [`ring::LOGO_ARC`]）的边长与环宽。
-const LOGO: f32 = 17.;
-const LOGO_WIDTH: f32 = 2.5;
+const LOGO: f32 = 18.;
+const LOGO_WIDTH: f32 = 2.4;
 /// 标志离红绿灯多远、与名字的间距、右边状态离窗口边多远。
 const LOGO_MARGIN: f32 = 14.;
-const LOGO_GAP: f32 = 10.;
-const STATUS_MARGIN: f32 = 28.;
+const LOGO_GAP: f32 = 9.;
+const STATUS_MARGIN: f32 = 20.;
 /// 可用空间少于这么多时标成橙色：约 10 Mbps 的视频再下十几分钟就满。
 const LOW_SPACE: u64 = 1 << 30;
 /// 设置按钮的边长。
-const SETTINGS: f32 = 36.;
+const SETTINGS: f32 = 34.;
 
 impl Shell {
     pub(super) fn render_header(
@@ -81,13 +81,13 @@ impl Shell {
                     .pr(px(STATUS_MARGIN))
                     .flex()
                     .items_center()
-                    .gap(px(14.))
+                    .gap(px(16.))
                     .child(ui::num(
                         div()
                             .flex()
-                            .gap(px(6.))
+                            .gap(px(18.))
                             .text_size(px(13.))
-                            .text_color(theme::muted())
+                            .text_color(theme::soft())
                             .children(activity)
                             .children(space.map(|(text, warn)| {
                                 div()
@@ -108,7 +108,7 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_full()
+            .rounded(px(10.))
             .border_1()
             .cursor_pointer()
             .map(|button| {
@@ -117,15 +117,14 @@ impl Shell {
                         .border_color(theme::edge())
                         .bg(theme::selected())
                         .text_color(theme::cyan())
-                        .shadow(ui::glow(theme::cyan(), 14., 0.25))
                 } else {
                     button
                         .border_color(gpui_kit::transparent_black())
                         .text_color(theme::muted())
-                        .hover(|s| s.bg(theme::raised()))
+                        .hover(|s| s.bg(theme::selected()))
                 }
             })
             .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)))
-            .child(Icon::new(IconName::Settings).size(px(18.)))
+            .child(Icon::new(IconName::Settings).size(px(17.)))
     }
 }

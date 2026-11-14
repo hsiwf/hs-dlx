@@ -1,6 +1,5 @@
-//! 左边的任务列表：每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，在网页里找视频流时有网页那一项。
-
-use std::time::Instant;
+//! 左边的任务栏面板：标题栏写有几个任务，下面每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，在网页里
+//! 找视频流时有网页那一项。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -14,22 +13,17 @@ use crate::new_task::Phase;
 use crate::tasks::{Row, Tasks};
 use crate::{ring, theme, ui};
 
-/// 任务列表的宽度。
-const WIDTH: f32 = 300.;
-/// 窗口窄时任务列表最多收到的宽度。
+/// 任务栏的宽度。
+const WIDTH: f32 = 288.;
+/// 窗口窄时任务栏最多收到的宽度。
 pub(super) const MIN_WIDTH: f32 = 240.;
 
-/// 列表小环的边长与环宽。
-const ORB: f32 = 52.;
+/// 小环的边长与环宽。
+const ORB: f32 = 46.;
 const ORB_WIDTH: f32 = 5.;
 
 impl Shell {
-    pub(super) fn render_list(
-        &self,
-        tasks: &Tasks,
-        now: Instant,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    pub(super) fn render_list(&self, tasks: &Tasks, cx: &Context<Self>) -> impl IntoElement {
         let new_task = self
             .new_task()
             .map(|view| new_task_item(view.read(cx).phase()));
@@ -45,21 +39,38 @@ impl Shell {
             .rows()
             .iter()
             .rev()
-            .map(|row| self.render_orb(row, selected, dim, now, cx))
+            .map(|row| self.render_orb(row, selected, dim, cx))
             .collect();
-        div()
-            .id("tasks")
+        ui::deck()
             .flex_basis(px(WIDTH))
             .flex_shrink(1.)
             .min_w(px(MIN_WIDTH))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .py(px(8.))
-            .overflow_y_scroll()
-            .children(new_task)
-            .children(sniff)
-            .children(orbs)
+            .p(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .px(px(12.))
+                    .pt(px(10.))
+                    .pb(px(8.))
+                    .text_size(px(13.))
+                    .text_color(theme::muted())
+                    .child("任务")
+                    .child(ui::num(div().child(tasks.rows().len().to_string()))),
+            )
+            .child(
+                div()
+                    .id("tasks")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(new_task)
+                    .children(sniff)
+                    .children(orbs),
+            )
     }
 
     /// `selected` 为选中的任务（见 [`Shell::selected_row`]）。
@@ -68,15 +79,14 @@ impl Shell {
         row: &Row,
         selected: Option<hs_m3u8_app::TaskId>,
         dim: bool,
-        now: Instant,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let id = row.task.id;
-        let look = look(row, now);
+        let look = look(row);
         let on = selected == Some(id) && matches!(self.page, Page::Task);
         let (fraction, color) = (look.fraction, look.orb);
         ui::list_item(("task", id.0 as u64), on)
-            .when(dim, |s| s.opacity(0.55))
+            .when(dim, |s| s.opacity(0.5))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
             .child(
@@ -110,7 +120,7 @@ impl Shell {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(11.))
+                                .text_size(px(10.5))
                                 .text_color(theme::soft())
                                 .child(look.short),
                         ))
@@ -132,6 +142,7 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
         .min_w_0()
         .child(
             div()
+                .text_size(px(14.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .truncate()
                 .child(title),
@@ -154,10 +165,10 @@ fn sniff_item(
     cx: &Context<Shell>,
 ) -> Stateful<Div> {
     ui::list_item("sniff", on)
-        .when(dim, |item| item.opacity(0.55))
+        .when(dim, |item| item.opacity(0.5))
         .cursor_pointer()
         .on_click(cx.listener(|this, _, _, cx| this.show_sniff(cx)))
-        .child(ui::rings(ORB, ORB_WIDTH, 20.))
+        .child(ui::rings(ORB, 3., 10.))
         .child(two_lines(
             title.unwrap_or_else(|| "网页里的视频流".to_owned()),
             if found == 0 {
@@ -175,7 +186,7 @@ fn new_task_item(phase: Phase) -> impl IntoElement {
                 .size(px(ORB))
                 .flex_none()
                 .rounded_full()
-                .border_2()
+                .border(px(2.5))
                 .border_dashed()
                 .border_color(theme::cyan()),
         )

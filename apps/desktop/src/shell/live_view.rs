@@ -1,8 +1,7 @@
-//! 直播录制的任务视图：中间是钟面（见 [`crate::live`]），信号栏上面是录制的概况与图例。
+//! 直播录制的任务视图：舞台中间是钟面（见 [`crate::live`]），检查面板里是录制的读数与钟面的图例。
 
 use std::time::Duration;
 
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, canvas, div, px,
 };
@@ -14,7 +13,7 @@ use crate::live::{self, Face};
 use crate::ring::{AREA, angle};
 use crate::tasks::Row;
 use crate::ui::{self, CAPTION_LINE, TEXT_LINE};
-use crate::{format, theme};
+use crate::{dial, format, theme};
 
 /// 钟面上 00、15、30、45 分标记的半径。
 const MARK_RADIUS: f32 = 210.;
@@ -59,10 +58,7 @@ pub(super) fn figure(row: &Row, look: &Look) -> Div {
     } else {
         look.line.clone()
     };
-    div()
-        .relative()
-        .size(px(AREA))
-        .flex_none()
+    dial::face(theme::red())
         .child(
             canvas(
                 |_, _, _| {},
@@ -146,7 +142,7 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
-        .bg(theme::panel())
+        .bg(theme::deck())
         .border_1()
         .border_color(theme::warn_edge())
         .text_size(px(12.))
@@ -162,9 +158,8 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
     })
 }
 
-/// 信号栏上面的录制概况：标题与来源，已录、缺失、会话、刷新，与钟面的图例。
-pub(super) fn summary(row: &Row) -> Div {
-    let host = row.task.spec.url.host_str().unwrap_or_default().to_owned();
+/// 录制的读数：已录、这次打开以来缺失、会话、刷新。
+pub(super) fn reads(row: &Row) -> Vec<(SharedString, SharedString)> {
     let recorded = row.completed().map_or_else(
         || "—".to_owned(),
         |(segments, bytes)| format!("{segments} 片 · {}", format::bytes(bytes)),
@@ -201,23 +196,20 @@ pub(super) fn summary(row: &Row) -> Div {
             || if progress.is_some() { "正常" } else { "—" }.to_owned(),
             |reason| format!("失败：{reason}"),
         );
-    let refresh_failed = progress.is_some_and(|p| p.refresh_errors.iter().any(Option::is_some));
-    let stat = |label: &'static str, value: String| {
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .min_w_0()
-            .child(ui::caption(label))
-            .child(ui::num(
-                div()
-                    .text_size(px(13.))
-                    .line_height(px(TEXT_LINE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .truncate()
-                    .child(value),
-            ))
-    };
+    [
+        ("已录", recorded),
+        ("这次打开以来缺失", missed),
+        ("会话", session),
+        ("刷新", refresh),
+    ]
+    .into_iter()
+    .map(|(label, value)| (label.into(), value.into()))
+    .collect()
+}
+
+/// 钟面的图例：各会话的颜色、这次打开以前录的与缺片。
+pub(super) fn legend(row: &Row) -> Div {
+    let timeline = &row.timeline;
     // 只有一个会话时不提会话；有几个时按钟面上交替的颜色列出各自的会话，每种最多列三个
     let colors = live::session_colors();
     let mut sessions_legend: Vec<(Hsla, String)> = match timeline.sessions.as_slice() {
@@ -248,56 +240,26 @@ pub(super) fn summary(row: &Row) -> Div {
         div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(10.))
             .text_size(px(12.))
             .line_height(px(CAPTION_LINE))
+            .text_color(theme::soft())
             .child(div().w(px(2.)).h(px(2. * half)).rounded(px(1.)).bg(color))
             .child(text)
     };
     div()
         .flex()
         .flex_col()
-        .gap(px(14.))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_size(px(18.))
-                        .font_weight(FontWeight::BOLD)
-                        .line_clamp(2)
-                        .child(row.task.spec.title.clone()),
-                )
-                .child(ui::caption(host)),
+        .gap(px(6.))
+        .child(div().pb(px(2.)).child(ui::caption("钟面")))
+        .children(
+            sessions_legend
+                .into_iter()
+                .map(|(color, text)| legend(color, live::HALF, text)),
         )
-        .child(
-            div()
-                .grid()
-                .grid_cols(2)
-                .gap(px(12.))
-                .child(stat("已录", recorded))
-                .child(stat("这次打开以来缺失", missed))
-                .child(stat("会话", session))
-                .child(
-                    stat("刷新", refresh).when(refresh_failed, |s| s.text_color(theme::orange())),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .children(
-                    sessions_legend
-                        .into_iter()
-                        .map(|(color, text)| legend(color, live::HALF, text)),
-                )
-                .child(legend(
-                    theme::orange(),
-                    live::MISS_HALF,
-                    "缺片（取不到或刷新前已滑出窗口）".to_owned(),
-                )),
-        )
+        .child(legend(
+            theme::orange(),
+            live::MISS_HALF,
+            "缺片（取不到或刷新前已滑出窗口）".to_owned(),
+        ))
 }

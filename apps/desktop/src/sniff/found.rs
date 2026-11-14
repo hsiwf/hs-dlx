@@ -6,11 +6,10 @@ use hs_m3u8_core::{Probe, Url};
 pub(super) enum Check {
     Waiting,
     Running,
-    /// 探测成了：结果、探测时带的请求头与列表里的说明（几档清晰度、时长或直播）
+    /// 探测成了：结果与探测时带的请求头
     Ready {
         probe: Box<Probe>,
         headers: Vec<(String, String)>,
-        summary: String,
     },
     /// 没成：原因与探测时带的请求头；没配出请求头（读不出 Cookie）时为 None
     Failed {

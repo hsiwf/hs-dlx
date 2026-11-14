@@ -1,20 +1,41 @@
-//! 界面配色：深色底；发光的青色为进度与选中，橙色为重试与要处理的问题，红色为录制。
+//! 界面配色：三层材质——舱底（窗口底色，中间的舞台在这一层）、面板（任务栏、检查面板、整页面板）、面板里抬起的一层
+//! （选中项、输入框、读数格）。颜色即含义：发光的青色为在进行与可操作，橙色为重试与要处理的问题，红色只用于录制。
 
 use gpui_kit::{Hsla, rgb};
 
-/// 窗口底色
+/// 窗口底色（舱底）：中间的舞台直接在它上面
 pub fn ground() -> Hsla {
-    rgb(0x07080C).into()
+    rgb(0x05070B).into()
+}
+
+/// 面板：任务栏、检查面板与整页面板的底色
+pub fn deck() -> Hsla {
+    rgb(0x0A0E16).into()
+}
+
+/// 面板的描边
+pub fn deck_edge() -> Hsla {
+    rgb(0x18202E).into()
+}
+
+/// 面板里分隔标题栏、底栏与各段的细线
+pub fn hairline() -> Hsla {
+    rgb(0x141B28).into()
+}
+
+/// 读数格与面板里的卡片的底色
+pub fn cell() -> Hsla {
+    rgb(0x0C111B).into()
+}
+
+/// 读数格的标签、时间：最次一级、只作标注的字
+pub fn faint() -> Hsla {
+    rgb(0x737C94).into()
 }
 
 /// 刻度环中间的圆盘
 pub fn disc() -> Hsla {
-    rgb(0x0B0E15).into()
-}
-
-/// 浮在底色上的面：卡片、提示、输入框
-pub fn panel() -> Hsla {
-    rgb(0x0E1118).into()
+    rgb(0x080B12).into()
 }
 
 /// 可点的东西静止时的底色，以及悬停时稍微抬起的底色
@@ -82,6 +103,16 @@ pub fn cyan_dim() -> Hsla {
     rgb(0x2C7F88).into()
 }
 
+/// 橙色实心上的文字
+pub fn on_amber() -> Hsla {
+    rgb(0x1F1204).into()
+}
+
+/// 要处理的说明的底色
+pub fn warn_ground() -> Hsla {
+    rgb(0x140F08).into()
+}
+
 /// 青色实心上的文字
 pub fn on_cyan() -> Hsla {
     rgb(0x04161A).into()
@@ -99,7 +130,7 @@ pub fn written() -> Hsla {
 
 /// 要留意的：重试、失败、要用户处理的提示
 pub fn orange() -> Hsla {
-    rgb(0xFF9F43).into()
+    rgb(0xFFA24C).into()
 }
 
 /// 直播录制
@@ -112,14 +143,19 @@ pub fn finished() -> Hsla {
     rgb(0x3B4253).into()
 }
 
+/// 要留意级别的信号的字
+pub fn warn_text() -> Hsla {
+    rgb(0xFFC48C).into()
+}
+
+/// 失败级别的信号的字
+pub fn error_text() -> Hsla {
+    rgb(0xFF8A8D).into()
+}
+
 /// 要留意级别的描边：重试类信号与要用户关掉的提示
 pub fn warn_edge() -> Hsla {
     rgb(0x5A3A18).into()
-}
-
-/// 失败级别的描边
-pub fn error_edge() -> Hsla {
-    rgb(0x5A1F22).into()
 }
 
 /// `color` 换成透明度 `alpha`（0 到 1），发光与半透明用。

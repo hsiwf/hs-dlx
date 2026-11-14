@@ -1,9 +1,7 @@
-//! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、列表小环。
-
-use std::time::Instant;
+//! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_m3u8_app::{Failure, FailureKind, Status};
+use hs_m3u8_app::{Failure, Status};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -18,6 +16,8 @@ pub struct Look {
     pub ticks: Ticks,
     pub big: String,
     pub line: String,
+    /// 失败时这类失败多半是怎么回事（完整的错误在信号里）；不是失败时为 None
+    pub hint: Option<&'static str>,
     /// 列表小环：进度（0 到 1）、颜色与中间的简写
     pub fraction: f32,
     pub orb: Hsla,
@@ -35,47 +35,7 @@ enum Stopped<'a> {
     Failed(&'a Failure),
 }
 
-/// 失败时圆盘里的大字与说明：大字为状态码或种类，说明写这类失败多半是怎么回事；完整的错误在信号里。
-fn failure_text(failure: &Failure) -> (String, &'static str) {
-    match failure.kind {
-        FailureKind::Status(code @ (401 | 403)) => (
-            code.to_string(),
-            "服务器拒绝了请求，多要带上来源页的 Referer 或 Cookie",
-        ),
-        FailureKind::Status(code @ (404 | 410)) => {
-            (code.to_string(), "服务器上已没有这个地址，多为链接过期")
-        }
-        FailureKind::Status(code) => (code.to_string(), "服务器没有正常回应"),
-        FailureKind::Network => (
-            "网络".into(),
-            "连不上服务器或传输中断，检查网络或代理后重试",
-        ),
-        FailureKind::Certificate => ("证书".into(), "服务器的证书不受信任"),
-        FailureKind::Disk => ("磁盘".into(), "读写本机的文件出错，或读不到所在的盘"),
-        FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
-        FailureKind::SourceChanged => (
-            "不符".into(),
-            "来源与已下载的接不上：点播只能重新下载，直播可以写出已录的",
-        ),
-        FailureKind::Malformed => (
-            "内容".into(),
-            "取到的不是视频该有的内容，多为错误页或登录页，常要补 Cookie",
-        ),
-        FailureKind::Stalled => ("停滞".into(), "直播长时间录不到新内容"),
-        FailureKind::Mp4Unsupported => (
-            "不兼容".into(),
-            "内容放不进 MP4：改存本地 HLS，已下的照样用",
-        ),
-        FailureKind::NothingToWrite => {
-            ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")
-        }
-        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
-        FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见右边的信号"),
-        FailureKind::Other => ("!".into(), "原因见右边的信号"),
-    }
-}
-
-pub fn look(row: &Row, now: Instant) -> Look {
+pub fn look(row: &Row) -> Look {
     if row.discarding {
         return discarding(row, "放弃中", "停下并删除任务目录");
     }
@@ -85,7 +45,7 @@ pub fn look(row: &Row, now: Instant) -> Look {
             "放弃没做完",
             "任务目录可能已删了一部分，再放弃一次即可",
         ),
-        Status::Running => running(row, Amount::of(row).unwrap_or_default(), now),
+        Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
         Status::Done => done_look(row),
@@ -105,13 +65,14 @@ fn discarding(row: &Row, state: &str, line: &str) -> Look {
         },
         big: "…".to_owned(),
         line: line.to_owned(),
+        hint: None,
         fraction: 0.0,
         orb: theme::finished(),
         short: "…".to_owned(),
     }
 }
 
-/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字与说明按种类（见 [`failure_text`]），完整的
+/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字与说明按种类（见 [`format::failure`]），完整的
 /// 错误在信号里。点了继续、还在读任务目录时状态写「正在继续」。
 fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let amount = Amount::of(row);
@@ -127,7 +88,7 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let fraction = amount.as_ref().map_or(0.0, Amount::fraction);
     match why {
         Stopped::Paused => {
-            let (big, line) = paused_text(row, amount.as_ref(), recording);
+            let (big, line) = kept_text(row, amount.as_ref(), recording, true);
             Look {
                 state: state("已暂停"),
                 color: theme::muted(),
@@ -139,18 +100,21 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 },
                 big,
                 line,
+                hint: None,
                 fraction,
                 orb: theme::cyan_dim(),
             }
         }
         Stopped::Failed(failure) => {
-            let (big, hint) = failure_text(failure);
+            let (big, hint) = format::failure(failure.kind);
+            let (_, line) = kept_text(row, amount.as_ref(), recording, false);
             Look {
                 state: state("需要处理"),
                 color: theme::orange(),
                 ticks: ticks(theme::finished()),
                 big,
-                line: hint.to_owned(),
+                line,
+                hint: Some(hint),
                 fraction,
                 orb: theme::orange(),
                 short: "!".to_owned(),
@@ -159,9 +123,15 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     }
 }
 
-/// 暂停的任务的大字与说明：录制写已录的时长，点播写百分比与片数；没有内容时说明为什么。
-fn paused_text(row: &Row, amount: Option<&Amount>, recording: bool) -> (String, String) {
+/// 停着的任务的大字与说明：录制写已录的时长，点播写百分比与片数，`paused` 时写明继续时接着下；没有内容时说明为什么。
+fn kept_text(
+    row: &Row,
+    amount: Option<&Amount>,
+    recording: bool,
+    paused: bool,
+) -> (String, String) {
     let known = amount.is_some_and(|a| a.total > 0);
+    let then = if paused { " · 继续时接着下" } else { "" };
     let line = match (amount, &row.disk) {
         (Some(a), _) if recording => {
             format!(
@@ -170,13 +140,9 @@ fn paused_text(row: &Row, amount: Option<&Amount>, recording: bool) -> (String, 
                 format::bytes(a.bytes)
             )
         }
-        (Some(a), _) if a.total > 0 => format!("{} / {} 片 · 继续时接着下", a.done, a.total),
+        (Some(a), _) if a.total > 0 => format!("已下 {} / {} 片{then}", a.done, a.total),
         (Some(a), _) if a.done > 0 => {
-            format!(
-                "已下 {} 片 · {} · 继续时接着下",
-                a.done,
-                format::bytes(a.bytes)
-            )
+            format!("已下 {} 片 · {}{then}", a.done, format::bytes(a.bytes))
         }
         (_, Disk::Unreadable(reason)) => format!("读不出任务目录：{reason}"),
         (_, Disk::Unread) => "正在读取任务目录".to_owned(),
@@ -215,13 +181,14 @@ fn done_look(row: &Row) -> Look {
             || row.file_name.clone(),
             |r| finished_text(&row.task.spec.output, r),
         ),
+        hint: None,
         fraction: 1.0,
         orb: theme::finished(),
         short: "✓".to_owned(),
     }
 }
 
-fn running(row: &Row, amount: Amount, now: Instant) -> Look {
+fn running(row: &Row, amount: Amount) -> Look {
     let stage = row.progress.as_ref().map_or(Stage::Preparing, |p| p.stage);
     if stage == Stage::Writing {
         let writing = row.progress.as_ref().and_then(|p| p.writing);
@@ -249,6 +216,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
                 || "不联网".to_owned(),
                 |c| format!("已写 {} / {} 个文件 · 不联网", c.done, c.total),
             ),
+            hint: None,
             fraction: written,
             orb: theme::cyan_pale(),
             short: percent,
@@ -261,6 +229,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             ticks: Ticks::of(0, 0, true),
             big: format::clock(amount.duration.max(row.recorded_before_writing)),
             line: "不联网，只写出已录的".to_owned(),
+            hint: None,
             fraction: 0.0,
             orb: theme::cyan(),
             short: "…".to_owned(),
@@ -276,6 +245,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             },
             big: format::clock(amount.duration),
             line: format!("{} 片 · {}", amount.done, format::bytes(amount.bytes)),
+            hint: None,
             fraction: 1.0,
             orb: theme::red(),
             short: "REC".to_owned(),
@@ -288,6 +258,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             ticks: Ticks::of(0, 0, true),
             big: "—".to_owned(),
             line: "拉取播放列表".to_owned(),
+            hint: None,
             fraction: 0.0,
             orb: theme::cyan(),
             short: "…".to_owned(),
@@ -298,25 +269,13 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
         .progress
         .as_ref()
         .is_some_and(|p| !p.retrying.is_empty());
-    let mut line = format!(
-        "{} / {} 片 · {}/s",
-        amount.done,
-        amount.total,
-        format::bytes(row.rate.bytes_per_second(now) as u64)
-    );
-    if let Some(left) = row
-        .rate
-        .remaining(now, amount.total.saturating_sub(amount.done))
-    {
-        line.push_str(" · ");
-        line.push_str(&format::remaining(left));
-    }
     Look {
         state: "下载中".to_owned(),
         color: theme::cyan(),
         ticks,
         big: percent(amount.fraction()),
-        line,
+        line: format!("{} / {} 片", amount.done, amount.total),
+        hint: None,
         fraction: amount.fraction(),
         orb: theme::cyan(),
         short: percent(amount.fraction()),
@@ -325,7 +284,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use hs_m3u8_app::{Failure, FailureKind, Finished, Status};
     use hs_m3u8_core::{FileCount, Progress, SegmentCounts, Stage, Writing};
@@ -338,27 +297,17 @@ mod tests {
     #[test]
     fn paused_tasks_show_what_is_in_the_work_dir() {
         let mut paused = row(Status::Paused, false, Some(160));
-        assert_eq!(look(&paused, Instant::now()).line, "正在读取任务目录");
+        assert_eq!(look(&paused).line, "正在读取任务目录");
         paused.disk = Disk::Unreadable("权限不够".into());
-        assert_eq!(
-            look(&paused, Instant::now()).line,
-            "读不出任务目录：权限不够"
-        );
+        assert_eq!(look(&paused).line, "读不出任务目录：权限不够");
         paused.disk = Disk::Read(None);
-        assert!(
-            look(&paused, Instant::now())
-                .line
-                .starts_with("任务目录不在")
-        );
+        assert!(look(&paused).line.starts_with("任务目录不在"));
         paused.disk = Disk::Read(Some(saved(40, false)));
-        let seen = look(&paused, Instant::now());
+        let seen = look(&paused);
         assert_eq!((seen.big.as_str(), seen.fraction), ("25%", 0.25));
         assert_eq!((seen.ticks.count, seen.ticks.lit), (160, 40));
         paused.task.total = None;
-        assert_eq!(
-            look(&paused, Instant::now()).line,
-            "已下 40 片 · 4.0 MB · 继续时接着下"
-        );
+        assert_eq!(look(&paused).line, "已下 40 片 · 4.0 MB · 继续时接着下");
     }
 
     /// 继续后在准备阶段就失败：这次运行的进度是 0/0，读到任务目录后按目录里已有的显示。
@@ -371,10 +320,11 @@ mod tests {
         let mut failed = row(Status::Failed(forbidden), false, Some(420));
         failed.progress = Some(Progress::default());
         failed.disk = Disk::Read(Some(saved(143, false)));
-        let seen = look(&failed, Instant::now());
+        let seen = look(&failed);
         assert_eq!((seen.ticks.count, seen.ticks.lit), (360, 122));
         assert_eq!(seen.big, "403");
-        assert!(seen.line.contains("Referer"), "{}", seen.line);
+        assert!(seen.hint.is_some_and(|hint| hint.contains("Referer")));
+        assert_eq!(seen.line, "已下 143 / 420 片");
     }
 
     /// 暂停的直播录制写已录的时长，不写片数与百分比。
@@ -382,7 +332,7 @@ mod tests {
     fn paused_recordings_show_recorded_time() {
         let mut paused = row(Status::Paused, true, None);
         paused.disk = Disk::Read(Some(saved(40, true)));
-        let seen = look(&paused, Instant::now());
+        let seen = look(&paused);
         assert_eq!((seen.big.as_str(), seen.short.as_str()), ("00:40", "‖"));
         assert!(seen.line.starts_with("已录 00:40"), "{}", seen.line);
     }
@@ -407,7 +357,7 @@ mod tests {
             }),
             ..Progress::default()
         });
-        let seen = look(&writing, Instant::now());
+        let seen = look(&writing);
         assert_eq!(
             (seen.state.as_str(), seen.big.as_str()),
             ("写出 MP4", "99%")
@@ -423,7 +373,7 @@ mod tests {
             bytes: 1_420_000_000,
             resolution: Some((1920, 1080)),
         });
-        let seen = look(&done, Instant::now());
+        let seen = look(&done);
         assert_eq!((seen.ticks.count, seen.ticks.lit), (60, 60));
         assert_eq!(seen.big, "48:12");
         assert_eq!(seen.line, "MP4 · 1920×1080 · 1.4 GB");

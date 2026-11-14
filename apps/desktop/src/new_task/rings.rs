@@ -1,14 +1,17 @@
-//! 新建页中间的同心环：各档清晰度的几何、点击判定与画法。
+//! 新建页舞台中间的图形：探测中与失败时是表盘，探测完成后是各档清晰度的同心环（几何、点击判定与画法）。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AbsoluteLength, Context, Div, FontWeight, InteractiveElement as _, MouseButton,
-    ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled, canvas, div, px,
+    AbsoluteLength, AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled,
+    canvas, div, px,
 };
+use hs_m3u8_app::Failure;
 use hs_m3u8_core::{Probe, VariantInfo};
 
-use super::{NewTask, Probing, duration_of};
-use crate::{format, theme, ui};
+use super::{NewTask, PageCheck, Probing, duration_of};
+use crate::ring::{self, Ticks};
+use crate::{dial, format, theme, ui};
 
 /// 同心环所在方框的边长。
 const BOX: f32 = 480.;
@@ -22,8 +25,6 @@ const INNER: f32 = 102.;
 const SINGLE_RADIUS: f32 = 174.;
 /// 只有一档时那一环的宽。
 const SINGLE_WIDTH: f32 = 14.;
-/// 探测中占位的三个暗环的半径。
-const PLACEHOLDER_RADII: [f32; 3] = [OUTER, SINGLE_RADIUS, 134.];
 /// 圆心处写字的方框边长。
 const CENTER_BOX: f32 = 180.;
 /// 标签所在的横坐标（相对同心环区域）：引线从环上 45° 处水平拉到这里。
@@ -142,56 +143,60 @@ impl NewTask {
         hit(&rings(&master.variants), (dx * dx + dy * dy).sqrt())
     }
 
-    pub(super) fn render_figure(&self, cx: &mut Context<Self>) -> Div {
+    /// 舞台中间的图形：探测中（与取到的不是播放列表、正在网页里看时）是转着彗尾的表盘，失败时是橙色的表盘，探测完成
+    /// 后是同心环。
+    pub(super) fn render_figure(&self, cx: &mut Context<Self>) -> AnyElement {
+        match &self.probing {
+            Probing::Ready(probe) => self.rings_figure(probe, cx).into_any_element(),
+            Probing::Failed(failure) if self.page_check != PageCheck::Opening => {
+                failed_dial(failure).into_any_element()
+            }
+            Probing::Running | Probing::Failed(_) => self.probing_dial(cx).into_any_element(),
+        }
+    }
+
+    /// 探测中的表盘：彗尾按探测了多久转，圆盘里写探测了多久（逐帧重画见 [`NewTask::animate`]）。系统要求减少动态效果
+    /// 时彗尾停在 12 点、不写时长。
+    fn probing_dial(&self, cx: &Context<Self>) -> Div {
+        let animate = !cx.reduce_motion();
+        let elapsed = self.since.elapsed();
+        let head = if animate {
+            elapsed.as_secs_f32() / dial::TURN
+        } else {
+            0.
+        };
+        let doing = if self.page_check == PageCheck::Opening {
+            "在网页里打开看看"
+        } else {
+            "读取播放列表"
+        };
+        dial::dial(
+            theme::cyan(),
+            dial::figure(move |bounds, window, _| {
+                ring::paint_comet(bounds, ring::RADIUS, head, theme::cyan(), window)
+            }),
+            dial_readout(
+                "探测中",
+                theme::cyan(),
+                if animate {
+                    format::clock(elapsed)
+                } else {
+                    "…".to_owned()
+                },
+                doing,
+            ),
+        )
+    }
+
+    /// 探测完成时的同心环与右侧的标签，点环选中一档。
+    fn rings_figure(&self, probe: &Probe, cx: &mut Context<Self>) -> Div {
         let Figure {
             rings,
             labels,
             center,
             note,
-        } = match &self.probing {
-            Probing::Running => Figure {
-                // 探测中：三个暗环占位
-                rings: PLACEHOLDER_RADII
-                    .into_iter()
-                    .map(|r| ring_div(r, 4.).border_color(theme::ring_idle()))
-                    .collect(),
-                labels: Vec::new(),
-                center: "探测中".to_owned(),
-                note: self.url.host_str().unwrap_or_default().to_owned(),
-            },
-            Probing::Failed(_) => Figure {
-                rings: vec![ring_div(SINGLE_RADIUS, 4.).border_color(theme::orange())],
-                labels: Vec::new(),
-                center: "探测失败".to_owned(),
-                note: String::new(),
-            },
-            Probing::Ready(probe) => self.ready_figure(probe),
-        };
-        // 按键在界面上看不出来：探测完成后在同心环下面写一行
-        let keys_hint = match &self.probing {
-            Probing::Ready(probe) => Some(
-                if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
-                    "↑ ↓ 换一档 · 回车开始"
-                } else {
-                    "回车开始"
-                },
-            ),
-            Probing::Running | Probing::Failed(_) => None,
-        }
-        .map(|text| {
-            div()
-                .absolute()
-                .left_0()
-                .top(px(BOX_TOP + BOX))
-                .w(px(BOX))
-                .text_center()
-                .child(ui::caption(text))
-        });
+        } = self.ready_figure(probe);
         let bounds_cell = self.rings_bounds.clone();
-        let center_color = match self.probing {
-            Probing::Failed(_) => theme::orange(),
-            _ => theme::text(),
-        };
         div()
             .relative()
             .w(px(FIGURE_WIDTH))
@@ -244,24 +249,35 @@ impl NewTask {
                             .flex_col()
                             .items_center()
                             .justify_center()
-                            .gap(px(6.))
+                            .gap(px(4.))
                             .child(ui::num(
                                 div()
-                                    .text_size(px(30.))
+                                    .text_size(px(34.))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(center_color)
                                     .child(center),
                             ))
                             .child(ui::num(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .text_color(theme::muted())
                                     .child(note),
                             )),
                     )
                     .children(labels),
             )
-            .children(keys_hint)
+    }
+
+    /// 探测完成后舞台里同心环下面的一行：按键在界面上看不出来。
+    pub(super) fn keys_hint(&self) -> Option<AnyElement> {
+        let Probing::Ready(probe) = &self.probing else {
+            return None;
+        };
+        let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
+            "↑ ↓ 换一档 · 回车开始"
+        } else {
+            "回车开始"
+        };
+        Some(ui::caption(text).into_any_element())
     }
 
     /// 探测完成时的同心环：圆心写选中一档的清晰度与大小上限，只有一档时写时长与片数。
@@ -311,12 +327,11 @@ impl NewTask {
             let v = &master.variants[ring.index];
             let anchor = ring.radius * std::f32::consts::FRAC_1_SQRT_2;
             let (x, y) = (c + anchor, c - anchor);
-            let text = match v.bandwidth {
-                Some(bw) if v.resolution.is_some() => {
-                    format!("{} · {}", format::variant(v), format::bitrate(bw))
-                }
-                _ => format::variant(v),
-            };
+            let label = format::variant(v);
+            let rate = v
+                .bandwidth
+                .filter(|_| v.resolution.is_some())
+                .map(format::bitrate);
             labels.push(
                 div()
                     .absolute()
@@ -330,23 +345,26 @@ impl NewTask {
                 div()
                     .absolute()
                     .left(px(LABEL_X))
-                    .top(px(y - 8.))
+                    .top(px(y - 11.))
                     .flex()
-                    .items_center()
+                    .items_baseline()
                     .gap(px(8.))
                     .whitespace_nowrap()
-                    .text_size(px(12.))
-                    .child(if on {
-                        ui::dot(theme::cyan(), 6.)
-                    } else {
-                        div().size(px(6.)).rounded_full().bg(theme::hover_edge())
-                    })
+                    .text_size(px(15.))
                     .child(ui::num(
                         div()
                             .text_color(if on { theme::text() } else { theme::muted() })
-                            .when(on, |s| s.font_weight(FontWeight::SEMIBOLD))
-                            .child(text),
-                    )),
+                            .when(on, |s| s.font_weight(FontWeight::BOLD))
+                            .child(label),
+                    ))
+                    .children(rate.map(|rate| {
+                        ui::num(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::muted())
+                                .child(rate),
+                        )
+                    })),
             );
         }
         let picked = &master.variants[self.variant];
@@ -362,6 +380,58 @@ impl NewTask {
             note: size,
         }
     }
+}
+
+/// 探测失败的表盘：整圈暗橙色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
+fn failed_dial(failure: &Failure) -> Div {
+    let (mark, hint) = format::failure(failure.kind);
+    let ticks = Ticks {
+        count: 120,
+        lit: 120,
+        written: 0,
+        active: 0,
+        retrying: false,
+        color: theme::alpha(theme::orange(), 0.45),
+        glow: false,
+    };
+    dial::dial(
+        theme::orange(),
+        dial::figure(move |bounds, window, _| {
+            ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
+        }),
+        dial_readout("探测失败", theme::orange(), mark, hint),
+    )
+}
+
+/// 表盘圆盘里的字：状态（带颜色）、大字与一行说明。
+fn dial_readout(
+    state: &'static str,
+    color: gpui_kit::Hsla,
+    big: String,
+    line: &'static str,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(10.))
+        .child(div().text_size(px(13.)).text_color(color).child(state))
+        .child(ui::num(
+            div()
+                .text_size(px(64.))
+                .line_height(px(64.))
+                .font_weight(FontWeight::BOLD)
+                .child(big),
+        ))
+        .child(
+            div()
+                .max_w(px(dial::TEXT_WIDTH))
+                .text_size(px(13.))
+                .text_color(theme::muted())
+                .text_center()
+                .line_clamp(2)
+                .child(line),
+        )
 }
 
 /// 同心环区域里随探测状态变的部分。

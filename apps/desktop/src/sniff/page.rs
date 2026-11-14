@@ -1,25 +1,16 @@
-//! 网页一栏：后退、前进、刷新、地址栏与收起，下面是网页本身。
+//! 网页的面板：后退、前进、刷新、地址栏与关闭嗅探页，下面是网页本身。
 
 use gpui_kit::component::input::Input;
 use gpui_kit::{Context, Div, ParentElement as _, Styled as _, div, px};
 
-use super::SniffView;
+use super::{SniffEvent, SniffView};
 use crate::theme;
-use crate::ui::{self, Tone};
+use crate::ui::{self, FIELD_HEIGHT, Tone};
 
-/// 打开网页时右边列表一栏的宽度。
-const ASIDE_WIDTH: f32 = 380.;
-/// 窗口窄时右边一栏最多收到的宽度。
-const ASIDE_MIN_WIDTH: f32 = 300.;
-/// 网页一栏最窄多宽：常见网页的移动版布局从这里起。
+/// 网页的面板最窄多宽：常见网页的移动版布局从这里起。
 const PAGE_MIN_WIDTH: f32 = 480.;
-
-/// 显示网页时，列表在右边一栏。
-pub(super) fn aside(list: Div) -> Div {
-    list.flex_basis(px(ASIDE_WIDTH))
-        .flex_shrink(1.)
-        .min_w(px(ASIDE_MIN_WIDTH))
-}
+/// 后退、前进、刷新按钮的边长。
+const NAV: f32 = 36.;
 
 impl SniffView {
     /// 后退、前进或刷新：`act` 调网页的那个操作，`what` 为没做成时的说法。
@@ -49,6 +40,10 @@ impl SniffView {
                 Tone::Ghost,
                 cx.listener(move |this, _, _, cx| this.navigate(act, what, cx)),
             )
+            .w(px(NAV))
+            .h(px(NAV))
+            .px_0()
+            .text_size(px(17.))
         };
         let toolbar = div()
             .flex()
@@ -57,7 +52,7 @@ impl SniffView {
             .px(px(12.))
             .py(px(10.))
             .border_b_1()
-            .border_color(theme::line())
+            .border_color(theme::hairline())
             .child(nav("back", "‹", wry::WebView::go_back, "没能后退", cx))
             .child(nav(
                 "forward",
@@ -71,21 +66,23 @@ impl SniffView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h(px(36.))
+                    .h(px(FIELD_HEIGHT))
                     .ml(px(6.))
                     .px(px(6.))
                     .flex()
                     .items_center()
                     .rounded(px(10.))
-                    .bg(theme::raised())
+                    .bg(theme::ground())
+                    .border_1()
+                    .border_color(theme::ring_idle())
                     .text_size(px(13.))
                     .child(Input::new(&self.address).appearance(false)),
             )
             .child(ui::button(
-                "hide-page",
-                "收起网页",
+                "close-sniff-page",
+                "关闭",
                 Tone::Ghost,
-                cx.listener(|this, _, _, cx| this.show_page(false, cx)),
+                cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)),
             ));
         // 网页建不出来时没有「打开网页」，到不了这里
         let page = self
@@ -94,16 +91,11 @@ impl SniffView {
         let trouble = self
             .webview()
             .and_then(|webview| webview.read(cx).trouble());
-        div()
+        // 原生网页盖住下边的圆角，下边不留圆角
+        ui::deck()
             .flex_1()
             .min_w(px(PAGE_MIN_WIDTH))
-            .flex()
-            .flex_col()
-            // 原生网页盖住下边，圆角只留上边
-            .rounded_t(px(18.))
-            .border_1()
-            .border_color(theme::line())
-            .bg(theme::disc())
+            .rounded_b_none()
             .child(toolbar)
             .children(page)
             .children(trouble.map(|reason| div().p(px(10.)).child(ui::error_text(reason))))

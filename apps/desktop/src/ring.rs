@@ -1,4 +1,4 @@
-//! 环的画法：中央的刻度环（任务的分片、待机）与列表里的小进度环；刻度、角度与圆上的点也给直播钟面（[`crate::live`]）
+//! 环的画法：中央的刻度环（任务的分片、待机与探测的彗尾）、外圈的表圈与列表里的小进度环；刻度、角度与圆上的点也给直播钟面（[`crate::live`]）
 //! 用。都以绘制区域的中心为圆心，从 12 点方向顺时针。
 
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -10,6 +10,9 @@ use crate::theme;
 /// 中央刻度环的绘制区域边长与刻度环的半径。
 pub const AREA: f32 = 460.;
 pub const RADIUS: f32 = 206.;
+
+/// 表圈（[`paint_bezel`]）刻度的外沿半径：离绘制区域的边留 1。
+const BEZEL: f32 = AREA / 2. - 1.;
 
 /// 刻度环最多画几个刻度：在 [`RADIUS`] 的环上每格 2 宽、至少留 1.6 的缝。分片更多时一个刻度管几片。
 pub const MAX_TICKS: usize = 360;
@@ -132,30 +135,55 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
     }
 }
 
-/// 待机时的刻度环：一圈暗刻度，12 点前有一段由淡到亮的彗尾。
-pub fn paint_standby(bounds: Bounds<Pixels>, radius: f32, window: &mut Window) {
+/// 彗尾环：一圈 120 格暗刻度，`head`（整圈为 1，从 12 点顺时针）前的 22 格由淡到亮成 `color`，最前面的一格带光晕。
+/// 待机时彗头停在 12 点；探测、找流时随时间转。
+pub fn paint_comet(
+    bounds: Bounds<Pixels>,
+    radius: f32,
+    head: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
     const COUNT: usize = 120;
     const TAIL: usize = 22;
     let center = bounds.center();
+    let first = (head.rem_euclid(1.) * COUNT as f32).round() as usize + COUNT - TAIL;
+    let lit = |i: usize| (i + COUNT - first % COUNT) % COUNT;
     let mut idle = Stroke::new(2., theme::line(), HALF);
-    for i in 0..COUNT - TAIL {
+    for i in (0..COUNT).filter(|&i| lit(i) >= TAIL) {
         idle.tick(center, radius, angle(i as f32 / COUNT as f32));
     }
     idle.paint(window);
-    // 越接近 12 点越亮，最前面的一格带光晕
     for k in 0..TAIL {
-        let i = COUNT - TAIL + k;
-        let rad = angle(i as f32 / COUNT as f32);
+        let rad = angle(((first + k) % COUNT) as f32 / COUNT as f32);
         let strength = (k + 1) as f32 / TAIL as f32;
         if k == TAIL - 1 {
-            let mut halo = Stroke::new(6., theme::alpha(theme::cyan(), 0.3), HALF + 1.);
+            let mut halo = Stroke::new(6., theme::alpha(color, 0.3), HALF + 1.);
             halo.tick(center, radius, rad);
             halo.paint(window);
         }
-        let mut tick = Stroke::new(2., theme::alpha(theme::cyan(), strength.powf(1.6)), HALF);
+        let mut tick = Stroke::new(2., theme::alpha(color, strength.powf(1.6)), HALF);
         tick.tick(center, radius, rad);
         tick.paint(window);
     }
+}
+
+/// 表圈：贴着 [`AREA`] 边的 120 格细刻度，每 10 格一格长而亮，只作刻度盘的外框、不表示数据。
+pub fn paint_bezel(bounds: Bounds<Pixels>, window: &mut Window) {
+    const COUNT: usize = 120;
+    let center = bounds.center();
+    let mut major = Stroke::new(1.2, theme::stroke(), 3.5);
+    let mut minor = Stroke::new(1.2, theme::hairline(), 2.);
+    for i in 0..COUNT {
+        let rad = angle(i as f32 / COUNT as f32);
+        if i % 10 == 0 {
+            major.tick(center, BEZEL - 3.5, rad);
+        } else {
+            minor.tick(center, BEZEL - 2., rad);
+        }
+    }
+    major.paint(window);
+    minor.paint(window);
 }
 
 /// 在 `bounds` 里画一个贴着边、宽 `width` 的环：底色 `track` 一整圈，上面从 12 点起顺时针画 `fraction`（0 到 1）

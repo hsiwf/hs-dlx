@@ -2,6 +2,8 @@
 //! 转交给它后退出（见 hs-m3u8-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
 //! main_window）。
 
+mod dial;
+mod dock;
 mod format;
 mod headers;
 mod links;

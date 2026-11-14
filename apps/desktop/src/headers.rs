@@ -131,9 +131,9 @@ impl Render for HeadersEditor {
                 .px(px(12.))
                 .py(px(6.))
                 .rounded(px(10.))
-                .bg(theme::panel())
+                .bg(theme::cell())
                 .border_1()
-                .border_color(theme::edge())
+                .border_color(theme::deck_edge())
                 .text_size(px(12.))
                 .line_height(px(TEXT_LINE))
                 .child(
@@ -173,12 +173,13 @@ impl Render for HeadersEditor {
             .child(
                 div()
                     .px(px(12.))
-                    .h(px(ui::BUTTON_HEIGHT))
+                    .h(px(ui::FIELD_HEIGHT))
                     .flex()
                     .items_center()
                     .rounded(px(10.))
+                    .bg(theme::ground())
                     .border_1()
-                    .border_color(theme::stroke())
+                    .border_color(theme::ring_idle())
                     .text_size(px(13.))
                     .child(Input::new(&self.input).appearance(false)),
             )

@@ -32,9 +32,10 @@ use self::inbox::{Engine, Inbox};
 use self::script::Report;
 use self::verdict::Judge;
 pub use self::verdict::Verdict;
+use crate::dial;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
-use crate::ui::{self, GAP};
+use crate::ui::GAP;
 use crate::web_route::{Lease, RelayFailure, WebRoute};
 
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
@@ -84,7 +85,7 @@ pub struct SniffView {
     /// 网页的出口没照此刻的设置的原因（见 [`WebRoute::acquire`]）
     proxy_note: Option<String>,
     /// 网页开着期间持有的出口；建不出网页时为 None
-    _lease: Option<Rc<Lease>>,
+    lease: Option<Rc<Lease>>,
     _relay_failures: Subscription,
     judge: Judge,
     found: Vec<Found>,
@@ -102,7 +103,7 @@ pub struct SniffView {
     /// 正在后台探测的一条（一次一条）；释放即取消
     checking: Option<Task<()>>,
     _engine: Task<()>,
-    /// 加载够久时重画一次，好给出建议
+    /// 找流中逐帧重画、加载够久时重画一次好给出建议（见 [`SniffView::wait_to_suggest`]）
     _suggest: Task<()>,
     /// 到时还没有结论就按打不开定论
     _deadline: Task<()>,
@@ -255,7 +256,7 @@ impl SniffView {
             },
             failure: None,
             proxy_note,
-            _lease: lease,
+            lease,
             _relay_failures: relay_failures,
             judge,
             found: Vec::new(),
@@ -276,11 +277,24 @@ impl SniffView {
         view
     }
 
-    /// 从现在起 [`SUGGEST_AFTER`] 后重画一次：那时还没找到流就给出建议。
+    /// 从现在起到 [`SUGGEST_AFTER`]：还没找到流、嗅探页显示着而网页收起时每隔 [`dial::FRAME`] 重画一次，让找流的
+    /// 小表盘转起来（系统要求减少动态效果时不画）；到时再重画一次，那时还没找到流就给出建议。
     fn wait_to_suggest(&mut self, cx: &mut Context<Self>) {
         self.load.since = Instant::now();
+        let since = self.load.since;
         self._suggest = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SUGGEST_AFTER).await;
+            while since.elapsed() < SUGGEST_AFTER {
+                cx.background_executor().timer(dial::FRAME).await;
+                let closed = this.update(cx, |this, cx| {
+                    let searching = this.found.is_empty() && this.failure.is_none();
+                    if searching && this.on_screen && !this.page_shown && !cx.reduce_motion() {
+                        cx.notify();
+                    }
+                });
+                if closed.is_err() {
+                    return;
+                }
+            }
             // 关了时不用重画
             let _closed = this.update(cx, |_, cx| cx.notify());
         });
@@ -391,7 +405,7 @@ impl SniffView {
 
     /// 不再持有网页的出口（这个视图要被换掉）：之后建的网页按此刻的设置定出口，不照这个旧的。
     pub fn release_route(&mut self) {
-        self._lease = None;
+        self.lease = None;
     }
 
     /// 加进列表并排队探测；同一个框架又报来的同一条流换成新地址（见 [`Found::renew`]），满了的只计数。
@@ -552,13 +566,17 @@ impl Render for SniffView {
             self.address
                 .update(cx, |input, cx| input.set_value(text, window, cx));
         }
-        let body = div().flex_1().flex().gap(px(2. * GAP)).pb(px(ui::BOTTOM));
         if self.page_shown {
-            body.child(self.render_page(cx))
-                .child(page::aside(self.render_list(cx)))
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .gap(px(GAP))
+                .child(self.render_page(cx))
+                .child(self.render_aside(cx))
         } else {
-            body.justify_center()
-                .child(list::alone(self.render_list(cx)))
+            self.render_deck(cx)
         }
     }
 }

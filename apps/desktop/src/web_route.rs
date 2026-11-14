@@ -37,6 +37,22 @@ pub struct Lease {
     relay: Option<(Relay, Arc<RwLock<Upstream>>)>,
 }
 
+impl Lease {
+    /// 网页此刻经哪里出去（显示用）：跟随系统、直连或经哪个代理（已去掉凭据的写法）。
+    pub fn egress(&self) -> String {
+        match &self.relay {
+            None => "跟随系统".to_owned(),
+            Some((_, current)) => match &*current
+                .read()
+                .expect("持锁时只赋值与克隆，不会 panic 留下中毒的锁")
+            {
+                Upstream::Direct => "直连".to_owned(),
+                Upstream::Proxy(url) => format!("经 {}", hs_m3u8_core::bare_url(url)),
+            },
+        }
+    }
+}
+
 /// 进程里的出口：开着的网页照的出口，与把中转报来的连不过去发给嗅探页。
 pub struct WebRoute {
     /// 开着的网页照的；都关了时升级不成

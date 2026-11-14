@@ -1,4 +1,5 @@
-//! 视频流一栏：网页的标题、主机与加载到哪一步，找到的流，网页要开的新窗口与要下载的文件，操作。
+//! 嗅探页的面板：网页收起时为一整块面板（标题栏、左边找到的流或找流中的表盘、右边「这个页面」一栏），网页显示着时
+//! 为网页右边的一块（找到的流）。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -11,50 +12,423 @@ use hs_m3u8_core::Url;
 use super::found::{Check, Found};
 use super::{MAX_FOUND, SUGGEST_AFTER, SniffEvent, SniffView};
 use crate::links::http_url;
-use crate::theme;
-use crate::ui::{self, CAPTION_LINE, TEXT_LINE, Tone};
+use crate::new_task::describe;
+use crate::ui::{self, Step, TEXT_LINE, Tone};
+use crate::{dial, format, ring, theme};
 
-/// 不显示网页时列表的最大宽度。
-const MAX_WIDTH: f32 = 760.;
+/// 「这个页面」一栏的宽。
+const ABOUT_WIDTH: f32 = 300.;
+/// 找流中的小表盘：边长、刻度环的半径、圆盘的直径。
+const SCAN: f32 = 220.;
+const SCAN_RADIUS: f32 = 93.;
+const SCAN_DISC: f32 = 148.;
 /// 流前面的小同心环（见 [`ui::rings`]）的边长。
 const RINGS: f32 = 44.;
-
-/// 不显示网页时，列表独占主体。
-pub(super) fn alone(list: Div) -> Div {
-    list.flex_1().max_w(px(MAX_WIDTH)).pt(px(8.))
-}
+/// 网页显示着时右边一块的宽与窗口窄时最多收到的宽。
+const ASIDE_WIDTH: f32 = 380.;
+const ASIDE_MIN_WIDTH: f32 = 300.;
 
 impl SniffView {
-    pub(super) fn render_list(&self, cx: &mut Context<Self>) -> Div {
-        let suggest = self.found.is_empty() && self.load.since.elapsed() >= SUGGEST_AFTER;
-        let body: Vec<AnyElement> = match &self.webview {
-            Err(reason) => vec![ui::error_text(reason.clone()).into_any_element()],
-            // 打不开时原因写在下面，这里不再写在等
-            Ok(_) if self.found.is_empty() && self.failure.is_some() => Vec::new(),
-            Ok(_) if self.found.is_empty() => vec![
+    /// 网页收起时的整块面板。
+    pub(super) fn render_deck(&self, cx: &mut Context<Self>) -> Div {
+        ui::deck()
+            .flex_1()
+            .min_w_0()
+            .child(self.render_head(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.render_found(cx))
+                    .child(self.render_about(cx)),
+            )
+    }
+
+    /// 网页显示着时网页右边的一块：找到的流与网页要做的事。
+    pub(super) fn render_aside(&self, cx: &mut Context<Self>) -> Div {
+        let heading = if self.found.is_empty() {
+            "还没找到视频流".to_owned()
+        } else {
+            format!("找到 {} 条视频流", self.found.len())
+        };
+        let rows: Vec<AnyElement> = if self.found.is_empty() {
+            vec![ui::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element()]
+        } else {
+            self.rows(true, cx)
+        };
+        ui::deck()
+            .flex_basis(px(ASIDE_WIDTH))
+            .flex_shrink(1.)
+            .min_w(px(ASIDE_MIN_WIDTH))
+            .child(ui::page_head(
+                None,
+                heading,
+                Some(self.state().1.into()),
+                [ui::button(
+                    "hide-page",
+                    "收起网页",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.show_page(false, cx)),
+                )
+                .into_any_element()],
+            ))
+            .child(
+                div()
+                    .id("found")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .p(px(14.))
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .px(px(14.))
+                    .pb(px(14.))
+                    .children(self.offers(cx))
+                    .children(self.notes().into_iter().map(ui::caption))
+                    .children(self.error.clone().map(ui::error_text)),
+            )
+    }
+
+    /// 网页加载到哪一步：状态点的颜色与说法。
+    fn state(&self) -> (gpui_kit::Hsla, &'static str) {
+        match (&self.webview, self.load.shown.is_some()) {
+            (Err(_), _) => (theme::orange(), "建不出网页"),
+            _ if self.failure.is_some() => (theme::orange(), "打不开"),
+            (Ok(_), false) => (theme::cyan(), "正在打开"),
+            (Ok(_), true) if self.load.finished => (theme::cyan(), "已加载"),
+            (Ok(_), true) => (theme::cyan(), "加载中"),
+        }
+    }
+
+    /// 加载够久还没找到流：给出建议。
+    fn suggest(&self) -> bool {
+        self.found.is_empty() && self.load.since.elapsed() >= SUGGEST_AFTER
+    }
+
+    /// 标题栏：网页的标题与地址，右边是加载状态与操作（打不开时刷新、打开网页、关闭）。
+    fn render_head(&self, cx: &mut Context<Self>) -> Div {
+        let (color, state) = self.state();
+        let failed = self.failure.is_some();
+        let shown = self
+            .load
+            .shown
+            .as_deref()
+            .and_then(http_url)
+            .unwrap_or_else(|| self.opened.clone());
+        let mut actions = vec![ui::status(color, state).into_any_element()];
+        if failed {
+            actions.push(
+                ui::button(
+                    "reload",
+                    "刷新",
+                    Tone::Glow,
+                    cx.listener(|this, _, _, cx| {
+                        this.navigate(wry::WebView::reload, "没能刷新", cx)
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+        if self.webview.is_ok() {
+            actions.push(
+                ui::button(
+                    "show-page",
+                    "打开网页",
+                    if self.suggest() && !failed {
+                        Tone::Glow
+                    } else {
+                        Tone::Plain
+                    },
+                    cx.listener(|this, _, _, cx| this.show_page(true, cx)),
+                )
+                .into_any_element(),
+            );
+        }
+        actions.push(
+            ui::button(
+                "close-sniff",
+                "关闭",
+                Tone::Ghost,
+                cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)),
+            )
+            .into_any_element(),
+        );
+        ui::page_head(
+            Some(ui::rings(40., 3., 10.).into_any_element()),
+            self.title
+                .clone()
+                .unwrap_or_else(|| "网页里的视频流".to_owned()),
+            Some(meta(&shown).into()),
+            actions,
+        )
+    }
+
+    /// 左边：找到的流；还没有时为找流中的小表盘与说明，打不开时为原因。
+    fn render_found(&self, cx: &mut Context<Self>) -> Div {
+        let column = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(20.));
+        let column = match &self.webview {
+            Err(reason) => column
+                .items_center()
+                .justify_center()
+                .child(ui::note(reason.clone(), true).max_w(px(440.))),
+            Ok(_) if self.found.is_empty() => column
+                .items_center()
+                .justify_center()
+                .gap(px(18.))
+                .children(self.failure.is_none().then(|| self.scan_dial(cx)))
+                .child(self.waiting_text())
+                // 找不到流时，打开的地址可能本身就是播放列表（缺请求头时源站回了网页）：交回新建页改请求头
+                .child(ui::button(
+                    "probe-opened",
+                    "当作播放列表探测",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.open_opened(cx)),
+                )),
+            Ok(_) => {
+                let checking = self
+                    .found
+                    .iter()
+                    .any(|found| matches!(found.check, Check::Waiting | Check::Running));
+                column
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("找到 {} 条视频流", self.found.len())),
+                            )
+                            .child(ui::caption(if checking {
+                                "正在后台探测"
+                            } else {
+                                "已在后台探测好"
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("found")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .children(self.rows(false, cx)),
+                    )
+            }
+        };
+        column.children(self.error.clone().map(ui::error_text))
+    }
+
+    /// 还没找到流时表盘下面的说明：打不开时为原因。
+    fn waiting_text(&self) -> Div {
+        let (title, line) = match (&self.failure, self.load.shown.is_some(), self.suggest()) {
+            (Some(reason), _, _) => (reason.clone(), "刷新后重新找"),
+            (None, false, false) => (
+                "正在打开网页".to_owned(),
+                "网页在后台打开，不显示；找到的视频流会列在这里",
+            ),
+            (None, false, true) => ("网页还没打开".to_owned(), "可能连不上：打开网页看看"),
+            (None, true, false) => (
+                "网页在后台加载，找到的流会列在这里".to_owned(),
+                "要登录、点验证或点了播放才出视频的网页，打开网页弄完再收起",
+            ),
+            (None, true, true) => (
+                "还没找到视频流".to_owned(),
+                "有的网页要登录、或点了播放才加载视频：打开网页弄好后，这里会列出来",
+            ),
+        };
+        div()
+            .max_w(px(420.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.))
+            .text_center()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .when(self.failure.is_some(), |s| s.text_color(theme::orange()))
+                    .child(title),
+            )
+            .child(
                 div()
                     .text_size(px(13.))
                     .line_height(px(TEXT_LINE))
                     .text_color(theme::muted())
-                    .child(match (self.load.shown.is_some(), suggest) {
-                        (false, false) => "正在打开网页…",
-                        (false, true) => "网页还没打开，可能连不上：打开网页看看",
-                        (true, false) => "正在网页里找视频流…",
-                        (true, true) => {
-                            "还没找到。有的网页要登录、或点了播放才加载视频：打开网页弄好后，这里会列出来。"
-                        }
-                    })
-                    .into_any_element(),
-            ],
-            Ok(_) => {
-                let first = self.first_ready();
-                self.found
-                    .iter()
-                    .enumerate()
-                    .map(|(index, found)| self.render_row(index, found, first == Some(index), cx))
-                    .collect()
-            }
+                    .child(line),
+            )
+    }
+
+    /// 找流中的小表盘：彗尾按打开了多久转，圆盘里写打开了多久（逐帧重画见 [`SniffView::wait_to_suggest`]）。到了给出
+    /// 建议的时候、嗅探页不显示或系统要求减少动态效果时停下，只写在找。
+    fn scan_dial(&self, cx: &Context<Self>) -> Div {
+        let elapsed = self.load.since.elapsed();
+        let animate = !self.suggest() && self.on_screen && !self.page_shown && !cx.reduce_motion();
+        let head = if animate {
+            elapsed.as_secs_f32() / dial::TURN
+        } else {
+            0.
         };
+        let inset = (SCAN - SCAN_DISC) / 2.;
+        div()
+            .relative()
+            .size(px(SCAN))
+            .flex_none()
+            .child(
+                gpui_kit::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        ring::paint_comet(bounds, SCAN_RADIUS, head, theme::cyan(), window)
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(inset))
+                    .left(px(inset))
+                    .size(px(SCAN_DISC))
+                    .rounded_full()
+                    .bg(theme::disc())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.))
+                    .when(animate, |disc| {
+                        disc.child(ui::num(
+                            div()
+                                .text_size(px(28.))
+                                .font_weight(FontWeight::BOLD)
+                                .child(format::clock(elapsed)),
+                        ))
+                    })
+                    .child(ui::caption("在找视频流")),
+            )
+    }
+
+    /// 右边「这个页面」一栏：加载到哪一步、找到几条与网页经哪里出去，网页要做的事，与下载时带什么。
+    fn render_about(&self, cx: &mut Context<Self>) -> Div {
+        let found = ("找到".into(), format!("{} 条", self.found.len()).into());
+        let egress = self
+            .lease
+            .as_ref()
+            .map(|lease| ("网络".into(), lease.egress().into()));
+        div()
+            .w(px(ABOUT_WIDTH))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .p(px(20.))
+            .border_l_1()
+            .border_color(theme::hairline())
+            .child(ui::caption("这个页面"))
+            .child(ui::steps(self.steps()))
+            .child(ui::reads(vec![found], egress))
+            .children(self.offers(cx))
+            .children(self.notes().into_iter().map(ui::caption))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .line_height(px(TEXT_LINE))
+                    .text_color(theme::muted())
+                    .child("下载时带上网页存下的 Cookie 与来源地址：要登录的网页，先打开网页登录"),
+            )
+    }
+
+    /// 打开、加载、找流三步。
+    fn steps(&self) -> Vec<(SharedString, Step)> {
+        if self.webview.is_err() {
+            return vec![("打开网页".into(), Step::Failed)];
+        }
+        let shown = self.load.shown.is_some();
+        let failed = self.failure.is_some();
+        let open = match (shown, failed) {
+            (true, _) => Step::Done,
+            (false, true) => Step::Failed,
+            (false, false) => Step::Now,
+        };
+        let load = match (shown, failed, self.load.finished) {
+            (false, _, _) => Step::Waiting,
+            (true, true, _) => Step::Failed,
+            (true, false, true) => Step::Done,
+            (true, false, false) => Step::Now,
+        };
+        let find = if shown && !failed {
+            Step::Now
+        } else {
+            Step::Waiting
+        };
+        let find_text = if self.found.is_empty() {
+            "找视频流".to_owned()
+        } else {
+            format!("找到 {} 条，接着找", self.found.len())
+        };
+        vec![
+            ("打开网页".into(), open),
+            ("加载网页".into(), load),
+            (find_text.into(), find),
+        ]
+    }
+
+    /// 网页要做、没有放行的事（开新窗口、下载），与让用户接着做的按钮。
+    fn offers(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let popup = self.popup.clone().map(|url| {
+            let target = url.clone();
+            offer(
+                format!("网页要开新窗口：{}", meta(&url)),
+                "open-popup",
+                "在这里打开",
+                cx.listener(move |this, _, _, cx| {
+                    this.popup = None;
+                    this.open(target.as_str(), cx);
+                }),
+            )
+        });
+        let download = self.download.clone().map(|url| {
+            let target = url.clone();
+            offer(
+                format!("网页要下载文件（没有下）：{}", meta(&url)),
+                "probe-download",
+                "探测它",
+                cx.listener(move |this, _, _, cx| {
+                    this.download = None;
+                    this.open_download(target.clone(), cx);
+                }),
+            )
+        });
+        popup.into_iter().chain(download).collect()
+    }
+
+    /// 列表之外要说明的：没列出的条数、出口没照设置、丢了的消息。
+    fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         if self.overflow > 0 {
             notes.push(format!(
@@ -71,152 +445,17 @@ impl SniffView {
                 "网页发来的消息太多或太长，丢了 {dropped} 条，可能有流没列出"
             ));
         }
-        let popup = self.popup.clone().map(|url| {
-            let target = url.clone();
-            offer_line(
-                format!("网页要开新窗口：{}", meta(&url)),
-                "open-popup",
-                "在这里打开",
-                cx.listener(move |this, _, _, cx| {
-                    this.popup = None;
-                    this.open(target.as_str(), cx);
-                }),
-            )
-        });
-        let download = self.download.clone().map(|url| {
-            let target = url.clone();
-            offer_line(
-                format!("网页要下载文件（没有下）：{}", meta(&url)),
-                "probe-download",
-                "探测它",
-                cx.listener(move |this, _, _, cx| {
-                    this.download = None;
-                    this.open_download(target.clone(), cx);
-                }),
-            )
-        });
-        let failure = self
-            .failure
-            .as_ref()
-            .map(|reason| ui::error_text(format!("{reason}：刷新后重新找")));
-        let failed = self.failure.is_some();
-        let actions = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(10.))
-            .when(failed, |actions| {
-                actions.child(ui::button(
-                    "reload",
-                    "刷新",
-                    Tone::Glow,
-                    cx.listener(|this, _, _, cx| {
-                        this.navigate(wry::WebView::reload, "没能刷新", cx)
-                    }),
-                ))
-            })
-            .when(!self.page_shown && self.webview.is_ok(), |actions| {
-                actions.child(ui::button(
-                    "show-page",
-                    "打开网页",
-                    if suggest && !failed {
-                        Tone::Glow
-                    } else {
-                        Tone::Plain
-                    },
-                    cx.listener(|this, _, _, cx| this.show_page(true, cx)),
-                ))
-            })
-            // 找不到流时，打开的地址可能本身就是播放列表（缺请求头时源站回了网页）：交回新建页改请求头
-            .when(self.found.is_empty(), |actions| {
-                actions.child(ui::button(
-                    "probe-opened",
-                    "当作播放列表探测",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.open_opened(cx)),
-                ))
-            })
-            .child(div().flex_1())
-            .child(ui::button(
-                "close-sniff",
-                "关闭",
-                Tone::Ghost,
-                cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)),
-            ));
-        div()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(self.render_heading())
-            .child(
-                div()
-                    .id("found")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .children(body),
-            )
-            .children(failure)
-            .children(popup)
-            .children(download)
-            .children(notes.into_iter().map(ui::caption))
-            .children(self.error.clone().map(ui::error_text))
-            .child(actions)
+        notes
     }
 
-    /// 标题与主机，右边是网页加载到哪一步。
-    fn render_heading(&self) -> Div {
-        let host = self
-            .load
-            .shown
-            .as_deref()
-            .and_then(http_url)
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .unwrap_or_default();
-        let state = match (&self.webview, self.load.shown.is_some()) {
-            (Err(_), _) => None,
-            _ if self.failure.is_some() => Some((theme::orange(), "打不开")),
-            (Ok(_), false) => Some((theme::cyan(), "正在打开")),
-            (Ok(_), true) if self.load.finished => Some((theme::cyan(), "已加载")),
-            (Ok(_), true) => Some((theme::cyan(), "加载中")),
-        };
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(8.))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::BOLD)
-                            .truncate()
-                            .child(
-                                self.title
-                                    .clone()
-                                    .unwrap_or_else(|| "网页里的视频流".to_owned()),
-                            ),
-                    )
-                    .child(ui::num(ui::caption(host))),
-            )
-            .children(state.map(|(color, text)| {
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(ui::dot(color, 7.))
-                    .child(ui::caption(text.to_owned()))
-            }))
+    /// 找到的流，最该下载的一条（见 [`SniffView::first_ready`]）突出；`compact` 为网页显示着时的窄列表。
+    fn rows(&self, compact: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let first = self.first_ready();
+        self.found
+            .iter()
+            .enumerate()
+            .map(|(index, found)| self.render_row(index, found, first == Some(index), compact, cx))
+            .collect()
     }
 
     /// 最该下载的一条：第一条探测好的主播放列表（有几档清晰度可挑），没有时第一条探测好的。
@@ -229,27 +468,24 @@ impl SniffView {
         ready(true).or_else(|| ready(false))
     }
 
-    /// 一条流：同心环、名字、地址与探测说明，与能做的事：探测好的下载；没成的重试（重新读 Cookie），配好了请求头的
-    /// 还能打开新建页改请求头再试。
+    /// 一条流：同心环、名字、地址与探测结果，与能做的事：探测好的下载（几档可挑的写挑清晰度）；没成的重试（重新读
+    /// Cookie），配好了请求头的还能打开新建页改请求头再试。
     fn render_row(
         &self,
         index: usize,
         found: &Found,
-        first: bool,
+        best: bool,
+        compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (mut detail, failed) = match &found.check {
-            Check::Waiting => ("等待探测".to_owned(), false),
-            Check::Running => ("探测中…".to_owned(), false),
-            Check::Ready { summary, .. } => (summary.clone(), false),
-            Check::Failed { reason, .. } => (reason.clone(), true),
+        let (tags, failed): (Vec<String>, Option<String>) = match &found.check {
+            Check::Waiting => (vec!["等待探测".to_owned()], None),
+            Check::Running => (vec!["探测中…".to_owned()], None),
+            Check::Ready { probe, .. } => (describe(probe), None),
+            Check::Failed { reason, .. } => (Vec::new(), Some(reason.clone())),
         };
-        if found.skipped > 0 {
-            detail.push_str(&format!(
-                " · 没带 {} 个放不进请求头的 Cookie",
-                found.skipped
-            ));
-        }
+        let skipped =
+            (found.skipped > 0).then(|| format!("没带 {} 个放不进请求头的 Cookie", found.skipped));
         let open = |label: &'static str, tone: Tone, cx: &mut Context<Self>| {
             let url = found.url.clone();
             ui::button(
@@ -270,33 +506,56 @@ impl SniffView {
         };
         let actions = match &found.check {
             Check::Waiting | Check::Running => Vec::new(),
-            Check::Ready { .. } => vec![open(
-                "下载",
-                if first { Tone::Glow } else { Tone::Plain },
-                cx,
-            )],
+            Check::Ready { probe, .. } => {
+                let label = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
+                    "挑清晰度"
+                } else {
+                    "下载"
+                };
+                vec![open(label, if best { Tone::Glow } else { Tone::Plain }, cx)]
+            }
             Check::Failed {
                 headers: Some(_), ..
             } => vec![retry(cx), open("查看", Tone::Plain, cx)],
             Check::Failed { headers: None, .. } => vec![retry(cx)],
         };
+        let detail = if compact {
+            ui::num(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(theme::muted())
+                    .truncate()
+                    .child(tags.join("，")),
+            )
+        } else {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .children(tags.into_iter().map(tag))
+        };
         div()
             .flex()
             .items_center()
             .gap(px(14.))
-            .p(px(12.))
-            .rounded(px(14.))
+            .px(px(16.))
+            .py(px(14.))
+            .rounded(px(16.))
+            .bg(theme::cell())
             .border_1()
-            .border_color(theme::edge())
-            .bg(theme::panel())
-            .child(ui::rings(RINGS, 4., 18.))
+            .border_color(if best {
+                theme::alpha(theme::cyan(), 0.45)
+            } else {
+                theme::deck_edge()
+            })
+            .child(ui::rings(RINGS, 3., 10.).when(!best, |rings| rings.opacity(0.6)))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(3.))
+                    .gap(px(4.))
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -306,31 +565,44 @@ impl SniffView {
                     .child(ui::num(
                         div()
                             .text_size(px(12.))
-                            .line_height(px(CAPTION_LINE))
-                            .text_color(theme::muted())
+                            .text_color(theme::faint())
                             .truncate()
                             .child(SharedString::from(meta(&found.url))),
                     ))
-                    .child(
+                    .child(detail)
+                    .children(failed.map(|reason| {
                         div()
-                            .text_size(px(12.))
-                            .line_height(px(CAPTION_LINE))
-                            .text_color(if failed {
-                                theme::orange()
-                            } else {
-                                theme::soft()
-                            })
+                            .text_size(px(12.5))
+                            .line_height(px(TEXT_LINE))
+                            .text_color(theme::orange())
                             .line_clamp(2)
-                            .child(detail),
-                    ),
+                            .child(reason)
+                    }))
+                    .children(skipped.map(ui::caption)),
             )
             .child(div().flex().flex_none().gap(px(8.)).children(actions))
             .into_any_element()
     }
 }
 
-/// 网页要做、没有放行的一件事（开新窗口、下载）与让用户接着做的按钮。
-fn offer_line(
+/// 流的一项探测结果（时长、几档清晰度、几条音轨、直播）。
+fn tag(text: String) -> Div {
+    ui::num(
+        div()
+            .h(px(22.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .bg(theme::selected())
+            .text_size(px(12.))
+            .text_color(theme::soft())
+            .child(text),
+    )
+}
+
+/// 网页要做、没有放行的一件事与让用户接着做的按钮。
+fn offer(
     text: String,
     id: &'static str,
     label: &'static str,
@@ -338,9 +610,20 @@ fn offer_line(
 ) -> Div {
     div()
         .flex()
-        .items_center()
+        .flex_col()
         .gap(px(10.))
-        .child(div().flex_1().min_w_0().child(ui::caption(text)))
+        .p(px(12.))
+        .rounded(px(14.))
+        .bg(theme::cell())
+        .border_1()
+        .border_color(theme::deck_edge())
+        .child(
+            div()
+                .text_size(px(12.5))
+                .line_height(px(TEXT_LINE))
+                .text_color(theme::soft())
+                .child(text),
+        )
         .child(ui::button(id, label, Tone::Plain, act))
 }
 

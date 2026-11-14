@@ -1,13 +1,13 @@
-//! 主窗口：顶栏；左边一列任务小环；中间是选中任务的刻度环（新建时换成同心环，没有任务时是待机环）；右边是这个任务
-//! 的信号；底部是粘贴栏；右上角是要用户关掉的提示。任务的状态在 [`crate::tasks`] 里，这里管这个窗口自己的状态与
-//! 事件；新建、对任务的操作、退出时的询问与各块的画法在子模块里。
+//! 主窗口：顶栏下面，左边的任务栏面板列出任务的小环；中间的舞台是选中任务的表盘（新建时换成同心环，没有任务时是
+//! 待机的表盘）与底部的粘贴栏；右边的检查面板是这个任务的读数、信号与操作。嗅探页与设置页占满任务栏右边。右上角是
+//! 要用户关掉的提示。任务的状态在 [`crate::tasks`] 里，这里管这个窗口自己的状态与事件；新建、对任务的操作、退出时
+//! 的询问与各块的画法在子模块里。
 
 mod creating;
 mod live_view;
 mod look;
 mod notices;
 mod operations;
-mod paste_bar;
 mod plan;
 mod quit;
 mod task_list;
@@ -19,7 +19,6 @@ pub use self::quit::Leave;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
     Subscription, Window, div, px,
@@ -27,6 +26,7 @@ use gpui_kit::{
 use hs_m3u8_app::TaskId;
 use hs_m3u8_instance::Handoff;
 
+use crate::dock::{Dock, DockEvent};
 use crate::headers::HeadersEditor;
 use crate::links;
 use crate::new_task;
@@ -37,16 +37,16 @@ use crate::tasks::{Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 
-/// 窗口的最小宽：放得下列表收到最窄时、最宽的一个视图（待机页没有列表，比它们窄）。
+/// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图（待机页没有任务栏，比它们窄）。
 pub const MIN_WIDTH: f32 =
     2. * PAD + task_list::MIN_WIDTH + GAP + max(new_task::MIN_WIDTH, task_view::MIN_WIDTH);
-/// 窗口的最小高：放得下顶栏、最高的一个视图与粘贴栏。
+/// 窗口的最小高：放得下顶栏、最高的一个视图与下边距。
 pub const MIN_HEIGHT: f32 = TITLE_HEIGHT
     + max(
         max(task_view::MIN_HEIGHT, task_view::STANDBY_MIN_HEIGHT),
         new_task::MIN_HEIGHT,
     )
-    + paste_bar::HEIGHT;
+    + PAD;
 
 /// 主体显示的页。
 enum Page {
@@ -77,12 +77,11 @@ pub struct Shell {
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
     page: Page,
-    /// 嗅探页与对它的订阅：关掉之前一直留着（不显示时网页藏起来、不出声），任务列表里有一项可以回去
+    /// 嗅探页与对它的订阅：关掉之前一直留着（不显示时网页藏起来、不出声），任务栏里有一项可以回去
     sniff: Option<(Entity<SniffView>, Subscription)>,
-    paste: Entity<InputState>,
+    /// 粘贴栏：任务页、待机页与新建页的舞台里放的同一个
+    dock: Entity<Dock>,
     home: Option<PathBuf>,
-    /// 粘贴栏里的内容不能探测的原因；再探测或改了内容时清掉
-    input_error: Option<String>,
     /// 剪贴板里一条还没下过、也不在探测中的 m3u8 链接
     clipboard: Option<hs_m3u8_core::Url>,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
@@ -100,21 +99,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let paste = cx.new(|cx| InputState::new(window, cx).placeholder("粘贴链接，回车探测"));
-        paste.update(cx, |input, cx| input.focus(window, cx));
+        let dock = cx.new(|cx| Dock::new(window, cx));
+        dock.update(cx, |dock, cx| dock.focus(window, cx));
         let typed = cx.subscribe_in(
-            &paste,
+            &dock,
             window,
-            |this: &mut Self, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    let text = input.read(cx).value().to_string();
-                    this.probe(&text, window, cx);
-                }
-                InputEvent::Change => {
-                    this.input_error = None;
-                    cx.notify();
-                }
-                InputEvent::Focus | InputEvent::Blur => {}
+            |this: &mut Self, _, event: &DockEvent, window, cx| match event {
+                DockEvent::Probe(text) => this.probe(text, window, cx),
             },
         );
         let activated = cx.observe_window_activation(window, |this, window, cx| {
@@ -136,9 +127,8 @@ impl Shell {
             selected,
             page: Page::Task,
             sniff: None,
-            paste,
+            dock,
             home: dirs::home_dir(),
-            input_error: None,
             clipboard: None,
             confirm_discard: None,
             editing_headers: None,
@@ -155,8 +145,8 @@ impl Shell {
     pub fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
         if let Handoff::Link(link) = handoff {
             if self.new_task().is_some() {
-                self.paste
-                    .update(cx, |input, cx| input.set_value(link, window, cx));
+                self.dock
+                    .update(cx, |dock, cx| dock.set_text(link, window, cx));
                 self.tell(
                     "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
                         .to_owned(),
@@ -171,8 +161,8 @@ impl Shell {
 
     /// 把 `text` 填进粘贴栏并探测。
     pub(super) fn probe_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.paste
-            .update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        self.dock
+            .update(cx, |dock, cx| dock.set_text(text.to_owned(), window, cx));
         self.probe(text, window, cx);
     }
 
@@ -228,6 +218,9 @@ impl Shell {
             }
         }
         self.page = page;
+        let new_task = self.new_task().map(Entity::downgrade);
+        self.dock
+            .update(cx, |dock, cx| dock.set_new_task(new_task, cx));
         cx.notify();
     }
 
@@ -283,12 +276,18 @@ impl Render for Shell {
         let now = Instant::now();
         let cx = &*cx;
         let tasks = self.tasks.read(cx);
-        let mut body = div().flex_1().min_h_0().flex().gap(px(GAP)).px(px(PAD));
+        let mut body = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .gap(px(GAP))
+            .px(px(PAD))
+            .pb(px(PAD));
         let listed = !tasks.rows().is_empty() || self.new_task().is_some() || self.sniff.is_some();
-        // 网页显示着时占满主体，不显示任务列表
+        // 网页显示着时占满主体，不显示任务栏
         let page_shown = matches!(&self.page, Page::Sniff(sniff) if sniff.read(cx).page_shown());
         if !page_shown && listed {
-            body = body.child(self.render_list(tasks, now, cx));
+            body = body.child(self.render_list(tasks, cx));
         }
         body = match &self.page {
             Page::NewTask { view, .. } => body.child(view.clone()),
@@ -296,8 +295,8 @@ impl Render for Shell {
             Page::Settings { view, .. } => body.child(view.clone()),
             Page::Task => match self.selected_row(tasks) {
                 Some(row) => {
-                    let (main, aside) = self.render_task(row, now, cx);
-                    body.child(main).child(aside)
+                    let (stage, inspector) = self.render_task(row, now, cx);
+                    body.child(stage).child(inspector)
                 }
                 None => body.child(self.render_standby(cx)),
             },
@@ -312,7 +311,6 @@ impl Render for Shell {
             .text_size(px(14.))
             .child(self.render_header(tasks, now, cx))
             .child(body)
-            .child(self.render_footer(tasks, cx))
             .child(self.render_notices(tasks, cx))
     }
 }

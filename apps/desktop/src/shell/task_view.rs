@@ -1,159 +1,151 @@
-//! 选中任务的视图：中间的刻度环与下面的操作，右边的信号；没有任务时的待机页。
+//! 选中任务的舞台与检查面板：舞台中间是表盘（直播录制是钟面），检查面板是读数、信号与操作；没有任务时的待机页。
 
 use std::time::Instant;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_m3u8_app::Status;
+use hs_m3u8_app::{OutputSpec, Status};
 use hs_m3u8_core::bare_url;
 
-use super::look::look;
+use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
-use crate::ring;
 use crate::signals::{Level, Signal};
-use crate::tasks::{Row, resume_label};
-use crate::theme;
-use crate::ui::{self, BOTTOM, BUTTON_HEIGHT, CAPTION_LINE, GAP, TEXT_LINE, Tone, max};
+use crate::tasks::{Amount, Row, resume_label};
+use crate::ui::{self, BUTTON_HEIGHT, GAP, INSPECTOR_MIN_WIDTH, TEXT_LINE, Tone};
+use crate::{dial, format, ring, theme};
 
-/// 中央刻度环里的深色圆盘离绘制区域边缘多远。
-const DISC_INSET: f32 = 70.;
-/// 圆盘里的字离圆盘边多远。
-const DISC_PADDING: f32 = 24.;
-/// 右边信号栏的宽度。
-const SIGNAL_WIDTH: f32 = 300.;
-/// 窗口窄时信号栏最多收到的宽度。
-const SIGNAL_MIN_WIDTH: f32 = 240.;
-/// 中央刻度环到下面一行按钮的间距。
-const ACTIONS_GAP: f32 = 24.;
-/// 待机页里中央刻度环到剪贴板卡片的间距。
-const SUGGESTION_GAP: f32 = 28.;
-/// 剪贴板卡片的上下内边距。
-const SUGGESTION_PADDING: f32 = 10.;
-/// 剪贴板卡片里两行字的间距。
-const SUGGESTION_LINE_GAP: f32 = 2.;
-/// 任务视图的最小宽：中央刻度环与收到最窄的信号栏。
-pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + SIGNAL_MIN_WIDTH;
-/// 任务视图中间一栏的最小高：中央刻度环、间距、一行按钮、下边距。
-pub(super) const MIN_HEIGHT: f32 = ring::AREA + ACTIONS_GAP + BUTTON_HEIGHT + BOTTOM;
-/// 待机页的最小高：中央刻度环、间距、剪贴板卡片（内边距、1 像素描边，与按钮和两行字中高的一个）、下边距。
-pub(super) const STANDBY_MIN_HEIGHT: f32 = ring::AREA
-    + SUGGESTION_GAP
-    + 2. * (SUGGESTION_PADDING + 1.)
-    + max(
-        BUTTON_HEIGHT,
-        CAPTION_LINE + SUGGESTION_LINE_GAP + TEXT_LINE,
-    )
-    + BOTTOM;
+/// 待机页里剪贴板卡片的最大宽与上下内边距。
+const SUGGESTION_WIDTH: f32 = 560.;
+const SUGGESTION_PADDING: f32 = 12.;
+/// 剪贴板卡片的高：内边距、1 像素描边与按钮（比里面的两行字高）。
+const SUGGESTION_HEIGHT: f32 = 2. * (SUGGESTION_PADDING + 1.) + BUTTON_HEIGHT;
+/// 信号的时刻一栏的宽：放得下「11-14 10:20」。
+const SIGNAL_AT_WIDTH: f32 = 72.;
+/// 任务页的最小宽：表盘与收到最窄的检查面板。
+pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
+/// 任务页的最小高：放得下表盘与粘贴栏的舞台。
+pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA);
+/// 待机页的最小高：舞台里多一张剪贴板卡片。
+pub(super) const STANDBY_MIN_HEIGHT: f32 = MIN_HEIGHT + SUGGESTION_HEIGHT + 12.;
+
+/// 检查面板底栏里的操作：最该按的一个与其余的。
+struct Foot {
+    primary: Option<Stateful<Div>>,
+    rest: Vec<Stateful<Div>>,
+}
 
 impl Shell {
-    /// 中间一栏与右边的信号栏。
+    /// 舞台与检查面板。
     pub(super) fn render_task(&self, row: &Row, now: Instant, cx: &Context<Self>) -> (Div, Div) {
-        let look = look(row, now);
-        let ticks = look.ticks;
+        let look = look(row);
         // 直播录制（没完成的）画钟面
         let live = row.recording() && row.task.status != Status::Done;
-        let ring = if live {
+        let figure = if live {
             live_view::figure(row, &look)
         } else {
-            ring_with_disc(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
-                    },
-                )
-                .absolute()
-                .size_full()
-                .into_any_element(),
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(look.color)
-                            .child(look.state),
-                    )
-                    .child(ui::num(
-                        div()
-                            .text_size(px(64.))
-                            .line_height(px(64.))
-                            .font_weight(FontWeight::BOLD)
-                            .child(look.big),
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_center()
-                            .line_clamp(2)
-                            .child(row.task.spec.title.clone()),
-                    )
-                    .child(ui::num(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme::muted())
-                            .text_center()
-                            .line_clamp(3)
-                            .child(SharedString::from(look.line)),
-                    )),
+            let ticks = look.ticks;
+            dial::dial(
+                look.color,
+                dial::figure(move |bounds, window, _| {
+                    ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
+                }),
+                readout(&look),
             )
         };
-        // 中间一栏至少放得下中央刻度环：窗口窄时先收两侧的栏
-        let main = div()
-            .flex_1()
-            .min_w(px(ring::AREA))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(ACTIONS_GAP))
-            .pb(px(BOTTOM))
-            .child(ring)
-            .child(
+        let stage = ui::stage(
+            ring::AREA,
+            figure,
+            self.clipboard_hint(cx),
+            self.dock.clone(),
+        );
+        (stage, self.inspector(row, &look, live, now, cx))
+    }
+
+    /// 剪贴板里有链接、粘贴栏空着时，粘贴栏上面的一行。
+    fn clipboard_hint(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let url = self.clipboard.clone()?;
+        if !self.dock.read(cx).text(cx).is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .max_w_full()
+                .text_size(px(12.))
+                .text_color(theme::muted())
+                .child(ui::num(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("剪贴板：{}", bare_url(&url))),
+                ))
+                .child(
+                    div()
+                        .id("probe-clipboard-hint")
+                        .flex_none()
+                        .text_color(theme::cyan())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme::cyan_pale()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.probe_text(url.as_str(), window, cx)
+                        }))
+                        .child("探测"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn inspector(
+        &self,
+        row: &Row,
+        look: &Look,
+        live: bool,
+        now: Instant,
+        cx: &Context<Self>,
+    ) -> Div {
+        let host = row.task.spec.url.host_str().unwrap_or_default().to_owned();
+        let mut body: Vec<AnyElement> = Vec::new();
+        if let Some(card) = self.headers_card(row, cx) {
+            body.push(card.into_any_element());
+        }
+        let cells = if live {
+            live_view::reads(row)
+        } else {
+            reads(row, now)
+        };
+        if !cells.is_empty() {
+            body.push(ui::reads(cells, None).into_any_element());
+        }
+        if live {
+            body.push(live_view::legend(row).into_any_element());
+        }
+        body.push(signals(&row.signals).into_any_element());
+        let Foot { primary, rest } = self.foot(row, cx);
+        let mut foot: Vec<AnyElement> = Vec::new();
+        if let Some(hint) = look.hint {
+            foot.push(ui::note(hint, true).into_any_element());
+        }
+        foot.extend(primary.map(IntoElement::into_any_element));
+        if !rest.is_empty() {
+            foot.push(
                 div()
                     .flex()
                     .flex_wrap()
-                    .justify_center()
                     .gap(px(10.))
-                    .children(self.actions(row, cx)),
+                    .children(rest)
+                    .into_any_element(),
             );
-        // 最新的在最上面，多了可以滚动
-        let aside = div()
-            .flex_basis(px(SIGNAL_WIDTH))
-            .flex_shrink(1.)
-            .min_w(px(SIGNAL_MIN_WIDTH))
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .py(px(8.))
-            .pr(px(8.))
-            .children(live.then(|| live_view::summary(row)))
-            .children(self.headers_card(row, cx))
-            .child(ui::caption("信号"))
-            .child(
-                div()
-                    .id("signals")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .pb(px(16.))
-                    .children(row.signals.iter().rev().map(signal_card)),
-            );
-        (main, aside)
+        }
+        ui::inspector(row.task.spec.title.clone(), host, body, foot)
     }
 
-    /// 正在改这个任务的请求头时，信号栏上方的编辑卡片。
+    /// 正在改这个任务的请求头时，检查面板最上面的编辑卡片。
     fn headers_card(&self, row: &Row, cx: &Context<Self>) -> Option<Div> {
         let (_, editor) = self
             .editing_headers
@@ -173,7 +165,7 @@ impl Shell {
                 .gap(px(12.))
                 .p(px(14.))
                 .rounded(px(14.))
-                .bg(theme::panel())
+                .bg(theme::cell())
                 .border_1()
                 .border_color(theme::edge())
                 .child(ui::caption("请求头"))
@@ -182,14 +174,17 @@ impl Shell {
                     div()
                         .flex()
                         .gap(px(10.))
-                        .child(ui::button(
-                            "save-headers",
-                            label,
-                            Tone::Glow,
-                            cx.listener(move |this, _, window, cx| {
-                                this.save_headers(resume, window, cx)
-                            }),
-                        ))
+                        .child(
+                            ui::button(
+                                "save-headers",
+                                label,
+                                Tone::Glow,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.save_headers(resume, window, cx)
+                                }),
+                            )
+                            .flex_1(),
+                        )
                         .child(ui::button(
                             "cancel-headers",
                             "取消",
@@ -216,98 +211,86 @@ impl Shell {
         stopped_plan(failure, row.recording(), row.task.write_only, editing)
     }
 
-    /// 暂停或失败的任务的操作（见 [`stopped_plan`]），第一个发光，改请求头不在第一个时只是文字。
-    fn stopped_actions(
-        &self,
-        row: &Row,
-        discard: AnyElement,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
+    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为橙色），其余在下面一行。
+    fn stopped_foot(&self, row: &Row, discard: Stateful<Div>, cx: &Context<Self>) -> Foot {
         let id = row.task.id;
-        let failure = match &row.task.status {
-            Status::Failed(failure) => Some(failure.kind),
-            _ => None,
-        };
-        let mut actions: Vec<AnyElement> = self
-            .plan(row)
-            .actions
-            .iter()
-            .enumerate()
-            .map(|(index, action)| {
-                let tone = match (index, action) {
-                    (0, _) => Tone::Glow,
-                    (_, Action::EditHeaders) => Tone::Ghost,
-                    _ => Tone::Plain,
-                };
-                match action {
-                    Action::EditHeaders => ui::button(
-                        "edit-headers",
-                        "改请求头",
-                        tone,
-                        cx.listener(move |this, _, window, cx| this.edit_headers(id, window, cx)),
-                    ),
-                    Action::WriteRecorded => ui::button(
-                        "write-recorded",
-                        "写出已录的",
-                        tone,
-                        cx.listener(move |this, _, _, cx| this.write_recorded(id, cx)),
-                    ),
-                    Action::SwitchToHls => ui::button(
-                        "switch-hls",
-                        "改存本地 HLS",
-                        tone,
-                        cx.listener(move |this, _, _, cx| this.switch_to_hls(id, cx)),
-                    ),
-                    Action::Resume => ui::button(
-                        "resume",
-                        resume_label(failure.is_some(), row.task.write_only),
-                        tone,
-                        cx.listener(move |this, _, _, cx| this.resume(id, cx)),
-                    ),
-                    Action::OpenFolder => {
-                        let target = row.task.spec.output.options().target;
-                        let folder = target
-                            .mp4()
-                            .or(target.hls())
-                            .and_then(|path| path.parent())
-                            .expect("输出是以文件名结尾的绝对路径")
-                            .to_path_buf();
-                        ui::button(
-                            "open-folder",
-                            "打开保存目录",
-                            tone,
-                            move |_, _, cx| cx.open_with_system(&folder),
-                        )
-                    }
-                }
-                .into_any_element()
-            })
-            .collect();
-        actions.push(discard);
-        actions
+        let failed = matches!(row.task.status, Status::Failed(_));
+        let plan = self.plan(row);
+        let mut primary = None;
+        let mut rest = Vec::new();
+        for (index, action) in plan.actions.iter().enumerate() {
+            let (key, label, detail): (&'static str, String, Option<SharedString>) = match action {
+                Action::EditHeaders => (
+                    "edit-headers",
+                    "改请求头".to_owned(),
+                    plan.resume_after_headers.then(|| "保存后接着重试".into()),
+                ),
+                Action::WriteRecorded => (
+                    "write-recorded",
+                    "写出已录的".to_owned(),
+                    Some(format!("不联网，写出 {}", format::clock(row.recorded())).into()),
+                ),
+                Action::SwitchToHls => (
+                    "switch-hls",
+                    "改存本地 HLS".to_owned(),
+                    Some("已下的照样用".into()),
+                ),
+                Action::Resume => (
+                    "resume",
+                    resume_label(failed, row.task.write_only).to_owned(),
+                    None,
+                ),
+                Action::OpenFolder => ("open-folder", "打开保存目录".to_owned(), None),
+            };
+            let act = *action;
+            let folder = folder_of(&row.task.spec.output);
+            let on_click = cx.listener(move |this, _, window, cx| match act {
+                Action::EditHeaders => this.edit_headers(id, window, cx),
+                Action::WriteRecorded => this.write_recorded(id, cx),
+                Action::SwitchToHls => this.switch_to_hls(id, cx),
+                Action::Resume => this.resume(id, cx),
+                Action::OpenFolder => cx.open_with_system(&folder),
+            });
+            if index == 0 {
+                let tone = if failed { Tone::Amber } else { Tone::Glow };
+                primary = Some(ui::primary(key, label, detail, tone, true, on_click));
+            } else {
+                rest.push(ui::button(key, label, Tone::Plain, on_click).flex_1());
+            }
+        }
+        rest.push(discard);
+        Foot { primary, rest }
     }
 
-    fn actions(&self, row: &Row, cx: &Context<Self>) -> Vec<AnyElement> {
+    fn foot(&self, row: &Row, cx: &Context<Self>) -> Foot {
         if !row.idle() {
-            return Vec::new();
+            return Foot {
+                primary: None,
+                rest: Vec::new(),
+            };
         }
         let id = row.task.id;
         let confirming = self.confirm_discard == Some(id);
         let discard = |cx: &Context<Self>| {
-            ui::button(
+            let button = ui::button(
                 "discard",
                 if confirming {
                     "再点一次：删除已下的内容"
                 } else {
                     "放弃任务"
                 },
-                Tone::Plain,
+                if confirming { Tone::Plain } else { Tone::Ghost },
                 cx.listener(move |this, _, _, cx| this.discard(id, confirming, cx)),
-            )
-            .when(confirming, |b| {
-                b.border_color(theme::orange()).text_color(theme::orange())
-            })
-            .into_any_element()
+            );
+            // 确认时独占一行，写清后果
+            if confirming {
+                button
+                    .w_full()
+                    .border_color(theme::orange())
+                    .text_color(theme::orange())
+            } else {
+                button
+            }
         };
         let pause = |cx: &Context<Self>| {
             ui::button(
@@ -316,129 +299,129 @@ impl Shell {
                 Tone::Plain,
                 cx.listener(move |this, _, _, cx| this.tasks.read(cx).pause(id)),
             )
-            .into_any_element()
+            .flex_1()
+        };
+        let forget = |tone: Tone, cx: &Context<Self>| {
+            ui::button(
+                "forget",
+                "从列表移除",
+                tone,
+                cx.listener(move |this, _, _, cx| {
+                    this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
+                }),
+            )
         };
         match &row.task.status {
-            Status::DiscardUnfinished => vec![discard(cx)],
-            Status::Running if row.stoppable() => vec![
-                ui::button(
+            Status::DiscardUnfinished => Foot {
+                primary: None,
+                rest: vec![discard(cx).flex_1()],
+            },
+            Status::Running if row.stoppable() => Foot {
+                primary: Some(ui::primary(
                     "stop",
                     "停止并写出",
+                    Some(format!("写出已录的 {}", format::clock(row.recorded())).into()),
                     Tone::Rec,
+                    true,
                     cx.listener(move |this, _, _, cx| {
                         this.tasks.read(cx).stop(id);
                         cx.notify();
                     }),
-                )
-                .into_any_element(),
-                pause(cx),
-                discard(cx),
-            ],
-            Status::Running => vec![pause(cx), discard(cx)],
+                )),
+                rest: vec![pause(cx), discard(cx)],
+            },
+            Status::Running => Foot {
+                primary: None,
+                rest: vec![pause(cx), discard(cx)],
+            },
             // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录
-            Status::Paused | Status::Failed(_) if row.task.work_dir.is_none() => vec![
-                ui::button(
-                    "forget",
-                    "从列表移除",
-                    Tone::Plain,
-                    cx.listener(move |this, _, _, cx| {
-                        this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
-                    }),
-                )
-                .into_any_element(),
-            ],
-            Status::Paused | Status::Failed(_) => self.stopped_actions(row, discard(cx), cx),
+            Status::Paused | Status::Failed(_) if row.task.work_dir.is_none() => Foot {
+                primary: None,
+                rest: vec![forget(Tone::Plain, cx).flex_1()],
+            },
+            Status::Paused | Status::Failed(_) => self.stopped_foot(row, discard(cx), cx),
             Status::Done => {
                 // 输出在不在是完成时与打开应用时在后台查的；还没查完时先不给这两个按钮
                 let (mp4, shown) = row
                     .present
                     .as_ref()
                     .map_or((None, None), |p| (p.mp4.clone(), p.shown.clone()));
-                let mut actions = Vec::new();
-                if let Some(mp4) = mp4 {
-                    actions.push(
-                        ui::button("play", "▶ 播放", Tone::Glow, move |_, _, cx| {
-                            cx.open_with_system(&mp4)
-                        })
-                        .into_any_element(),
-                    );
-                }
+                let primary = mp4.map(|mp4| {
+                    ui::primary(
+                        "play",
+                        "播放",
+                        Some(row.file_name.clone().into()),
+                        Tone::Glow,
+                        true,
+                        move |_, _, cx| cx.open_with_system(&mp4),
+                    )
+                });
+                let mut rest = Vec::new();
                 if let Some(shown) = shown {
-                    actions.push(
+                    rest.push(
                         ui::button(
                             "reveal",
                             "在访达中显示",
                             Tone::Plain,
                             move |_, _, cx| cx.reveal_path(&shown),
                         )
-                        .into_any_element(),
+                        .flex_1(),
                     );
                 }
-                actions.push(
-                    ui::button(
-                        "forget",
-                        "从列表移除",
-                        Tone::Ghost,
-                        cx.listener(move |this, _, _, cx| {
-                            this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
-                        }),
-                    )
-                    .into_any_element(),
-                );
-                actions
+                rest.push(forget(Tone::Ghost, cx));
+                Foot { primary, rest }
             }
         }
     }
 
-    /// 没有任务也没在新建时：待机的刻度环；剪贴板里有链接时放在环下面，一键探测。
+    /// 没有任务也没在新建时：待机的表盘；剪贴板里有链接时放在粘贴栏上面，一键探测。
     pub(super) fn render_standby(&self, cx: &Context<Self>) -> impl IntoElement {
-        let ring = ring_with_disc(
-            canvas(
-                |_, _, _| {},
-                |bounds, _, window, _| ring::paint_standby(bounds, ring::RADIUS, window),
-            )
-            .absolute()
-            .size_full()
-            .into_any_element(),
+        let figure = dial::dial(
+            theme::cyan(),
+            dial::figure(|bounds, window, _| {
+                ring::paint_comet(bounds, ring::RADIUS, 0., theme::cyan(), window)
+            }),
             div()
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(10.))
+                .text_center()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme::cyan())
                         .child("就绪"),
                 )
                 .child(
                     div()
-                        .text_size(px(30.))
+                        .text_size(px(28.))
                         .font_weight(FontWeight::BOLD)
-                        .child("粘贴链接"),
+                        .child("粘贴链接开始"),
                 )
                 .child(
                     div()
                         .text_size(px(13.))
                         .text_color(theme::muted())
-                        .child("m3u8 · 回车探测"),
+                        .child("m3u8 地址，或有视频的网页"),
                 ),
         );
         let suggestion = self.clipboard.clone().map(|url| {
             let shown = bare_url(&url).to_string();
             div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .gap(px(14.))
                 .w_full()
-                .max_w(px(560.))
-                .pl(px(20.))
-                .pr(px(10.))
+                .max_w(px(SUGGESTION_WIDTH))
+                .pl(px(18.))
+                .pr(px(SUGGESTION_PADDING))
                 .py(px(SUGGESTION_PADDING))
-                .rounded(px(18.))
-                .bg(theme::panel())
+                .rounded(px(16.))
+                .bg(theme::deck())
                 .border_1()
-                .border_color(theme::edge())
+                .border_color(theme::deck_edge())
                 .child(ui::dot(theme::cyan(), 8.))
                 .child(
                     div()
@@ -446,15 +429,15 @@ impl Shell {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(SUGGESTION_LINE_GAP))
+                        .gap(px(2.))
                         .child(ui::caption("剪贴板里的链接"))
-                        .child(
+                        .child(ui::num(
                             div()
-                                .text_size(px(13.))
+                                .text_size(px(13.5))
                                 .line_height(px(TEXT_LINE))
                                 .truncate()
                                 .child(shown),
-                        ),
+                        )),
                 )
                 .child(ui::button(
                     "probe-clipboard",
@@ -464,66 +447,171 @@ impl Shell {
                         this.probe_text(url.as_str(), window, cx)
                     }),
                 ))
+                .into_any_element()
         });
-        div()
-            .flex_1()
-            .min_w(px(ring::AREA))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(SUGGESTION_GAP))
-            .pb(px(BOTTOM))
-            .child(ring)
-            .children(suggestion)
+        ui::stage(ring::AREA, figure, suggestion, self.dock.clone())
     }
 }
 
-/// 中央刻度环：`ring` 是撑满整块区域的画布，中间压一个深色圆盘，`center` 放在圆盘里。
-fn ring_with_disc(ring: AnyElement, center: Div) -> Div {
-    let disc = ring::AREA - 2. * DISC_INSET;
-    let place = || {
-        div()
-            .absolute()
-            .top(px(DISC_INSET))
-            .left(px(DISC_INSET))
-            .size(px(disc))
-    };
+/// 圆盘里的字：状态（带颜色）、大字与下面一行说明。
+fn readout(look: &Look) -> Div {
     div()
-        .relative()
-        .size(px(ring::AREA))
-        .flex_none()
-        .child(ring)
-        .child(place().rounded_full().bg(theme::disc()))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(8.))
         .child(
-            place()
-                .px(px(DISC_PADDING))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(center),
+            div()
+                .text_size(px(13.))
+                .text_color(look.color)
+                .child(look.state.clone()),
         )
+        .child(ui::num(
+            div()
+                .text_size(px(66.))
+                .line_height(px(66.))
+                .font_weight(FontWeight::BOLD)
+                .child(look.big.clone()),
+        ))
+        .child(ui::num(
+            div()
+                .max_w(px(dial::TEXT_WIDTH))
+                .text_size(px(13.))
+                .line_height(px(TEXT_LINE))
+                .text_color(theme::muted())
+                .text_center()
+                .line_clamp(2)
+                .child(SharedString::from(look.line.clone())),
+        ))
 }
 
-fn signal_card(signal: &Signal) -> impl IntoElement {
-    ui::card(match signal.level {
-        Level::Info => theme::line(),
-        Level::Warn => theme::warn_edge(),
-        Level::Error => theme::error_edge(),
-    })
-    .flex()
-    .flex_col()
-    .gap(px(4.))
-    .child(ui::num(
-        div()
-            .flex()
-            .justify_between()
-            .text_size(px(11.))
-            .text_color(theme::muted())
-            .child(signal.at.clone())
-            .when(signal.repeat > 1, |s| {
-                s.child(format!("×{}", signal.repeat))
-            }),
-    ))
-    .child(SharedString::from(signal.text.clone()))
+/// 检查面板的读数（直播录制的见 [`live_view::reads`]）：下载中为速度、剩余、已下与分片，写出中为已下与分片，停着的为
+/// 已下的片数与大小，完成的为时长、大小、画面与输出；还没有内容时为空。
+fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    if row.task.status == Status::Done {
+        let Some(result) = row.task.result.as_ref() else {
+            return Vec::new();
+        };
+        let mut cells = vec![
+            cell(
+                "时长",
+                result
+                    .duration
+                    .map_or_else(|| "—".to_owned(), format::clock),
+            ),
+            cell("大小", format::bytes(result.bytes)),
+        ];
+        if let Some((width, height)) = result.resolution {
+            cells.push(cell("画面", format!("{width}×{height}")));
+        }
+        cells.push(cell(
+            "保存为",
+            output_kind(&row.task.spec.output).to_owned(),
+        ));
+        return cells;
+    }
+    let Some(amount) = Amount::of(row) else {
+        return Vec::new();
+    };
+    let Amount {
+        done, total, bytes, ..
+    } = amount;
+    let segments = if total > 0 {
+        format!("{done} / {total}")
+    } else {
+        done.to_string()
+    };
+    match row.task.status {
+        Status::Running if row.written_share().is_some() => {
+            vec![cell("已下", format::bytes(bytes)), cell("分片", segments)]
+        }
+        Status::Running if total > 0 && !row.task.write_only => {
+            let speed = format!("{}/s", format::bytes(row.rate.bytes_per_second(now) as u64));
+            let left = row
+                .rate
+                .remaining(now, total.saturating_sub(done))
+                .map_or_else(
+                    || "—".to_owned(),
+                    |left| format::remaining(left).replacen("剩余 ", "", 1),
+                );
+            vec![
+                cell("速度", speed),
+                cell("剩余", left),
+                cell("已下", format::bytes(bytes)),
+                cell("分片", segments),
+            ]
+        }
+        Status::Running => Vec::new(),
+        _ if done == 0 => Vec::new(),
+        _ => vec![
+            cell("已下", format!("{segments} 片")),
+            cell("大小", format::bytes(bytes)),
+        ],
+    }
+}
+
+/// 输出的种类。
+fn output_kind(output: &OutputSpec) -> &'static str {
+    match output {
+        OutputSpec::Mp4(_) => "MP4",
+        OutputSpec::Hls(_) => "本地 HLS",
+        OutputSpec::Both { .. } => "MP4 与本地 HLS",
+    }
+}
+
+/// 输出所在的目录：占着输出路径的东西就在里面。
+fn folder_of(output: &OutputSpec) -> std::path::PathBuf {
+    let target = output.options().target;
+    target
+        .mp4()
+        .or(target.hls())
+        .and_then(|path| path.parent())
+        .expect("输出是以文件名结尾的绝对路径")
+        .to_path_buf()
+}
+
+/// 信号：最新的在最上面，左边是时刻，字色是级别。
+fn signals(signals: &[Signal]) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .child(div().pb(px(6.)).child(ui::caption("信号")))
+        .children(signals.iter().rev().map(|signal| {
+            let color = match signal.level {
+                Level::Info => theme::soft(),
+                Level::Warn => theme::warn_text(),
+                Level::Error => theme::error_text(),
+            };
+            div()
+                .flex()
+                .gap(px(10.))
+                .py(px(7.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .text_size(px(13.))
+                .line_height(px(19.))
+                .child(ui::num(
+                    div()
+                        .w(px(SIGNAL_AT_WIDTH))
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(theme::faint())
+                        .child(signal.at.clone()),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(color)
+                        .child(SharedString::from(signal.text.clone()))
+                        .when(signal.repeat > 1, |s| {
+                            s.child(ui::num(
+                                div()
+                                    .text_color(theme::faint())
+                                    .child(format!("×{}", signal.repeat)),
+                            ))
+                        }),
+                )
+        }))
 }

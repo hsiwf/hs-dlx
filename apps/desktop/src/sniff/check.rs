@@ -11,7 +11,6 @@ use hs_m3u8_webview::cookies::{Cookie, cookies_for};
 
 use super::found::Check;
 use super::{SniffView, request};
-use crate::new_task;
 use crate::wait::within;
 
 /// 等网页引擎回出 Cookie 最多多久：引擎卡住时不让探测一直挂着。
@@ -121,7 +120,6 @@ async fn run(
     let probing = std::pin::pin!(probing);
     let check = match within(probing, executor.timer(PROBE_TIMEOUT)).await {
         Some(Ok(Ok(probe))) => Check::Ready {
-            summary: new_task::describe(&probe).join(" · "),
             probe: Box::new(probe),
             headers: made.headers.clone(),
         },

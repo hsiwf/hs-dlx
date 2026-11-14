@@ -1,16 +1,17 @@
-//! 新建任务：带着请求头探测地址（或用嗅探页已探测好的结果），每档清晰度画成一个同心环（越粗码率越高，引线连到右侧
-//! 的标签），点环或用方向键选中，再选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新探测；取到的不是播放列表
-//! 时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在选项栏里。
+//! 新建任务：带着请求头探测地址（或用嗅探页已探测好的结果），舞台上每档清晰度画成一个同心环（越粗码率越高，引线
+//! 连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新
+//! 探测；取到的不是播放列表时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理
+//! 写在检查面板里。舞台底部是外面给的粘贴栏。
 
+mod inspector;
 mod rings;
-mod side;
 
 use self::rings::{FIGURE_HEIGHT, FIGURE_WIDTH};
 
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{
     AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
@@ -21,17 +22,17 @@ use hs_m3u8_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playli
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, Source, Url};
 
+use crate::dial;
+use crate::dock::Dock;
 use crate::format;
 use crate::headers::HeadersEditor;
 use crate::route::Route;
-use crate::ui::{BOTTOM, GAP};
+use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
 
-/// 窗口窄时选项栏最多收到的宽度：放得下一行「MP4 · 本地 HLS · 两者」三个胶囊。
-const OPTION_MIN_WIDTH: f32 = 260.;
-/// 新建页的最小宽：整个同心环区域与收到最窄的选项栏。
-pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + OPTION_MIN_WIDTH;
-/// 新建页的最小高：同心环区域与下边距。
-pub const MIN_HEIGHT: f32 = FIGURE_HEIGHT + BOTTOM;
+/// 新建页的最小宽：整个同心环区域与收到最窄的检查面板（放得下一行「MP4 · 本地 HLS · 两者」三个选项）。
+pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + INSPECTOR_MIN_WIDTH;
+/// 新建页的最小高：放得下同心环区域、按键说明与粘贴栏的舞台。
+pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT + ui::CAPTION_LINE + 12.);
 
 /// 要探测的链接。
 #[derive(Clone)]
@@ -104,6 +105,8 @@ pub struct NewTask {
     /// 交给服务的网页标题（见 [`Link::title`]）
     page_title: Option<String>,
     probing: Probing,
+    /// 这次探测开始的时刻：探测中的表盘写探测了多久
+    since: Instant,
     /// 取到的不是播放列表后，外面看它是不是网页看到哪一步
     page_check: PageCheck,
     /// 从嗅探页来的流：失败页上不再给「在网页里找视频流」
@@ -128,20 +131,24 @@ pub struct NewTask {
     focus: FocusHandle,
     /// 这个地址的请求经哪里走：还没读到系统代理时为 None
     route: Option<Route>,
+    /// 舞台底部的粘贴栏（外面的，各页共用）
+    dock: Entity<Dock>,
     _route: Task<()>,
     _probe: Task<()>,
+    /// 探测中逐帧重画表盘，探测有了结果即停
+    _frames: Task<()>,
 }
 
 impl EventEmitter<NewTaskEvent> for NewTask {}
 
 impl NewTask {
-    /// 打开 `link` 的新建页；`from_sniff` 为从嗅探页来的。
+    /// 打开 `link` 的新建页；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
     pub fn new(
         service: Rc<Service>,
         link: Link,
         from_sniff: bool,
         folder: PathBuf,
-        home: Option<PathBuf>,
+        dock: Entity<Dock>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -172,6 +179,7 @@ impl NewTask {
             page_title,
             url,
             probing: Probing::Running,
+            since: Instant::now(),
             page_check: PageCheck::Idle,
             from_sniff,
             variant: 0,
@@ -179,15 +187,17 @@ impl NewTask {
             hovered: None,
             output: OutputKind::Mp4,
             folder,
-            home,
+            home: dirs::home_dir(),
             rings_bounds: Rc::new(Cell::new(Bounds::default())),
             error: None,
             creating: false,
             headers: editor,
             focus: cx.focus_handle(),
             route: None,
+            dock,
             _route: route,
             _probe: Task::ready(()),
+            _frames: Task::ready(()),
         };
         match probe {
             Some(probe) => view.probed(Probing::Ready(probe)),
@@ -213,6 +223,8 @@ impl NewTask {
             }
         };
         self.probing = Probing::Running;
+        self.since = Instant::now();
+        self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
             let (probing, not_page) = match handle.await {
                 Ok(Ok(probe)) => (Probing::Ready(Box::new(probe)), false),
@@ -254,7 +266,28 @@ impl NewTask {
     /// 外面开始在网页引擎里打开地址、看它是不是网页：探测失败的说明先不显示。
     pub fn opening_page(&mut self, cx: &mut Context<Self>) {
         self.page_check = PageCheck::Opening;
+        self.animate(cx);
         cx.notify();
+    }
+
+    /// 探测中（[`Phase::Probing`]）每隔 [`dial::FRAME`] 重画一次，让表盘上的彗尾转起来；系统要求减少动态效果时不画。
+    fn animate(&mut self, cx: &mut Context<Self>) {
+        self._frames = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(dial::FRAME).await;
+                let going = this.update(cx, |this, cx| {
+                    let going = this.phase() == Phase::Probing && !cx.reduce_motion();
+                    if going {
+                        cx.notify();
+                    }
+                    going
+                });
+                // 视图关掉了，或不再探测
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        });
     }
 
     /// 外面正在网页引擎里打开地址（[`NewTask::opening_page`] 之后，没有重新探测）。
@@ -430,26 +463,23 @@ impl NewTask {
 impl Render for NewTask {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let figure = self.render_figure(cx);
-        let side = self.render_side(cx);
-        // 中间一栏至少放得下整个同心环区域：窗口窄时先收两侧的栏
+        let inspector = self.render_inspector(cx);
+        // 舞台至少放得下整个同心环区域：窗口窄时先收两侧的面板
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
             .flex_1()
             .min_w(px(MIN_WIDTH))
+            .min_h_0()
             .flex()
             .gap(px(GAP))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(FIGURE_WIDTH))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .pb(px(BOTTOM))
-                    .child(figure),
-            )
-            .child(side)
+            .child(ui::stage(
+                FIGURE_WIDTH,
+                figure,
+                self.keys_hint(),
+                self.dock.clone(),
+            ))
+            .child(inspector)
     }
 }
 
