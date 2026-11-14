@@ -4,11 +4,12 @@ hs-m3u8 桌面应用静态链接或随带了以下软件：
 
 1. FFmpeg 9.0.2（https://ffmpeg.org），按 GNU Lesser General Public License（LGPL）2.1 或更高版本授权，全文见
    FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见本项目源码里的
-   third_party/ffmpeg/build.sh。对应的源码包 ffmpeg-9.0.2.tar.xz 可从 https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz 取得，SHA-256 为
+   third_party/ffmpeg/build.sh。对应的源码包 ffmpeg-9.0.2.tar.xz 可从
+   https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz 取得，SHA-256 为
    8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e。
 
    换用修改过的 FFmpeg：按 build.sh 里的 configure 参数编译修改过的 FFmpeg 源码并安装到某个目录，再在本项目源码目录
-   里以 FFMPEG_DIR=<该目录> cargo build --release -p hs-m3u8-desktop 重新构建桌面应用。
+   里以 FFMPEG_DIR=<该目录> cargo build --release -p hs-m3u8-desktop 重新构建。
 
 2. Rust crate，各自的许可证见 THIRD-PARTY-RUST.txt；Rust 标准库按 MIT 或 Apache-2.0 授权
    （https://github.com/rust-lang/rust）。
