@@ -34,7 +34,8 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let activity = format::activity(&tasks.activity(now));
+        let activity = tasks.activity(now);
+        let activity = format::activity(activity.running, activity.speed);
         // 可用空间：不足或读不出时标橙色，只标这一段
         let space = tasks.free_space().map(|free| match free {
             Ok(bytes) => (

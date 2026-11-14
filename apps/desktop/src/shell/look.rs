@@ -5,7 +5,7 @@ use hs_m3u8_app::{Failure, Status};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
-use crate::tasks::{Amount, Disk, Row, finished_text};
+use crate::tasks::{Amount, Disk, Output, Row, finished_text};
 use crate::{format, theme};
 
 /// 一个任务此刻的样子。
@@ -191,15 +191,13 @@ fn done_look(row: &Row) -> Look {
 fn running(row: &Row, amount: Amount) -> Look {
     let stage = row.progress.as_ref().map_or(Stage::Preparing, |p| p.stage);
     if stage == Stage::Writing {
-        let writing = row.progress.as_ref().and_then(|p| p.writing);
-        let (kind, count) = match writing {
-            Some(w) => match (w.mp4, w.hls) {
-                (Some(c), _) => ("写出 MP4", Some(c)),
-                (None, Some(c)) => ("写出本地 HLS", Some(c)),
-                (None, None) => ("写出", None),
-            },
-            None => ("写出", None),
+        let writing = row.writing();
+        let kind = match writing {
+            Some((Output::Mp4, _)) => "写出 MP4",
+            Some((Output::Hls, _)) => "写出本地 HLS",
+            None => "写出",
         };
+        let count = writing.map(|(_, count)| count);
         let written = row.written_share().unwrap_or(0.0);
         let percent = percent(written);
         let ticks = Ticks::of(amount.total, amount.done, false);

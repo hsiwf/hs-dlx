@@ -6,15 +6,9 @@ use std::time::Duration;
 use hs_m3u8_app::FailureKind;
 use hs_m3u8_core::VariantInfo;
 
-/// 在运行的任务数与合计速度（「2 个进行中 · ↓ 18.4 MB/s」）；没有在运行的任务时为 None。
-pub fn activity(activity: &crate::tasks::Activity) -> Option<String> {
-    (activity.running > 0).then(|| {
-        format!(
-            "{} 个进行中 · ↓ {}/s",
-            activity.running,
-            bytes(activity.speed as u64)
-        )
-    })
+/// 在运行的任务数 `running` 与合计速度 `speed`（字节每秒）：「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
+pub fn activity(running: usize, speed: f64) -> Option<String> {
+    (running > 0).then(|| format!("{running} 个进行中 · ↓ {}/s", bytes(speed as u64)))
 }
 
 /// 字节数：1000 进制，保留一位小数（`812 B`、`1.9 GB`）；四舍五入后到 1000 的进到下一级。

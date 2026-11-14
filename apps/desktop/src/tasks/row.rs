@@ -5,12 +5,19 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
 use hs_m3u8_app::{Finished, OutputSpec, Status, Task};
-use hs_m3u8_core::{Progress, Saved, Stage};
+use hs_m3u8_core::{FileCount, Progress, Saved, Stage};
 
 use crate::format;
 use crate::live::Timeline;
 use crate::rate::Rate;
 use crate::signals::{self, Level, Signal};
+
+/// 写出的一种输出。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    Mp4,
+    Hls,
+}
 
 /// 任务目录里已完成的内容读到了哪一步。
 pub enum Disk {
@@ -131,22 +138,28 @@ impl Row {
         self.reading += 1;
     }
 
-    /// 正在写出时写出的比例（0 到 1，按写出的文件数）；不在写出阶段时为 None。
+    /// 进度里报的写出计数：写的是哪种输出与写了几个文件；同时写 MP4 与本地 HLS 时为 MP4 的。还没报时为 None。
+    pub fn writing(&self) -> Option<(Output, FileCount)> {
+        let writing = self.progress.as_ref()?.writing?;
+        writing
+            .mp4
+            .map(|count| (Output::Mp4, count))
+            .or(writing.hls.map(|count| (Output::Hls, count)))
+    }
+
+    /// 正在写出时写出的比例（0 到 1，按 [`Row::writing`] 的文件数，还没报时为 0）；不在写出阶段时为 None。
     pub fn written_share(&self) -> Option<f32> {
-        let progress = self.progress.as_ref()?;
-        if progress.stage != Stage::Writing {
+        if self.progress.as_ref()?.stage != Stage::Writing {
             return None;
         }
-        let writing = progress.writing?;
-        let count = writing.mp4.or(writing.hls);
-        Some(count.map_or(0.0, |c| {
+        Some(self.writing().map_or(0.0, |(_, c)| {
             (c.done as f32 / c.total.max(1) as f32).clamp(0.0, 1.0)
         }))
     }
 
     /// 在运行的点播此刻的进度（0 到 1）：写出时为写出的比例，下载时为已下的片数比例（还不知道合计时为 0）。不是在运行
     /// 的点播（停着的、录直播的、只写出已录的）时为 None。
-    pub fn download_share(&self) -> Option<f32> {
+    pub fn progress_share(&self) -> Option<f32> {
         if self.task.status != Status::Running || self.task.write_only || self.recording() {
             return None;
         }

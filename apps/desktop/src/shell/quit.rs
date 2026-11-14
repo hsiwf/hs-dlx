@@ -179,13 +179,15 @@ fn answered(tasks: &mut Tasks, choice: Choice, cx: &mut Context<Tasks>) -> After
     };
     let after = match choice {
         Choice::Pause | Choice::StopRecordings => {
-            if !tasks.reopened_while_asking() {
+            if reopened {
+                tasks.stay_after_reopen();
+            } else {
                 tasks.quit_after_stopping(choice == Choice::StopRecordings, cx);
             }
             After::Nothing
         }
         Choice::Background | Choice::Cancel if quit_requested && !reopened => {
-            tasks.asked();
+            tasks.stay_unanswered();
             After::AskQuit
         }
         Choice::Background if !reopened => {

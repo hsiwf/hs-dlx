@@ -92,8 +92,9 @@ impl Tasks {
         }
     }
 
-    /// 问完了、接着要再问一次（退出应用）：回到没在问，不答复在等的系统退出请求（再问的答案去答复它）。
-    pub fn asked(&mut self) {
+    /// 问完了、接着要再问一次（退出应用）：回到没在问，但不答复在等的系统退出请求（再问的答案去答复它；
+    /// 与 [`Tasks::stay`] 的区别）。
+    pub fn stay_unanswered(&mut self) {
         self.quit = Quit::Staying;
     }
 
@@ -123,14 +124,20 @@ impl Tasks {
         self.add_notice(why);
     }
 
-    /// 选了退出时，提示框开着期间再次打开过应用（见 [`Tasks::receive`]）：不退出了，提示原因。
+    /// 选了退出时，提示框开着期间再次打开过应用（见 [`Tasks::receive`]）：不退出了，提示原因；没再次打开过时什么也
+    /// 不做。返回是否再次打开过。
     pub fn reopened_while_asking(&mut self) -> bool {
         let reopened = matches!(self.quit, Quit::Asking { reopened: true, .. });
         if reopened {
-            self.stay();
-            self.add_notice("提示框开着时再次打开了应用，没有退出".to_owned());
+            self.stay_after_reopen();
         }
         reopened
+    }
+
+    /// 选了退出，但提示框开着期间再次打开过应用：不退出了，提示原因。
+    pub fn stay_after_reopen(&mut self) {
+        self.stay();
+        self.add_notice("提示框开着时再次打开了应用，没有退出".to_owned());
     }
 
     /// 不退出：在等答复的系统退出请求随之取消（注销、关机不再进行）。

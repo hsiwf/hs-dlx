@@ -19,7 +19,7 @@ pub use self::operations::resume_label;
 pub use self::quit::{Departure, Quit};
 #[cfg(test)]
 pub use self::row::sample;
-pub use self::row::{Amount, Disk, Row, finished_text};
+pub use self::row::{Amount, Disk, Output, Row, finished_text};
 use crate::signals::Level;
 use crate::wait::within;
 
@@ -52,7 +52,7 @@ pub struct Activity {
     pub running: usize,
     /// 合计下载速度（字节每秒）
     pub speed: f64,
-    /// 在运行的点播的平均进度（0 到 1，见 [`Row::download_share`]）；没有时为 None
+    /// 在运行的点播的平均进度（0 到 1，见 [`Row::progress_share`]）；没有时为 None
     pub progress: Option<f32>,
     /// 有在录的直播
     pub recording: bool,
@@ -81,7 +81,8 @@ pub struct Tasks {
     early: Vec<Event>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
-    /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）
+    /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）；macOS 上总能点程序坞回到窗口，用不到
+    #[cfg(not(target_os = "macos"))]
     receives_handoffs: bool,
     _events: Task<()>,
     _handoffs: Task<()>,
@@ -118,6 +119,7 @@ impl Tasks {
             let _unsaved = this.service.close();
             async {}
         });
+        #[cfg(not(target_os = "macos"))]
         let receives_handoffs = handoffs.is_ok();
         let handing = match handoffs {
             Ok(mut handoffs) => cx.spawn(async move |this, cx| {
@@ -166,6 +168,7 @@ impl Tasks {
             creating: 0,
             early: Vec::new(),
             free_space: None,
+            #[cfg(not(target_os = "macos"))]
             receives_handoffs,
             _events: receiving,
             _handoffs: handing,
@@ -364,7 +367,7 @@ impl Tasks {
             .collect();
         let shares: Vec<f32> = running
             .iter()
-            .filter_map(|row| row.download_share())
+            .filter_map(|row| row.progress_share())
             .collect();
         Activity {
             running: running.len(),
@@ -384,6 +387,7 @@ impl Tasks {
     }
 
     /// 收得了后打开的实例转交来的：再次打开应用会回到窗口。
+    #[cfg(not(target_os = "macos"))]
     pub fn receives_handoffs(&self) -> bool {
         self.receives_handoffs
     }

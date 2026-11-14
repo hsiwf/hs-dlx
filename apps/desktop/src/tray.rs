@@ -197,8 +197,8 @@ impl Tray {
         self.refreshed_at = Some(Instant::now());
         let read = tasks.read(cx);
         let activity = read.activity(Instant::now());
-        let mut status =
-            format::activity(&activity).unwrap_or_else(|| "没有进行中的任务".to_owned());
+        let mut status = format::activity(activity.running, activity.speed)
+            .unwrap_or_else(|| "没有进行中的任务".to_owned());
         if activity.failed > 0 {
             status.push_str(&format!(" · {} 个需要处理", activity.failed));
         }

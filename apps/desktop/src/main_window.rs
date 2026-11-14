@@ -142,23 +142,32 @@ fn should_close(view: &WeakEntity<Shell>, window: &mut Window, cx: &mut App) -> 
 
 /// 主窗口关掉后怎么回来（写进关窗时的提示）；回不来时为 None（不给在后台继续）。macOS 上总能点程序坞里的图标；
 /// Linux 上托盘建得起也可能看不见（桌面没有托盘宿主），只算再次打开应用（要收得了转交）。
+#[cfg(target_os = "macos")]
 fn back(cx: &App) -> Option<&'static str> {
-    let tray = Tray::installed(cx);
+    Some(if Tray::installed(cx) {
+        "点菜单栏或程序坞里的图标回到窗口"
+    } else {
+        "点程序坞里的图标回到窗口"
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn back(cx: &App) -> Option<&'static str> {
     let reopen = tasks(cx).is_some_and(|tasks| tasks.read(cx).receives_handoffs());
-    if cfg!(target_os = "macos") {
-        return Some(if tray {
-            "点菜单栏或程序坞里的图标回到窗口"
-        } else {
-            "点程序坞里的图标回到窗口"
-        });
+    match (Tray::installed(cx), reopen) {
+        (true, true) => Some("点通知区域的图标或再次打开应用回到窗口"),
+        (true, false) => Some("点通知区域的图标回到窗口"),
+        (false, true) => Some("再次打开应用回到窗口"),
+        (false, false) => None,
     }
-    match (tray, reopen) {
-        (true, true) if cfg!(target_os = "windows") => {
-            Some("点通知区域的图标或再次打开应用回到窗口")
-        }
-        (true, false) if cfg!(target_os = "windows") => Some("点通知区域的图标回到窗口"),
+}
+
+#[cfg(target_os = "linux")]
+fn back(cx: &App) -> Option<&'static str> {
+    let reopen = tasks(cx).is_some_and(|tasks| tasks.read(cx).receives_handoffs());
+    match (Tray::installed(cx), reopen) {
         (true, true) => Some("点托盘图标或再次打开应用回到窗口"),
-        (_, true) => Some("再次打开应用回到窗口"),
+        (false, true) => Some("再次打开应用回到窗口"),
         (_, false) => None,
     }
 }
