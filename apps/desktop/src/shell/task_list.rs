@@ -34,6 +34,7 @@ impl Shell {
             let (title, found) = (read.page_title(), read.found_count());
             sniff_item(title, found, on, dim, cx)
         });
+        let empty = tasks.rows().is_empty() && new_task.is_none() && sniff.is_none();
         let selected = self.selected_row(tasks).map(|row| row.task.id);
         let orbs: Vec<_> = tasks
             .rows()
@@ -69,7 +70,8 @@ impl Shell {
                     .gap(px(2.))
                     .children(new_task)
                     .children(sniff)
-                    .children(orbs),
+                    .children(orbs)
+                    .when(empty, |list| list.children(empty_slots())),
             )
     }
 
@@ -191,4 +193,72 @@ fn new_task_item(phase: Phase) -> impl IntoElement {
                 .border_color(theme::cyan()),
         )
         .child(two_lines("新任务".to_owned(), phase.label().to_owned()))
+}
+
+/// 还没有任务时：三个渐隐的空槽位（虚线环与两道暗条，与任务一项同样的版式）与一句说明。
+fn empty_slots() -> Vec<gpui_kit::AnyElement> {
+    let slot = |opacity: f32, width: f32| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .p(px(10.))
+            .opacity(opacity)
+            .child(
+                div()
+                    .size(px(ORB))
+                    .flex_none()
+                    .rounded_full()
+                    .border_2()
+                    .border_dashed()
+                    .border_color(theme::ring_idle()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .h(px(9.))
+                            .w(px(width))
+                            .rounded(px(5.))
+                            .bg(theme::selected()),
+                    )
+                    .child(
+                        div()
+                            .h(px(7.))
+                            .w(px(width * 0.6))
+                            .rounded(px(4.))
+                            .bg(theme::raised()),
+                    ),
+            )
+            .into_any_element()
+    };
+    vec![
+        slot(0.9, 136.),
+        slot(0.6, 112.),
+        slot(0.35, 124.),
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .px(px(12.))
+            .pt(px(14.))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("还没有任务"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .line_height(px(ui::TEXT_LINE))
+                    .text_color(theme::muted())
+                    .child("探测好、开始下载后列在这里；关窗时可以让它在后台接着下"),
+            )
+            .into_any_element(),
+    ]
 }

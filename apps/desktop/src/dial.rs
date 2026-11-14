@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Div, Hsla, IntoElement, ParentElement as _, Styled as _, canvas, div, px,
 };
@@ -24,11 +25,23 @@ pub const TEXT_WIDTH: f32 = 240.;
 /// 背光：表盘后面一个看不见的圆投下的大片柔光，直径与模糊半径。
 const LIGHT: f32 = 300.;
 const LIGHT_BLUR: f32 = 200.;
-/// 背光的强度（0 到 1）：只在舱底上透出一层颜色，不抢刻度。
-const LIGHT_STRENGTH: f32 = 0.09;
+/// 背光平时的强度（0 到 1）：只在舱底上透出一层颜色，不抢刻度。
+pub const LIGHT_STRENGTH: f32 = 0.09;
 
 /// 表盘：`light` 为背光的颜色（随状态），`figure` 为撑满整块区域的刻度，圆盘压在中间，`center` 放在圆盘里。
 pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
+    lit_dial(light, LIGHT_STRENGTH, false, figure, center)
+}
+
+/// [`dial`]，背光的强度为 `strength`（0 到 1）；`scope` 时下面垫一层待机的刻度面（见 [`ring::paint_scope`]，超出舞台的
+/// 部分由舞台裁掉）。
+pub fn lit_dial(
+    light: Hsla,
+    strength: f32,
+    scope: bool,
+    figure: AnyElement,
+    center: impl IntoElement,
+) -> Div {
     let disc = AREA - 2. * DISC_INSET;
     let place = || {
         div()
@@ -37,7 +50,7 @@ pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
             .left(px(DISC_INSET))
             .size(px(disc))
     };
-    face(light)
+    lit_face(light, strength, scope)
         .child(figure)
         .child(
             place()
@@ -58,11 +71,20 @@ pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
 
 /// 没有圆盘的表盘（直播钟面的指针扫过圆心）：背光与表圈，`figure` 与其余的字由调用方叠上去。
 pub fn face(light: Hsla) -> Div {
+    lit_face(light, LIGHT_STRENGTH, false)
+}
+
+fn lit_face(light: Hsla, strength: f32, scope: bool) -> Div {
     let offset = (AREA - LIGHT) / 2.;
     div()
         .relative()
         .size(px(AREA))
         .flex_none()
+        .when(scope, |face| {
+            face.child(figure(|bounds, window, _| {
+                ring::paint_scope(bounds, window)
+            }))
+        })
         .child(
             div()
                 .absolute()
@@ -70,7 +92,7 @@ pub fn face(light: Hsla) -> Div {
                 .left(px(offset))
                 .size(px(LIGHT))
                 .rounded_full()
-                .shadow(ui::glow(light, LIGHT_BLUR, LIGHT_STRENGTH)),
+                .shadow(ui::glow(light, LIGHT_BLUR, strength)),
         )
         .child(
             canvas(

@@ -46,7 +46,7 @@ impl Dock {
                     this.refused = None;
                     cx.notify();
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
+                InputEvent::Focus | InputEvent::Blur => cx.notify(),
             },
         );
         Dock {
@@ -94,8 +94,9 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let value = self.input.read(cx).value();
+        let focused = self.typing(window, cx);
         let typed = http_url(&value);
         let probing = self
             .new_task
@@ -148,14 +149,30 @@ impl Render for Dock {
             .rounded_full()
             .bg(theme::deck())
             .border_1()
-            .border_color(theme::edge())
-            .shadow(vec![gpui_kit::BoxShadow {
-                color: theme::alpha(gpui_kit::black(), 0.45),
-                offset: gpui_kit::point(px(0.), px(18.)),
-                blur_radius: px(40.),
-                spread_radius: px(0.),
-                inset: false,
-            }])
+            .border_color(if focused {
+                theme::cyan_dim()
+            } else {
+                theme::edge()
+            })
+            .shadow(
+                [gpui_kit::BoxShadow {
+                    color: theme::alpha(gpui_kit::black(), 0.45),
+                    offset: gpui_kit::point(px(0.), px(18.)),
+                    blur_radius: px(40.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }]
+                .into_iter()
+                // 输入时外面一圈淡青的光环
+                .chain(focused.then(|| gpui_kit::BoxShadow {
+                    color: theme::alpha(theme::cyan(), 0.1),
+                    offset: gpui_kit::point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(3.),
+                    inset: false,
+                }))
+                .collect(),
+            )
             .child(ui::dot(theme::cyan(), 8.))
             .child(
                 div()

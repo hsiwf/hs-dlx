@@ -186,6 +186,56 @@ pub fn paint_bezel(bounds: Bounds<Pixels>, window: &mut Window) {
     minor.paint(window);
 }
 
+/// 待机时舞台的刻度面，以 `bounds` 的中心（表盘的圆心）为圆心：表盘外一圈细实线、一圈短划、一圈点，两条贯穿的准线
+/// 与准线上表盘外的短刻度（每 5 格一格长）。线会画出 `bounds`，由舞台裁掉；都很淡，只给舞台一层仪表的质感。
+pub fn paint_scope(bounds: Bounds<Pixels>, window: &mut Window) {
+    const SOLID: f32 = 300.;
+    const DASHED: f32 = 350.;
+    const DOTTED: f32 = 420.;
+    const REACH: f32 = 1600.;
+    const STEP: f32 = 24.;
+    let center = bounds.center();
+    window.paint_path(arc(center, SOLID, 1., 0., 1.), theme::hairline());
+    let mut dashes = PathBuilder::stroke(px(1.));
+    for i in 0..120 {
+        let from = i as f32 / 120.;
+        dashes.move_to(on_circle(center, DASHED, angle(from)));
+        dashes.line_to(on_circle(center, DASHED, angle(from + 1. / 360.)));
+    }
+    window.paint_path(
+        dashes.build().expect(TESSELLATED),
+        theme::alpha(theme::hover_edge(), 0.3),
+    );
+    let mut dots = Stroke::new(1.2, theme::alpha(theme::hover_edge(), 0.25), 0.6);
+    for i in 0..240 {
+        dots.tick(center, DOTTED, angle(i as f32 / 240.));
+    }
+    dots.paint(window);
+    let mut cross = PathBuilder::stroke(px(1.));
+    for (dx, dy) in [(1., 0.), (0., 1.)] {
+        cross.move_to(point(center.x - px(REACH * dx), center.y - px(REACH * dy)));
+        cross.line_to(point(center.x + px(REACH * dx), center.y + px(REACH * dy)));
+    }
+    window.paint_path(cross.build().expect(TESSELLATED), theme::hairline());
+    let mut marks = PathBuilder::stroke(px(1.));
+    let first = (AREA / 2. / STEP).ceil() as usize;
+    for k in first..(REACH / STEP) as usize {
+        let half = if k % 5 == 0 { 6. } else { 3. };
+        let at = k as f32 * STEP;
+        for sign in [-1., 1.] {
+            let along = px(sign * at);
+            marks.move_to(point(center.x + along, center.y - px(half)));
+            marks.line_to(point(center.x + along, center.y + px(half)));
+            marks.move_to(point(center.x - px(half), center.y + along));
+            marks.line_to(point(center.x + px(half), center.y + along));
+        }
+    }
+    window.paint_path(
+        marks.build().expect(TESSELLATED),
+        theme::alpha(theme::hover_edge(), 0.45),
+    );
+}
+
 /// 在 `bounds` 里画一个贴着边、宽 `width` 的环：底色 `track` 一整圈，上面从 12 点起顺时针画 `fraction`（0 到 1）
 /// 的 `color`。
 pub fn paint_arc(

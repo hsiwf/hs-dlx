@@ -553,6 +553,8 @@ pub fn stage(
         .flex_1()
         .min_w(px(min_width))
         .min_h_0()
+        // 表盘的背光与待机的刻度面不画出舞台
+        .overflow_hidden()
         .flex()
         .flex_col()
         .items_center()

@@ -17,11 +17,11 @@ mod title_bar;
 pub use self::quit::Leave;
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Window, div, px,
+    Subscription, Task, Window, div, px,
 };
 use hs_m3u8_app::TaskId;
 use hs_m3u8_instance::Handoff;
@@ -37,16 +37,14 @@ use crate::tasks::{Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 
-/// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图（待机页没有任务栏，比它们窄）。
+/// 待机页重画的间隔：彗尾 20 秒扫一圈 120 格，一帧前进一格。
+const STANDBY_FRAME: Duration = Duration::from_micros(166_667);
+
+/// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图。
 pub const MIN_WIDTH: f32 =
     2. * PAD + task_list::MIN_WIDTH + GAP + max(new_task::MIN_WIDTH, task_view::MIN_WIDTH);
 /// 窗口的最小高：放得下顶栏、最高的一个视图与下边距。
-pub const MIN_HEIGHT: f32 = TITLE_HEIGHT
-    + max(
-        max(task_view::MIN_HEIGHT, task_view::STANDBY_MIN_HEIGHT),
-        new_task::MIN_HEIGHT,
-    )
-    + PAD;
+pub const MIN_HEIGHT: f32 = TITLE_HEIGHT + max(task_view::MIN_HEIGHT, new_task::MIN_HEIGHT) + PAD;
 
 /// 主体显示的页。
 enum Page {
@@ -84,6 +82,10 @@ pub struct Shell {
     home: Option<PathBuf>,
     /// 剪贴板里一条还没下过、也不在探测中的 m3u8 链接
     clipboard: Option<hs_m3u8_core::Url>,
+    /// 待机页逐帧重画的定时器：在待机页时有，离开即释放（见 [`Shell::sync_standby`]）
+    standby_frames: Option<Task<()>>,
+    /// 这次进入待机页的时刻：彗尾与背光按它走
+    standby_since: Instant,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
     confirm_discard: Option<TaskId>,
     /// 正在改请求头的停着的任务与编辑框
@@ -119,6 +121,7 @@ impl Shell {
             if this.selected.is_none_or(|id| tasks.row(id).is_none()) {
                 this.selected = tasks.rows().last().map(|row| row.task.id);
             }
+            this.sync_standby(cx);
             cx.notify();
         });
         let selected = tasks.read(cx).rows().last().map(|row| row.task.id);
@@ -130,11 +133,14 @@ impl Shell {
             dock,
             home: dirs::home_dir(),
             clipboard: None,
+            standby_frames: None,
+            standby_since: Instant::now(),
             confirm_discard: None,
             editing_headers: None,
             _subscriptions: vec![typed, activated, changed],
         };
         shell.refresh_clipboard(cx);
+        shell.sync_standby(cx);
         if let Some(link) = link {
             shell.probe_text(&link, window, cx);
         }
@@ -221,7 +227,35 @@ impl Shell {
         let new_task = self.new_task().map(Entity::downgrade);
         self.dock
             .update(cx, |dock, cx| dock.set_new_task(new_task, cx));
+        self.sync_standby(cx);
         cx.notify();
+    }
+
+    /// 显示着待机页（任务页、没有任务）时每隔 [`STANDBY_FRAME`] 重画一次，让彗尾慢慢扫、背光起伏（系统要求减少动态
+    /// 效果时不画）；离开待机页即停。
+    fn sync_standby(&mut self, cx: &mut Context<Self>) {
+        let standby = matches!(self.page, Page::Task) && self.selected.is_none();
+        if !standby {
+            self.standby_frames = None;
+            return;
+        }
+        if self.standby_frames.is_some() {
+            return;
+        }
+        self.standby_since = Instant::now();
+        self.standby_frames = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(STANDBY_FRAME).await;
+                let closed = this.update(cx, |_, cx| {
+                    if !cx.reduce_motion() {
+                        cx.notify();
+                    }
+                });
+                if closed.is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     /// 打开设置页；已开着时关上。读不出设置时提示原因。
@@ -272,7 +306,7 @@ impl Shell {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let cx = &*cx;
         let tasks = self.tasks.read(cx);
@@ -283,10 +317,9 @@ impl Render for Shell {
             .gap(px(GAP))
             .px(px(PAD))
             .pb(px(PAD));
-        let listed = !tasks.rows().is_empty() || self.new_task().is_some() || self.sniff.is_some();
         // 网页显示着时占满主体，不显示任务栏
         let page_shown = matches!(&self.page, Page::Sniff(sniff) if sniff.read(cx).page_shown());
-        if !page_shown && listed {
+        if !page_shown {
             body = body.child(self.render_list(tasks, cx));
         }
         body = match &self.page {
@@ -298,7 +331,10 @@ impl Render for Shell {
                     let (stage, inspector) = self.render_task(row, now, cx);
                     body.child(stage).child(inspector)
                 }
-                None => body.child(self.render_standby(cx)),
+                None => {
+                    let (stage, inspector) = self.render_standby(tasks, window, cx);
+                    body.child(stage).child(inspector)
+                }
             },
         };
         div()
