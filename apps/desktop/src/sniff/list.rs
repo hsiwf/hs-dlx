@@ -53,7 +53,10 @@ impl SniffView {
             format!("找到 {} 条视频流", self.found.len())
         };
         let rows: Vec<AnyElement> = if self.found.is_empty() {
-            vec![ui::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element()]
+            vec![
+                ui::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element(),
+                self.probe_opened(cx).into_any_element(),
+            ]
         } else {
             self.rows(true, cx)
         };
@@ -92,10 +95,28 @@ impl SniffView {
                     .gap(px(10.))
                     .px(px(14.))
                     .pb(px(14.))
+                    .children(self.failure_note())
                     .children(self.offers(cx))
                     .children(self.notes().into_iter().map(ui::caption))
                     .children(self.error.clone().map(ui::error_text)),
             )
+    }
+
+    /// 页面打不开（导航没成、网页进程退出）时的原因与做法；没有时为 None。
+    fn failure_note(&self) -> Option<Div> {
+        self.failure
+            .as_ref()
+            .map(|reason| ui::note(format!("{reason}：刷新后重新找"), true))
+    }
+
+    /// 还没找到流时：打开的地址可能本身就是播放列表（缺请求头时源站回了网页），交回新建页改请求头。
+    fn probe_opened(&self, cx: &mut Context<Self>) -> gpui_kit::Stateful<Div> {
+        ui::button(
+            "probe-opened",
+            "当作播放列表探测",
+            Tone::Plain,
+            cx.listener(|this, _, _, cx| this.open_opened(cx)),
+        )
     }
 
     /// 网页加载到哪一步：状态点的颜色与说法。
@@ -186,26 +207,23 @@ impl SniffView {
             Err(reason) => column
                 .items_center()
                 .justify_center()
-                .child(ui::note(reason.clone(), true).max_w(px(440.))),
+                .gap(px(18.))
+                .child(ui::note(reason.clone(), true).max_w(px(440.)))
+                .child(self.probe_opened(cx)),
             Ok(_) if self.found.is_empty() => column
                 .items_center()
                 .justify_center()
                 .gap(px(18.))
                 .children(self.failure.is_none().then(|| self.scan_dial(cx)))
                 .child(self.waiting_text())
-                // 找不到流时，打开的地址可能本身就是播放列表（缺请求头时源站回了网页）：交回新建页改请求头
-                .child(ui::button(
-                    "probe-opened",
-                    "当作播放列表探测",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.open_opened(cx)),
-                )),
+                .child(self.probe_opened(cx)),
             Ok(_) => {
                 let checking = self
                     .found
                     .iter()
                     .any(|found| matches!(found.check, Check::Waiting | Check::Running));
                 column
+                    .children(self.failure_note())
                     .child(
                         div()
                             .flex()
@@ -328,7 +346,11 @@ impl SniffView {
                                 .child(format::clock(elapsed)),
                         ))
                     })
-                    .child(ui::caption("在找视频流")),
+                    .child(ui::caption(if self.load.shown.is_some() {
+                        "在找视频流"
+                    } else {
+                        "正在打开网页"
+                    })),
             )
     }
 

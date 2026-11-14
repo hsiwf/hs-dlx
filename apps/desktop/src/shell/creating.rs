@@ -12,6 +12,10 @@ use crate::sniff::{SniffEvent, SniffView, Verdict};
 impl Shell {
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(url) = links::http_url(text) else {
+            // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：回任务页，原因才看得见
+            if matches!(self.page, Page::Sniff(_) | Page::Settings { .. }) {
+                self.show(Page::Task, cx);
+            }
             self.dock
                 .update(cx, |dock, cx| dock.refuse(links::NOT_HTTP.to_owned(), cx));
             return;
@@ -251,12 +255,15 @@ impl Shell {
         self.new_task() == Some(view)
     }
 
-    /// 在嗅探页里打开网页 `url`（已开着的换成这个：先关掉它，它的网页与出口随之释放，新网页按此刻的设置定出口）。
+    /// 在嗅探页里打开网页 `url`（已开着的换成这个）。旧的视图连同它的网页与出口要到这一轮更新结束时才释放，新网页
+    /// 推迟到那之后再建，出口才按此刻的设置定（见 [`crate::web_route::WebRoute::acquire`]）。
     fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
         self.sniff = None;
-        let service = self.tasks.read(cx).service().clone();
-        let view = cx.new(|cx| SniffView::new(service, url, window, cx));
-        self.adopt_sniff(view, window, cx);
+        cx.defer_in(window, move |this, window, cx| {
+            let service = this.tasks.read(cx).service().clone();
+            let view = cx.new(|cx| SniffView::new(service, url, window, cx));
+            this.adopt_sniff(view, window, cx);
+        });
     }
 
     /// 让 `view` 成为嗅探页（已开着的换成它）并显示。

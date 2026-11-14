@@ -228,7 +228,10 @@ impl Shell {
                 Action::WriteRecorded => (
                     "write-recorded",
                     "写出已录的".to_owned(),
-                    Some(format!("不联网，写出 {}", format::clock(row.recorded())).into()),
+                    // 不知道已录多久（任务目录读不出、还没报进度）时不写，不写成 00:00
+                    Amount::of(row).map(|amount| {
+                        format!("不联网，写出 {}", format::clock(amount.duration)).into()
+                    }),
                 ),
                 Action::SwitchToHls => (
                     "switch-hls",
@@ -320,7 +323,9 @@ impl Shell {
                 primary: Some(ui::primary(
                     "stop",
                     "停止并写出",
-                    Some(format!("写出已录的 {}", format::clock(row.recorded())).into()),
+                    Amount::of(row).map(|amount| {
+                        format!("写出已录的 {}", format::clock(amount.duration)).into()
+                    }),
                     Tone::Rec,
                     true,
                     cx.listener(move |this, _, _, cx| {
@@ -447,18 +452,16 @@ impl Shell {
 
     /// 待机页的检查面板：新任务照着开始的保存位置、可用空间与网络，剪贴板里的链接，与能粘贴哪两种链接。
     fn standby_inspector(&self, tasks: &Tasks, cx: &Context<Self>) -> Div {
-        let free = match tasks.free_space() {
-            None => "—".to_owned(),
-            Some(Ok(bytes)) => format::bytes(*bytes),
-            Some(Err(_)) => "读不出".to_owned(),
+        let (free, no_space) = match tasks.free_space() {
+            None => ("—".to_owned(), None),
+            Some(Ok(bytes)) => (format::bytes(*bytes), None),
+            Some(Err(reason)) => ("读不出".to_owned(), Some(reason.clone())),
         };
-        let network = match tasks.service().settings() {
-            Ok(settings) => match settings.proxy {
-                Proxy::System => "跟随系统",
-                Proxy::Direct => "直连",
-                Proxy::Url(_) => "指定代理",
-            },
-            Err(_) => "读不出设置",
+        let (network, unreadable) = match &self.standby_proxy {
+            Ok(Proxy::System) => ("跟随系统", None),
+            Ok(Proxy::Direct) => ("直连", None),
+            Ok(Proxy::Url(_)) => ("指定代理", None),
+            Err(reason) => ("读不出", Some(format!("读不出设置：{reason}"))),
         };
         let mut body = vec![
             ui::reads(
@@ -473,6 +476,12 @@ impl Shell {
             )
             .into_any_element(),
         ];
+        body.extend(
+            [no_space, unreadable]
+                .into_iter()
+                .flatten()
+                .map(|reason| ui::error_text(reason).into_any_element()),
+        );
         if let Some(url) = self.clipboard.clone() {
             let host = url.host_str().unwrap_or_default().to_owned();
             let path = url.path().to_owned();

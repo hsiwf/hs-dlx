@@ -37,7 +37,7 @@ embed-resource = "=3.0.12"
 workspace = true
 
 # 安装包（cargo-packager，版本见 .github/workflows/desktop.yml）：macOS 出 .app 与 .dmg，Windows 出 NSIS 安装程序（装在
-# 当前用户下，不要管理员），Linux 出 deb（CI 只打这些，见 desktop.yml）。第三方声明当作资源放进去（各平台的位置见
+# 当前用户下，不要管理员），Linux 出 deb（按平台指定格式，见 Makefile 的 PACKAGE_FORMATS）。第三方声明当作资源放进去（各平台的位置见
 # settings.rs 的 installed_notices）
 [package.metadata.packager]
 product-name = "hs-m3u8"

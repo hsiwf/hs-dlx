@@ -276,8 +276,9 @@ impl NewTask {
             loop {
                 cx.background_executor().timer(dial::FRAME).await;
                 let going = this.update(cx, |this, cx| {
-                    let going = this.phase() == Phase::Probing && !cx.reduce_motion();
-                    if going {
+                    let going = this.phase() == Phase::Probing;
+                    // 减少动态效果可能随时开关：开着时不画，循环照旧，关掉后接着转
+                    if going && !cx.reduce_motion() {
                         cx.notify();
                     }
                     going

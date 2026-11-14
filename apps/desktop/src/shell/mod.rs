@@ -86,6 +86,8 @@ pub struct Shell {
     standby_frames: Option<Task<()>>,
     /// 这次进入待机页的时刻：彗尾与背光按它走
     standby_since: Instant,
+    /// 进入待机页时读到的代理设置（待机页写新任务经哪里走；在设置页改了之后回来会重读）；读不出时为原因
+    standby_proxy: Result<hs_m3u8_core::Proxy, String>,
     /// 点过一次「放弃任务」、等着再点一次确认的任务
     confirm_discard: Option<TaskId>,
     /// 正在改请求头的停着的任务与编辑框
@@ -135,6 +137,7 @@ impl Shell {
             clipboard: None,
             standby_frames: None,
             standby_since: Instant::now(),
+            standby_proxy: Ok(hs_m3u8_core::Proxy::System),
             confirm_discard: None,
             editing_headers: None,
             _subscriptions: vec![typed, activated, changed],
@@ -243,6 +246,13 @@ impl Shell {
             return;
         }
         self.standby_since = Instant::now();
+        self.standby_proxy = self
+            .tasks
+            .read(cx)
+            .service()
+            .settings()
+            .map(|settings| settings.proxy)
+            .map_err(|error| error.to_string());
         self.standby_frames = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(STANDBY_FRAME).await;

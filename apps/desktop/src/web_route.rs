@@ -5,9 +5,9 @@
 //! - 跟随系统：交给网页引擎自己照系统代理走（含自动代理配置 PAC 与自动发现）。
 //! - 直连、指定代理：网页指向本机的中转（hs-m3u8-relay），由它直连或经上游代理（可带口令）出去。中转在第一个这样的
 //!   网页建出时开，之后开到应用退出、端口不变（WebView2 同时开着的网页要同样的启动参数，网页关掉后它的浏览器进程还会
-//!   留一会儿，换了端口的新网页就建不出来）；没有网页开着时中转没有上游、一律回 502，不再借用已撤掉的上游。网页开着时
-//!   设置在直连与指定代理之间改了，之后的连接立即照新的走（见 [`WebRoute::setting_changed`]）；与跟随系统之间改的，
-//!   网页都关掉后才换。
+//!   留一会儿，换了端口的新网页就建不出来）；没有网页开着时中转没有上游，一律回 502。网页开着时设置在直连与指定代理
+//!   之间改了，之后的连接立即照新的走（见 [`WebRoute::setting_changed`]）；与跟随系统之间改的，网页都关掉后才换，
+//!   Windows 上要重启应用才换（见 [`hs_m3u8_webview::PROXY_FIXED_FOR_PROCESS`]），之前建网页时报原因。
 //!
 //! 平台不能单独设代理而设置是直连或指定代理时，不建网页（照系统代理走就违背了设置）。
 
@@ -71,6 +71,8 @@ pub struct WebRoute {
     open: Weak<Lease>,
     /// 中转与它此刻的上游：第一个经中转的网页建出时开，开到应用退出；没有网页开着时上游为 None
     relay: Option<(Relay, Current)>,
+    /// 进程里第一个网页照的是不是跟随系统；还没建过网页时为 None
+    first_system: Option<bool>,
     /// 中转报来的连不过去，由 `_dispatching` 在界面线程上发给订阅的嗅探页
     failed: mpsc::Sender<RelayFailure>,
     _dispatching: Task<()>,
@@ -100,6 +102,7 @@ impl WebRoute {
             WebRoute {
                 open: Weak::new(),
                 relay: None,
+                first_system: None,
                 failed,
                 _dispatching: dispatching,
             }
@@ -115,12 +118,22 @@ impl WebRoute {
     }
 
     /// 给一个要建的网页：网页该设的代理，网页开着期间持有。`setting` 为此刻设置里的代理。有网页开着时照它们的；
-    /// 设置与它们照的在跟随系统与另两种之间不同时，附上说明。平台不能单独设代理而设置要求、开不了中转时为原因。
+    /// 设置与它们照的在跟随系统与另两种之间不同时，附上说明。平台不能单独设代理而设置要求、开不了中转、Windows 上
+    /// 设置与进程里第一个网页照的在跟随系统与另两种之间不同（见 [`hs_m3u8_webview::PROXY_FIXED_FOR_PROCESS`]）时为原因。
     pub fn acquire(&mut self, setting: &Proxy) -> Result<(Rc<Lease>, Option<String>), String> {
+        let system = *setting == Proxy::System;
         if let Some(open) = self.open.upgrade() {
-            let note = (open.upstream.is_none() != (*setting == Proxy::System))
+            let note = (open.upstream.is_none() != system)
                 .then(|| "代理设置改过了：嗅探页的网页都关掉、再打开后才照新的走".to_owned());
             return Ok((open, note));
+        }
+        if hs_m3u8_webview::PROXY_FIXED_FOR_PROCESS
+            && self.first_system.is_some_and(|first| first != system)
+        {
+            return Err(
+                "代理设置在跟随系统与直连、指定代理之间改过：Windows 上要重启应用，网页才照新的设置打开"
+                    .to_owned(),
+            );
         }
         let lease = match upstream_of(setting) {
             None => Lease {
@@ -144,6 +157,7 @@ impl WebRoute {
         };
         let lease = Rc::new(lease);
         self.open = Rc::downgrade(&lease);
+        self.first_system.get_or_insert(system);
         Ok((lease, None))
     }
 

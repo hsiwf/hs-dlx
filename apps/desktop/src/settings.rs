@@ -279,7 +279,8 @@ impl SettingsView {
             .children(self.proxy_error.clone().map(ui::error_text))
             .child(ui::caption(
                 match hs_m3u8_webview::custom_proxy_supported() {
-                    Ok(()) => "在下的任务暂停再继续后才换；嗅探页开着的网页在直连与指定代理之间立即换，与跟随系统之间换要都关掉再开".to_owned(),
+                    Ok(()) if hs_m3u8_webview::PROXY_FIXED_FOR_PROCESS => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要重启应用".to_owned(),
+                    Ok(()) => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要把它们都关掉再开".to_owned(),
                     Err(reason) => format!(
                         "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
                     ),

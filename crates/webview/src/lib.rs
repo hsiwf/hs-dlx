@@ -10,7 +10,7 @@ pub mod cookies;
 mod failure;
 
 pub use failure::Failure;
-pub use proxy::{WebProxy, custom_proxy_supported};
+pub use proxy::{PROXY_FIXED_FOR_PROCESS, WebProxy, custom_proxy_supported};
 #[cfg(target_os = "linux")]
 mod linux;
 mod media;

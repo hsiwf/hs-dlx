@@ -286,7 +286,8 @@ impl SniffView {
             while since.elapsed() < SUGGEST_AFTER {
                 cx.background_executor().timer(dial::FRAME).await;
                 let closed = this.update(cx, |this, cx| {
-                    let searching = this.found.is_empty() && this.failure.is_none();
+                    let searching =
+                        this.webview.is_ok() && this.found.is_empty() && this.failure.is_none();
                     if searching && this.on_screen && !this.page_shown && !cx.reduce_motion() {
                         cx.notify();
                     }

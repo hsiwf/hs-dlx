@@ -6,7 +6,7 @@
 //! - Windows：能设，建网页时作为 WebView2 的启动参数传入（同一进程里同时开着的网页要用同样的参数，否则后建的建不
 //!   出来）。
 //!
-//! 所以 macOS 与 Windows 上同时开着的网页应当设同一个代理。
+//! 所以 macOS 与 Windows 上同时开着的网页应当设同一个代理；Windows 上更进一步，见 [`PROXY_FIXED_FOR_PROCESS`]。
 //!
 //! 引擎只收主机与端口，不收口令。设代理要在网页开始加载之前（见 [`crate::WebView::build`]）。
 
@@ -18,6 +18,10 @@ pub enum WebProxy {
     /// 经这个 HTTP 代理（用 CONNECT 建隧道）
     Http { host: String, port: u16 },
 }
+
+/// 这个平台上进程里第一个网页的代理要一直沿用：Windows 的网页都关掉后 WebView2 的浏览器进程还会留一会儿，它在时
+/// 启动参数不同的网页建不出来，而它什么时候退出不可知，按进程里一直沿用处理。别的平台上网页都关掉后即可换。
+pub const PROXY_FIXED_FOR_PROCESS: bool = cfg!(target_os = "windows");
 
 /// 这个平台的网页能不能设 [`WebProxy::Http`]；不能时为原因。
 pub fn custom_proxy_supported() -> Result<(), String> {
