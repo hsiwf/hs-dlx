@@ -17,7 +17,9 @@ use hs_m3u8_instance::{Handoff, Handoffs, Received};
 
 pub use self::operations::resume_label;
 pub use self::quit::Quit;
-pub use self::row::{Look, Row, finished_text, look};
+#[cfg(test)]
+pub use self::row::sample;
+pub use self::row::{Amount, Disk, Row, finished_text};
 use crate::signals::Level;
 use crate::wait::within;
 
@@ -110,14 +112,11 @@ impl Tasks {
     ) -> Self {
         let service = Rc::new(service);
         let now = Instant::now();
-        let mut notices = Vec::new();
+        let mut problems = Vec::new();
         let rows: Vec<Row> = match service.tasks() {
             Ok(tasks) => tasks.into_iter().map(|task| Row::new(task, now)).collect(),
             Err(error) => {
-                notices.push(Notice {
-                    id: 0,
-                    text: format!("读不出任务列表：{error}"),
-                });
+                problems.push(format!("读不出任务列表：{error}"));
                 Vec::new()
             }
         };
@@ -139,10 +138,7 @@ impl Tasks {
                 }
             }),
             Err(reason) => {
-                notices.push(Notice {
-                    id: notices.len() as u64,
-                    text: format!("收不了再次打开应用时转交的链接：{reason}"),
-                });
+                problems.push(format!("收不了再次打开应用时转交的链接：{reason}"));
                 Task::ready(())
             }
         };
@@ -171,8 +167,8 @@ impl Tasks {
             service,
             rows,
             folder,
-            next_notice: notices.len() as u64,
-            notices,
+            notices: Vec::new(),
+            next_notice: 0,
             quit: Quit::Staying,
             creating: 0,
             early: Vec::new(),
@@ -183,6 +179,9 @@ impl Tasks {
             _free_space: Task::ready(()),
             _quitting: quitting,
         };
+        for problem in problems {
+            tasks.add_notice(problem);
+        }
         let ids: Vec<TaskId> = tasks.rows.iter().map(|r| r.task.id).collect();
         for id in ids {
             tasks.after_stop(id, cx);
@@ -209,7 +208,7 @@ impl Tasks {
                 }
                 cx.emit(TasksEvent::HandedOver(handoff));
             }
-            Err(reason) => self.notify(format!("再次打开应用时转交的链接没收到：{reason}")),
+            Err(reason) => self.add_notice(format!("再次打开应用时转交的链接没收到：{reason}")),
         }
         cx.notify();
     }
@@ -261,13 +260,13 @@ impl Tasks {
             }
             Event::TotalUnsaved { id, error } => {
                 let title = self.title(id);
-                self.notify(format!(
+                self.add_notice(format!(
                     "没能记下「{title}」的总片数：{error}；任务照常下载，停下时再记"
                 ));
             }
             Event::Orphaned { paths, reason } => {
                 let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                self.notify(format!(
+                self.add_notice(format!(
                     "新建任务时存储写不进，任务已取消，但留下了不在任何任务名下的 {}：{reason}",
                     paths.join("、")
                 ));
@@ -311,7 +310,7 @@ impl Tasks {
             self.cancel_quit(format!("「{title}」停下时有要处理的，没有退出"));
         }
         for text in problems {
-            self.notify(text);
+            self.add_notice(text);
         }
         self.after_stop(id, cx);
         self.quit_if_idle(cx);
@@ -372,7 +371,7 @@ impl Tasks {
         let downloading: Vec<f32> = running
             .iter()
             .filter(|row| !row.recording())
-            .map(|row| look(row, now).fraction)
+            .map(|row| Amount::of(row).map_or(0., |amount| amount.fraction()))
             .collect();
         Activity {
             running: running.len(),
@@ -412,11 +411,15 @@ impl Tasks {
         &self.folder
     }
 
-    /// 新建任务默认保存到的目录换了（已存进设置）：按新目录读可用空间。
-    pub fn set_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+    /// 换新建任务默认保存到的目录：存进设置，存进了才换、按新目录读可用空间。存不进时为原因。
+    pub fn set_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) -> Result<(), String> {
+        self.service
+            .set_folder(&folder)
+            .map_err(|error| error.to_string())?;
         self.folder = folder;
         self.watch_free_space(cx);
         cx.notify();
+        Ok(())
     }
 
     pub fn free_space(&self) -> Option<&Result<u64, String>> {
@@ -427,8 +430,14 @@ impl Tasks {
         &self.notices
     }
 
-    /// 加一条提示（调用方随后通知窗口重画）。
-    pub fn notify(&mut self, text: String) {
+    /// 加一条提示并通知窗口重画。
+    pub fn tell(&mut self, text: String, cx: &mut Context<Self>) {
+        self.add_notice(text);
+        cx.notify();
+    }
+
+    /// 加一条提示；调用方随后通知窗口重画。
+    fn add_notice(&mut self, text: String) {
         self.notices.push(Notice {
             id: self.next_notice,
             text,

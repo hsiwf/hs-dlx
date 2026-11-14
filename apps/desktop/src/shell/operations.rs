@@ -8,24 +8,31 @@ use super::Shell;
 use crate::headers::HeadersEditor;
 
 impl Shell {
-    /// 继续：关掉请求头编辑框。
+    /// 继续：开始了就关掉请求头编辑框（没开始时编辑框里填的留着）。
     pub(super) fn resume(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        self.editing_headers = None;
-        self.tasks.update(cx, |tasks, cx| tasks.resume(id, cx));
+        if self.tasks.update(cx, |tasks, cx| tasks.resume(id, cx)) {
+            self.editing_headers = None;
+        }
     }
 
-    /// 不再续录，只写出已录的：关掉请求头编辑框。
+    /// 不再续录，只写出已录的：开始了就关掉请求头编辑框。
     pub(super) fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        self.editing_headers = None;
-        self.tasks
-            .update(cx, |tasks, cx| tasks.write_recorded(id, cx));
+        if self
+            .tasks
+            .update(cx, |tasks, cx| tasks.write_recorded(id, cx))
+        {
+            self.editing_headers = None;
+        }
     }
 
-    /// 改存本地 HLS 再跑：关掉请求头编辑框。
+    /// 改存本地 HLS 再跑：开始了就关掉请求头编辑框。
     pub(super) fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        self.editing_headers = None;
-        self.tasks
-            .update(cx, |tasks, cx| tasks.switch_to_hls(id, cx));
+        if self
+            .tasks
+            .update(cx, |tasks, cx| tasks.switch_to_hls(id, cx))
+        {
+            self.editing_headers = None;
+        }
     }
 
     /// 放弃任务：要删已下载内容的，第一次点只是要求确认。

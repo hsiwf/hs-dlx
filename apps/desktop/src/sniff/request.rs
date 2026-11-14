@@ -4,16 +4,14 @@ use hs_m3u8_core::{Url, check_option_header};
 use hs_m3u8_webview::cookies::Cookie;
 
 /// 要探测的一条流与它的来历。
-pub struct Stream<'a> {
-    pub stream: &'a Url,
+pub struct Stream {
+    pub url: Url,
     /// 报它的框架的地址，网页引擎给的；认不出是哪个框架（Linux）或框架不是 http(s) 的（about:blank、srcdoc）时为 None
-    pub frame: Option<&'a Url>,
+    pub frame: Option<Url>,
     /// 网页的 User-Agent，为空时不带
-    pub agent: &'a str,
+    pub agent: String,
     /// 找到这条流时已显示的顶层页面的地址，网页引擎给的；不是 http(s) 的为 None
-    pub top: Option<&'a Url>,
-    /// 网页引擎里会发往这条流的 Cookie
-    pub cookies: Vec<Cookie>,
+    pub top: Option<Url>,
 }
 
 /// 探测时带的请求头与没带上的 Cookie 个数。
@@ -24,7 +22,7 @@ pub struct Headers {
     pub skipped: usize,
 }
 
-/// 探测 `found.stream` 要带的请求头，都按核心的规则校验过：
+/// 探测 `stream` 要带的请求头，`cookies` 为网页引擎里会发往它的 Cookie；都按核心的规则校验过：
 ///
 /// - Referer：报它的框架的网站（origin，浏览器跨站时的默认做法；核心会把它发给分片与 key 所在的每个主机，完整的页面
 ///   地址里常有会话参数），认不出框架时为顶层页面的网站。只用网页引擎给的地址，网页自己说的一概不用（能伪造成别的
@@ -33,25 +31,25 @@ pub struct Headers {
 /// - Cookie：流与顶层页面同一站点、且报它的框架（网页引擎认得出的）也与流同一站点时全带；否则只带跨站也带的
 ///   （[`Cookie::cross_site`]）。别的站点的框架（如广告）能报任意地址，不能借它带上这个站点的登录 Cookie。放不进请求
 ///   头的跳过，计入 [`Headers::skipped`]。
-pub fn headers_for(found: &Stream<'_>) -> Result<Headers, String> {
+pub fn headers_for(stream: &Stream, cookies: &[Cookie]) -> Result<Headers, String> {
     let mut headers = Vec::new();
-    if let Some(origin) = found.frame.or(found.top)
-        && !(origin.scheme() == "https" && found.stream.scheme() == "http")
+    if let Some(origin) = stream.frame.as_ref().or(stream.top.as_ref())
+        && !(origin.scheme() == "https" && stream.url.scheme() == "http")
     {
         headers.push((
             "Referer".to_owned(),
             format!("{}/", origin.origin().ascii_serialization()),
         ));
     }
-    if !found.agent.is_empty() {
-        headers.push(("User-Agent".to_owned(), found.agent.to_owned()));
+    if !stream.agent.is_empty() {
+        headers.push(("User-Agent".to_owned(), stream.agent.clone()));
     }
-    let same_site = [found.top, found.frame]
-        .into_iter()
-        .all(|page| page.is_some_and(|page| same_site(page, found.stream)));
+    let same_site = [&stream.top, &stream.frame].into_iter().all(|page| {
+        page.as_ref()
+            .is_some_and(|page| same_site(page, &stream.url))
+    });
     let mut skipped = 0;
-    let pairs: Vec<String> = found
-        .cookies
+    let pairs: Vec<String> = cookies
         .iter()
         .filter(|cookie| same_site || cookie.cross_site)
         .filter_map(|cookie| {
@@ -102,30 +100,36 @@ mod tests {
         }
     }
 
-    fn found<'a>(stream: &'a Url, frame: Option<&'a Url>, top: Option<&'a Url>) -> Stream<'a> {
+    fn found(stream: &Url, frame: Option<&Url>, top: Option<&Url>) -> Stream {
         Stream {
-            stream,
-            frame,
-            agent: "",
-            top,
-            cookies: vec![
-                cookie("sid", "1", false),
-                cookie("cdn", "1", true),
-                cookie("", "1", true),
-                cookie("bad", "a\u{1}b", true),
-            ],
+            url: stream.clone(),
+            frame: frame.cloned(),
+            agent: String::new(),
+            top: top.cloned(),
         }
+    }
+
+    /// 同站的、跨站也带的、没名字的、值里有控制字符的各一个。
+    fn cookies() -> Vec<Cookie> {
+        vec![
+            cookie("sid", "1", false),
+            cookie("cdn", "1", true),
+            cookie("", "1", true),
+            cookie("bad", "a\u{1}b", true),
+        ]
     }
 
     #[test]
     fn referer_is_the_frame_site() {
         let stream = url("https://cdn.video.example/a/index.m3u8");
         let frame = url("https://www.video.example/watch?session=secret");
-        let made = headers_for(&Stream {
-            agent: "UA",
-            cookies: Vec::new(),
-            ..found(&stream, Some(&frame), None)
-        })
+        let made = headers_for(
+            &Stream {
+                agent: "UA".to_owned(),
+                ..found(&stream, Some(&frame), None)
+            },
+            &[],
+        )
         .unwrap();
         assert_eq!(
             made.headers,
@@ -139,19 +143,11 @@ mod tests {
         );
         // 认不出框架时为顶层页面的网站
         let top = url("https://www.video.example/list");
-        let made = headers_for(&Stream {
-            cookies: Vec::new(),
-            ..found(&stream, None, Some(&top))
-        })
-        .unwrap();
+        let made = headers_for(&found(&stream, None, Some(&top)), &[]).unwrap();
         assert_eq!(made.headers[0].1, "https://www.video.example/");
         // 从 https 页面请求 http 的流不带
         let plain = url("http://cdn.video.example/a/index.m3u8");
-        let made = headers_for(&Stream {
-            cookies: Vec::new(),
-            ..found(&plain, Some(&frame), None)
-        })
-        .unwrap();
+        let made = headers_for(&found(&plain, Some(&frame), None), &[]).unwrap();
         assert_eq!(made.headers, []);
     }
 
@@ -160,15 +156,15 @@ mod tests {
         let stream = url("https://cdn.video.example/a/index.m3u8");
         let top = url("https://www.video.example/watch/3");
         // 页面与报它的框架都同站：全带；没名字的、值里有控制字符的跳过并计数，不连累别的
-        let made = headers_for(&found(&stream, Some(&top), Some(&top))).unwrap();
+        let made = headers_for(&found(&stream, Some(&top), Some(&top)), &cookies()).unwrap();
         assert_eq!(made.headers.last().unwrap().1, "sid=1; cdn=1");
         assert_eq!(made.skipped, 2);
         // 别的站点的框架（广告）报的：只带跨站也带的
         let ad = url("https://ads.example.co.uk/slot");
-        let made = headers_for(&found(&stream, Some(&ad), Some(&top))).unwrap();
+        let made = headers_for(&found(&stream, Some(&ad), Some(&top)), &cookies()).unwrap();
         assert_eq!(made.headers.last().unwrap().1, "cdn=1");
         // 认不出框架时同样只带跨站也带的
-        let made = headers_for(&found(&stream, None, Some(&top))).unwrap();
+        let made = headers_for(&found(&stream, None, Some(&top)), &cookies()).unwrap();
         assert_eq!(made.headers.last().unwrap().1, "cdn=1");
         // 可注册域名按公共后缀列表算（example.co.uk，不是 co.uk）；协议不同不算同一站点
         assert!(same_site(

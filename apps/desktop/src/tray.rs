@@ -200,8 +200,7 @@ impl Tray {
         if let Err(error) = self.apply(&shown) {
             self.broken = true;
             tasks.update(cx, |tasks, cx| {
-                tasks.notify(format!("托盘图标出错，之后不再更新：{error}"));
-                cx.notify();
+                tasks.tell(format!("托盘图标出错，之后不再更新：{error}"), cx)
             });
             return;
         }

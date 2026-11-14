@@ -75,15 +75,17 @@ impl Shell {
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
                     NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
+                    // 这个任务照选的存；记成之后新建的默认位置，记不下时提示
                     NewTaskEvent::FolderChanged(folder) => {
-                        this.tasks.update(cx, |tasks, cx| {
-                            if let Err(error) = tasks.service().set_folder(folder) {
-                                tasks.notify(format!(
-                                    "新的保存位置没能记下，下次打开时不在：{error}"
-                                ));
-                            }
-                            tasks.set_folder(folder.clone(), cx);
-                        });
+                        let saved = this
+                            .tasks
+                            .update(cx, |tasks, cx| tasks.set_folder(folder.clone(), cx));
+                        if let Err(error) = saved {
+                            this.tell(
+                                format!("新的保存位置没能记成默认的，下次新建时不在：{error}"),
+                                cx,
+                            );
+                        }
                     }
                 }
                 cx.notify();
@@ -182,6 +184,7 @@ impl Shell {
             Verdict::Page => None,
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
+            Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),
             Verdict::Download => Some("网页引擎打开它是要下载的文件，不是网页".to_owned()),
             Verdict::Broken(reason) => Some(format!("在网页里也打不开：{reason}")),
         };
@@ -231,7 +234,7 @@ impl Shell {
                         Err(error) if this.showing(&view) => {
                             view.update(cx, |view, cx| view.failed(error, cx))
                         }
-                        Err(error) => this.notify(format!("新建 {shown} 失败：{error}"), cx),
+                        Err(error) => this.tell(format!("新建 {shown} 失败：{error}"), cx),
                     }
                     cx.notify();
                 })
@@ -239,8 +242,7 @@ impl Shell {
             // 等待期间窗口关掉了：建成的已在列表里，失败改为提示
             if closed && let Some(error) = failure {
                 tasks.update(cx, |tasks, cx| {
-                    tasks.notify(format!("新建 {shown} 失败：{error}"));
-                    cx.notify();
+                    tasks.tell(format!("新建 {shown} 失败：{error}"), cx)
                 });
             }
         })

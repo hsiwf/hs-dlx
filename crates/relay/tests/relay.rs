@@ -168,7 +168,7 @@ fn relay_reporting(
         failures
             .lock()
             .unwrap()
-            .push((target.host.clone(), reason.to_owned()));
+            .push((target.host.to_string(), reason.to_owned()));
     });
     Relay::start(route, report).unwrap()
 }
@@ -289,6 +289,19 @@ async fn failures_are_answered_and_reported() {
     let response = fetch(&relay, "http://127.0.0.1:1/a").await;
     assert!(response.starts_with("HTTP/1.1 502"), "{response}");
     assert_eq!(failures.lock().unwrap()[0].0, "127.0.0.1");
+
+    // IPv6 的目标照 URL 的写法报出（带方括号），与打开的地址的主机能比较
+    let mut stream = TcpStream::connect(("127.0.0.1", relay.port()))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"CONNECT [::1]:1 HTTP/1.1\r\nHost: [::1]:1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    assert_eq!(failures.lock().unwrap()[1].0, "[::1]");
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@
 
 mod creating;
 mod live_view;
+mod look;
 mod notices;
 mod operations;
 mod paste_bar;
@@ -72,7 +73,7 @@ enum Page {
 /// 主窗口的视图：任务状态在 [`Tasks`] 里，这里是这个窗口自己的（选中哪个任务、显示哪一页、粘贴栏、嗅探页）。
 pub struct Shell {
     tasks: Entity<Tasks>,
-    /// 选中的任务；不在列表里（已移除）或没选过时为最新的一个，见 [`Shell::selected_row`]
+    /// 选中的任务：打开窗口时与选中的被移除时为最新的一个；没有任务时为 None
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
     page: Page,
@@ -121,7 +122,14 @@ impl Shell {
                 this.refresh_clipboard(cx);
             }
         });
-        let changed = cx.observe(&tasks, |_, _, cx| cx.notify());
+        // 选中的一行被移除（放弃、从列表移除）时改选当时最新的一行
+        let changed = cx.observe(&tasks, |this: &mut Self, tasks, cx| {
+            let tasks = tasks.read(cx);
+            if this.selected.is_none_or(|id| tasks.row(id).is_none()) {
+                this.selected = tasks.rows().last().map(|row| row.task.id);
+            }
+            cx.notify();
+        });
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             // 视图已不在时没有要问的
@@ -144,9 +152,10 @@ impl Shell {
             }
             close
         });
+        let selected = tasks.read(cx).rows().last().map(|row| row.task.id);
         let mut shell = Shell {
             tasks,
-            selected: None,
+            selected,
             page: Page::Task,
             sniff: None,
             paste,
@@ -170,7 +179,7 @@ impl Shell {
             if self.new_task().is_some() {
                 self.paste
                     .update(cx, |input, cx| input.set_value(link, window, cx));
-                self.notify(
+                self.tell(
                     "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
                         .to_owned(),
                     cx,
@@ -189,19 +198,14 @@ impl Shell {
         self.probe(text, window, cx);
     }
 
-    /// 选中的一行：选过的还在列表里时为它，否则为最新的一行；没有任务时为 None。
+    /// 选中的一行；没有任务时为 None。
     fn selected_row<'a>(&self, tasks: &'a Tasks) -> Option<&'a Row> {
-        self.selected
-            .and_then(|id| tasks.row(id))
-            .or_else(|| tasks.rows().last())
+        self.selected.and_then(|id| tasks.row(id))
     }
 
     /// 加一条要用户关掉的提示。
-    fn notify(&mut self, text: String, cx: &mut Context<Self>) {
-        self.tasks.update(cx, |tasks, cx| {
-            tasks.notify(text);
-            cx.notify();
-        });
+    fn tell(&mut self, text: String, cx: &mut Context<Self>) {
+        self.tasks.update(cx, |tasks, cx| tasks.tell(text, cx));
     }
 
     /// 重读剪贴板：是 http(s) 的 m3u8 链接、不是已有任务也不在探测中时记下，供一键探测。
@@ -251,23 +255,19 @@ impl Shell {
             self.show(Page::Task, cx);
             return;
         }
-        let tasks = self.tasks.read(cx);
-        let (service, folder) = (tasks.service().clone(), tasks.folder().clone());
-        let proxy = match service.settings() {
+        let proxy = match self.tasks.read(cx).service().settings() {
             Ok(settings) => settings.proxy,
             Err(error) => {
-                self.notify(format!("读不出设置：{error}"), cx);
+                self.tell(format!("读不出设置：{error}"), cx);
                 return;
             }
         };
         let home = self.home.clone();
-        let view = cx.new(|cx| SettingsView::new(service, folder, home, proxy, window, cx));
+        let tasks = self.tasks.clone();
+        let view = cx.new(|cx| SettingsView::new(tasks, home, proxy, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
                 SettingsEvent::Dismissed => this.show(Page::Task, cx),
-                SettingsEvent::FolderChanged(folder) => this
-                    .tasks
-                    .update(cx, |tasks, cx| tasks.set_folder(folder.clone(), cx)),
             }
             cx.notify();
         });

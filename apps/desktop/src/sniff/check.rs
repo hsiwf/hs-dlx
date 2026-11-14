@@ -20,14 +20,6 @@ const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 秒、第一次重试前等约 0.5 秒，30 秒容得下一次连接超时后再试一次。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 要探测的流与它的来历（[`request::Stream`] 的拥有版）。
-struct Target {
-    stream: Url,
-    frame: Option<Url>,
-    top: Option<Url>,
-    agent: String,
-}
-
 impl SniffView {
     /// 没在探测时，探测下一条等着的流。网页建不出来时不探测（列表里写着原因）。
     pub(super) fn check_next(&mut self, cx: &mut Context<Self>) {
@@ -46,8 +38,8 @@ impl SniffView {
         };
         found.check = Check::Running;
         let cookies = cookies_for(webview.read(cx).raw(), &found.url);
-        let target = Target {
-            stream: found.url.clone(),
+        let target = request::Stream {
+            url: found.url.clone(),
             frame: found.frame.clone(),
             top: found.top.clone(),
             agent: found.agent.clone(),
@@ -91,7 +83,7 @@ impl SniffView {
 async fn run(
     service: &Rc<Service>,
     cookies: impl Future<Output = Result<Vec<Cookie>, String>>,
-    target: &Target,
+    target: &request::Stream,
     executor: &BackgroundExecutor,
 ) -> (Check, usize) {
     let cookies = within(std::pin::pin!(cookies), executor.timer(COOKIE_TIMEOUT))
@@ -102,15 +94,7 @@ async fn run(
                 COOKIE_TIMEOUT.as_secs()
             ))
         });
-    let made = cookies.and_then(|cookies| {
-        request::headers_for(&request::Stream {
-            stream: &target.stream,
-            frame: target.frame.as_ref(),
-            agent: &target.agent,
-            top: target.top.as_ref(),
-            cookies,
-        })
-    });
+    let made = cookies.and_then(|cookies| request::headers_for(target, &cookies));
     let made = match made {
         Ok(made) => made,
         Err(reason) => {
@@ -123,7 +107,7 @@ async fn run(
             );
         }
     };
-    let mut source = Source::new(target.stream.clone());
+    let mut source = Source::new(target.url.clone());
     source.http.headers.clone_from(&made.headers);
     let failed = |reason| Check::Failed {
         reason,

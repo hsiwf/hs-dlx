@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 
-use hs_m3u8_core::Proxy;
+use hs_m3u8_core::{Proxy, Url};
 
 use crate::preference::StoredPreference;
 use crate::{
     Error, Failure, FailureKind, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec,
-    naming, settings,
+    naming,
 };
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
@@ -154,7 +154,7 @@ fn rebuild_with_work_dir_and_result(tx: &Transaction<'_>) -> Result<(), Error> {
 }
 
 /// 第 3 版：设置（[`crate::Settings`]）只有一行，编号固定为 1；保存目录为 NULL 时没设过，代理的写法见
-/// [`crate::settings::proxy_code`]。
+/// [`proxy_code`]。
 fn create_settings_table(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
         "CREATE TABLE settings (
@@ -639,7 +639,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         .transpose()?;
     Ok(Settings {
         folder,
-        proxy: settings::parse_proxy(&proxy)?,
+        proxy: parse_proxy(&proxy)?,
     })
 }
 
@@ -656,9 +656,32 @@ pub fn set_folder(tx: &Transaction<'_>, folder: &Path) -> Result<(), Error> {
 pub fn set_proxy(tx: &Transaction<'_>, proxy: &Proxy) -> Result<(), Error> {
     tx.execute(
         "UPDATE settings SET proxy = ?1 WHERE id = 1",
-        params![settings::proxy_code(proxy)],
+        params![proxy_code(proxy)],
     )?;
     Ok(())
+}
+
+/// 代理在存储里的写法：`system`、`direct`，或 `url:<代理地址>`（明文，可带口令，与请求头一样只有本人可读写）。
+/// 存储格式的一部分，表上有 CHECK。
+fn proxy_code(proxy: &Proxy) -> String {
+    match proxy {
+        Proxy::System => "system".to_owned(),
+        Proxy::Direct => "direct".to_owned(),
+        Proxy::Url(url) => format!("url:{url}"),
+    }
+}
+
+/// 读回 [`proxy_code`] 的写法；认不出时报 [`Error::Corrupt`]。
+fn parse_proxy(code: &str) -> Result<Proxy, Error> {
+    match code {
+        "system" => Ok(Proxy::System),
+        "direct" => Ok(Proxy::Direct),
+        _ => code
+            .strip_prefix("url:")
+            .and_then(|url| Url::parse(url).ok())
+            .map(Proxy::Url)
+            .ok_or_else(|| Error::Corrupt("设置里的代理".to_owned())),
+    }
 }
 
 /// 输出在表里的三列：种类与两个路径。
@@ -708,6 +731,18 @@ mod tests {
     use hs_m3u8_core::hls::Preference;
 
     use super::*;
+
+    #[test]
+    fn proxies_read_back_as_written() {
+        for proxy in [
+            Proxy::System,
+            Proxy::Direct,
+            Proxy::Url(Url::parse("socks5h://user:pass@127.0.0.1:1080").unwrap()),
+        ] {
+            assert!(parse_proxy(&proxy_code(&proxy)).unwrap() == proxy);
+        }
+        assert!(matches!(parse_proxy("pac:x"), Err(Error::Corrupt(_))));
+    }
 
     fn spec(output: OutputSpec) -> TaskSpec {
         TaskSpec {

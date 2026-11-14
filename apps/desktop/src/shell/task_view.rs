@@ -10,11 +10,12 @@ use gpui_kit::{
 use hs_m3u8_app::Status;
 use hs_m3u8_core::bare_url;
 
+use super::look::look;
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::ring;
 use crate::signals::{Level, Signal};
-use crate::tasks::{Row, look, resume_label};
+use crate::tasks::{Row, resume_label};
 use crate::theme;
 use crate::ui::{self, BOTTOM, BUTTON_HEIGHT, CAPTION_LINE, GAP, TEXT_LINE, Tone, max};
 

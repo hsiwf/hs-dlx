@@ -10,38 +10,34 @@ const MAX_HEAD: usize = 64 * 1024;
 /// 一条连接要去的地方。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// 主机名或 IP（IPv6 不带方括号）
-    pub host: String,
+    /// 与 [`Url::host`] 同样规范化（域名小写、IPv6 不带方括号）：可以直接与打开的地址的主机比较
+    pub host: Host<String>,
     pub port: u16,
     /// 经 CONNECT 建隧道来的；否则是写着完整地址的 http 请求
     pub tunnel: bool,
 }
 
 impl Target {
-    /// 按 URL 写法的地址，供按协议选代理：隧道到 80 端口与 http 请求为 `http://`，别的隧道多为 HTTPS，为
-    /// `https://`（隧道里是什么协议看不出，只能按端口猜）。
-    pub fn url(&self) -> Url {
-        let scheme = if !self.tunnel || self.port == 80 {
-            "http"
-        } else {
-            "https"
-        };
-        let host = match self.host.parse::<std::net::Ipv6Addr>() {
-            Ok(_) => format!("[{}]", self.host),
-            Err(_) => self.host.clone(),
-        };
-        Url::parse(&format!("{scheme}://{host}:{}/", self.port))
-            .expect("主机名与端口由 URL 解析得来，拼回去仍是合法的 URL")
+    /// 「主机:端口」，IPv6 带方括号：CONNECT 请求的写法。
+    pub fn authority(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// 连接用的主机名或地址（IPv6 不带方括号）。
+    pub(crate) fn hostname(&self) -> String {
+        match &self.host {
+            Host::Domain(domain) => domain.clone(),
+            Host::Ipv4(address) => address.to_string(),
+            Host::Ipv6(address) => address.to_string(),
+        }
     }
 }
 
 /// 读出的请求头。
 pub(crate) struct Head {
     pub target: Target,
-    /// CONNECT 请求
-    pub connect: bool,
     method: String,
-    /// http 请求的完整地址
+    /// http 请求的完整地址；CONNECT 时为 None
     url: Option<Url>,
     version: String,
     /// 请求行之后的各行原样（不含结尾的空行）
@@ -86,43 +82,40 @@ pub(crate) async fn read_head(client: &mut TcpStream) -> Result<Head, HeadError>
     else {
         return Err(HeadError::Bad(format!("认不出的请求行：{request}")));
     };
-    let connect = method.eq_ignore_ascii_case("CONNECT");
-    let url = if connect {
-        // CONNECT 的目标为「主机:端口」，借 URL 解析出主机与端口
-        Url::parse(&format!("http://{target}/"))
+    let tunnel = method.eq_ignore_ascii_case("CONNECT");
+    let (host, port, url) = if tunnel {
+        // CONNECT 的目标为「主机:端口」，端口必须写
+        let (host, port) = target
+            .rsplit_once(':')
+            .ok_or_else(|| HeadError::Bad(format!("CONNECT 的目标要写端口：{target}")))?;
+        let host =
+            Host::parse(host).map_err(|_| HeadError::Bad(format!("认不出的主机：{target}")))?;
+        let port = port
+            .parse()
+            .map_err(|_| HeadError::Bad(format!("认不出的端口：{target}")))?;
+        (host, port, None)
     } else {
-        Url::parse(target)
-    }
-    .map_err(|_| HeadError::Bad(format!("认不出的目标：{target}")))?;
-    if !connect && url.scheme() != "http" {
-        return Err(HeadError::Bad(format!(
-            "只转发 http 地址，{} 地址要用 CONNECT",
-            url.scheme()
-        )));
-    }
-    let host = match url.host() {
-        Some(Host::Domain(domain)) => domain.to_owned(),
-        Some(Host::Ipv4(address)) => address.to_string(),
-        Some(Host::Ipv6(address)) => address.to_string(),
-        None => return Err(HeadError::Bad(format!("目标没有主机：{target}"))),
-    };
-    let port = match (connect, url.port_or_known_default()) {
-        // CONNECT 必须写端口：没写时 URL 照 http 补成 80，这里拒绝
-        (true, _) if url.port().is_none() && !target.ends_with(":80") => {
-            return Err(HeadError::Bad(format!("CONNECT 的目标要写端口：{target}")));
+        let url =
+            Url::parse(target).map_err(|_| HeadError::Bad(format!("认不出的目标：{target}")))?;
+        if url.scheme() != "http" {
+            return Err(HeadError::Bad(format!(
+                "只转发 http 地址，{} 地址要用 CONNECT",
+                url.scheme()
+            )));
         }
-        (_, Some(port)) => port,
-        (_, None) => return Err(HeadError::Bad(format!("目标没有端口：{target}"))),
+        let host = url
+            .host()
+            .ok_or_else(|| HeadError::Bad(format!("目标没有主机：{target}")))?
+            .to_owned();
+        let port = url
+            .port_or_known_default()
+            .expect("http 地址总有端口（没写时为 80）");
+        (host, port, Some(url))
     };
     Ok(Head {
-        target: Target {
-            host,
-            port,
-            tunnel: connect,
-        },
-        connect,
+        target: Target { host, port, tunnel },
         method: method.to_owned(),
-        url: (!connect).then_some(url),
+        url,
         version: version.to_owned(),
         lines: lines.collect(),
         rest,
@@ -182,15 +175,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn targets_choose_the_scheme_used_to_pick_a_proxy() {
-        let target = |port, tunnel| Target {
-            host: "::1".to_owned(),
-            port,
-            tunnel,
+    fn ipv6_targets_keep_brackets_only_in_the_authority() {
+        let target = Target {
+            host: Host::parse("[::1]").unwrap(),
+            port: 443,
+            tunnel: true,
         };
-        assert_eq!(target(443, true).url().as_str(), "https://[::1]/");
-        assert_eq!(target(80, true).url().as_str(), "http://[::1]/");
-        assert_eq!(target(8080, false).url().as_str(), "http://[::1]:8080/");
+        assert_eq!(target.authority(), "[::1]:443");
+        assert_eq!(target.hostname(), "::1");
     }
 
     #[test]

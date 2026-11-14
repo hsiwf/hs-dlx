@@ -18,8 +18,7 @@ use objc2::{MainThreadMarker, class, ffi, msg_send, sel};
 /// GPUI 注册的应用代理类名，见 gpui-pre-macos 0.3.12 的 `platform.rs`（进程加载时注册）。
 const DELEGATE_CLASS: &CStr = c"GPUIApplicationDelegate";
 
-/// `NSApplicationTerminateReply` 的取值。
-const TERMINATE_CANCEL: usize = 0;
+/// `NSApplicationTerminateReply` 的取值（取消为 0，不用：不退出经 Later 再答）。
 const TERMINATE_NOW: usize = 1;
 const TERMINATE_LATER: usize = 2;
 
@@ -35,11 +34,10 @@ pub enum Error {
     NotInstalled,
 }
 
-/// 系统要求退出时的答复。
+/// 系统要求退出时的答复。不退出也经 `Later` 与 [`reply_to_terminate`] 答（问的人只能在问完后知道）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
     Now,
-    Cancel,
     /// 先不答复，问完再调 [`reply_to_terminate`]
     Later,
 }
@@ -135,7 +133,6 @@ extern "C-unwind" fn should_terminate(_: *mut AnyObject, _: Sel, _: *mut AnyObje
     });
     match reply {
         Reply::Now => TERMINATE_NOW,
-        Reply::Cancel => TERMINATE_CANCEL,
         Reply::Later => {
             PENDING.set(true);
             TERMINATE_LATER

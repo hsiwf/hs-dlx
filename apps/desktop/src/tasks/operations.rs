@@ -169,36 +169,36 @@ impl Tasks {
         .detach();
     }
 
-    /// 继续：先读出任务目录里已有的，作本次运行的起点，再开始；读的期间这一行不能再操作。退出中不继续。
-    pub fn resume(&mut self, id: TaskId, cx: &mut Context<Self>) {
+    /// 继续：先读出任务目录里已有的，作本次运行的起点，再开始；读的期间这一行不能再操作。退出中不继续。开始了时为
+    /// true（下同）。
+    pub fn resume(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         if self.quitting() {
-            self.notify("正在退出，不再继续任务".to_owned());
-            cx.notify();
-            return;
+            self.tell("正在退出，不再继续任务".to_owned(), cx);
+            return false;
         }
         let Some(row) = self.row_mut(id) else {
-            return;
+            return false;
         };
         if !row.idle() {
-            return;
+            return false;
         }
         row.resuming = true;
         self.inspect(id, true, cx);
         cx.notify();
+        true
     }
 
     /// 不再续录，只把直播录制已录的写成输出；退出中不开始。
-    pub fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) {
+    pub fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         let title = self.title(id);
         if self.quitting() {
-            self.notify(format!("正在退出，「{title}」没有写出"));
-            cx.notify();
-            return;
+            self.tell(format!("正在退出，「{title}」没有写出"), cx);
+            return false;
         }
         if !self.row(id).is_some_and(Row::idle) {
-            return;
+            return false;
         }
-        match self.service.write_recorded(id) {
+        let started = match self.service.write_recorded(id) {
             Ok(task) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 // 核心报出进度之前，已录时长先按停下时知道的显示
@@ -209,22 +209,26 @@ impl Tasks {
                 // 写出不联网，没有下载速度与剩余时间可估
                 row.rate = Rate::new(Instant::now(), None);
                 row.signal(Level::Info, "不再续录，写出已录的".to_owned());
+                true
             }
-            Err(error) => self.notify(format!("写出「{title}」已录的失败：{error}")),
-        }
+            Err(error) => {
+                self.add_notice(format!("写出「{title}」已录的失败：{error}"));
+                false
+            }
+        };
         cx.notify();
+        started
     }
 
     /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。
-    pub fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) {
+    pub fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         let title = self.title(id);
         if self.quitting() {
-            self.notify(format!("正在退出，「{title}」没有改存本地 HLS"));
-            cx.notify();
-            return;
+            self.tell(format!("正在退出，「{title}」没有改存本地 HLS"), cx);
+            return false;
         }
         let Some(live) = self.row(id).filter(|row| row.idle()).map(Row::recording) else {
-            return;
+            return false;
         };
         match self.service.switch_to_hls(id) {
             Ok(task) => {
@@ -232,15 +236,14 @@ impl Tasks {
                 row.set_output(task.spec.output);
             }
             Err(error) => {
-                self.notify(format!("「{title}」没能改存本地 HLS：{error}"));
-                cx.notify();
-                return;
+                self.tell(format!("「{title}」没能改存本地 HLS：{error}"), cx);
+                return false;
             }
         }
         if live {
-            self.write_recorded(id, cx);
+            self.write_recorded(id, cx)
         } else {
-            self.resume(id, cx);
+            self.resume(id, cx)
         }
     }
 
@@ -255,7 +258,7 @@ impl Tasks {
             return;
         }
         if quitting {
-            self.notify(format!("正在退出，「{title}」没有继续"));
+            self.add_notice(format!("正在退出，「{title}」没有继续"));
             return;
         }
         let (baseline, start) = match &row.disk {
@@ -284,7 +287,7 @@ impl Tasks {
                 };
                 row.signal(Level::Info, text);
             }
-            Err(error) => self.notify(format!("继续「{title}」失败：{error}")),
+            Err(error) => self.add_notice(format!("继续「{title}」失败：{error}")),
         }
     }
 
@@ -317,7 +320,7 @@ impl Tasks {
                             let row = this.row_mut(id).expect("上面刚找到这一行");
                             row.task.status = task.status;
                         }
-                        Err(error) => this.notify(format!(
+                        Err(error) => this.add_notice(format!(
                             "读不出「{title}」放弃后的状态（{error}），界面上的状态可能不对"
                         )),
                     }
@@ -329,7 +332,7 @@ impl Tasks {
                     this.cancel_quit("放弃没做干净，没有退出".to_owned());
                 }
                 for text in problems {
-                    this.notify(text);
+                    this.add_notice(text);
                 }
                 this.after_stop(id, cx);
                 this.quit_if_idle(cx);
@@ -345,7 +348,7 @@ impl Tasks {
             Ok(()) => self.rows.retain(|row| row.task.id != id),
             Err(error) => {
                 let title = self.title(id);
-                self.notify(format!("移除「{title}」失败：{error}"));
+                self.add_notice(format!("移除「{title}」失败：{error}"));
             }
         }
         cx.notify();
@@ -365,13 +368,14 @@ impl Tasks {
                     row.task.spec.headers = headers;
                 }
                 if resume {
-                    self.resume(id, cx);
+                    // 开始不了时原因已提示
+                    let _started = self.resume(id, cx);
                 }
                 true
             }
             Err(error) => {
                 let title = self.title(id);
-                self.notify(format!("改「{title}」的请求头失败：{error}"));
+                self.add_notice(format!("改「{title}」的请求头失败：{error}"));
                 false
             }
         };

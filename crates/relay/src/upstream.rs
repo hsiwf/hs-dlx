@@ -28,21 +28,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 /// 照 `upstream` 连上 `target`：经 HTTP(S) 代理时用 CONNECT 建隧道。连不上、上游拒绝、超时时为原因。
 pub(crate) async fn connect(upstream: &Upstream, target: &Target) -> Result<Stream, String> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_now(upstream, target))
+    within(&target.authority(), connect_now(upstream, target)).await
+}
+
+/// 连 `what` 最多等 [`CONNECT_TIMEOUT`]：解析、连接、TLS 与代理握手都算在内。
+async fn within<T>(
+    what: &str,
+    connecting: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "{} 秒没能连上 {}:{}",
-                CONNECT_TIMEOUT.as_secs(),
-                target.host,
-                target.port
-            ))
-        })
+        .unwrap_or_else(|_| Err(format!("{} 秒没能连上 {what}", CONNECT_TIMEOUT.as_secs())))
 }
 
 async fn connect_now(upstream: &Upstream, target: &Target) -> Result<Stream, String> {
-    let host = target.host.as_str();
-    let port = target.port;
+    let hostname = target.hostname();
+    let (host, port) = (hostname.as_str(), target.port);
     let proxy = match upstream {
         Upstream::Direct => {
             let stream = TcpStream::connect((host, port))
@@ -58,14 +59,15 @@ async fn connect_now(upstream: &Upstream, target: &Target) -> Result<Stream, Str
         .trim_start_matches('[')
         .trim_end_matches(']');
     let socks = (proxy_host, proxy.port().unwrap_or(SOCKS_PORT));
-    let (user, password) = credentials(proxy)?;
     let failed = |error: tokio_socks::Error| format!("经 SOCKS 代理连不上 {host}:{port}：{error}");
+    if is_http(proxy) {
+        let mut stream = open_now(proxy).await?;
+        handshake(&mut stream, target, basic_auth(proxy).as_deref()).await?;
+        return Ok(stream);
+    }
+    // SOCKS 认证要文本
+    let (user, password) = credentials(proxy)?;
     let stream: Stream = match proxy.scheme() {
-        "http" | "https" => {
-            let mut stream = open_proxy(proxy).await?;
-            handshake(&mut stream, target, basic_auth(proxy).as_deref()).await?;
-            stream
-        }
         // socks5h 与 socks4a 把主机名交给代理解析；socks5 与 socks4 先在本机解析
         "socks5h" => Box::new(
             socks5(socks, (host, port), &user, &password)
@@ -125,8 +127,16 @@ pub(crate) fn is_http(proxy: &Url) -> bool {
     matches!(proxy.scheme(), "http" | "https")
 }
 
-/// 连上上游 HTTP(S) 代理本身：https 的这一段走 TLS，按系统的证书校验代理的证书。
+/// 连上上游 HTTP(S) 代理本身：https 的这一段走 TLS，按系统的证书校验代理的证书。最多等 [`CONNECT_TIMEOUT`]。
 pub(crate) async fn open_proxy(proxy: &Url) -> Result<Stream, String> {
+    within(
+        &format!("代理 {}", proxy.host_str().unwrap_or_default()),
+        open_now(proxy),
+    )
+    .await
+}
+
+async fn open_now(proxy: &Url) -> Result<Stream, String> {
     let host = proxy
         .host_str()
         .ok_or_else(|| "代理地址没有主机".to_owned())?
@@ -166,11 +176,7 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 
 /// 经 HTTP 代理的 CONNECT 握手：要到 2xx 才算通。
 async fn handshake(stream: &mut Stream, target: &Target, auth: Option<&str>) -> Result<(), String> {
-    let authority = format!(
-        "{}:{}",
-        target.url().host_str().unwrap_or_default(),
-        target.port
-    );
+    let authority = target.authority();
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(auth) = auth {
         request.push_str(&format!("Proxy-Authorization: {auth}\r\n"));

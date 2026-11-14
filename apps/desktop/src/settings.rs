@@ -1,19 +1,18 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、版本。改了即存进任务存储（见 [`hs_m3u8_app::Settings`]）。
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、版本。改了即存进任务存储（见 [`hs_m3u8_app::Settings`]），存进了
+//! 界面才换。
 
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, IntoElement,
     ParentElement as _, PathPromptOptions, Render, Styled as _, Subscription, Task, Window, div,
     px,
 };
-use hs_m3u8_app::Service;
 use hs_m3u8_core::{Proxy, Url};
 
 use crate::route::Route;
+use crate::tasks::Tasks;
 use crate::theme;
 use crate::ui::{self, BOTTOM, Tone};
 
@@ -25,8 +24,6 @@ const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
 /// 发给外面的事件。
 pub enum SettingsEvent {
     Dismissed,
-    /// 换了保存位置（已存进设置）：新建任务默认存到这里
-    FolderChanged(PathBuf),
 }
 
 /// 代理的三种方式；选中「指定代理」后要填了地址、保存才生效。
@@ -38,8 +35,8 @@ enum Mode {
 }
 
 pub struct SettingsView {
-    service: Rc<Service>,
-    folder: PathBuf,
+    /// 保存目录在这里（见 [`Tasks::set_folder`]）
+    tasks: Entity<Tasks>,
     home: Option<PathBuf>,
     /// 存着的代理
     proxy: Proxy,
@@ -48,8 +45,10 @@ pub struct SettingsView {
     address: Entity<InputState>,
     /// 跟随系统时一般的网址经哪里走；还没读到时为 None
     system: Option<Route>,
-    /// 最近一次没存进去的原因
-    error: Option<String>,
+    /// 保存目录最近一次没换成的原因
+    folder_error: Option<String>,
+    /// 代理最近一次没存进去的原因
+    proxy_error: Option<String>,
     _system: Task<()>,
     _typed: Subscription,
 }
@@ -57,10 +56,9 @@ pub struct SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
-    /// `folder` 为新建任务默认保存到的目录（设置里的，没设过时为系统的默认目录），`proxy` 为存着的代理。
+    /// `proxy` 为存着的代理。
     pub fn new(
-        service: Rc<Service>,
-        folder: PathBuf,
+        tasks: Entity<Tasks>,
         home: Option<PathBuf>,
         proxy: Proxy,
         window: &mut Window,
@@ -76,7 +74,7 @@ impl SettingsView {
             |this: &mut Self, _, event: &InputEvent, _, cx| match event {
                 InputEvent::PressEnter { .. } => this.save_custom(cx),
                 InputEvent::Change => {
-                    this.error = None;
+                    this.proxy_error = None;
                     cx.notify();
                 }
                 InputEvent::Focus | InputEvent::Blur => {}
@@ -92,33 +90,28 @@ impl SettingsView {
                 cx.notify();
             });
         });
-        let mode = match proxy {
-            Proxy::System => Mode::System,
-            Proxy::Direct => Mode::Direct,
-            Proxy::Url(_) => Mode::Custom,
-        };
+        let mode = mode_of(&proxy);
         SettingsView {
-            service,
-            folder,
+            tasks,
             home,
             proxy,
             mode,
             address,
             system: None,
-            error: None,
+            folder_error: None,
+            proxy_error: None,
             _system: system,
             _typed: typed,
         }
     }
 
-    /// 选了一种方式：跟随系统、直连即存；指定代理要填了地址再存。
+    /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了地址再存。
     fn pick(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        self.mode = mode;
-        self.error = None;
+        self.proxy_error = None;
         match mode {
-            Mode::System => self.save(Proxy::System),
-            Mode::Direct => self.save(Proxy::Direct),
-            Mode::Custom => {}
+            Mode::System => self.save(Proxy::System, cx),
+            Mode::Direct => self.save(Proxy::Direct, cx),
+            Mode::Custom => self.mode = Mode::Custom,
         }
         cx.notify();
     }
@@ -127,16 +120,23 @@ impl SettingsView {
     fn save_custom(&mut self, cx: &mut Context<Self>) {
         let text = self.address.read(cx).value().trim().to_owned();
         match Url::parse(&text) {
-            Ok(url) => self.save(Proxy::Url(url)),
-            Err(_) => self.error = Some(format!("不是代理地址，应形如 {PROXY_EXAMPLE}")),
+            Ok(url) => self.save(Proxy::Url(url), cx),
+            Err(_) => self.proxy_error = Some(format!("不是代理地址，应形如 {PROXY_EXAMPLE}")),
         }
         cx.notify();
     }
 
-    fn save(&mut self, proxy: Proxy) {
-        match self.service.set_proxy(&proxy) {
-            Ok(()) => self.proxy = proxy,
-            Err(error) => self.error = Some(error.to_string()),
+    /// 存 `proxy`：存进了才换成它，没存进时选中的方式回到存着的。
+    fn save(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_proxy(&proxy) {
+            Ok(()) => {
+                self.mode = mode_of(&proxy);
+                self.proxy = proxy;
+            }
+            Err(error) => {
+                self.mode = mode_of(&self.proxy);
+                self.proxy_error = Some(error.to_string());
+            }
         }
     }
 
@@ -154,17 +154,14 @@ impl SettingsView {
                 match result {
                     Ok(Ok(Some(mut paths))) if !paths.is_empty() => {
                         let folder = paths.swap_remove(0);
-                        match this.service.set_folder(&folder) {
-                            Ok(()) => {
-                                this.folder = folder.clone();
-                                cx.emit(SettingsEvent::FolderChanged(folder));
-                            }
-                            Err(error) => this.error = Some(error.to_string()),
-                        }
+                        this.folder_error = this
+                            .tasks
+                            .update(cx, |tasks, cx| tasks.set_folder(folder, cx))
+                            .err();
                     }
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => this.error = Some(format!("打不开目录选择：{error}")),
-                    Err(_) => this.error = Some("目录选择没有返回结果".to_owned()),
+                    Ok(Err(error)) => this.folder_error = Some(format!("打不开目录选择：{error}")),
+                    Err(_) => this.folder_error = Some("目录选择没有返回结果".to_owned()),
                 }
                 cx.notify();
             });
@@ -173,6 +170,12 @@ impl SettingsView {
     }
 
     fn render_proxy(&self, cx: &mut Context<Self>) -> Div {
+        // 选了指定代理、还没存进地址：写明此刻照旧按什么走
+        let unsaved = match (self.mode, &self.proxy) {
+            (Mode::Custom, Proxy::System) => Some("保存之前照旧跟随系统"),
+            (Mode::Custom, Proxy::Direct) => Some("保存之前照旧直连"),
+            _ => None,
+        };
         let chip = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
             ui::chip(
                 id,
@@ -226,7 +229,8 @@ impl SettingsView {
                     )
                     .child(ui::caption(
                         "http、https、socks4、socks4a、socks5 或 socks5h 开头，可带用户名与密码",
-                    )),
+                    ))
+                    .children(unsaved.map(ui::caption)),
             ),
         };
         section("代理")
@@ -240,12 +244,13 @@ impl SettingsView {
                     .child(chip("proxy-custom", "指定代理", Mode::Custom, cx)),
             )
             .children(line)
+            .children(self.proxy_error.clone().map(ui::error_text))
             .child(ui::caption(
                 match hs_m3u8_webview::custom_proxy_supported() {
-                    Ok(()) => "在下的任务暂停再继续、嗅探页重新打开后才换".to_owned(),
-                    Err(reason) => {
-                        format!("在下的任务暂停再继续后才换；嗅探页的网页照系统代理：{reason}")
-                    }
+                    Ok(()) => "在下的任务暂停再继续、嗅探页的网页都关掉再打开后才换".to_owned(),
+                    Err(reason) => format!(
+                        "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
+                    ),
                 },
             ))
     }
@@ -264,7 +269,10 @@ impl Render for SettingsView {
                         .min_w_0()
                         .truncate()
                         .text_size(px(15.))
-                        .child(crate::format::path(&self.folder, self.home.as_deref())),
+                        .child(crate::format::path(
+                            self.tasks.read(cx).folder(),
+                            self.home.as_deref(),
+                        )),
                 ))
                 .child(ui::button(
                     "settings-folder",
@@ -314,13 +322,19 @@ impl Render for SettingsView {
                                 cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)),
                             )),
                     )
-                    .child(folder)
+                    .child(folder.children(self.folder_error.clone().map(ui::error_text)))
                     .child(self.render_proxy(cx))
-                    .when_some(self.error.clone(), |page, error| {
-                        page.child(ui::error_text(error))
-                    })
                     .child(about),
             )
+    }
+}
+
+/// 存着 `proxy` 时选中的方式。
+fn mode_of(proxy: &Proxy) -> Mode {
+    match proxy {
+        Proxy::System => Mode::System,
+        Proxy::Direct => Mode::Direct,
+        Proxy::Url(_) => Mode::Custom,
     }
 }
 

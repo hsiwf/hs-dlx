@@ -62,8 +62,8 @@ impl SniffView {
                 self.overflow
             ));
         }
-        if let Some(reason) = &self.proxy_note {
-            notes.push(format!("网页照系统代理：{reason}"));
+        if let Some(note) = &self.proxy_note {
+            notes.push(note.clone());
         }
         let dropped = self.inbox.dropped();
         if dropped > 0 {

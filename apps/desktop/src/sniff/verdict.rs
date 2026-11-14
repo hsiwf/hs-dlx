@@ -10,9 +10,10 @@ pub enum Verdict {
     Pending,
     /// 网页
     Page,
-    /// 不是网页：网页引擎认出的类型（如 `video/mp4`），正文是 HLS 播放列表的为「HLS 播放列表」；文档加载完也没报
-    /// 类型（脚本没在里面跑，如 PDF）时为 None
+    /// 不是网页：网页引擎认出的类型（如 `video/mp4`）；文档加载完也没报类型（脚本没在里面跑，如 PDF）时为 None
     NotPage(Option<String>),
+    /// 按网页类型发来、正文是 HLS 播放列表（如 PHP 的默认类型）
+    Playlist,
     /// 打开的地址本身是要下载的文件
     Download,
     /// 打不开：建不出网页、导航没成、网页进程退出、到时还没有结论；原因
@@ -58,7 +59,7 @@ impl Judge {
             return false;
         }
         self.decide(if playlist {
-            Verdict::NotPage(Some("HLS 播放列表".to_owned()))
+            Verdict::Playlist
         } else {
             Verdict::Page
         })
@@ -110,10 +111,7 @@ mod tests {
         let mut judge = Judge::new();
         judge.document("text/html");
         judge.content(true);
-        assert_eq!(
-            judge.verdict(),
-            &Verdict::NotPage(Some("HLS 播放列表".into()))
-        );
+        assert_eq!(judge.verdict(), &Verdict::Playlist);
 
         // 视频文件：类型即定
         let mut judge = Judge::new();

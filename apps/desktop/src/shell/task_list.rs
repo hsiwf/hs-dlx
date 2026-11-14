@@ -8,9 +8,10 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
 
+use super::look::look;
 use super::{Page, Shell};
 use crate::new_task::Phase;
-use crate::tasks::{Row, Tasks, look};
+use crate::tasks::{Row, Tasks};
 use crate::{ring, theme, ui};
 
 /// 任务列表的宽度。

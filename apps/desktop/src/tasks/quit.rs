@@ -88,7 +88,7 @@ impl Tasks {
         if self.quit == Quit::Waiting {
             self.stay();
         }
-        self.notify(why);
+        self.add_notice(why);
     }
 
     /// 选了退出时，提示框开着期间再次打开过应用（见 [`Tasks::receive`]）：不退出了，提示原因。
@@ -96,7 +96,7 @@ impl Tasks {
         let reopened = matches!(self.quit, Quit::Asking { reopened: true });
         if reopened {
             self.stay();
-            self.notify("提示框开着时再次打开了应用，没有退出".to_owned());
+            self.add_notice("提示框开着时再次打开了应用，没有退出".to_owned());
         }
         reopened
     }

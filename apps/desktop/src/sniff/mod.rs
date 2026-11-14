@@ -15,9 +15,7 @@ mod request;
 mod script;
 mod verdict;
 
-use std::net::Ipv4Addr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -27,9 +25,7 @@ use gpui_kit::{
 };
 use hs_m3u8_app::Service;
 use hs_m3u8_core::Url;
-use hs_m3u8_relay::Relay;
-use hs_m3u8_webview::{WebProxy, WebView};
-use tokio::sync::mpsc;
+use hs_m3u8_webview::WebView;
 
 use self::found::{Check, Found};
 use self::inbox::{Engine, Inbox};
@@ -39,9 +35,8 @@ pub use self::verdict::Verdict;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::ui::{self, GAP};
+use crate::web_route::{Lease, RelayFailure, WebRoute};
 
-/// 中转报来、还没处理的连不过去的最多积多少条：网页能让中转连不过去任意多次，再多的丢掉。
-const RELAY_FAILURES: usize = 64;
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
 const MAX_FOUND: usize = 200;
 /// 加载这么久还没找到流时给出建议：没开始显示的多半打不开，显示了的多半要登录或点了播放才加载视频。
@@ -86,11 +81,11 @@ pub struct SniffView {
     load: Load,
     /// 当前页面的故障（导航没成、网页进程退出）：要刷新才回来
     failure: Option<String>,
-    /// 网页没照设置里的代理走、照系统代理的原因
+    /// 网页的出口没照此刻的设置的原因（见 [`WebRoute::acquire`]）
     proxy_note: Option<String>,
-    /// 网页经的本机代理中转；随视图释放停下
-    _relay: Option<Relay>,
-    _relay_failures: Task<()>,
+    /// 网页开着期间持有的出口；建不出网页时为 None
+    _lease: Option<Rc<Lease>>,
+    _relay_failures: Subscription,
     judge: Judge,
     found: Vec<Found>,
     /// 列表满了之后又找到的条数
@@ -167,31 +162,12 @@ impl SniffView {
                     });
                 }
             });
-        // 网页经本机中转照设置里的代理走；设不了时照系统代理并写明原因。中转连不过去的报到界面线程，积多了丢
-        let (failed_sender, mut failed_receiver) =
-            mpsc::channel::<(String, String)>(RELAY_FAILURES);
-        let report: hs_m3u8_relay::Report = Arc::new(move |target, reason| {
-            // 满了或视图已关时不要
-            let _dropped = failed_sender.try_send((target.host.clone(), reason.to_owned()));
+        // 网页的出口进程里共用（见 crate::web_route）；中转连不过去的报来时看是不是打开的地址
+        let route = WebRoute::get(cx);
+        let relay_failures = cx.subscribe(&route, |this: &mut Self, _, failure, cx| {
+            this.on_relay_failure(failure, cx)
         });
-        let relay = service
-            .settings()
-            .map_err(|error| format!("读不出设置：{error}"))
-            .and_then(|settings| {
-                hs_m3u8_webview::custom_proxy_supported()?;
-                Relay::start(crate::route::relay_route(settings.proxy), report)
-            });
-        let (proxy, relay, proxy_note) = match relay {
-            Ok(relay) => (
-                WebProxy::Http {
-                    host: Ipv4Addr::LOCALHOST.to_string(),
-                    port: relay.port(),
-                },
-                Some(relay),
-                None,
-            ),
-            Err(reason) => (WebProxy::System, None, Some(reason)),
-        };
+        let acquired = route.update(cx, |route, _| route.acquire(&service));
         let failed = {
             let inbox = inbox.clone();
             move |failure| {
@@ -201,25 +177,30 @@ impl SniffView {
                 });
             }
         };
-        let webview = WebView::build(builder, url.as_str(), &proxy, failed, window, cx)
-            .map(|webview| cx.new(|_| webview))
-            .map_err(|error| format!("建不出网页：{error}"));
-        let relay_failures = cx.spawn(async move |this, cx| {
-            while let Some((host, reason)) = failed_receiver.recv().await {
-                if this
-                    .update(cx, |this, cx| this.on_relay_failure(&host, reason, cx))
-                    .is_err()
-                {
-                    break;
-                }
+        let (lease, proxy_note, webview) = match acquired {
+            Ok((lease, note)) => {
+                let webview =
+                    WebView::build(builder, url.as_str(), &lease.proxy, failed, window, cx)
+                        .map(|webview| cx.new(|_| webview))
+                        .map_err(|error| format!("建不出网页：{error}"));
+                (Some(lease), note, webview)
             }
-        });
+            Err(reason) => (None, None, Err(reason)),
+        };
         let engine = cx.spawn(async move |this, cx| {
-            while let Some(event) = events.recv().await {
-                if this
-                    .update(cx, |this, cx| this.on_engine(event, cx))
-                    .is_err()
-                {
+            while let Some(first) = events.recv().await {
+                // 网页引擎在同一次回调里报的事件一起到（回调与这里都在界面线程上）：一批处理完再按加载完定论
+                let mut batch = vec![first];
+                while let Ok(next) = events.try_recv() {
+                    batch.push(next);
+                }
+                let alive = this.update(cx, |this, cx| {
+                    for event in batch {
+                        this.on_engine(event, cx);
+                    }
+                    this.settle(cx);
+                });
+                if alive.is_err() {
                     break;
                 }
             }
@@ -271,7 +252,7 @@ impl SniffView {
             },
             failure: None,
             proxy_note,
-            _relay: relay,
+            _lease: lease,
             _relay_failures: relay_failures,
             judge,
             found: Vec::new(),
@@ -322,10 +303,11 @@ impl SniffView {
                 self.apply_media(cx);
                 false
             }
+            // 定论放到这一批处理完（见 settle）
             Engine::Finished(url) => {
                 self.load.finished = true;
                 self.navigated = Some(url);
-                self.load.shown.is_some() && self.judge.finished()
+                false
             }
             // 正在做的后台探测不依赖网页进程，照常做完
             Engine::LoadFailed(reason) => {
@@ -376,14 +358,23 @@ impl SniffView {
         cx.notify();
     }
 
+    /// 一批引擎事件处理完：显示过的页面加载完了，就按它报过的类型定论。放到批末是因为 WebView2 对没成的导航也先报
+    /// 加载完、再报失败（同一次回调），失败要先定。
+    fn settle(&mut self, cx: &mut Context<Self>) {
+        if self.load.finished && self.load.shown.is_some() && self.judge.finished() {
+            cx.emit(SniffEvent::Decided);
+        }
+    }
+
     /// 中转连不过去：打开的地址还没开始显示、连的正是它时，网页打不开（网页引擎拿到中转的 502 不报原因）；页面里别的
-    /// 请求连不过去由页面自己处理。
-    fn on_relay_failure(&mut self, host: &str, reason: String, cx: &mut Context<Self>) {
-        if self.load.shown.is_some() || self.opened.host_str() != Some(host) {
+    /// 请求、别的嗅探页的连不过去由页面自己处理。
+    fn on_relay_failure(&mut self, failure: &RelayFailure, cx: &mut Context<Self>) {
+        let opened = self.opened.host().map(|host| host.to_owned());
+        if self.load.shown.is_some() || opened.as_ref() != Some(&failure.target.host) {
             return;
         }
-        self.failure = Some(reason.clone());
-        if self.judge.fail(reason) {
+        self.failure = Some(failure.reason.clone());
+        if self.judge.fail(failure.reason.clone()) {
             cx.emit(SniffEvent::Decided);
         }
         cx.notify();

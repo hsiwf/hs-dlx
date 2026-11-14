@@ -1,9 +1,12 @@
-//! 网页的请求经哪个代理：照系统代理设置，或经一个 HTTP 代理（应用在本机开的中转，见 hs-m3u8-relay）。各平台的
-//! 网页引擎能不能设（[`custom_proxy_supported`]）：
+//! 网页的请求经哪个代理：照系统代理设置，或经一个不带口令的 HTTP 代理。各平台的网页引擎能不能设
+//! （[`custom_proxy_supported`]）与设在哪里：
 //!
 //! - macOS：14 起能设，设在网页的数据存储上（进程里的网页共用一个，跟随系统时清掉之前设的）。
-//! - Linux：能设，设在 WebKitGTK 的数据管理器上（各网页共用默认的上下文）。
-//! - Windows：能设，建网页时作为 WebView2 的启动参数传入。
+//! - Linux：能设，设在 WebKitGTK 的数据管理器上（每个网页各自一个上下文）。
+//! - Windows：能设，建网页时作为 WebView2 的启动参数传入（同一进程里同时开着的网页要用同样的参数，否则后建的建不
+//!   出来）。
+//!
+//! 所以 macOS 与 Windows 上同时开着的网页应当设同一个代理。
 //!
 //! 引擎只收主机与端口，不收口令。设代理要在网页开始加载之前（见 [`crate::WebView::build`]）。
 
@@ -66,7 +69,7 @@ pub(crate) fn after_build(webview: &wry::WebView, proxy: &WebProxy) {
     }
 }
 
-/// 建好网页、开始加载之前：Linux 上照 `proxy` 设网页的数据管理器（各网页共用默认的上下文）。
+/// 建好网页、开始加载之前：Linux 上照 `proxy` 设这个网页的数据管理器。
 #[cfg(target_os = "linux")]
 pub(crate) fn after_build(webview: &wry::WebView, proxy: &WebProxy) {
     use webkit2gtk::{

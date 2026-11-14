@@ -43,9 +43,11 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
         COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
         COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
         COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED,
+        ICoreWebView2NavigationCompletedEventArgs2,
     };
     use webview2_com::{NavigationCompletedEventHandler, ProcessFailedEventHandler};
     use windows::core::BOOL;
+    use windows::core::Interface as _;
     use wry::WebViewExtWindows as _;
 
     let failed = |error| wry::Error::WebView2Error(webview2_com::Error::WindowsError(error));
@@ -66,12 +68,23 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
             // SAFETY: 同上。
             unsafe { args.WebErrorStatus(&mut status) }?;
             // 被别的导航取代（换页、下载）不算没打开
-            if status != COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
-                report(Failure::LoadFailed(format!(
-                    "网页引擎报导航没成（WebErrorStatus {}）",
-                    status.0
-                )));
+            if status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
+                return Ok(());
             }
+            // 拿到了 HTTP 响应的（4xx、5xx：要登录、人机验证、地区限制的页面照样显示了）不算没打开；状态码为 0 即没
+            // 拿到响应。旧的 WebView2 运行时没有这个接口，照没成报
+            if let Ok(args) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
+                let mut code = 0;
+                // SAFETY: 同上。
+                unsafe { args.HttpStatusCode(&mut code) }?;
+                if code > 0 {
+                    return Ok(());
+                }
+            }
+            report(Failure::LoadFailed(format!(
+                "网页引擎报导航没成（WebErrorStatus {}）",
+                status.0
+            )));
             Ok(())
         }))
     };

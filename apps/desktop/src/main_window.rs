@@ -107,10 +107,7 @@ fn hand_over(handoff: Handoff, cx: &mut App) {
 /// 加一条提示（窗口关着时，下次打开窗口时看得到）。
 fn tell(text: String, cx: &mut App) {
     if let Some(tasks) = tasks(cx) {
-        tasks.update(cx, |tasks, cx| {
-            tasks.notify(text);
-            cx.notify();
-        });
+        tasks.update(cx, |tasks, cx| tasks.tell(text, cx));
     }
 }
 

@@ -1,10 +1,7 @@
-//! 请求经哪里走：照设置里的代理（[`hs_m3u8_app::Settings::proxy`]），跟随系统时照系统代理设置读，与任务实际走的
-//! 相同；嗅探页的网页经本机中转照同一个设置走（[`relay_route`]）。读系统代理要调操作系统的接口，在后台调。
+//! 任务的请求经哪里走（显示用）：照设置里的代理（[`hs_m3u8_app::Settings::proxy`]），跟随系统时照系统代理设置读，
+//! 与任务实际走的相同。读系统代理要调操作系统的接口，在后台调。嗅探页的网页见 [`crate::web_route`]。
 
 use hs_m3u8_core::{Proxy, ProxySource, SystemProxy, Url, bare_url};
-use std::sync::Arc;
-
-use hs_m3u8_relay::Upstream;
 
 /// 访问某个地址时请求经哪里走。
 pub enum Route {
@@ -54,21 +51,4 @@ fn source_name(system: &SystemProxy) -> &'static str {
         ProxySource::MacOs => "系统设置",
         ProxySource::Windows => "Internet 选项",
     }
-}
-
-/// 嗅探页的网页经本机中转（hs-m3u8-relay）出去时，每条连接经哪里走：照设置里的代理 `proxy`，跟随系统时每条连接
-/// 按当时的系统代理设置（与任务一样先看环境变量）。
-pub fn relay_route(proxy: Proxy) -> hs_m3u8_relay::Route {
-    Arc::new(move |target: &hs_m3u8_relay::Target| match &proxy {
-        Proxy::Direct => Ok(Upstream::Direct),
-        Proxy::Url(url) => Ok(Upstream::Proxy(url.clone())),
-        Proxy::System => match hs_m3u8_core::system_proxy() {
-            Ok(Some(system)) => Ok(system
-                .proxy_for(&target.url())
-                .cloned()
-                .map_or(Upstream::Direct, Upstream::Proxy)),
-            Ok(None) => Ok(Upstream::Direct),
-            Err(error) => Err(error.to_string()),
-        },
-    })
 }

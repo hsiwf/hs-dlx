@@ -19,6 +19,7 @@ mod theme;
 mod tray;
 mod ui;
 mod wait;
+mod web_route;
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -157,9 +158,9 @@ fn main() {
                             "{reason}：关掉窗口让任务在后台继续后，再次打开应用回到窗口"
                         ));
                     }
-                    tasks.update(cx, |tasks, _| {
+                    tasks.update(cx, |tasks, cx| {
                         for problem in problems {
-                            tasks.notify(problem);
+                            tasks.tell(problem, cx);
                         }
                     });
                     main_window::show(link, cx)
