@@ -41,6 +41,8 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
   开了 merge commit 一种合并方式：`main` 与 `dev` 的历史保持一致，下一次从 `dev` 提 PR 时不会出现重复的提交。
 
 提交信息写成 `<type>: <描述>`，type 为 `feat`、`fix`、`refactor`、`docs`、`test`、`chore`、`perf`、`ci`。
+提交信息（含正文）里不要出现 `[skip ci]`、`[ci skip]`、`[no ci]`、`[skip actions]`、`[actions skip]`：GitHub 见到就不为
+这次推送与 PR 跑工作流，PR 上没有检查、合并不了，推到 main 上的也不会发版。
 
 ## 发版
 
