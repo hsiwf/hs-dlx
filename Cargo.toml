@@ -23,9 +23,8 @@ fs4 = { version = "1.1.0", default-features = false }
 gpui-kit = "=0.9.1"
 # Linux 上嵌网页用的 GTK 3 绑定，与 wry 0.57.2 用的同一版
 gtk = "0.18"
-# HLS 的探测、下载、直播录制与转封装（hs-m3u8 的核心库）。
-# 简化：用本机旁边的 hs-m3u8 源码目录，hs-m3u8 推送并打标签后换成钉在标签上的 git 依赖
-hs-m3u8-core = { path = "../hs-m3u8/crates/core" }
+# HLS 的探测、下载、直播录制与转封装（hs-m3u8 的核心库）；固定到 hs-m3u8 主干上的提交，升级时与下面的 ffmpeg-sys-next 一起改
+hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "b39d8296585507fdb2d13e5d5bdbf2b0e4d1abbc" }
 # 比较路径时统一 Unicode 写法（NFC）
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
 # 新建任务时把地址里的路径段解码成标题
@@ -47,4 +46,4 @@ wry = "=0.57.2"
 
 [patch.crates-io]
 # hs-m3u8 对 ffmpeg-sys-next 的本地修改（与上游的差异见那里的 PATCHED.md）：依赖方的 patch 不会传过来，这里照样打上
-ffmpeg-sys-next = { path = "../hs-m3u8/third_party/ffmpeg-sys-next" }
+ffmpeg-sys-next = { git = "https://github.com/x-haose/hs-m3u8", rev = "b39d8296585507fdb2d13e5d5bdbf2b0e4d1abbc" }
