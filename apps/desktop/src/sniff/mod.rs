@@ -15,7 +15,9 @@ mod request;
 mod script;
 mod verdict;
 
+use std::net::Ipv4Addr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -25,7 +27,9 @@ use gpui_kit::{
 };
 use hs_m3u8_app::Service;
 use hs_m3u8_core::Url;
-use hs_m3u8_webview::WebView;
+use hs_m3u8_relay::Relay;
+use hs_m3u8_webview::{WebProxy, WebView};
+use tokio::sync::mpsc;
 
 use self::found::{Check, Found};
 use self::inbox::{Engine, Inbox};
@@ -36,6 +40,8 @@ use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::ui::{self, GAP};
 
+/// 中转报来、还没处理的连不过去的最多积多少条：网页能让中转连不过去任意多次，再多的丢掉。
+const RELAY_FAILURES: usize = 64;
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
 const MAX_FOUND: usize = 200;
 /// 加载这么久还没找到流时给出建议：没开始显示的多半打不开，显示了的多半要登录或点了播放才加载视频。
@@ -80,8 +86,11 @@ pub struct SniffView {
     load: Load,
     /// 当前页面的故障（导航没成、网页进程退出）：要刷新才回来
     failure: Option<String>,
-    /// 网页没照设置里的代理走、照系统代理的原因（见 [`crate::route::web_proxy`]）
+    /// 网页没照设置里的代理走、照系统代理的原因
     proxy_note: Option<String>,
+    /// 网页经的本机代理中转；随视图释放停下
+    _relay: Option<Relay>,
+    _relay_failures: Task<()>,
     judge: Judge,
     found: Vec<Found>,
     /// 列表满了之后又找到的条数
@@ -158,13 +167,30 @@ impl SniffView {
                     });
                 }
             });
-        let (proxy, proxy_note) = match service
+        // 网页经本机中转照设置里的代理走；设不了时照系统代理并写明原因。中转连不过去的报到界面线程，积多了丢
+        let (failed_sender, mut failed_receiver) =
+            mpsc::channel::<(String, String)>(RELAY_FAILURES);
+        let report: hs_m3u8_relay::Report = Arc::new(move |target, reason| {
+            // 满了或视图已关时不要
+            let _dropped = failed_sender.try_send((target.host.clone(), reason.to_owned()));
+        });
+        let relay = service
             .settings()
-            .map_err(|error| error.to_string())
-            .and_then(|settings| crate::route::web_proxy(&settings.proxy))
-        {
-            Ok(proxy) => (proxy, None),
-            Err(reason) => (hs_m3u8_webview::WebProxy::System, Some(reason)),
+            .map_err(|error| format!("读不出设置：{error}"))
+            .and_then(|settings| {
+                hs_m3u8_webview::custom_proxy_supported()?;
+                Relay::start(crate::route::relay_route(settings.proxy), report)
+            });
+        let (proxy, relay, proxy_note) = match relay {
+            Ok(relay) => (
+                WebProxy::Http {
+                    host: Ipv4Addr::LOCALHOST.to_string(),
+                    port: relay.port(),
+                },
+                Some(relay),
+                None,
+            ),
+            Err(reason) => (WebProxy::System, None, Some(reason)),
         };
         let failed = {
             let inbox = inbox.clone();
@@ -178,6 +204,16 @@ impl SniffView {
         let webview = WebView::build(builder, url.as_str(), &proxy, failed, window, cx)
             .map(|webview| cx.new(|_| webview))
             .map_err(|error| format!("建不出网页：{error}"));
+        let relay_failures = cx.spawn(async move |this, cx| {
+            while let Some((host, reason)) = failed_receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_relay_failure(&host, reason, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let engine = cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
@@ -235,6 +271,8 @@ impl SniffView {
             },
             failure: None,
             proxy_note,
+            _relay: relay,
+            _relay_failures: relay_failures,
             judge,
             found: Vec::new(),
             overflow: 0,
@@ -333,6 +371,19 @@ impl SniffView {
             }
         };
         if decided {
+            cx.emit(SniffEvent::Decided);
+        }
+        cx.notify();
+    }
+
+    /// 中转连不过去：打开的地址还没开始显示、连的正是它时，网页打不开（网页引擎拿到中转的 502 不报原因）；页面里别的
+    /// 请求连不过去由页面自己处理。
+    fn on_relay_failure(&mut self, host: &str, reason: String, cx: &mut Context<Self>) {
+        if self.load.shown.is_some() || self.opened.host_str() != Some(host) {
+            return;
+        }
+        self.failure = Some(reason.clone());
+        if self.judge.fail(reason) {
             cx.emit(SniffEvent::Decided);
         }
         cx.notify();

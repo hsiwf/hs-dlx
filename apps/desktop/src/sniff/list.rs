@@ -29,6 +29,8 @@ impl SniffView {
         let suggest = self.found.is_empty() && self.load.since.elapsed() >= SUGGEST_AFTER;
         let body: Vec<AnyElement> = match &self.webview {
             Err(reason) => vec![ui::error_text(reason.clone()).into_any_element()],
+            // 打不开时原因写在下面，这里不再写在等
+            Ok(_) if self.found.is_empty() && self.failure.is_some() => Vec::new(),
             Ok(_) if self.found.is_empty() => vec![
                 div()
                     .text_size(px(13.))

@@ -240,12 +240,14 @@ impl SettingsView {
                     .child(chip("proxy-custom", "指定代理", Mode::Custom, cx)),
             )
             .children(line)
-            .child(ui::caption(match crate::route::web_proxy(&self.proxy) {
-                Ok(_) => "在下的任务暂停再继续、嗅探页重新打开后才换".to_owned(),
-                Err(reason) => format!(
-                    "在下的任务暂停再继续、嗅探页重新打开后才换；嗅探页的网页照系统代理：{reason}"
-                ),
-            }))
+            .child(ui::caption(
+                match hs_m3u8_webview::custom_proxy_supported() {
+                    Ok(()) => "在下的任务暂停再继续、嗅探页重新打开后才换".to_owned(),
+                    Err(reason) => {
+                        format!("在下的任务暂停再继续后才换；嗅探页的网页照系统代理：{reason}")
+                    }
+                },
+            ))
     }
 }
 

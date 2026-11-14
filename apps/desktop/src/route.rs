@@ -1,8 +1,10 @@
 //! 请求经哪里走：照设置里的代理（[`hs_m3u8_app::Settings::proxy`]），跟随系统时照系统代理设置读，与任务实际走的
-//! 相同；嗅探页的网页照同一个设置（[`web_proxy`]）。读系统代理要调操作系统的接口，在后台调。
+//! 相同；嗅探页的网页经本机中转照同一个设置走（[`relay_route`]）。读系统代理要调操作系统的接口，在后台调。
 
 use hs_m3u8_core::{Proxy, ProxySource, SystemProxy, Url, bare_url};
-use hs_m3u8_webview::WebProxy;
+use std::sync::Arc;
+
+use hs_m3u8_relay::Upstream;
 
 /// 访问某个地址时请求经哪里走。
 pub enum Route {
@@ -54,29 +56,19 @@ fn source_name(system: &SystemProxy) -> &'static str {
     }
 }
 
-/// 嗅探页的网页照设置里的代理 `proxy` 走时用的网页代理；网页引擎用不了它时为原因，网页照系统代理。
-pub fn web_proxy(proxy: &Proxy) -> Result<WebProxy, String> {
-    let web = match proxy {
-        Proxy::System => WebProxy::System,
-        Proxy::Direct => WebProxy::Direct,
-        Proxy::Url(url) => {
-            if !url.username().is_empty() || url.password().is_some() {
-                return Err("网页用不了带用户名、密码的代理".to_owned());
-            }
-            let host = url
-                .host_str()
-                .ok_or_else(|| "代理地址没有主机".to_owned())?
-                .to_owned();
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| "网页用的代理地址要写端口".to_owned())?;
-            match url.scheme() {
-                "http" => WebProxy::Http { host, port },
-                "socks5" | "socks5h" => WebProxy::Socks5 { host, port },
-                other => return Err(format!("网页只能用 http 或 socks5 代理，用不了 {other}")),
-            }
-        }
-    };
-    hs_m3u8_webview::supported(&web)?;
-    Ok(web)
+/// 嗅探页的网页经本机中转（hs-m3u8-relay）出去时，每条连接经哪里走：照设置里的代理 `proxy`，跟随系统时每条连接
+/// 按当时的系统代理设置（与任务一样先看环境变量）。
+pub fn relay_route(proxy: Proxy) -> hs_m3u8_relay::Route {
+    Arc::new(move |target: &hs_m3u8_relay::Target| match &proxy {
+        Proxy::Direct => Ok(Upstream::Direct),
+        Proxy::Url(url) => Ok(Upstream::Proxy(url.clone())),
+        Proxy::System => match hs_m3u8_core::system_proxy() {
+            Ok(Some(system)) => Ok(system
+                .proxy_for(&target.url())
+                .cloned()
+                .map_or(Upstream::Direct, Upstream::Proxy)),
+            Ok(None) => Ok(Upstream::Direct),
+            Err(error) => Err(error.to_string()),
+        },
+    })
 }
