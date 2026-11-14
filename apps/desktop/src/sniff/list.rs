@@ -60,7 +60,7 @@ impl SniffView {
                 self.overflow
             ));
         }
-        let dropped = self.inbox.dropped.get();
+        let dropped = self.inbox.dropped();
         if dropped > 0 {
             notes.push(format!(
                 "网页发来的消息太多或太长，丢了 {dropped} 条，可能有流没列出"
@@ -86,18 +86,21 @@ impl SniffView {
                 "探测它",
                 cx.listener(move |this, _, _, cx| {
                     this.download = None;
-                    this.open_new_task(target.clone(), cx);
+                    this.open_download(target.clone(), cx);
                 }),
             )
         });
-        let crashed = self
-            .crashed
-            .then(|| ui::error_text("网页进程意外退出了：刷新后重新找".to_owned()));
+        let failure = self
+            .failure
+            .as_ref()
+            .map(|reason| ui::error_text(format!("{reason}：刷新后重新找")));
+        let failed = self.failure.is_some();
         let actions = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(10.))
-            .when(self.crashed, |actions| {
+            .when(failed, |actions| {
                 actions.child(ui::button(
                     "reload",
                     "刷新",
@@ -111,12 +114,21 @@ impl SniffView {
                 actions.child(ui::button(
                     "show-page",
                     "打开网页",
-                    if suggest && !self.crashed {
+                    if suggest && !failed {
                         Tone::Glow
                     } else {
                         Tone::Plain
                     },
                     cx.listener(|this, _, _, cx| this.show_page(true, cx)),
+                ))
+            })
+            // 找不到流时，打开的地址可能本身就是播放列表（缺请求头时源站回了网页）：交回新建页改请求头
+            .when(self.found.is_empty(), |actions| {
+                actions.child(ui::button(
+                    "probe-opened",
+                    "当作播放列表探测",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.open_opened(cx)),
                 ))
             })
             .child(div().flex_1())
@@ -143,7 +155,7 @@ impl SniffView {
                     .gap(px(10.))
                     .children(body),
             )
-            .children(crashed)
+            .children(failure)
             .children(popup)
             .children(download)
             .children(notes.into_iter().map(ui::caption))
@@ -162,7 +174,7 @@ impl SniffView {
             .unwrap_or_default();
         let state = match (&self.webview, self.load.shown.is_some()) {
             (Err(_), _) => None,
-            _ if self.crashed => Some((theme::orange(), "网页进程退出了")),
+            _ if self.failure.is_some() => Some((theme::orange(), "打不开")),
             (Ok(_), false) => Some((theme::cyan(), "正在打开")),
             (Ok(_), true) if self.load.finished => Some((theme::cyan(), "已加载")),
             (Ok(_), true) => Some((theme::cyan(), "加载中")),
@@ -239,7 +251,7 @@ impl SniffView {
                 ("open-found", index),
                 label,
                 tone,
-                cx.listener(move |this, _, _, cx| this.open_new_task(url.clone(), cx)),
+                cx.listener(move |this, _, _, cx| this.open_found(index, &url, cx)),
             )
         };
         let retry = |cx: &mut Context<Self>| {
@@ -248,7 +260,7 @@ impl SniffView {
                 ("retry-found", index),
                 "重试",
                 Tone::Plain,
-                cx.listener(move |this, _, _, cx| this.retry(Some(&url), cx)),
+                cx.listener(move |this, _, _, cx| this.retry(Some((index, &url)), cx)),
             )
         };
         let actions = match &found.check {

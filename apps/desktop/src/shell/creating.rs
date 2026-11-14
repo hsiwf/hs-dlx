@@ -58,16 +58,18 @@ impl Shell {
                         this.create(view.clone(), (**draft).clone(), window, cx)
                     }
                     NewTaskEvent::Dismissed => {
-                        let back = match (&this.page, &this.sniff) {
-                            (
-                                Page::NewTask {
-                                    from_sniff: true, ..
-                                },
-                                Some((sniff, _)),
-                            ) => Page::Sniff(sniff.clone()),
-                            _ => Page::Task,
-                        };
-                        this.show(back, cx);
+                        if matches!(
+                            this.page,
+                            Page::NewTask {
+                                from_sniff: true,
+                                ..
+                            }
+                        ) && this.sniff.is_some()
+                        {
+                            this.show_sniff(cx);
+                        } else {
+                            this.show(Page::Task, cx);
+                        }
                     }
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
                     NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
@@ -86,7 +88,7 @@ impl Shell {
                 view: view.clone(),
                 _subscription: subscription,
                 from_sniff,
-                checking: None,
+                page_check: None,
             },
             cx,
         );
@@ -118,7 +120,7 @@ impl Shell {
         let Page::NewTask {
             view: shown,
             from_sniff: false,
-            checking,
+            page_check,
             ..
         } = &mut self.page
         else {
@@ -138,7 +140,7 @@ impl Shell {
                 }
             },
         );
-        *checking = Some((sniff.clone(), subscription));
+        *page_check = Some((sniff.clone(), subscription));
         view.update(cx, |view, cx| view.opening_page(cx));
         // 建不出网页时一开始就有结论
         self.checked_page(&sniff, window, cx);
@@ -152,17 +154,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Page::NewTask { view, checking, .. } = &mut self.page else {
+        let Page::NewTask {
+            view, page_check, ..
+        } = &mut self.page
+        else {
             return;
         };
-        if checking
+        if page_check
             .as_ref()
             .is_none_or(|(checked, _)| checked != sniff)
         {
             return;
         }
         if !view.read(cx).is_opening_page() {
-            *checking = None;
+            *page_check = None;
             return;
         }
         let note = match sniff.read(cx).verdict() {
@@ -170,9 +175,10 @@ impl Shell {
             Verdict::Page => None,
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
+            Verdict::Download => Some("网页引擎打开它是要下载的文件，不是网页".to_owned()),
             Verdict::Broken(reason) => Some(format!("在网页里也打不开：{reason}")),
         };
-        *checking = None;
+        *page_check = None;
         match note {
             Some(note) => view.update(cx, |view, cx| view.not_a_page(note, cx)),
             None => self.adopt_sniff(sniff.clone(), window, cx),
@@ -319,7 +325,7 @@ impl Shell {
                 cx.notify();
             },
         );
-        self.sniff = Some((view.clone(), subscription));
-        self.show(Page::Sniff(view), cx);
+        self.sniff = Some((view, subscription));
+        self.show_sniff(cx);
     }
 }

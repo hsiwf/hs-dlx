@@ -69,15 +69,16 @@ fn free_space(folder: &std::path::Path) -> Result<u64, String> {
 enum Page {
     /// 选中的任务；没有任务时为待机页
     Task,
-    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页；`checking`
-    /// 为第一次探测取到的不是播放列表时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
+    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页；
+    /// `page_check` 为第一次探测取到的不是播放列表时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
     NewTask {
         view: Entity<NewTask>,
         _subscription: Subscription,
         from_sniff: bool,
-        checking: Option<(Entity<SniffView>, Subscription)>,
+        page_check: Option<(Entity<SniffView>, Subscription)>,
     },
-    /// 网页里的视频流（即 [`Shell::sniff`] 里的视图）；网页显示着时占满主体，不显示任务列表
+    /// 网页里的视频流：只经 [`Shell::show_sniff`] 换上，视图即 [`Shell::sniff`] 里的；网页显示着时占满主体，不显示任务
+    /// 列表
     Sniff(Entity<SniffView>),
 }
 
@@ -85,8 +86,11 @@ enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Quit {
     Staying,
-    /// 正在问要不要退出（提示框开着）：再来的退出请求不再问
-    Asking,
+    /// 正在问要不要退出（提示框开着）：再来的退出请求不再问；`reopened` 为期间再次打开过应用（接手了转交），选了
+    /// 退出也不退出
+    Asking {
+        reopened: bool,
+    },
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
     Waiting,
     /// 退出已不可撤回（已向系统发出退出）：不再接手转交来的链接
@@ -197,7 +201,7 @@ impl Shell {
                 .unwrap_or(true)
         });
         #[cfg(target_os = "macos")]
-        if let Err(error) = shell_asks_before_terminate(window, cx) {
+        if let Err(error) = quit::ask_before_terminate(window, cx) {
             notices.push(Notice {
                 id: notices.len() as u64,
                 text: format!("从程序坞退出、注销时不会先问：{error}"),
@@ -281,13 +285,19 @@ impl Shell {
         shell
     }
 
-    /// 再次打开应用时转交来的：已决定退出时不接手（交来的一方告诉用户没交过去）；否则接手，窗口到前台，等着退出的不
-    /// 再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次没收成的转交提示原因。
+    /// 再次打开应用时转交来的：已决定退出时不接手（交来的一方告诉用户正在退出）；否则接手，窗口到前台，等着退出的、
+    /// 正在问要不要退出的不再退出；有链接就探测，新建页开着时不替换它，只填进粘贴栏。一次没收成的转交提示原因。
     fn receive(&mut self, received: Received, window: &mut Window, cx: &mut Context<Self>) {
         match received {
-            Ok(_) if self.quit == Quit::Leaving => {}
+            Ok(delivery) if self.quit == Quit::Leaving => delivery.refuse_leaving(),
             Ok(delivery) => {
-                let handoff = delivery.accept();
+                // 交出的一方已不等（界面 2 秒没接手）时它已把链接告诉用户，这里不再处理
+                let Some(handoff) = delivery.accept() else {
+                    return;
+                };
+                if let Quit::Asking { reopened } = &mut self.quit {
+                    *reopened = true;
+                }
                 cx.activate(true);
                 window.activate_window();
                 if self.quitting() {
@@ -544,6 +554,13 @@ impl Shell {
         cx.notify();
     }
 
+    /// 换到嗅探页（[`Shell::sniff`] 里的视图）；嗅探页已关时什么也不做（旧帧上的点击）。
+    fn show_sniff(&mut self, cx: &mut Context<Self>) {
+        if let Some((view, _)) = &self.sniff {
+            self.show(Page::Sniff(view.clone()), cx);
+        }
+    }
+
     /// 显示着的新建视图；不在新建页时为 None。
     fn new_task(&self) -> Option<&Entity<NewTask>> {
         match &self.page {
@@ -551,28 +568,6 @@ impl Shell {
             Page::Task | Page::Sniff(_) => None,
         }
     }
-}
-
-/// 系统要退出应用（程序坞、注销、关机）时先问外壳（见 [`Shell::should_terminate`]）。窗口已关（关窗即退出的那一次）
-/// 时照常退出。
-#[cfg(target_os = "macos")]
-fn shell_asks_before_terminate(
-    window: &mut Window,
-    cx: &mut Context<Shell>,
-) -> Result<(), hs_m3u8_macos::Error> {
-    let (this, handle, mut app) = (
-        cx.entity().downgrade(),
-        window.window_handle(),
-        cx.to_async(),
-    );
-    hs_m3u8_macos::ask_before_terminate(move || {
-        handle
-            .update(&mut app, |_, window, cx| {
-                this.update(cx, |shell, cx| shell.should_terminate(window, cx))
-            })
-            .and_then(|answer| answer)
-            .unwrap_or(true)
-    })
 }
 
 /// 任务停下时的信号。

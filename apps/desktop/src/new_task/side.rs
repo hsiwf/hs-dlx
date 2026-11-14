@@ -9,7 +9,9 @@ use gpui_kit::{
 use hs_m3u8_app::OutputKind;
 use hs_m3u8_core::Probe;
 
-use super::{NewTask, NewTaskEvent, OPTION_MIN_WIDTH, Probing, Route, describe, duration_of};
+use super::{
+    NewTask, NewTaskEvent, OPTION_MIN_WIDTH, PageCheck, Probing, Route, describe, duration_of,
+};
 use crate::ui::{self, Tone};
 use crate::{format, theme};
 
@@ -46,20 +48,23 @@ impl NewTask {
             );
         match &self.probing {
             Probing::Running => side.child(div().flex_1()).child(self.cancel_button(cx)),
-            Probing::Failed(_) if self.opening_page => side
+            Probing::Failed(_) if self.page_check == PageCheck::Opening => side
                 .child(ui::caption("取到的不是播放列表，正在网页里打开看看…"))
                 .child(div().flex_1())
                 .child(self.cancel_button(cx)),
             Probing::Failed(failure) => {
                 // 被拒或取到错误页的多半缺请求头：给出编辑框，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的
                 // 还可以在网页里打开它找视频流
-                let headers = failure.kind.headers_may_help();
+                let headers = failure.kind.headers_likely_missing();
                 let again = headers || failure.kind.retry_helps();
                 side.child(
                     ui::card(theme::error_edge())
                         .child(SharedString::from(failure.message.clone())),
                 )
-                .children(self.page_note.clone().map(ui::caption))
+                .children(match &self.page_check {
+                    PageCheck::NotPage(note) => Some(ui::caption(note.clone())),
+                    PageCheck::Idle | PageCheck::Opening => None,
+                })
                 .children(self.route_line())
                 .when(headers, |side| {
                     side.child(

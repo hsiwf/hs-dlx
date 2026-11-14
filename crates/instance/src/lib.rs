@@ -7,8 +7,8 @@
 //!   核对对端的用户就是任务存储文件的属主。
 //! - Windows：管道只许属主与 SYSTEM 访问；管道名带 128 位随机数、只记在本用户的数据目录里，别的用户猜不到，抢不先建。
 //!
-//! 协议：4 字节大端长度 + UTF-8 链接（长度 0 为只到前台），链接最长 64 KiB；界面接手后主实例回 1 个字节 1，界面不接
-//! 手（如已在退出）时不回、关掉连接。连接、读写与等界面接手各限 2 秒。
+//! 协议：4 字节大端长度 + UTF-8 链接（长度 0 为只到前台），链接最长 64 KiB；主实例回 1 个字节：1 为界面接手了，0 为
+//! 正在退出、不接手；别的情况（界面 2 秒没接手、读不完）不回，关掉连接。连接、读写与等界面接手各限 2 秒。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,12 +23,14 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_LINK: u32 = 64 * 1024;
 /// 连上主实例、一次转交的读写，各最多多久：对端不说话时不让双方一直等。
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
-/// 主实例等界面接手最多多久：界面线程卡住（如退出时等任务停下）时让交出的一方及时报没交过去。
+/// 主实例等界面接手最多多久：界面线程卡住（如退出时等任务停下并补写存储）时让交出的一方及时报没交过去。
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 收连接出错后隔多久再收：出错多为进程的文件描述符用尽，立即重试只会空转。
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
-/// 主实例收下时回的字节。
+/// 主实例回的字节：界面接手了。
 const ACCEPTED: u8 = 1;
+/// 主实例回的字节：正在退出，不接手。
+const LEAVING: u8 = 0;
 
 /// 再次打开应用时交来的。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,20 +41,52 @@ pub enum Handoff {
     Link(String),
 }
 
-/// 交来的一次转交。界面接手（[`Delivery::accept`]）后才给交出的一方回确认；释放它而不接手时，交出的一方报没交过去
-/// （由它把链接告诉用户）。
+/// 界面对一次转交的答复。
+#[derive(Debug)]
+enum Answer {
+    Accepted,
+    Leaving,
+}
+
+/// 交来的一次转交。界面接手（[`Delivery::accept`]）后才给交出的一方回确认；正在退出的回不接手
+/// （[`Delivery::refuse_leaving`]）。两者都由交出的一方把结果告诉用户。
 #[derive(Debug)]
 pub struct Delivery {
     handoff: Handoff,
-    accepted: oneshot::Sender<()>,
+    answer: oneshot::Sender<Answer>,
 }
 
 impl Delivery {
-    /// 接手：给交出的一方回确认（交来之后 2 秒才接手的，对端已报没交过去）。
-    pub fn accept(self) -> Handoff {
-        // 收转交的一方已不等（超时、连接断了）时没有谁要这个确认
-        let _gone = self.accepted.send(());
-        self.handoff
+    /// 接手：给交出的一方回确认，返回交来的。交来之后 2 秒还没接手的，交出的一方已报没交过去、把链接告诉了用户，
+    /// 这时为 None，界面不该再处理它。
+    pub fn accept(self) -> Option<Handoff> {
+        self.answer
+            .send(Answer::Accepted)
+            .is_ok()
+            .then_some(self.handoff)
+    }
+
+    /// 正在退出、不接手：交出的一方报主实例正在退出（[`HandOverError::Leaving`]）。
+    pub fn refuse_leaving(self) {
+        // 收转交的一方已不等时，交出的一方照常报没交过去
+        let _gone = self.answer.send(Answer::Leaving);
+    }
+}
+
+/// 把链接交给主实例没成。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HandOverError {
+    /// 主实例正在退出，不再接手：等它退出后再打开即可
+    #[error("已经打开的那个正在退出")]
+    Leaving,
+    /// 别的原因（链接为空或太长、读不出主实例的地址、连不上、对端不是本用户、超时、界面没接手）
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for HandOverError {
+    fn from(reason: String) -> HandOverError {
+        HandOverError::Failed(reason)
     }
 }
 
@@ -106,11 +140,10 @@ pub fn listen(store: &Path) -> Result<Handoffs, String> {
 }
 
 /// 再次打开的实例把 `link` 交给主实例（None 时只请它到前台）：`store` 为主实例打开着的任务存储文件。主实例的界面接手
-/// 后回了确认才算交过去；链接为空或太长、读不出主实例的地址、连不上（主实例已退出或还没开始收）、对端不是本用户、
-/// 超时或界面没接手时为原因。
-pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), String> {
+/// 后回了确认才算交过去。
+pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), HandOverError> {
     let message = match link {
-        Some("") => return Err("链接是空的".to_owned()),
+        Some("") => return Err("链接是空的".to_owned().into()),
         Some(link) => link.as_bytes(),
         None => &[],
     };
@@ -123,12 +156,11 @@ pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), String> {
         let stream =
             match tokio::time::timeout(EXCHANGE_TIMEOUT, Stream::connect(endpoint.name()?)).await {
                 Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => return Err(format!("连不上已经打开的那个：{error}")),
+                Ok(Err(error)) => return Err(format!("连不上已经打开的那个：{error}").into()),
                 Err(_) => {
-                    return Err(format!(
-                        "{} 秒没能连上已经打开的那个",
-                        EXCHANGE_TIMEOUT.as_secs()
-                    ));
+                    return Err(
+                        format!("{} 秒没能连上已经打开的那个", EXCHANGE_TIMEOUT.as_secs()).into(),
+                    );
                 }
             };
         endpoint.check_peer(&stream)?;
@@ -141,15 +173,17 @@ pub fn hand_over(store: &Path, link: Option<&str>) -> Result<(), String> {
         };
         // 对端读、等界面接手、回确认都有各自的时限，这里等它们加起来
         let waited = EXCHANGE_TIMEOUT * 2 + ACCEPT_TIMEOUT;
-        match tokio::time::timeout(waited, exchange).await {
-            Ok(Ok(ACCEPTED)) => Ok(()),
-            Ok(Ok(other)) => Err(format!("已经打开的那个回了认不出的确认 {other}")),
+        let failed = match tokio::time::timeout(waited, exchange).await {
+            Ok(Ok(ACCEPTED)) => return Ok(()),
+            Ok(Ok(LEAVING)) => return Err(HandOverError::Leaving),
+            Ok(Ok(other)) => format!("已经打开的那个回了认不出的确认 {other}"),
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err("已经打开的那个没有接手（可能正在退出）".to_owned())
+                "已经打开的那个没有接手".to_owned()
             }
-            Ok(Err(error)) => Err(format!("交给已经打开的那个时出错：{error}")),
-            Err(_) => Err(format!("已经打开的那个 {} 秒没有回应", waited.as_secs())),
-        }
+            Ok(Err(error)) => format!("交给已经打开的那个时出错：{error}"),
+            Err(_) => format!("已经打开的那个 {} 秒没有回应", waited.as_secs()),
+        };
+        Err(failed.into())
     })
 }
 
@@ -316,8 +350,8 @@ impl Endpoint {
         Ok(())
     }
 
-    /// 收一次转交：核对对端、读出链接、交给界面，界面接手后回确认。交给界面之前出的错为 Err；界面接手后回确认没成的
-    /// 也报出来（界面已接手，对端会以为没交过去）。界面没接手（释放了、超时）时不回确认，对端照常报没交过去。
+    /// 收一次转交：核对对端、读出链接、交给界面，照界面的答复回字节。交给界面之前出的错为 Err；回答复没成的也报出来
+    /// （界面已接手时，对端会以为没交过去）。界面 2 秒没答复时不回，对端照常报没交过去。
     async fn serve(
         &self,
         stream: Stream,
@@ -351,26 +385,26 @@ impl Endpoint {
         } else {
             Handoff::Link(text)
         };
-        let (accepted, acceptance) = oneshot::channel();
-        if sender.send(Ok(Delivery { handoff, accepted })).is_err() {
+        let (answer, answered) = oneshot::channel();
+        if sender.send(Ok(Delivery { handoff, answer })).is_err() {
             // 界面已经关了：不回确认，对端照常报没交过去
             return Ok(());
         }
-        if !matches!(
-            tokio::time::timeout(ACCEPT_TIMEOUT, acceptance).await,
-            Ok(Ok(()))
-        ) {
-            return Ok(());
-        }
+        // 超时即释放接收端：之后才接手的界面从 accept 得知交出的一方已不等
+        let reply = match tokio::time::timeout(ACCEPT_TIMEOUT, answered).await {
+            Ok(Ok(Answer::Accepted)) => ACCEPTED,
+            Ok(Ok(Answer::Leaving)) => LEAVING,
+            Ok(Err(_)) | Err(_) => return Ok(()),
+        };
         let confirm = async {
             let mut stream = &stream;
-            stream.write_u8(ACCEPTED).await?;
+            stream.write_u8(reply).await?;
             stream.flush().await
         };
         match tokio::time::timeout(EXCHANGE_TIMEOUT, confirm).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(format!("收下了交来的链接，但没能回确认：{error}")),
-            Err(_) => Err("收下了交来的链接，但回确认超时".to_owned()),
+            Ok(Err(error)) => Err(format!("没能给交链接的一方回答复：{error}")),
+            Err(_) => Err("给交链接的一方回答复超时".to_owned()),
         }
     }
 }

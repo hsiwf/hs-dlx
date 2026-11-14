@@ -14,7 +14,8 @@ use crate::links::http_url;
 ///   并实测后去掉这一限制。
 /// - 播放列表：fetch 与 XHR 的响应类型是 HLS 播放列表（`application/vnd.apple.mpegurl` 之类）的，与地址路径以
 ///   `.m3u8` 结尾的请求（含资源加载记录与 video、source 元素上的），每个地址只报一次。
-/// - 文档类型：顶层框架在文档建出时报一次 `document.contentType`。
+/// - 文档类型：顶层框架在文档建出时报一次 `document.contentType`，正文就绪（DOMContentLoaded）时再报一次正文是否以
+///   `#EXTM3U` 开头（按网页类型发来的播放列表）。
 /// - 发回 JSON（见 [`Report`]）。发送出的任何错都不抛进页面：脚本改写了页面的 fetch 与 XHR，抛出的异常会成为页面
 ///   自己的请求失败。
 pub const SCRIPT: &str = r#"
@@ -28,7 +29,15 @@ pub const SCRIPT: &str = r#"
   var send = function (message) {
     try { channel.postMessage(JSON.stringify(message)); } catch (e) {}
   };
-  if (window === window.top) send({ kind: 'document', type: document.contentType });
+  if (window === window.top) {
+    send({ kind: 'document', type: document.contentType });
+    var content = function () {
+      var text = document.body ? document.body.textContent : '';
+      send({ kind: 'content', playlist: /^\s*#EXTM3U/.test(text.slice(0, 64)) });
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', content);
+    else content();
+  }
   var playlist = /^\s*(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(x-)?mpegurl)\s*(;|$)/i;
   var named = function (raw) {
     var url;
@@ -91,6 +100,8 @@ pub enum Report {
     Stream { url: Url, agent: String },
     /// 顶层文档的类型（MIME，如 `text/html`）
     Document { content_type: String },
+    /// 顶层文档的正文就绪：`playlist` 为正文以 `#EXTM3U` 开头
+    Content { playlist: bool },
 }
 
 /// 消息的原样内容，未校验。
@@ -104,6 +115,9 @@ enum Raw {
     Document {
         #[serde(rename = "type")]
         content_type: String,
+    },
+    Content {
+        playlist: bool,
     },
 }
 
@@ -120,6 +134,7 @@ pub fn parse(message: &str) -> Option<Report> {
         Raw::Document { content_type } => Report::Document {
             content_type: clip(&content_type),
         },
+        Raw::Content { playlist } => Report::Content { playlist },
     })
 }
 
@@ -151,6 +166,10 @@ mod tests {
             Some(Report::Document {
                 content_type: "text/html".into()
             })
+        );
+        assert_eq!(
+            parse(r#"{"kind":"content","playlist":true}"#),
+            Some(Report::Content { playlist: true })
         );
         // 不是 http(s)、认不出的种类、太长的都不要
         assert_eq!(

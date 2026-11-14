@@ -20,8 +20,8 @@ const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 秒、第一次重试前等约 0.5 秒，30 秒容得下一次连接超时后再试一次。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 要探测的流与它的来历（见 [`request::Found`]）。
-struct Request {
+/// 要探测的流与它的来历（[`request::Stream`] 的拥有版）。
+struct Target {
     stream: Url,
     frame: Option<Url>,
     top: Option<Url>,
@@ -46,7 +46,7 @@ impl SniffView {
         };
         found.check = Check::Running;
         let cookies = cookies_for(webview.read(cx).raw(), &found.url);
-        let request = Request {
+        let target = Target {
             stream: found.url.clone(),
             frame: found.frame.clone(),
             top: found.top.clone(),
@@ -55,15 +55,15 @@ impl SniffView {
         let service = self.service.clone();
         self.checking = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
-            let (check, skipped) = run(&service, cookies, &request, &executor).await;
+            let (check, skipped) = run(&service, cookies, &target, &executor).await;
             // 关了时不再需要结果
             let _closed = this.update(cx, |this, cx| {
                 this.checking = None;
-                // 换页时列表清空、探测随之取消，探测中的也不换地址：这条一定还在
+                // 一次只探测一条；换页时列表清空、探测随之取消：探测中的就是这条
                 let entry = this
                     .found
                     .iter_mut()
-                    .find(|entry| entry.url == request.stream)
+                    .find(|entry| matches!(entry.check, Check::Running))
                     .expect("探测中的流在探测完之前一直在列表里");
                 entry.check = check;
                 entry.skipped = skipped;
@@ -73,11 +73,11 @@ impl SniffView {
         }));
     }
 
-    /// 没成的流重新排队探测（重新读 Cookie）：`url` 为那一条，None 为全部没成的。
-    pub(super) fn retry(&mut self, url: Option<&Url>, cx: &mut Context<Self>) {
-        for found in &mut self.found {
-            if matches!(found.check, Check::Failed { .. })
-                && url.is_none_or(|url| *url == found.url)
+    /// 没成的流重新排队探测（重新读 Cookie）：`row` 为列表里那一条（见 [`SniffView::row`]），None 为全部没成的。
+    pub(super) fn retry(&mut self, row: Option<(usize, &Url)>, cx: &mut Context<Self>) {
+        let one = row.and_then(|(index, url)| self.row(index, url));
+        for (index, found) in self.found.iter_mut().enumerate() {
+            if matches!(found.check, Check::Failed { .. }) && (row.is_none() || one == Some(index))
             {
                 found.check = Check::Waiting;
             }
@@ -91,7 +91,7 @@ impl SniffView {
 async fn run(
     service: &Rc<Service>,
     cookies: impl Future<Output = Result<Vec<Cookie>, String>>,
-    request: &Request,
+    target: &Target,
     executor: &BackgroundExecutor,
 ) -> (Check, usize) {
     let cookies = within(std::pin::pin!(cookies), executor.timer(COOKIE_TIMEOUT))
@@ -103,11 +103,11 @@ async fn run(
             ))
         });
     let made = cookies.and_then(|cookies| {
-        request::headers_for(&request::Found {
-            stream: &request.stream,
-            frame: request.frame.as_ref(),
-            agent: &request.agent,
-            top: request.top.as_ref(),
+        request::headers_for(&request::Stream {
+            stream: &target.stream,
+            frame: target.frame.as_ref(),
+            agent: &target.agent,
+            top: target.top.as_ref(),
             cookies,
         })
     });
@@ -123,7 +123,7 @@ async fn run(
             );
         }
     };
-    let mut source = Source::new(request.stream.clone());
+    let mut source = Source::new(target.stream.clone());
     source.http.headers.clone_from(&made.headers);
     // 超时即释放句柄、取消探测
     let probing = std::pin::pin!(service.probe(source));

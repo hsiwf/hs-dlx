@@ -25,6 +25,7 @@ use gpui_kit::{
     TitlebarOptions, WindowBounds, WindowOptions, div, point, px, size,
 };
 use hs_m3u8_app::{Service, Store};
+use hs_m3u8_instance::HandOverError;
 
 use crate::shell::{MIN_HEIGHT, MIN_WIDTH, Shell};
 use crate::ui::{PAD, TITLE_HEIGHT};
@@ -87,6 +88,9 @@ fn main() {
         report(info);
         std::process::abort();
     }));
+    // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调由主窗口登记）
+    #[cfg(target_os = "macos")]
+    hs_m3u8_macos::install();
     application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
@@ -119,7 +123,16 @@ fn main() {
                         Err(hs_m3u8_app::Error::InUse(_)) => {
                             return match hs_m3u8_instance::hand_over(&path, link.as_deref()) {
                                 Ok(()) => Ok(None),
-                                Err(reason) => Err(Failure::new(
+                                Err(HandOverError::Leaving) => Err(Failure::new(
+                                    "hs-m3u8 正在退出",
+                                    match &link {
+                                        Some(link) => {
+                                            format!("等它退出后再打开这个链接：{link}")
+                                        }
+                                        None => "等它退出后再打开".to_owned(),
+                                    },
+                                )),
+                                Err(HandOverError::Failed(reason)) => Err(Failure::new(
                                     "hs-m3u8 已经在运行",
                                     match &link {
                                         Some(link) => format!(

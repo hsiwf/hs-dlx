@@ -24,7 +24,7 @@ pub(super) struct Plan {
     /// 最该先做的排第一，各不相同
     pub actions: Vec<Action>,
     /// 改请求头保存后接着续传续录。只保存的：只写出已录的（不联网），失败与请求头无关的（见
-    /// [`FailureKind::headers_matter`]）
+    /// [`FailureKind::headers_can_change_outcome`]）
     pub resume_after_headers: bool,
 }
 
@@ -34,7 +34,7 @@ pub(super) struct Plan {
 /// - 再跑一次：选了只写出的写出，其余续传续录；没有可写出的改为续录。
 /// - 被拒或取到错误页的，先改请求头；放不进 MP4 的，先改存本地 HLS，此前再跑只会同样失败。
 /// - 直播接不上之前录的、来源已没有（404/410）或停滞的，先写出已录的：续录多半不成。
-/// - 再试也一样的不给再跑；改了请求头可能不一样的（[`FailureKind::headers_matter`]），保存后接着跑。
+/// - 再试也一样的不给再跑；改了请求头可能不一样的（[`FailureKind::headers_can_change_outcome`]），保存后接着跑。
 /// - 直播停着时都能写出已录的，选了只写出的也能改回续录；任何停着的任务都能改请求头。
 pub(super) fn stopped_plan(
     failure: Option<FailureKind>,
@@ -48,7 +48,7 @@ pub(super) fn stopped_plan(
     } else {
         Action::Resume
     };
-    let headers_first = failure.is_some_and(FailureKind::headers_may_help);
+    let headers_first = failure.is_some_and(FailureKind::headers_likely_missing);
     let live_over = live
         && matches!(
             failure,
@@ -91,7 +91,7 @@ pub(super) fn stopped_plan(
     }
     Plan {
         actions,
-        resume_after_headers: failure.is_none_or(FailureKind::headers_matter)
+        resume_after_headers: failure.is_none_or(FailureKind::headers_can_change_outcome)
             && rerun == Action::Resume,
     }
 }

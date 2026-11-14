@@ -1,17 +1,20 @@
 //! 网页里的视频流：网页在后台加载、不显示，主体列出找到的视频流，每条在后台探测好（几档清晰度、时长或直播），用户
 //! 挑一条下载。要登录、认证或手动点播放时可以打开网页（左边网页、右边列表），弄完收起。
 //!
-//! 页面的地址、加载与标题由网页引擎报；脚本发回的只有找到的流与文档类型，按不可信数据校验、限量（见
-//! [`script`]）。网页要开的新窗口与要下载的文件都不放行，列出来由用户决定。网页里的视频与音频只在网页显示着时放。
+//! 页面的地址、加载、标题与故障由网页引擎报；脚本发回的只有找到的流、顶层文档的类型与正文是否为播放列表，按不可信
+//! 数据校验、限量（见 [`script`]、[`inbox`]）。打开的地址是不是网页按第一个顶层文档定论（见 [`verdict`]）。网页要开
+//! 的新窗口与要下载的文件都不放行，列出来由用户决定。网页里的视频与音频只在网页显示着时放。找不到流时，打开的地址
+//! 可以当作播放列表交回新建页（缺请求头时源站回了网页）。
 
 mod check;
 mod found;
+mod inbox;
 mod list;
 mod page;
 mod request;
 mod script;
+mod verdict;
 
-use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -23,22 +26,23 @@ use gpui_kit::{
 use hs_m3u8_app::Service;
 use hs_m3u8_core::Url;
 use hs_m3u8_webview::WebView;
-use tokio::sync::mpsc;
 
 use self::found::{Check, Found};
+use self::inbox::{Engine, Inbox};
 use self::script::Report;
+use self::verdict::Judge;
+pub use self::verdict::Verdict;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::ui::{self, GAP};
 
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
 const MAX_FOUND: usize = 200;
-/// 网页发来、还没处理的消息最多积多少条：网页发得比处理得快时，再来的丢掉并计数。页面加载的事件不计、不丢。
-const QUEUE: usize = 256;
 /// 加载这么久还没找到流时给出建议：没开始显示的多半打不开，显示了的多半要登录或点了播放才加载视频。
 const SUGGEST_AFTER: Duration = Duration::from_secs(12);
-/// 显示网页时可以让出的文档类型：网页引擎当作网页显示的。
-const PAGE_TYPES: [&str; 2] = ["text/html", "application/xhtml+xml"];
+/// 打开地址后最多等多久有是不是网页的结论，到时按打不开定论：慢的网页首字节也在十几秒内，网页引擎没给出故障（如
+/// macOS 上连不上时）也不让新建页一直等。
+const DECIDE_WITHIN: Duration = Duration::from_secs(30);
 
 /// 发给外面的事件。
 pub enum SniffEvent {
@@ -49,80 +53,6 @@ pub enum SniffEvent {
     PageToggled,
     /// 打开的地址是不是网页有了结论（[`SniffView::verdict`]）
     Decided,
-}
-
-/// 打开的地址是不是网页：按网页引擎打开它后建出的第一个顶层文档判断，之后的换页不改。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// 还不知道：顶层文档还没建出
-    Pending,
-    /// 网页（HTML）
-    Page,
-    /// 不是网页：网页引擎认出的类型（如 `video/mp4`）；文档加载完也没报类型时为 None
-    NotPage(Option<String>),
-    /// 建不出网页，或网页进程在有结论之前退出：原因
-    Broken(String),
-}
-
-/// 网页引擎报来的事。页面加载按发生的先后处理、不丢；别的网页能任意多发，积多了丢（见 [`Inbox`]）。
-enum Engine {
-    /// 开始显示这个地址（导航已提交）：之前找到的都属于上一个页面
-    Started(String),
-    Finished(String),
-    /// 网页进程退出了（macOS）
-    Crashed,
-    /// 脚本发回的消息与发它的框架的地址（网页引擎给的，见 [`hs_m3u8_webview::ipc_frame`]）
-    Message {
-        body: String,
-        frame: Option<String>,
-    },
-    Title(String),
-    /// 网页要在新窗口里打开的地址（链接的 target=_blank、window.open）
-    Popup(String),
-    /// 网页要下载的文件的地址
-    Download(String),
-}
-
-impl Engine {
-    /// 积多了能丢的。
-    fn droppable(&self) -> bool {
-        !matches!(
-            self,
-            Engine::Started(_) | Engine::Finished(_) | Engine::Crashed
-        )
-    }
-}
-
-/// 网页引擎报来、还没处理的事：一条按先后的通道，能丢的另计数、限量。
-struct Inbox {
-    sender: mpsc::UnboundedSender<Engine>,
-    /// 在通道里的能丢的事的条数
-    pending: Cell<usize>,
-    /// 积压满了或太长而丢掉的条数，从打开起算
-    dropped: Cell<u64>,
-}
-
-impl Inbox {
-    /// 交给处理它的任务：能丢的积满了、消息太长时丢掉并计数，标题先截短；视图关了时什么也不做。
-    fn offer(&self, event: Engine) {
-        let event = match event {
-            Engine::Message { body, .. } if body.len() > script::MAX_MESSAGE => {
-                self.dropped.set(self.dropped.get() + 1);
-                return;
-            }
-            Engine::Title(title) => Engine::Title(script::clip(&title)),
-            event => event,
-        };
-        if event.droppable() {
-            if self.pending.get() >= QUEUE {
-                self.dropped.set(self.dropped.get() + 1);
-                return;
-            }
-            self.pending.set(self.pending.get() + 1);
-        }
-        // 视图关了时没有人收
-        let _closed = self.sender.send(event);
-    }
 }
 
 /// 当前页面加载到哪一步。
@@ -136,6 +66,8 @@ struct Load {
 
 pub struct SniffView {
     service: Rc<Service>,
+    /// 打开的地址：可以当作播放列表交回新建页
+    opened: Url,
     /// 建不出网页时为原因
     webview: Result<Entity<WebView>, String>,
     /// 网页显示着（左边网页、右边列表）；否则只有列表，网页在后台
@@ -146,9 +78,9 @@ pub struct SniffView {
     /// 网页的标题；还没有时为 None
     title: Option<String>,
     load: Load,
-    /// 网页进程退出了，要刷新才回来
-    crashed: bool,
-    verdict: Verdict,
+    /// 当前页面的故障（导航没成、网页进程退出）：要刷新才回来
+    failure: Option<String>,
+    judge: Judge,
     found: Vec<Found>,
     /// 列表满了之后又找到的条数
     overflow: usize,
@@ -166,6 +98,8 @@ pub struct SniffView {
     _engine: Task<()>,
     /// 加载够久时重画一次，好给出建议
     _suggest: Task<()>,
+    /// 到时还没有结论就按打不开定论
+    _deadline: Task<()>,
     _typed: Subscription,
 }
 
@@ -179,12 +113,7 @@ impl SniffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (sender, mut events) = mpsc::unbounded_channel::<Engine>();
-        let inbox = Rc::new(Inbox {
-            sender,
-            pending: Cell::new(0),
-            dropped: Cell::new(0),
-        });
+        let (inbox, mut events) = Inbox::new();
         let offer = |make: fn(String) -> Engine| {
             let inbox = inbox.clone();
             move |text: String| inbox.offer(make(text))
@@ -227,16 +156,17 @@ impl SniffView {
                     });
                 }
             });
-        #[cfg(target_os = "macos")]
-        let builder = {
-            use wry::WebViewBuilderExtDarwin as _;
-            let inbox = inbox.clone();
-            builder.with_on_web_content_process_terminate_handler(move || {
-                inbox.offer(Engine::Crashed);
-            })
-        };
         let builder = builder.with_url(url.as_str());
-        let webview = WebView::build(builder, window, cx)
+        let failed = {
+            let inbox = inbox.clone();
+            move |failure| {
+                inbox.offer(match failure {
+                    hs_m3u8_webview::Failure::LoadFailed(reason) => Engine::LoadFailed(reason),
+                    hs_m3u8_webview::Failure::ProcessGone => Engine::Crashed,
+                });
+            }
+        };
+        let webview = WebView::build(builder, failed, window, cx)
             .map(|webview| cx.new(|_| webview))
             .map_err(|error| format!("建不出网页：{error}"));
         let engine = cx.spawn(async move |this, cx| {
@@ -262,12 +192,28 @@ impl SniffView {
                 InputEvent::Change | InputEvent::Focus | InputEvent::Blur => {}
             },
         );
-        let verdict = match &webview {
-            Ok(_) => Verdict::Pending,
-            Err(reason) => Verdict::Broken(reason.clone()),
-        };
+        let mut judge = Judge::new();
+        if let Err(reason) = &webview {
+            judge.fail(reason.clone());
+        }
+        let deadline = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DECIDE_WITHIN).await;
+            // 关了时不再需要结论
+            let _closed = this.update(cx, |this, cx| {
+                let what = if this.load.shown.is_some() {
+                    "加载完"
+                } else {
+                    "打开"
+                };
+                let reason = format!("网页 {} 秒还没{what}", DECIDE_WITHIN.as_secs());
+                if this.judge.fail(reason) {
+                    cx.emit(SniffEvent::Decided);
+                }
+            });
+        });
         let mut view = SniffView {
             service,
+            opened: url,
             webview,
             page_shown: false,
             on_screen: false,
@@ -278,8 +224,8 @@ impl SniffView {
                 finished: false,
                 since: Instant::now(),
             },
-            crashed: false,
-            verdict,
+            failure: None,
+            judge,
             found: Vec::new(),
             overflow: 0,
             inbox,
@@ -290,6 +236,7 @@ impl SniffView {
             checking: None,
             _engine: engine,
             _suggest: Task::ready(()),
+            _deadline: deadline,
             _typed: typed,
         };
         view.apply_media(cx);
@@ -297,32 +244,19 @@ impl SniffView {
         view
     }
 
-    /// 从现在起 [`SUGGEST_AFTER`] 后重画一次：那时还没找到流就给出建议；打开的地址到那时还没开始显示的，按打不开定论。
+    /// 从现在起 [`SUGGEST_AFTER`] 后重画一次：那时还没找到流就给出建议。
     fn wait_to_suggest(&mut self, cx: &mut Context<Self>) {
         self.load.since = Instant::now();
         self._suggest = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SUGGEST_AFTER).await;
             // 关了时不用重画
-            let _closed = this.update(cx, |this, cx| {
-                if this.verdict == Verdict::Pending && this.load.shown.is_none() {
-                    this.decide(
-                        Verdict::Broken(format!("网页 {} 秒还没打开", SUGGEST_AFTER.as_secs())),
-                        cx,
-                    );
-                }
-                cx.notify();
-            });
+            let _closed = this.update(cx, |_, cx| cx.notify());
         });
     }
 
     fn on_engine(&mut self, event: Engine, cx: &mut Context<Self>) {
-        if event.droppable() {
-            let pending = self.inbox.pending.get();
-            self.inbox
-                .pending
-                .set(pending.checked_sub(1).expect("能丢的事入队时计过数"));
-        }
-        match event {
+        self.inbox.received(&event);
+        let decided = match event {
             Engine::Started(url) => {
                 self.found.clear();
                 self.overflow = 0;
@@ -330,7 +264,7 @@ impl SniffView {
                 self.error = None;
                 self.popup = None;
                 self.download = None;
-                self.crashed = false;
+                self.failure = None;
                 self.checking = None;
                 self.load.shown = Some(url.clone());
                 self.load.finished = false;
@@ -338,43 +272,32 @@ impl SniffView {
                 self.wait_to_suggest(cx);
                 // 新页面照当前是否显示决定放不放
                 self.apply_media(cx);
+                false
             }
             Engine::Finished(url) => {
                 self.load.finished = true;
                 self.navigated = Some(url);
-                // 文档加载完也没报类型：脚本没在它里面跑（如 PDF），不当网页
-                if self.verdict == Verdict::Pending && self.load.shown.is_some() {
-                    self.decide(Verdict::NotPage(None), cx);
-                }
+                self.load.shown.is_some() && self.judge.finished()
+            }
+            // 正在做的后台探测不依赖网页进程，照常做完
+            Engine::LoadFailed(reason) => {
+                self.failure = Some(reason.clone());
+                self.judge.fail(reason)
             }
             Engine::Crashed => {
-                self.crashed = true;
-                self.checking = None;
-                if self.verdict == Verdict::Pending {
-                    self.decide(Verdict::Broken("网页进程意外退出了".to_owned()), cx);
-                }
+                let reason = "网页进程意外退出了".to_owned();
+                self.failure = Some(reason.clone());
+                self.judge.fail(reason)
             }
             Engine::Message { body, frame } => match script::parse(&body) {
                 Some(Report::Stream { url, agent }) => {
                     let top = self.load.shown.as_deref().and_then(http_url);
                     let frame = frame.as_deref().and_then(http_url);
                     self.add(Found::new(url, frame, top, agent), cx);
+                    false
                 }
-                Some(Report::Document { content_type }) => {
-                    if self.verdict == Verdict::Pending {
-                        let page = PAGE_TYPES
-                            .iter()
-                            .any(|page| content_type.eq_ignore_ascii_case(page));
-                        self.decide(
-                            if page {
-                                Verdict::Page
-                            } else {
-                                Verdict::NotPage(Some(content_type))
-                            },
-                            cx,
-                        );
-                    }
-                }
+                Some(Report::Document { content_type }) => self.judge.document(&content_type),
+                Some(Report::Content { playlist }) => self.judge.content(playlist),
                 None => return,
             },
             // 单页应用换页时地址变了而不重新加载，常伴着改标题：顺带读一次地址
@@ -386,28 +309,28 @@ impl SniffView {
                         Err(error) => self.error = Some(format!("读不出网页的地址：{error}")),
                     }
                 }
+                false
             }
             // 不是 http(s) 的（about:blank、blob: 之类）没什么可开
-            Engine::Popup(url) => self.popup = http_url(&url),
-            Engine::Download(url) => {
-                // 打开的地址本身就是要下载的文件
-                if self.verdict == Verdict::Pending && self.load.shown.is_none() {
-                    self.decide(Verdict::NotPage(None), cx);
-                }
-                self.download = http_url(&url);
+            Engine::Popup(url) => {
+                self.popup = http_url(&url);
+                false
             }
+            Engine::Download(url) => {
+                self.download = http_url(&url);
+                // 还没显示任何页面：打开的地址本身就是要下载的文件
+                self.load.shown.is_none() && self.judge.download()
+            }
+        };
+        if decided {
+            cx.emit(SniffEvent::Decided);
         }
         cx.notify();
     }
 
-    fn decide(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
-        self.verdict = verdict;
-        cx.emit(SniffEvent::Decided);
-    }
-
-    /// 加进列表并排队探测；同一条流又报来的换成新地址（见 [`Found::renew`]），满了的只计数。
+    /// 加进列表并排队探测；同一个框架又报来的同一条流换成新地址（见 [`Found::renew`]），满了的只计数。
     fn add(&mut self, found: Found, cx: &mut Context<Self>) {
-        if let Some(known) = self.found.iter_mut().find(|known| known.key == found.key) {
+        if let Some(known) = self.found.iter_mut().find(|known| known.same(&found)) {
             known.renew(found);
         } else if self.found.len() < MAX_FOUND {
             self.found.push(found);
@@ -419,7 +342,7 @@ impl SniffView {
 
     /// 打开的地址是不是网页。
     pub fn verdict(&self) -> &Verdict {
-        &self.verdict
+        self.judge.verdict()
     }
 
     /// 网页的标题；还没有时为 None。
@@ -500,20 +423,54 @@ impl SniffView {
         cx.notify();
     }
 
-    /// 打开 `url` 的新建页：探测好的带上结果与当时的请求头，网页的标题取现在的。
-    fn open_new_task(&self, url: Url, cx: &mut Context<Self>) {
-        let found = self.found.iter().find(|found| found.url == url);
-        let (headers, probe) = match found.map(|found| &found.check) {
-            Some(Check::Ready { probe, headers, .. }) => (headers.clone(), Some(probe.clone())),
-            Some(Check::Failed {
+    /// 列表里第 `index` 条、地址为 `url` 的流还在时为 `index`：画列表时记下的按钮在列表换了之后（旧帧上的点击）可能
+    /// 对不上，不同框架报的流也可能地址相同，两样都核对。
+    fn row(&self, index: usize, url: &Url) -> Option<usize> {
+        self.found
+            .get(index)
+            .is_some_and(|found| found.url == *url)
+            .then_some(index)
+    }
+
+    /// 打开列表里那一条流（见 [`SniffView::row`]）的新建页：探测好的带上结果与当时的请求头，没成的带上请求头，网页的
+    /// 标题取现在的。对不上时什么也不做。
+    fn open_found(&self, index: usize, url: &Url, cx: &mut Context<Self>) {
+        let Some(found) = self.row(index, url).map(|index| &self.found[index]) else {
+            return;
+        };
+        let (headers, probe) = match &found.check {
+            Check::Ready { probe, headers, .. } => (headers.clone(), Some(probe.clone())),
+            Check::Failed {
                 headers: Some(headers),
                 ..
-            }) => (headers.clone(), None),
-            _ => (Vec::new(), None),
+            } => (headers.clone(), None),
+            Check::Waiting | Check::Running | Check::Failed { headers: None, .. } => return,
         };
+        self.open_link(url.clone(), self.title.clone(), headers, probe, cx);
+    }
+
+    /// 把网页要下载的文件 `url` 不带请求头交给新建页去探测；任务照网页的标题取名。
+    fn open_download(&self, url: Url, cx: &mut Context<Self>) {
+        self.open_link(url, self.title.clone(), Vec::new(), None, cx);
+    }
+
+    /// 把打开的地址当作播放列表交给新建页：它取到的是网页（多为缺请求头时源站回的拦截页），网页的标题不是视频的，
+    /// 任务由地址取名。
+    fn open_opened(&self, cx: &mut Context<Self>) {
+        self.open_link(self.opened.clone(), None, Vec::new(), None, cx);
+    }
+
+    fn open_link(
+        &self,
+        url: Url,
+        title: Option<String>,
+        headers: Vec<(String, String)>,
+        probe: Option<Box<hs_m3u8_core::Probe>>,
+        cx: &mut Context<Self>,
+    ) {
         cx.emit(SniffEvent::Open(Link {
             url,
-            title: self.title.clone(),
+            title,
             headers,
             probe,
         }));

@@ -4,14 +4,13 @@ use std::time::Instant;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Stateful, StatefulInteractiveElement as _, Styled as _, canvas, div, px,
+    Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
+    StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
 
 use super::row::{Row, look};
 use super::{Page, Shell};
 use crate::new_task::Phase;
-use crate::sniff::SniffView;
 use crate::{ring, theme, ui};
 
 /// 任务列表的宽度。
@@ -33,7 +32,7 @@ impl Shell {
             let on = matches!(&self.page, Page::Sniff(shown) if shown == view);
             let read = view.read(cx);
             let (title, found) = (read.page_title(), read.found_count());
-            sniff_item(view.clone(), title, found, on, dim, cx)
+            sniff_item(title, found, on, dim, cx)
         });
         let orbs: Vec<_> = self
             .rows
@@ -137,10 +136,8 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
         ))
 }
 
-/// 网页里的视频流那一项（`view`）：两个同心实线环（与列表里每条流前面的一样），写网页的标题与找到了几条；`on` 为
-/// 正显示着。
+/// 网页里的视频流那一项：两个同心实线环（与列表里每条流前面的一样），写网页的标题与找到了几条；`on` 为正显示着。
 fn sniff_item(
-    view: Entity<SniffView>,
     title: Option<String>,
     found: usize,
     on: bool,
@@ -150,7 +147,7 @@ fn sniff_item(
     ui::list_item("sniff", on)
         .when(dim, |item| item.opacity(0.55))
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| this.show(Page::Sniff(view.clone()), cx)))
+        .on_click(cx.listener(|this, _, _, cx| this.show_sniff(cx)))
         .child(ui::rings(ORB, ORB_WIDTH, 20.))
         .child(two_lines(
             title.unwrap_or_else(|| "网页里的视频流".to_owned()),

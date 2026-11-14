@@ -33,7 +33,7 @@ impl Shell {
                             "不退出了",
                             Tone::Ghost,
                             cx.listener(|this, _, _, cx| {
-                                this.quit = Quit::Staying;
+                                this.stay();
                                 cx.notify();
                             }),
                         )),

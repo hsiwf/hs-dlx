@@ -144,9 +144,10 @@ impl FailureKind {
             | HttpErrorKind::Transport(_)
             | HttpErrorKind::Proxy(_) => FailureKind::Network,
             HttpErrorKind::Certificate(_) => FailureKind::Certificate,
+            // 重定向打转、次数过多多为登录状态不对（缺 Cookie），与取到登录页同类
+            HttpErrorKind::Redirect(_) => FailureKind::Malformed,
             HttpErrorKind::RangeIgnored(_)
             | HttpErrorKind::RangeMismatch(_)
-            | HttpErrorKind::Redirect(_)
             | HttpErrorKind::InvalidRequest(_) => FailureKind::Unrecoverable,
         }
     }
@@ -203,7 +204,7 @@ impl FailureKind {
 
     /// 改了请求头再跑可能有不同结果：失败出在请求上（被拒、错误页、网络、停滞），或还没跑出结果（没有可写出的，接着
     /// 录制）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占与其余再试也一样的，与请求头无关。
-    pub fn headers_matter(self) -> bool {
+    pub fn headers_can_change_outcome(self) -> bool {
         match self {
             FailureKind::Status(_)
             | FailureKind::Malformed
@@ -221,8 +222,9 @@ impl FailureKind {
         }
     }
 
-    /// 多半要先改请求头（补上 Referer、Cookie、Authorization）：被服务器拒绝，或取到的是错误页、登录页。
-    pub fn headers_may_help(self) -> bool {
+    /// 多半要先改请求头（补上 Referer、Cookie、Authorization）：被服务器拒绝，或取到的是错误页、登录页、重定向打转。
+    /// 是 [`FailureKind::headers_can_change_outcome`] 的一部分：这里为真的，那里一定为真。
+    pub fn headers_likely_missing(self) -> bool {
         matches!(
             self,
             FailureKind::Status(401 | 403) | FailureKind::Malformed
@@ -373,10 +375,10 @@ mod tests {
         assert!(FailureKind::Status(503).retry_helps());
         assert!(!FailureKind::Status(404).retry_helps());
         assert!(!FailureKind::Malformed.retry_helps());
-        assert!(FailureKind::Malformed.headers_may_help());
-        assert!(FailureKind::Status(403).headers_may_help());
-        assert!(!FailureKind::Network.headers_may_help());
-        assert!(!FailureKind::Unrecoverable.headers_matter());
+        assert!(FailureKind::Malformed.headers_likely_missing());
+        assert!(FailureKind::Status(403).headers_likely_missing());
+        assert!(!FailureKind::Network.headers_likely_missing());
+        assert!(!FailureKind::Unrecoverable.headers_can_change_outcome());
         let unaligned = CoreError::WorkDir {
             path: PathBuf::from("/m/a.hsdl"),
             problem: WorkDirProblem::Unaligned { track: 1 },

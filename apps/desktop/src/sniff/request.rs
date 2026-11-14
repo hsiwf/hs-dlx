@@ -3,8 +3,8 @@
 use hs_m3u8_core::{Url, check_option_header};
 use hs_m3u8_webview::cookies::Cookie;
 
-/// 一条流与它的来历。
-pub struct Found<'a> {
+/// 要探测的一条流与它的来历。
+pub struct Stream<'a> {
     pub stream: &'a Url,
     /// 报它的框架的地址，网页引擎给的；认不出是哪个框架（Linux）或框架不是 http(s) 的（about:blank、srcdoc）时为 None
     pub frame: Option<&'a Url>,
@@ -33,7 +33,7 @@ pub struct Headers {
 /// - Cookie：流与顶层页面同一站点、且报它的框架（网页引擎认得出的）也与流同一站点时全带；否则只带跨站也带的
 ///   （[`Cookie::cross_site`]）。别的站点的框架（如广告）能报任意地址，不能借它带上这个站点的登录 Cookie。放不进请求
 ///   头的跳过，计入 [`Headers::skipped`]。
-pub fn headers_for(found: &Found<'_>) -> Result<Headers, String> {
+pub fn headers_for(found: &Stream<'_>) -> Result<Headers, String> {
     let mut headers = Vec::new();
     if let Some(origin) = found.frame.or(found.top)
         && !(origin.scheme() == "https" && found.stream.scheme() == "http")
@@ -102,8 +102,8 @@ mod tests {
         }
     }
 
-    fn found<'a>(stream: &'a Url, frame: Option<&'a Url>, top: Option<&'a Url>) -> Found<'a> {
-        Found {
+    fn found<'a>(stream: &'a Url, frame: Option<&'a Url>, top: Option<&'a Url>) -> Stream<'a> {
+        Stream {
             stream,
             frame,
             agent: "",
@@ -121,7 +121,7 @@ mod tests {
     fn referer_is_the_frame_site() {
         let stream = url("https://cdn.video.example/a/index.m3u8");
         let frame = url("https://www.video.example/watch?session=secret");
-        let made = headers_for(&Found {
+        let made = headers_for(&Stream {
             agent: "UA",
             cookies: Vec::new(),
             ..found(&stream, Some(&frame), None)
@@ -139,7 +139,7 @@ mod tests {
         );
         // 认不出框架时为顶层页面的网站
         let top = url("https://www.video.example/list");
-        let made = headers_for(&Found {
+        let made = headers_for(&Stream {
             cookies: Vec::new(),
             ..found(&stream, None, Some(&top))
         })
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(made.headers[0].1, "https://www.video.example/");
         // 从 https 页面请求 http 的流不带
         let plain = url("http://cdn.video.example/a/index.m3u8");
-        let made = headers_for(&Found {
+        let made = headers_for(&Stream {
             cookies: Vec::new(),
             ..found(&plain, Some(&frame), None)
         })

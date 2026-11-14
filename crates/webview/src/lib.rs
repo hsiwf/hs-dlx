@@ -7,6 +7,9 @@
 //! [`WebView::hide`]。
 
 pub mod cookies;
+mod failure;
+
+pub use failure::Failure;
 #[cfg(target_os = "linux")]
 mod linux;
 mod media;
@@ -66,13 +69,17 @@ impl Drop for WebView {
 }
 
 impl WebView {
-    /// 按 `builder` 在 `window` 里建网页，做好各平台 wry 要的准备。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland
-    /// 窗口报错；GTK 在这里初始化，有网页期间由 GPUI 驱动它的主循环。
+    /// 按 `builder` 在 `window` 里建网页，做好各平台 wry 要的准备；网页出了 wry 不报的故障（见 [`Failure`]）时在界面
+    /// 线程上调 `on_failure`。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland 窗口报错；GTK 在这里初始化，有网页期间
+    /// 由 GPUI 驱动它的主循环。
     pub fn build(
         builder: wry::WebViewBuilder,
+        on_failure: impl Fn(Failure) + 'static,
         window: &mut Window,
         cx: &mut App,
     ) -> wry::Result<Self> {
+        let report: failure::Report = Rc::new(on_failure);
+        let builder = failure::before_build(builder, &report);
         #[cfg(target_os = "linux")]
         let (webview, gtk) = {
             let parent = linux::X11Parent::new(window)?;
@@ -81,6 +88,7 @@ impl WebView {
         };
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build_as_child(&*window)?;
+        failure::after_build(&webview, &report)?;
         // 第一次布局之前先不占地方
         webview.set_bounds(Rect::default())?;
         #[cfg(target_os = "linux")]

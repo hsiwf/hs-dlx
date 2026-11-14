@@ -108,6 +108,17 @@ impl Route {
     }
 }
 
+/// 第一次探测取到的不是播放列表后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
+#[derive(Clone, PartialEq, Eq)]
+enum PageCheck {
+    /// 没在看：探测没失败、不是这种失败，或用户已改请求头重新探测
+    Idle,
+    /// 正在看：探测失败的说明先不显示
+    Opening,
+    /// 看过了、不是网页（或打不开）：写在失败的说明下面的话
+    NotPage(String),
+}
+
 enum Probing {
     Running,
     Failed(Failure),
@@ -122,10 +133,8 @@ pub struct NewTask {
     /// 交给服务的网页标题（见 [`Link::title`]）
     page_title: Option<String>,
     probing: Probing,
-    /// 外面正在网页引擎里打开地址，看它是不是网页（探测失败的说明先不显示）
-    opening_page: bool,
-    /// 外面看过之后的说明（如网页引擎认出它是视频文件），写在失败的说明下面
-    page_note: Option<String>,
+    /// 取到的不是播放列表后，外面看它是不是网页看到哪一步
+    page_check: PageCheck,
     /// 从嗅探页来的流：失败页上不再给「在网页里找视频流」
     from_sniff: bool,
     /// 选中的变体在 `MasterInfo::variants` 里的下标；来源是媒体播放列表时不用
@@ -191,8 +200,7 @@ impl NewTask {
             page_title,
             url,
             probing: Probing::Running,
-            opening_page: false,
-            page_note: None,
+            page_check: PageCheck::Idle,
             from_sniff,
             variant: 0,
             audio: None,
@@ -222,8 +230,7 @@ impl NewTask {
         source.http.headers = headers;
         let handle = self.service.probe(source);
         self.probing = Probing::Running;
-        self.opening_page = false;
-        self.page_note = None;
+        self.page_check = PageCheck::Idle;
         self._probe = cx.spawn(async move |this, cx| {
             let (probing, not_page) = match handle.await {
                 Ok(Ok(probe)) => (Probing::Ready(Box::new(probe)), false),
@@ -264,19 +271,18 @@ impl NewTask {
 
     /// 外面开始在网页引擎里打开地址、看它是不是网页：探测失败的说明先不显示。
     pub fn opening_page(&mut self, cx: &mut Context<Self>) {
-        self.opening_page = true;
+        self.page_check = PageCheck::Opening;
         cx.notify();
     }
 
     /// 外面正在网页引擎里打开地址（[`NewTask::opening_page`] 之后，没有重新探测）。
     pub fn is_opening_page(&self) -> bool {
-        self.opening_page
+        self.page_check == PageCheck::Opening
     }
 
     /// 外面看过了、不是网页（或打不开）：显示探测失败的说明，`note` 写在下面。
     pub fn not_a_page(&mut self, note: String, cx: &mut Context<Self>) {
-        self.opening_page = false;
-        self.page_note = Some(note);
+        self.page_check = PageCheck::NotPage(note);
         cx.notify();
     }
 
@@ -297,7 +303,7 @@ impl NewTask {
     pub fn phase(&self) -> Phase {
         match self.probing {
             Probing::Running => Phase::Probing,
-            Probing::Failed(_) if self.opening_page => Phase::Probing,
+            Probing::Failed(_) if self.page_check == PageCheck::Opening => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
             Probing::Ready(_) => Phase::Ready,
         }

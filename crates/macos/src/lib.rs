@@ -4,4 +4,4 @@
 mod terminate;
 
 #[cfg(target_os = "macos")]
-pub use terminate::{Error, ask_before_terminate};
+pub use terminate::{Error, Reply, ask_before_terminate, install, reply_to_terminate};
