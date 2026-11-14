@@ -744,6 +744,18 @@ mod tests {
         assert!(matches!(parse_proxy("pac:x"), Err(Error::Corrupt(_))));
     }
 
+    /// 测试用的绝对路径 `/m/<name>`；Windows 上没有盘符的不算绝对路径，为 `C:\m\<name>`。只用作存储里的值，不访问
+    /// 文件系统。
+    fn m(name: &str) -> PathBuf {
+        let root = if cfg!(windows) { r"C:\m" } else { "/m" };
+        Path::new(root).join(name)
+    }
+
+    /// [`m`] 在表里的写法。
+    fn text(name: &str) -> String {
+        utf8(&m(name)).unwrap()
+    }
+
     fn spec(output: OutputSpec) -> TaskSpec {
         TaskSpec {
             title: "主题演讲".into(),
@@ -767,10 +779,10 @@ mod tests {
     fn tasks_round_trip_and_change_status() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let a = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 100).unwrap();
+        let a = add(&tx, OutputSpec::Mp4(m("a.mp4")), 100).unwrap();
         let both = OutputSpec::Both {
-            mp4: "/m/b.mp4".into(),
-            hls: "/m/b".into(),
+            mp4: m("b.mp4"),
+            hls: m("b"),
         };
         let b = add(&tx, both, 200).unwrap();
         let forbidden = Failure {
@@ -784,8 +796,8 @@ mod tests {
         let tx = store.transaction().unwrap();
         let tasks = list(&tx).unwrap();
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].spec, spec(OutputSpec::Mp4("/m/a.mp4".into())));
-        assert_eq!(tasks[0].work_dir.as_deref(), Some(Path::new("/m/a.hsdl")));
+        assert_eq!(tasks[0].spec, spec(OutputSpec::Mp4(m("a.mp4"))));
+        assert_eq!(tasks[0].work_dir.as_deref(), Some(m("a.hsdl").as_path()));
         assert_eq!(tasks[0].status, Status::Failed(forbidden));
         assert_eq!(tasks[1].status, Status::Done);
         assert_eq!(get(&tx, b).unwrap().unwrap().created_at, 200);
@@ -803,7 +815,7 @@ mod tests {
     fn every_failure_kind_is_stored() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let id = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
+        let id = add(&tx, OutputSpec::Mp4(m("a.mp4")), 1).unwrap();
         for kind in crate::failure::every() {
             let failed = Status::Failed(Failure {
                 kind,
@@ -818,8 +830,8 @@ mod tests {
     fn interrupted_tasks_become_paused() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let running = add(&tx, OutputSpec::Hls("/m/c".into()), 1).unwrap();
-        let done = add(&tx, OutputSpec::Hls("/m/d".into()), 2).unwrap();
+        let running = add(&tx, OutputSpec::Hls(m("c")), 1).unwrap();
+        let done = add(&tx, OutputSpec::Hls(m("d")), 2).unwrap();
         set_status(&tx, done, &Status::Done).unwrap();
         assert_eq!(pause_interrupted(&tx).unwrap(), 1);
         assert_eq!(get(&tx, running).unwrap().unwrap().status, Status::Paused);
@@ -831,9 +843,9 @@ mod tests {
     fn ids_are_not_reused() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let first = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
+        let first = add(&tx, OutputSpec::Mp4(m("a.mp4")), 1).unwrap();
         delete(&tx, first).unwrap();
-        let second = add(&tx, OutputSpec::Mp4("/m/b.mp4".into()), 2).unwrap();
+        let second = add(&tx, OutputSpec::Mp4(m("b.mp4")), 2).unwrap();
         assert!(second.0 > first.0, "{first:?} {second:?}");
     }
 
@@ -843,7 +855,10 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
         let preference = to_json(&StoredPreference::try_from(&Preference::default()).unwrap());
-        for (preference, mp4) in [("{}", "/m/x.mp4"), (preference.as_str(), "m/x.mp4")] {
+        for (preference, mp4) in [
+            ("{}", text("x.mp4")),
+            (preference.as_str(), "m/x.mp4".into()),
+        ] {
             tx.execute(
                 "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, created_at)
                  VALUES ('x', 'https://a/b.m3u8', ?1, '[]', 'mp4', ?2, 0, 'done', 1)",
@@ -919,26 +934,29 @@ mod tests {
         version_1(
             &path,
             &[
-                ("甲", "paused", "/m/a.mp4"),
-                ("乙", "done", "/m/A.mp4"),
-                ("丙", "failed", "/m/A.mp4"),
-                ("丁", "running", "/m/d.mp4"),
+                ("甲", "paused", &text("a.mp4")),
+                ("乙", "done", &text("A.mp4")),
+                ("丙", "failed", &text("A.mp4")),
+                ("丁", "running", &text("d.mp4")),
             ],
         );
         let mut store = Store::open(&path).unwrap();
         let tx = store.transaction().unwrap();
         let taken = taken_paths(&tx).unwrap();
-        assert!(taken.contains(&naming::path_key("/m/a.hsdl")), "{taken:?}");
+        assert!(
+            taken.contains(&naming::path_key(&text("a.hsdl"))),
+            "{taken:?}"
+        );
         let tasks = list(&tx).unwrap();
         let work_dirs: Vec<Option<&Path>> =
             tasks.iter().map(|task| task.work_dir.as_deref()).collect();
         assert_eq!(
             work_dirs,
             [
-                Some(Path::new("/m/a.hsdl")),
+                Some(m("a.hsdl").as_path()),
                 None,
                 None,
-                Some(Path::new("/m/d.hsdl"))
+                Some(m("d.hsdl").as_path())
             ]
         );
         assert_eq!(tasks[1].status, Status::Done);
@@ -950,7 +968,7 @@ mod tests {
         assert_eq!((tasks[0].total, &tasks[1].result), (None, &None));
         let last = tasks[3].id;
         delete(&tx, last).unwrap();
-        let next = add(&tx, OutputSpec::Mp4("/m/e.mp4".into()), 2).unwrap();
+        let next = add(&tx, OutputSpec::Mp4(m("e.mp4")), 2).unwrap();
         assert_eq!(next.0, last.0 + 1);
         // 迁移来的存储有一份没设过的设置
         assert!(settings(&tx).unwrap() == Settings::default());
@@ -965,11 +983,11 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
         assert!(settings(&tx).unwrap() == Settings::default());
-        set_folder(&tx, Path::new("/m/影片")).unwrap();
+        set_folder(&tx, &m("影片")).unwrap();
         let proxy = Proxy::Url(hs_m3u8_core::Url::parse("http://127.0.0.1:7890").unwrap());
         set_proxy(&tx, &proxy).unwrap();
         let read = settings(&tx).unwrap();
-        assert_eq!(read.folder.as_deref(), Some(Path::new("/m/影片")));
+        assert_eq!(read.folder.as_deref(), Some(m("影片").as_path()));
         assert!(read.proxy == proxy);
         assert!(
             tx.execute("UPDATE settings SET proxy = 'pac' WHERE id = 1", [])
@@ -995,10 +1013,10 @@ mod tests {
     fn work_dirs_are_unique_and_totals_are_kept() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let a = add(&tx, OutputSpec::Mp4("/m/a.mp4".into()), 1).unwrap();
+        let a = add(&tx, OutputSpec::Mp4(m("a.mp4")), 1).unwrap();
         assert!(matches!(
-            add(&tx, OutputSpec::Hls("/m/A".into()), 2),
-            Err(Error::PathTaken(path)) if path == Path::new("/m/A.hsdl")
+            add(&tx, OutputSpec::Hls(m("A")), 2),
+            Err(Error::PathTaken(path)) if path == m("A.hsdl")
         ));
         set_total(&tx, a, 664).unwrap();
         assert_eq!(get(&tx, a).unwrap().unwrap().total, Some(664));
