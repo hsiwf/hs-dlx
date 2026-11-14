@@ -40,15 +40,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwebkit2gtk-4.1-dev libgtk-3-dev
 
+      # 仓库里 Python 脚本（第三方声明、图标、找 FFmpeg 的构建脚本）的开发工具；uv 的版本取 pyproject.toml 的
+      # required-version
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
       - name: FFmpeg
         uses: ./.github/actions/ffmpeg
         with:
           cache-key: ${{ runner.os }}-${{ runner.arch }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      # 仓库里 Python 脚本（第三方声明、图标）的开发工具；uv 的版本取 pyproject.toml 的 required-version
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       # 检查项定义在 Makefile 里。依赖图、许可证、覆盖率与 Python 脚本的检查与平台无关，只在 Linux 上查；格式、clippy、
       # 文档与测试涉及各平台专属的代码（cfg 下的），三个平台都查

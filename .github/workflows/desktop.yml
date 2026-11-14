@@ -46,6 +46,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwebkit2gtk-4.1-dev libgtk-3-dev
 
+      # 找 FFmpeg 的构建脚本要用；uv 的版本取 pyproject.toml 的 required-version
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
       - name: FFmpeg
         uses: ./.github/actions/ffmpeg
         with:

@@ -1,5 +1,5 @@
 # cargo-deny 0.20 配置：Rust 依赖的安全公告、许可证白名单、禁用包与来源。make check 与 CI 执行。
-# 静态链接的 FFmpeg 不是 crate：build.sh 确认配置出的是 LGPL，随安装包分发的声明见 apps/desktop/LICENSES/NOTICE.txt。
+# 静态链接的 FFmpeg 不是 crate：编译它的 hs-m3u8 构建脚本确认配置出的是 LGPL，随安装包分发的声明见 apps/desktop/LICENSES/NOTICE.txt。
 
 [graph]
 # 发布安装包的平台；scripts/licenses.py 按它们汇总第三方声明

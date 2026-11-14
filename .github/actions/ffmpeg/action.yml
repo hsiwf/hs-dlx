@@ -1,5 +1,5 @@
 name: FFmpeg
-description: 恢复缓存的精简 FFmpeg 静态库，没有时用 third_party/ffmpeg/build.sh 编译到 third_party/ffmpeg/dist。Windows 上要先有 MSVC 环境与 MSYS2
+description: 恢复缓存的精简 FFmpeg 静态库，没有时用 hs-m3u8（Cargo.lock 固定的提交）的构建脚本编译到 third_party/ffmpeg/dist。要先装好 uv；Windows 上还要先有 MSVC 环境与 MSYS2
 
 inputs:
   cache-key:
@@ -9,23 +9,36 @@ inputs:
 runs:
   using: composite
   steps:
+    # 脚本在 cargo 取下的 hs-m3u8 副本里；缓存键按脚本的内容
+    - name: 找到构建脚本
+      id: script
+      shell: bash
+      run: |
+        script=$(uv run --no-project python scripts/hs_m3u8.py)
+        echo "path=$script" >> "$GITHUB_OUTPUT"
+        echo "hash=$(git hash-object "$script")" >> "$GITHUB_OUTPUT"
+
     - name: 缓存 FFmpeg
       id: cache
       if: inputs.cache-key != ''
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: third_party/ffmpeg/dist
-        key: ffmpeg-${{ inputs.cache-key }}-${{ hashFiles('third_party/ffmpeg/build.sh') }}
+        key: ffmpeg-${{ inputs.cache-key }}-${{ steps.script.outputs.hash }}
 
     - name: 编译 FFmpeg（Windows）
       if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
       shell: msys2 {0}
+      env:
+        SCRIPT: ${{ steps.script.outputs.path }}
       run: |
         # MSYS2 coreutils 的 link.exe 会遮住 MSVC 的链接器
         if [ -f /usr/bin/link.exe ]; then mv /usr/bin/link.exe /usr/bin/link.exe.msys; fi
-        bash third_party/ffmpeg/build.sh
+        bash "$SCRIPT" third_party/ffmpeg/dist third_party/ffmpeg/build
 
     - name: 编译 FFmpeg
       if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
       shell: bash
-      run: bash third_party/ffmpeg/build.sh
+      env:
+        SCRIPT: ${{ steps.script.outputs.path }}
+      run: bash "$SCRIPT" third_party/ffmpeg/dist third_party/ffmpeg/build

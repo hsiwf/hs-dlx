@@ -7,7 +7,7 @@ THIRD-PARTY-RUST.txt 收录桌面应用（hs-dlx）在各发布平台（deny.tom
 一份。收录的文件要对得上 crate 声明的许可证表达式：每个子句（可任选其一的几种许可证）至少有一种的原文在里面（按
 LICENSE_MARKS 里各许可证条款的特征认）；包里的对不上时，加上 third_party/crate-licenses/<名字>-<版本>/ 下的再认，仍
 对不上即失败。补的文件在 THIRD-PARTY-RUST.txt 里标出。NOTICE.txt 里 FFmpeg 的版本与源码包的 SHA-256 取自
-third_party/ffmpeg/build.sh，并列出只能按 MPL-2.0 取用的 crate 的源码出处。
+编译它的 hs-m3u8 构建脚本（见 hs_m3u8.py），并列出只能按 MPL-2.0 取用的 crate 的源码出处。
 """
 
 import argparse
@@ -20,6 +20,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, NoReturn
+
+from hs_m3u8 import FfmpegScript, ffmpeg_script
 
 ROOT = Path(__file__).resolve().parent.parent
 SUPPLIED = ROOT / "third_party/crate-licenses"
@@ -347,13 +349,13 @@ class Clauses:
         return {frozenset([word])}
 
 
-def ffmpeg_release() -> tuple[str, str]:
-    """静态链接的 FFmpeg 的版本与源码包的 SHA-256，取自 third_party/ffmpeg/build.sh。"""
-    script = (ROOT / "third_party/ffmpeg/build.sh").read_text(encoding="utf-8")
-    version = re.search(r"^VERSION=(\S+)$", script, re.MULTILINE)
-    sha256 = re.search(r"^SHA256=(\S+)$", script, re.MULTILINE)
+def ffmpeg_release(script: FfmpegScript) -> tuple[str, str]:
+    """静态链接的 FFmpeg 的版本与源码包的 SHA-256，取自编译它的构建脚本 `script`。"""
+    text = script.path.read_text(encoding="utf-8")
+    version = re.search(r"^VERSION=(\S+)$", text, re.MULTILINE)
+    sha256 = re.search(r"^SHA256=(\S+)$", text, re.MULTILINE)
     if version is None or sha256 is None:
-        message = "third_party/ffmpeg/build.sh 里找不到 VERSION= 或 SHA256="
+        message = f"{script.path} 里找不到 VERSION= 或 SHA256="
         raise SystemExit(message)
     return version[1], sha256[1]
 
@@ -365,12 +367,14 @@ def mpl_crates(crates: list[Crate]) -> list[Crate]:
 
 def ffmpeg_section() -> str:
     """NOTICE.txt 里 FFmpeg 的一段。"""
-    version, sha256 = ffmpeg_release()
+    script = ffmpeg_script()
+    version, sha256 = ffmpeg_release(script)
     tarball = f"ffmpeg-{version}.tar.xz"
     return f"""\
 1. FFmpeg {version}（https://ffmpeg.org），按 GNU Lesser General Public License（LGPL）2.1 或更高版本授权，全文见
-   FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见本项目源码里的
-   third_party/ffmpeg/build.sh。对应的源码包 {tarball} 可从
+   FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见 hs-m3u8 的构建脚本：
+   {script.url()}
+   对应的源码包 {tarball} 可从
    https://ffmpeg.org/releases/{tarball} 取得，SHA-256 为
    {sha256}。
 

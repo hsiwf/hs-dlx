@@ -74,16 +74,19 @@ rs_cov: ffmpeg_present
 	cargo llvm-cov clean --workspace
 	cargo llvm-cov -p hs-dlx-app --fail-under-lines 80 --summary-only
 
-# 装好的 FFmpeg 须是当前的构建脚本装的（标记文件是装它的脚本的副本）：改了组件而本地没重新构建时在这里失败
+# FFmpeg 用 hs-m3u8（Cargo.lock 固定的提交）的构建脚本编译，组件与核心库出自同一个提交；源码包与编译的中间文件放在
+# third_party/ffmpeg/build。打印脚本路径的命令：
+FFMPEG_SCRIPT := uv run --no-sync python scripts/hs_m3u8.py
+# 装好的 FFmpeg 须是那份脚本装的（标记文件是装它的脚本的副本）：升级 hs-m3u8 后它改了组件而本地没重新构建时在这里失败
 FFMPEG_MARKER := $(FFMPEG_DIST)/.hs-m3u8-ffmpeg
 
-ffmpeg_present:
+ffmpeg_present: py_env
 	@test -d $(FFMPEG_DIST)/include || { echo "缺少 $(FFMPEG_DIST)，先运行 make ffmpeg"; exit 1; }
-	@cmp -s $(FFMPEG_MARKER) third_party/ffmpeg/build.sh || \
-		{ echo "$(FFMPEG_DIST) 不是当前的 third_party/ffmpeg/build.sh 装的，先运行 make ffmpeg"; exit 1; }
+	@script=$$($(FFMPEG_SCRIPT)) && { cmp -s $(FFMPEG_MARKER) "$$script" || \
+		{ echo "$(FFMPEG_DIST) 不是 $$script 装的，先运行 make ffmpeg"; exit 1; }; }
 
-ffmpeg:
-	third_party/ffmpeg/build.sh
+ffmpeg: py_env
+	script=$$($(FFMPEG_SCRIPT)) && bash "$$script" $(FFMPEG_DIST) third_party/ffmpeg/build
 
 py_env:
 	uv sync --locked

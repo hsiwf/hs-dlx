@@ -58,7 +58,7 @@ icons = [
 ]
 resources = [{ src = "LICENSES", target = "LICENSES" }]
 
-# 与 third_party/ffmpeg/build.sh 的 MACOSX_DEPLOYMENT_TARGET 一致：随带的 FFmpeg 按它编译
+# 与 hs-m3u8 的 FFmpeg 构建脚本（third_party/ffmpeg/build.sh）的 MACOSX_DEPLOYMENT_TARGET 一致：随带的 FFmpeg 按它编译
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
 
