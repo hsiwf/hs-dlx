@@ -18,17 +18,24 @@ pub enum Departure {
     Busy { busy: usize, recording: bool },
 }
 
+/// 提示框在问的是什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// 退出应用（托盘、程序坞、注销，或没有要等的任务时关窗）
+    App,
+    /// 关窗；`quit_requested` 为问的期间又要退出应用，答完要按退出应用再问
+    Window { quit_requested: bool },
+}
+
 /// 退出进行到哪一步。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Quit {
     Staying,
-    /// 正在问要不要退出（提示框开着）：再来的请求不再问。`app` 为问的是退出应用（不是关窗）；`reopened` 为期间再次
-    /// 打开过应用（接手了转交），选了退出也不退出；`quit_requested` 为问的是关窗、期间又要退出应用（托盘、程序坞、
-    /// 注销），答完要按退出应用再问
+    /// 正在问要不要退出（提示框开着）：再来的请求不再问。`reopened` 为期间再次打开过应用（接手了转交），选了退出也
+    /// 不退出
     Asking {
-        app: bool,
+        asked: Asked,
         reopened: bool,
-        quit_requested: bool,
     },
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
     Waiting,
@@ -79,12 +86,11 @@ impl Tasks {
         }
     }
 
-    /// 开始问要不要退出（窗口里的提示框开着）；`app` 为问的是退出应用（不是关窗）。
-    pub fn ask(&mut self, app: bool) {
+    /// 开始问要不要退出（窗口里的提示框开着），问的是 `asked`。
+    pub fn ask(&mut self, asked: Asked) {
         self.quit = Quit::Asking {
-            app,
+            asked,
             reopened: false,
-            quit_requested: false,
         };
     }
 
@@ -92,8 +98,7 @@ impl Tasks {
     /// 就是答复；没在问时什么也不做。
     pub fn request_quit_while_asking(&mut self) {
         if let Quit::Asking {
-            app: false,
-            quit_requested,
+            asked: Asked::Window { quit_requested },
             ..
         } = &mut self.quit
         {

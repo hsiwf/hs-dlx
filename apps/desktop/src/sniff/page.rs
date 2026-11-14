@@ -5,7 +5,7 @@ use gpui_kit::{Context, Div, ParentElement as _, Styled as _, div, px};
 
 use super::{SniffEvent, SniffView};
 use crate::theme;
-use crate::ui::{self, FIELD_HEIGHT, Tone};
+use crate::ui::{self, Tone};
 
 /// 网页的面板最窄多宽：常见网页的移动版布局从这里起。
 const PAGE_MIN_WIDTH: f32 = 480.;
@@ -63,19 +63,10 @@ impl SniffView {
             ))
             .child(nav("reload", "↻", wry::WebView::reload, "没能刷新", cx))
             .child(
-                div()
+                ui::input_frame()
                     .flex_1()
-                    .min_w_0()
-                    .h(px(FIELD_HEIGHT))
                     .ml(px(6.))
                     .px(px(6.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(10.))
-                    .bg(theme::ground())
-                    .border_1()
-                    .border_color(theme::ring_idle())
-                    .text_size(px(13.))
                     .child(Input::new(&self.address).appearance(false)),
             )
             .child(ui::button(

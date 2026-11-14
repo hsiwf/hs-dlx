@@ -277,14 +277,16 @@ impl SniffView {
         view
     }
 
-    /// 从现在起到 [`SUGGEST_AFTER`]：还没找到流、嗅探页显示着而网页收起时每隔 [`dial::FRAME`] 重画一次，让找流的
+    /// 从现在起到 [`SUGGEST_AFTER`]：还没找到流、嗅探页显示着而网页收起时每隔 [`dial::frame`] 重画一次，让找流的
     /// 小表盘转起来（系统要求减少动态效果时不画）；到时再重画一次，那时还没找到流就给出建议。
     fn wait_to_suggest(&mut self, cx: &mut Context<Self>) {
         self.load.since = Instant::now();
         let since = self.load.since;
         self._suggest = cx.spawn(async move |this, cx| {
             while since.elapsed() < SUGGEST_AFTER {
-                cx.background_executor().timer(dial::FRAME).await;
+                cx.background_executor()
+                    .timer(dial::frame(dial::TURN))
+                    .await;
                 let closed = this.update(cx, |this, cx| {
                     let searching =
                         this.webview.is_ok() && this.found.is_empty() && this.failure.is_none();

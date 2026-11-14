@@ -38,16 +38,16 @@ pub fn clock(duration: Duration) -> String {
     }
 }
 
-/// 剩余时间：向上取整到秒，只写最大的两级（`剩余 42 秒`、`剩余 3 分 10 秒`、`剩余 1 小时 2 分`）。
-pub fn remaining(duration: Duration) -> String {
+/// 时长（剩余时间等）：向上取整到秒，只写最大的两级（`42 秒`、`3 分 10 秒`、`1 小时 2 分`）。
+pub fn duration(duration: Duration) -> String {
     let total = duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
     let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
     if h > 0 {
-        format!("剩余 {h} 小时 {m} 分")
+        format!("{h} 小时 {m} 分")
     } else if m > 0 {
-        format!("剩余 {m} 分 {s} 秒")
+        format!("{m} 分 {s} 秒")
     } else {
-        format!("剩余 {s} 秒")
+        format!("{s} 秒")
     }
 }
 
@@ -85,7 +85,8 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// 失败在表盘上的大字与说明：大字为状态码或种类，说明写这类失败多半是怎么回事（完整的错误另外列出）。
+/// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
+/// 新建页写在圆盘里。完整的错误另外列出。
 pub fn failure(kind: FailureKind) -> (String, &'static str) {
     match kind {
         FailureKind::Status(code @ (401 | 403)) => (
@@ -137,10 +138,10 @@ mod tests {
         assert_eq!(bytes(999_999), "1.0 MB");
         assert_eq!(clock(Duration::from_secs(48 * 60 + 12)), "48:12");
         assert_eq!(clock(Duration::from_secs(3600 + 12 * 60 + 34)), "1:12:34");
-        assert_eq!(remaining(Duration::from_secs(42)), "剩余 42 秒");
-        assert_eq!(remaining(Duration::from_secs(190)), "剩余 3 分 10 秒");
-        assert_eq!(remaining(Duration::from_secs(3720)), "剩余 1 小时 2 分");
-        assert_eq!(remaining(Duration::from_millis(600)), "剩余 1 秒");
+        assert_eq!(duration(Duration::from_secs(42)), "42 秒");
+        assert_eq!(duration(Duration::from_secs(190)), "3 分 10 秒");
+        assert_eq!(duration(Duration::from_secs(3720)), "1 小时 2 分");
+        assert_eq!(duration(Duration::from_millis(600)), "1 秒");
         assert_eq!(bitrate(6_300_000), "6.3 Mbps");
         assert_eq!(bitrate(128_000), "128 kbps");
         assert_eq!(bitrate(999_499), "999 kbps");

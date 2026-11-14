@@ -161,7 +161,7 @@ impl NewTask {
         let animate = !cx.reduce_motion();
         let elapsed = self.since.elapsed();
         let head = if animate {
-            elapsed.as_secs_f32() / dial::TURN
+            dial::head(elapsed, dial::TURN)
         } else {
             0.
         };
@@ -175,14 +175,14 @@ impl NewTask {
             dial::figure(move |bounds, window, _| {
                 ring::paint_comet(bounds, ring::RADIUS, head, theme::cyan(), window)
             }),
-            dial_readout(
+            dial::readout(
                 "探测中",
                 theme::cyan(),
-                if animate {
+                dial::Big::Figure(if animate {
                     format::clock(elapsed)
                 } else {
                     "…".to_owned()
-                },
+                }),
                 doing,
             ),
         )
@@ -385,53 +385,18 @@ impl NewTask {
 /// 探测失败的表盘：整圈暗橙色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
 fn failed_dial(failure: &Failure) -> Div {
     let (mark, hint) = format::failure(failure.kind);
-    let ticks = Ticks {
-        count: 120,
-        lit: 120,
-        written: 0,
-        active: 0,
-        retrying: false,
-        color: theme::alpha(theme::orange(), 0.45),
-        glow: false,
-    };
+    let ticks = Ticks::full(
+        ring::COMET_TICKS,
+        theme::alpha(theme::orange(), 0.45),
+        false,
+    );
     dial::dial(
         theme::orange(),
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
-        dial_readout("探测失败", theme::orange(), mark, hint),
+        dial::readout("探测失败", theme::orange(), dial::Big::Figure(mark), hint),
     )
-}
-
-/// 表盘圆盘里的字：状态（带颜色）、大字与一行说明。
-fn dial_readout(
-    state: &'static str,
-    color: gpui_kit::Hsla,
-    big: String,
-    line: &'static str,
-) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(10.))
-        .child(div().text_size(px(13.)).text_color(color).child(state))
-        .child(ui::num(
-            div()
-                .text_size(px(64.))
-                .line_height(px(64.))
-                .font_weight(FontWeight::BOLD)
-                .child(big),
-        ))
-        .child(
-            div()
-                .max_w(px(dial::TEXT_WIDTH))
-                .text_size(px(13.))
-                .text_color(theme::muted())
-                .text_center()
-                .line_clamp(2)
-                .child(line),
-        )
 }
 
 /// 同心环区域里随探测状态变的部分。

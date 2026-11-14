@@ -10,6 +10,7 @@ mod notices;
 mod operations;
 mod plan;
 mod quit;
+mod standby;
 mod task_list;
 mod task_view;
 mod title_bar;
@@ -17,7 +18,7 @@ mod title_bar;
 pub use self::quit::Leave;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
@@ -26,6 +27,7 @@ use gpui_kit::{
 use hs_m3u8_app::TaskId;
 use hs_m3u8_instance::Handoff;
 
+use crate::dial;
 use crate::dock::{Dock, DockEvent};
 use crate::headers::HeadersEditor;
 use crate::links;
@@ -37,9 +39,6 @@ use crate::tasks::{Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 
-/// 待机页重画的间隔：彗尾 20 秒扫一圈 120 格，一帧前进一格。
-const STANDBY_FRAME: Duration = Duration::from_micros(166_667);
-
 /// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图。
 pub const MIN_WIDTH: f32 =
     2. * PAD + task_list::MIN_WIDTH + GAP + max(new_task::MIN_WIDTH, task_view::MIN_WIDTH);
@@ -50,11 +49,12 @@ pub const MIN_HEIGHT: f32 = TITLE_HEIGHT + max(task_view::MIN_HEIGHT, new_task::
 enum Page {
     /// 选中的任务；没有任务时为待机页
     Task,
-    /// 新建页：视图与对它的订阅，离开新建页时一起释放；`from_sniff` 为从嗅探页打开的，关掉时回到嗅探页；
+    /// 新建页：视图与对它的订阅（它的事件、它的探测进度推给粘贴栏），离开新建页时一起释放；`from_sniff` 为从嗅探页
+    /// 打开的，关掉时回到嗅探页；
     /// `page_check` 为第一次探测取到的不是播放列表时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
     NewTask {
         view: Entity<NewTask>,
-        _subscription: Subscription,
+        _subscriptions: [Subscription; 2],
         from_sniff: bool,
         page_check: Option<(Entity<SniffView>, Subscription)>,
     },
@@ -227,14 +227,22 @@ impl Shell {
             }
         }
         self.page = page;
-        let new_task = self.new_task().map(Entity::downgrade);
-        self.dock
-            .update(cx, |dock, cx| dock.set_new_task(new_task, cx));
+        self.sync_dock(cx);
         self.sync_standby(cx);
         cx.notify();
     }
 
-    /// 显示着待机页（任务页、没有任务）时每隔 [`STANDBY_FRAME`] 重画一次，让彗尾慢慢扫、背光起伏（系统要求减少动态
+    /// 把显示着的新建页探测的链接与探测到哪一步告诉粘贴栏（没有新建页时告诉它没有）。
+    fn sync_dock(&mut self, cx: &mut Context<Self>) {
+        let probing = self.new_task().map(|view| {
+            let view = view.read(cx);
+            (view.url().clone(), view.phase().label())
+        });
+        self.dock
+            .update(cx, |dock, cx| dock.set_probing(probing, cx));
+    }
+
+    /// 显示着待机页（任务页、没有任务）时每隔 [`dial::frame`]（按 [`dial::STANDBY_TURN`]） 重画一次，让彗尾慢慢扫、背光起伏（系统要求减少动态
     /// 效果时不画）；离开待机页即停。
     fn sync_standby(&mut self, cx: &mut Context<Self>) {
         let standby = matches!(self.page, Page::Task) && self.selected.is_none();
@@ -255,7 +263,9 @@ impl Shell {
             .map_err(|error| error.to_string());
         self.standby_frames = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(STANDBY_FRAME).await;
+                cx.background_executor()
+                    .timer(dial::frame(dial::STANDBY_TURN))
+                    .await;
                 let closed = this.update(cx, |_, cx| {
                     if !cx.reduce_motion() {
                         cx.notify();

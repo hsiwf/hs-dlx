@@ -58,6 +58,19 @@ impl Ticks {
             glow: true,
         }
     }
+
+    /// `count` 格全部点亮成 `color`，`glow` 时发光：探测失败、认出了链接时的整圈。
+    pub fn full(count: usize, color: Hsla, glow: bool) -> Ticks {
+        Ticks {
+            count,
+            lit: count,
+            written: 0,
+            active: 0,
+            retrying: false,
+            color,
+            glow,
+        }
+    }
 }
 
 /// 一类刻度共用一条路径：线宽、颜色与半长。
@@ -136,8 +149,11 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
     }
 }
 
-/// 彗尾环：一圈 120 格暗刻度，`head`（整圈为 1，从 12 点顺时针）前的 22 格由淡到亮成 `color`，最前面的一格带光晕。
-/// 待机时彗头停在 12 点；探测、找流时随时间转。
+/// 彗尾一圈的刻度数。
+pub const COMET_TICKS: usize = 120;
+
+/// 彗尾环：一圈 [`COMET_TICKS`] 格暗刻度，`head`（整圈为 1，从 12 点顺时针）前的 22 格由淡到亮成 `color`，最前面的
+/// 一格带光晕。转的快慢见 [`crate::dial::TURN`]。
 pub fn paint_comet(
     bounds: Bounds<Pixels>,
     radius: f32,
@@ -145,7 +161,7 @@ pub fn paint_comet(
     color: Hsla,
     window: &mut Window,
 ) {
-    const COUNT: usize = 120;
+    const COUNT: usize = COMET_TICKS;
     const TAIL: usize = 22;
     let center = bounds.center();
     let first = (head.rem_euclid(1.) * COUNT as f32).round() as usize + COUNT - TAIL;
@@ -187,8 +203,8 @@ pub fn paint_bezel(bounds: Bounds<Pixels>, window: &mut Window) {
     minor.paint(window);
 }
 
-/// 待机时舞台的刻度面，以 `bounds` 的中心（表盘的圆心）为圆心：表盘外一圈细实线、一圈短划、一圈点，两条贯穿的准线
-/// 与准线上表盘外的短刻度（每 5 格一格长）。线会画出 `bounds`，由舞台裁掉；都很淡，只给舞台一层仪表的质感。
+/// 待机时舞台上的引导线，以 `bounds` 的中心（表盘的圆心）为圆心：表盘外一圈细实线、一圈短划、一圈点，两条贯穿的十字
+/// 线与十字线上表盘外的短刻度（每 5 格一格长）。线会画出 `bounds`，由舞台裁掉；都很淡，不表示数据。
 pub fn paint_scope(bounds: Bounds<Pixels>, window: &mut Window) {
     const SOLID: f32 = 300.;
     const DASHED: f32 = 350.;
@@ -279,7 +295,8 @@ fn arc(
     path.build().expect(TESSELLATED)
 }
 
-/// 刻度、圆弧与钟面指针都是不自交的折线，顶点最多几千个，远低于曲面细分的 u16 索引上限，细分不会失败。
+/// 刻度、圆弧、引导线与钟面指针都是描边（描边的细分不受线段相交影响），顶点最多几千个，远低于曲面细分的 u16 索引
+/// 上限，细分不会失败。
 pub(crate) const TESSELLATED: &str = "环上的折线曲面细分失败";
 
 /// 整圈为 1 的比例 `turn`（从 12 点顺时针）换成弧度（0 为 3 点方向）。

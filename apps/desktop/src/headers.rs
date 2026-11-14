@@ -170,19 +170,7 @@ impl Render for HeadersEditor {
             .flex_col()
             .gap(px(8.))
             .children(rows)
-            .child(
-                div()
-                    .px(px(12.))
-                    .h(px(ui::FIELD_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .rounded(px(10.))
-                    .bg(theme::ground())
-                    .border_1()
-                    .border_color(theme::ring_idle())
-                    .text_size(px(13.))
-                    .child(Input::new(&self.input).appearance(false)),
-            )
+            .child(ui::input_frame().child(Input::new(&self.input).appearance(false)))
             .children(self.error.clone().map(ui::error_text))
     }
 }

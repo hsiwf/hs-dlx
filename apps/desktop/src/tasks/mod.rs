@@ -16,7 +16,7 @@ use hs_m3u8_core::Stage;
 use hs_m3u8_instance::{Handoff, Handoffs, Received};
 
 pub use self::operations::resume_label;
-pub use self::quit::{Departure, Quit};
+pub use self::quit::{Asked, Departure, Quit};
 #[cfg(test)]
 pub use self::row::sample;
 pub use self::row::{Amount, Disk, Output, Row, finished_text};

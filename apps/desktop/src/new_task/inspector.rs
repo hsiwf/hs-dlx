@@ -10,23 +10,18 @@ use hs_m3u8_core::Probe;
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, duration_of};
 use crate::format;
-use crate::ui::{self, Step, Tone};
+use crate::ui::{self, Solid, Step, Tone};
 
 impl NewTask {
     pub(super) fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
         let host = self.url.host_str().unwrap_or_default().to_owned();
         let title = self.title.clone();
         match &self.probing {
+            // 探测是一次请求，中间没有可报的步骤：表盘写探测了多久，这里只写请求经哪里走
             Probing::Running => ui::inspector(
                 title,
                 host,
-                [ui::steps([
-                    ("读取播放列表".into(), Step::Now),
-                    ("列出清晰度与音轨".into(), Step::Waiting),
-                ])
-                .into_any_element()]
-                .into_iter()
-                .chain(self.reads_with_route(Vec::new())),
+                self.reads_with_route(Vec::new()),
                 [self.cancel(Tone::Plain, cx)],
             ),
             Probing::Failed(_) if self.page_check == PageCheck::Opening => ui::inspector(
@@ -115,7 +110,7 @@ impl NewTask {
                         "重新探测"
                     },
                     None,
-                    Tone::Amber,
+                    Solid::Amber,
                     true,
                     cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
                 )
@@ -289,7 +284,7 @@ impl NewTask {
                 "start",
                 headline,
                 Some(detail.join(" · ").into()),
-                Tone::Glow,
+                Solid::Glow,
                 !self.creating,
                 cx.listener(|this, _, window, cx| this.start(window, cx)),
             )

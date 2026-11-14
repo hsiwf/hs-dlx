@@ -304,7 +304,7 @@ impl SniffView {
         let elapsed = self.load.since.elapsed();
         let animate = !self.suggest() && self.on_screen && !self.page_shown && !cx.reduce_motion();
         let head = if animate {
-            elapsed.as_secs_f32() / dial::TURN
+            dial::head(elapsed, dial::TURN)
         } else {
             0.
         };
@@ -556,19 +556,14 @@ impl SniffView {
                 .gap(px(6.))
                 .children(tags.into_iter().map(tag))
         };
-        div()
+        ui::well()
             .flex()
             .items_center()
             .gap(px(14.))
             .px(px(16.))
             .py(px(14.))
-            .rounded(px(16.))
-            .bg(theme::cell())
-            .border_1()
-            .border_color(if best {
-                theme::alpha(theme::cyan(), 0.45)
-            } else {
-                theme::deck_edge()
+            .when(best, |row| {
+                row.border_color(theme::alpha(theme::cyan(), 0.45))
             })
             .child(ui::rings(RINGS, 3., 10.).when(!best, |rings| rings.opacity(0.6)))
             .child(
@@ -630,15 +625,11 @@ fn offer(
     label: &'static str,
     act: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> Div {
-    div()
+    ui::well()
         .flex()
         .flex_col()
         .gap(px(10.))
         .p(px(12.))
-        .rounded(px(14.))
-        .bg(theme::cell())
-        .border_1()
-        .border_color(theme::deck_edge())
         .child(
             div()
                 .text_size(px(12.5))

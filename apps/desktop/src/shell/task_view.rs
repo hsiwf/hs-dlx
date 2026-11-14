@@ -1,36 +1,37 @@
-//! 选中任务的舞台与检查面板：舞台中间是表盘（直播录制是钟面），检查面板是读数、信号与操作；没有任务时的待机页。
+//! 选中任务的舞台与检查面板：舞台中间是表盘（直播录制是钟面），检查面板是读数、信号与操作。
 
-use std::f32::consts::TAU;
 use std::time::Instant;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use hs_m3u8_app::{OutputSpec, Status};
-use hs_m3u8_core::{Proxy, bare_url};
+use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
-use crate::links::{self, http_url};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, Row, Tasks, resume_label};
-use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, TEXT_LINE, Tone};
+use crate::tasks::{Amount, Row, resume_label};
+use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
 use crate::{dial, format, ring, theme};
 
-/// 待机时彗尾扫一圈的秒数，与背光起伏一次的秒数。
-const STANDBY_TURN: f32 = 20.;
-const BREATH: f32 = 6.;
-/// 「能粘贴的」小图形的边长。
-const KIND_ICON: f32 = 28.;
+/// 在系统的文件管理器里显示输出：各平台的叫法。
+const REVEAL: &str = if cfg!(target_os = "macos") {
+    "在访达中显示"
+} else if cfg!(target_os = "windows") {
+    "在资源管理器中显示"
+} else {
+    "在文件夹中显示"
+};
 /// 信号的时刻一栏的宽：放得下「11-14 10:20」。
 const SIGNAL_AT_WIDTH: f32 = 72.;
 /// 任务页的最小宽：表盘与收到最窄的检查面板。
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
-pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA);
+pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA, 0.);
 
 /// 检查面板底栏里的操作：最该按的一个与其余的。
 struct Foot {
@@ -53,7 +54,12 @@ impl Shell {
                 dial::figure(move |bounds, window, _| {
                     ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
                 }),
-                readout(&look),
+                dial::readout(
+                    look.state.clone(),
+                    look.color,
+                    dial::Big::Figure(look.big.clone()),
+                    look.line.clone(),
+                ),
             )
         };
         let stage = ui::stage(
@@ -159,14 +165,12 @@ impl Shell {
             "保存".to_owned()
         };
         Some(
-            div()
+            ui::well()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
                 .p(px(14.))
-                .rounded(px(14.))
-                .bg(theme::cell())
-                .border_1()
+                // 正在编辑：描边比别的卡片亮一档
                 .border_color(theme::edge())
                 .child(ui::caption("请求头"))
                 .child(editor.clone())
@@ -255,8 +259,8 @@ impl Shell {
                 Action::OpenFolder => cx.open_with_system(&folder),
             });
             if index == 0 {
-                let tone = if failed { Tone::Amber } else { Tone::Glow };
-                primary = Some(ui::primary(key, label, detail, tone, true, on_click));
+                let solid = if failed { Solid::Amber } else { Solid::Glow };
+                primary = Some(ui::primary(key, label, detail, solid, true, on_click));
             } else {
                 rest.push(ui::button(key, label, Tone::Plain, on_click).flex_1());
             }
@@ -326,7 +330,7 @@ impl Shell {
                     Amount::of(row).map(|amount| {
                         format!("写出已录的 {}", format::clock(amount.duration)).into()
                     }),
-                    Tone::Rec,
+                    Solid::Rec,
                     true,
                     cx.listener(move |this, _, _, cx| {
                         this.tasks.read(cx).stop(id);
@@ -356,7 +360,7 @@ impl Shell {
                         "play",
                         "播放",
                         Some(row.file_name.clone().into()),
-                        Tone::Glow,
+                        Solid::Glow,
                         true,
                         move |_, _, cx| cx.open_with_system(&mp4),
                     )
@@ -364,12 +368,9 @@ impl Shell {
                 let mut rest = Vec::new();
                 if let Some(shown) = shown {
                     rest.push(
-                        ui::button(
-                            "reveal",
-                            "在访达中显示",
-                            Tone::Plain,
-                            move |_, _, cx| cx.reveal_path(&shown),
-                        )
+                        ui::button("reveal", REVEAL, Tone::Plain, move |_, _, cx| {
+                            cx.reveal_path(&shown)
+                        })
                         .flex_1(),
                     );
                 }
@@ -378,288 +379,6 @@ impl Shell {
             }
         }
     }
-
-    /// 没有任务时的待机页：舞台是垫着刻度面的表盘，彗尾慢慢扫、背光起伏（逐帧重画见 [`Shell::sync_standby`]）；输入时
-    /// 背光提亮，框里是可探测的链接时整圈蓄满、圆盘写认出了什么。检查面板是新任务照着开始的设置与剪贴板里的链接。
-    pub(super) fn render_standby(
-        &self,
-        tasks: &Tasks,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> (Div, Div) {
-        let dock = self.dock.read(cx);
-        let typed = dock.text(cx);
-        let link = http_url(&typed);
-        let animate = !cx.reduce_motion();
-        let elapsed = self.standby_since.elapsed().as_secs_f32();
-        let breath = if animate {
-            (elapsed * TAU / BREATH).sin() * 0.025
-        } else {
-            0.
-        };
-        let lift = match (&link, dock.typing(window, cx)) {
-            (Some(_), _) => 0.07,
-            (None, true) => 0.03,
-            (None, false) => 0.,
-        };
-        let head = if animate { elapsed / STANDBY_TURN } else { 0. };
-        let charged = link.is_some();
-        let figure = dial::figure(move |bounds, window, _| {
-            if charged {
-                let ticks = ring::Ticks {
-                    count: 120,
-                    lit: 120,
-                    ..ring::Ticks::of(0, 0, false)
-                };
-                ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
-            } else {
-                ring::paint_comet(bounds, ring::RADIUS, head, theme::cyan(), window)
-            }
-        });
-        let readout = match &link {
-            Some(url) => {
-                let stream = links::stream_url(url.as_str()).is_some();
-                standby_readout(
-                    if stream {
-                        "认出 m3u8 地址"
-                    } else {
-                        "认出链接"
-                    },
-                    url.host_str().unwrap_or_default().to_owned(),
-                    if stream {
-                        "回车探测清晰度与音轨"
-                    } else {
-                        "回车探测；是网页就在后台找视频流"
-                    },
-                )
-            }
-            None => standby_readout(
-                "就绪",
-                "粘贴链接开始".to_owned(),
-                "m3u8 地址，或有视频的网页",
-            ),
-        };
-        let figure = dial::lit_dial(
-            theme::cyan(),
-            dial::LIGHT_STRENGTH + breath + lift,
-            true,
-            figure,
-            readout,
-        );
-        let stage = ui::stage(ring::AREA, figure, None, self.dock.clone());
-        (stage, self.standby_inspector(tasks, cx))
-    }
-
-    /// 待机页的检查面板：新任务照着开始的保存位置、可用空间与网络，剪贴板里的链接，与能粘贴哪两种链接。
-    fn standby_inspector(&self, tasks: &Tasks, cx: &Context<Self>) -> Div {
-        let (free, no_space) = match tasks.free_space() {
-            None => ("—".to_owned(), None),
-            Some(Ok(bytes)) => (format::bytes(*bytes), None),
-            Some(Err(reason)) => ("读不出".to_owned(), Some(reason.clone())),
-        };
-        let (network, unreadable) = match &self.standby_proxy {
-            Ok(Proxy::System) => ("跟随系统", None),
-            Ok(Proxy::Direct) => ("直连", None),
-            Ok(Proxy::Url(_)) => ("指定代理", None),
-            Err(reason) => ("读不出", Some(format!("读不出设置：{reason}"))),
-        };
-        let mut body = vec![
-            ui::reads(
-                vec![
-                    ("可用空间".into(), free.into()),
-                    ("网络".into(), network.into()),
-                ],
-                Some((
-                    "保存到".into(),
-                    format::path(tasks.folder(), self.home.as_deref()).into(),
-                )),
-            )
-            .into_any_element(),
-        ];
-        body.extend(
-            [no_space, unreadable]
-                .into_iter()
-                .flatten()
-                .map(|reason| ui::error_text(reason).into_any_element()),
-        );
-        if let Some(url) = self.clipboard.clone() {
-            let host = url.host_str().unwrap_or_default().to_owned();
-            let path = url.path().to_owned();
-            body.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(ui::caption("剪贴板里的链接"))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .py(px(12.))
-                            .pl(px(14.))
-                            .pr(px(12.))
-                            .rounded(px(14.))
-                            .bg(theme::cell())
-                            .border_1()
-                            .border_color(theme::deck_edge())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .truncate()
-                                            .child(host),
-                                    )
-                                    .child(ui::num(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(theme::muted())
-                                            .truncate()
-                                            .child(path),
-                                    )),
-                            )
-                            .child(ui::button(
-                                "probe-clipboard",
-                                "探测",
-                                Tone::Plain,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.probe_text(url.as_str(), window, cx)
-                                }),
-                            )),
-                    )
-                    .into_any_element(),
-            );
-        }
-        body.push(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.))
-                .child(ui::caption("能粘贴的"))
-                .child(kind(
-                    ui::rings(KIND_ICON, 2.5, 14.).into_any_element(),
-                    "m3u8 地址",
-                    "直接探测出几档清晰度与音轨",
-                ))
-                .child(kind(
-                    page_icon(),
-                    "有视频的网页",
-                    "在后台打开，找出里面的视频流",
-                ))
-                .into_any_element(),
-        );
-        ui::inspector("准备就绪", "新任务照这些开始", body, [])
-    }
-}
-
-/// 待机表盘圆盘里的字：状态、大字（主机名或「粘贴链接开始」）与一行说明。
-fn standby_readout(state: &'static str, big: String, line: &'static str) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(10.))
-        .text_center()
-        .child(
-            div()
-                .text_size(px(13.))
-                .text_color(theme::cyan())
-                .child(state),
-        )
-        .child(ui::num(
-            div()
-                .max_w(px(dial::TEXT_WIDTH))
-                .text_size(px(26.))
-                .font_weight(FontWeight::BOLD)
-                .truncate()
-                .child(big),
-        ))
-        .child(
-            div()
-                .max_w(px(dial::TEXT_WIDTH))
-                .text_size(px(13.))
-                .text_color(theme::muted())
-                .child(line),
-        )
-}
-
-/// 「能粘贴的」一行：图形、名字与它会怎样。
-fn kind(icon: AnyElement, name: &'static str, does: &'static str) -> Div {
-    div().flex().items_start().gap(px(12.)).child(icon).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .child(
-                div()
-                    .text_size(px(13.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(name),
-            )
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .text_color(theme::muted())
-                    .child(does),
-            ),
-    )
-}
-
-/// 网页的小图形：圆角方框里两道横线。
-fn page_icon() -> AnyElement {
-    let bar = |width: f32| div().h(px(2.)).w(px(width)).bg(theme::hover_edge());
-    div()
-        .size(px(KIND_ICON))
-        .flex_none()
-        .flex()
-        .flex_col()
-        .gap(px(3.))
-        .p(px(6.))
-        .rounded(px(7.))
-        .border_2()
-        .border_color(theme::hover_edge())
-        .child(bar(12.))
-        .child(bar(8.))
-        .into_any_element()
-}
-
-/// 圆盘里的字：状态（带颜色）、大字与下面一行说明。
-fn readout(look: &Look) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(8.))
-        .child(
-            div()
-                .text_size(px(13.))
-                .text_color(look.color)
-                .child(look.state.clone()),
-        )
-        .child(ui::num(
-            div()
-                .text_size(px(66.))
-                .line_height(px(66.))
-                .font_weight(FontWeight::BOLD)
-                .child(look.big.clone()),
-        ))
-        .child(ui::num(
-            div()
-                .max_w(px(dial::TEXT_WIDTH))
-                .text_size(px(13.))
-                .line_height(px(TEXT_LINE))
-                .text_color(theme::muted())
-                .text_center()
-                .line_clamp(2)
-                .child(SharedString::from(look.line.clone())),
-        ))
 }
 
 /// 检查面板的读数（直播录制的见 [`live_view::reads`]）：下载中为速度、剩余、已下与分片，写出中为已下与分片，停着的为
@@ -708,10 +427,7 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             let left = row
                 .rate
                 .remaining(now, total.saturating_sub(done))
-                .map_or_else(
-                    || "—".to_owned(),
-                    |left| format::remaining(left).replacen("剩余 ", "", 1),
-                );
+                .map_or_else(|| "—".to_owned(), format::duration);
             vec![
                 cell("速度", speed),
                 cell("剩余", left),
@@ -757,8 +473,8 @@ fn signals(signals: &[Signal]) -> Div {
         .children(signals.iter().rev().map(|signal| {
             let color = match signal.level {
                 Level::Info => theme::soft(),
-                Level::Warn => theme::warn_text(),
-                Level::Error => theme::error_text(),
+                Level::Warn => theme::signal_warn(),
+                Level::Error => theme::signal_error(),
             };
             div()
                 .flex()

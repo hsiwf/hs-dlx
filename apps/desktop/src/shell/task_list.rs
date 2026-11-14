@@ -195,7 +195,7 @@ fn new_task_item(phase: Phase) -> impl IntoElement {
         .child(two_lines("新任务".to_owned(), phase.label().to_owned()))
 }
 
-/// 还没有任务时：三个渐隐的空槽位（虚线环与两道暗条，与任务一项同样的版式）与一句说明。
+/// 还没有任务时：三个渐隐的空槽位（暗环与两道暗条，与任务一项同样的版式；虚线环留给「新任务」）与一句说明。
 fn empty_slots() -> Vec<gpui_kit::AnyElement> {
     let slot = |opacity: f32, width: f32| {
         div()
@@ -210,7 +210,6 @@ fn empty_slots() -> Vec<gpui_kit::AnyElement> {
                     .flex_none()
                     .rounded_full()
                     .border_2()
-                    .border_dashed()
                     .border_color(theme::ring_idle()),
             )
             .child(

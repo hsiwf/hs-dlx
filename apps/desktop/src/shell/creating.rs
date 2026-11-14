@@ -92,11 +92,13 @@ impl Shell {
                 cx.notify();
             },
         );
+        // 探测到哪一步变了时告诉粘贴栏
+        let observing = cx.observe(&view, |this: &mut Self, _, cx| this.sync_dock(cx));
         let ready = view.read(cx).phase() == Phase::Ready;
         self.show(
             Page::NewTask {
                 view: view.clone(),
-                _subscription: subscription,
+                _subscriptions: [subscription, observing],
                 from_sniff,
                 page_check: None,
             },

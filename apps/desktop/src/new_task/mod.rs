@@ -3,10 +3,10 @@
 //! 探测；取到的不是播放列表时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理
 //! 写在检查面板里。舞台底部是外面给的粘贴栏。
 
+mod figure;
 mod inspector;
-mod rings;
 
-use self::rings::{FIGURE_HEIGHT, FIGURE_WIDTH};
+use self::figure::{FIGURE_HEIGHT, FIGURE_WIDTH};
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
 /// 新建页的最小宽：整个同心环区域与收到最窄的检查面板（放得下一行「MP4 · 本地 HLS · 两者」三个选项）。
 pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + INSPECTOR_MIN_WIDTH;
 /// 新建页的最小高：放得下同心环区域、按键说明与粘贴栏的舞台。
-pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT + ui::CAPTION_LINE + 12.);
+pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT, ui::CAPTION_LINE);
 
 /// 要探测的链接。
 #[derive(Clone)]
@@ -73,7 +73,7 @@ impl Phase {
     /// 粘贴栏右侧与任务列表里新任务一项的说明。
     pub fn label(self) -> &'static str {
         match self {
-            Phase::Probing => "正在探测",
+            Phase::Probing => "探测中",
             Phase::Ready => "探测完成",
             Phase::Failed => "探测失败",
         }
@@ -270,11 +270,13 @@ impl NewTask {
         cx.notify();
     }
 
-    /// 探测中（[`Phase::Probing`]）每隔 [`dial::FRAME`] 重画一次，让表盘上的彗尾转起来；系统要求减少动态效果时不画。
+    /// 探测中（[`Phase::Probing`]）每隔 [`dial::frame`] 重画一次，让表盘上的彗尾转起来；系统要求减少动态效果时不画。
     fn animate(&mut self, cx: &mut Context<Self>) {
         self._frames = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(dial::FRAME).await;
+                cx.background_executor()
+                    .timer(dial::frame(dial::TURN))
+                    .await;
                 let going = this.update(cx, |this, cx| {
                     let going = this.phase() == Phase::Probing;
                     // 减少动态效果可能随时开关：开着时不画，循环照旧，关掉后接着转
@@ -353,7 +355,7 @@ impl NewTask {
         let Some(master) = &probe.master else {
             return;
         };
-        let order: Vec<usize> = rings::rings(&master.variants)
+        let order: Vec<usize> = figure::rings(&master.variants)
             .iter()
             .map(|ring| ring.index)
             .collect();

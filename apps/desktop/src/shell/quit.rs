@@ -4,7 +4,7 @@
 use gpui_kit::{Context, PromptButton, PromptLevel, Window};
 
 use super::Shell;
-use crate::tasks::{Departure, Quit, Tasks};
+use crate::tasks::{Asked, Departure, Quit, Tasks};
 
 /// 要走的是什么。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ impl Shell {
             cx,
         );
         // 没有要等的任务时关窗即退出应用
-        self.tasks.update(cx, |tasks, _| tasks.ask(true));
+        self.tasks.update(cx, |tasks, _| tasks.ask(Asked::App));
         let tasks = self.tasks.clone();
         cx.spawn(async move |_, cx| {
             let leave = matches!(answer.await, Ok(0));
@@ -135,8 +135,14 @@ impl Shell {
             &buttons,
             cx,
         );
-        self.tasks
-            .update(cx, |tasks, _| tasks.ask(leave == Leave::App));
+        self.tasks.update(cx, |tasks, _| {
+            tasks.ask(match leave {
+                Leave::App => Asked::App,
+                Leave::Window { .. } => Asked::Window {
+                    quit_requested: false,
+                },
+            })
+        });
         let tasks = self.tasks.clone();
         cx.spawn_in(window, async move |this, cx| {
             // 提示框没答（窗口没了）算取消
@@ -174,10 +180,13 @@ impl Shell {
 fn answered(tasks: &mut Tasks, choice: Choice, cx: &mut Context<Tasks>) -> After {
     let (reopened, quit_requested) = match tasks.quit() {
         Quit::Asking {
+            asked: Asked::Window { quit_requested },
             reopened,
-            quit_requested,
-            ..
         } => (reopened, quit_requested),
+        Quit::Asking {
+            asked: Asked::App,
+            reopened,
+        } => (reopened, false),
         Quit::Staying | Quit::Waiting | Quit::Leaving => (false, false),
     };
     let after = match choice {

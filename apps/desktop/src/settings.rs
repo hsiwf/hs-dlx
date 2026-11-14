@@ -14,7 +14,7 @@ use hs_m3u8_core::{Proxy, Url};
 use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme;
-use crate::ui::{self, FIELD_HEIGHT, Tone};
+use crate::ui::{self, Tone};
 use crate::web_route::WebRoute;
 
 /// 设置各行的最大宽度。
@@ -232,18 +232,9 @@ impl SettingsView {
                             .items_center()
                             .gap(px(8.))
                             .child(
-                                div()
+                                ui::input_frame()
                                     .flex_1()
-                                    .min_w_0()
-                                    .h(px(FIELD_HEIGHT))
                                     .px(px(6.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(10.))
-                                    .border_1()
-                                    .border_color(theme::ring_idle())
-                                    .bg(theme::ground())
-                                    .text_size(px(13.))
                                     .child(Input::new(&self.address).appearance(false)),
                             )
                             .child(ui::button(
@@ -392,8 +383,7 @@ impl Render for SettingsView {
 }
 
 /// 随安装包附上的第三方声明目录（打包时由 cargo-packager 当作资源放进，见 apps/desktop/Cargo.toml）：macOS 在
-/// `.app/Contents/Resources/LICENSES`，Windows 在程序旁的 `LICENSES`，Linux 在 `/usr/lib/<程序名>/LICENSES`（AppImage 里
-/// 同样相对程序）。找不到（从源码直接运行）时为原因。
+/// `.app/Contents/Resources/LICENSES`，Windows 在程序旁的 `LICENSES`，Linux 在 `/usr/lib/<程序名>/LICENSES`（deb）。找不到（从源码直接运行）时为原因。
 fn installed_notices() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|error| format!("找不到程序所在的位置：{error}"))?;
     let beside = exe.parent().ok_or("程序没有所在的目录")?;

@@ -1,11 +1,12 @@
-//! 中央表盘的版式：背光、表圈、撑满 [`AREA`] 的刻度（任务的分片、直播钟面、探测的彗尾）、深色圆盘与圆盘里的字。
-//! 任务页、待机页、新建页（探测中与失败）与嗅探页（找流中）共用。
+//! 中央表盘的版式：背光、表圈、撑满 [`AREA`] 的刻度（任务的分片、直播钟面、探测的彗尾）、深色圆盘与圆盘里的字
+//! （[`readout`]），以及彗尾转动的快慢。任务页、待机页与新建页（探测中与失败）用；嗅探页找流中的小表盘只用彗尾。
 
 use std::time::Duration;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Div, Hsla, IntoElement, ParentElement as _, Styled as _, canvas, div, px,
+    AnyElement, Div, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _,
+    canvas, div, px,
 };
 
 use crate::ring::{self, AREA};
@@ -15,30 +16,59 @@ use crate::{theme, ui};
 const DISC_INSET: f32 = 70.;
 /// 圆盘里的字离圆盘边多远。
 const DISC_PADDING: f32 = 24.;
-/// 彗尾（[`ring::paint_comet`]）转一圈的秒数。
-pub const TURN: f32 = 4.;
-/// 彗尾动画一帧的间隔：彗尾的位置按格取整（一圈 120 格），一帧正好前进一格，更密的帧画出来也一样。
-pub const FRAME: Duration = Duration::from_micros(33_333);
+/// 探测、找流时彗尾（[`ring::paint_comet`]）转一圈要多久。
+pub const TURN: Duration = Duration::from_secs(4);
+/// 待机时彗尾扫一圈要多久：慢到只是在动。
+pub const STANDBY_TURN: Duration = Duration::from_secs(20);
+
+/// 彗尾转一圈要 `turn` 时，一帧的间隔：彗尾的位置按格取整（一圈 [`ring::COMET_TICKS`] 格），一帧正好前进一格，更密的
+/// 帧画出来也一样。
+pub const fn frame(turn: Duration) -> Duration {
+    Duration::from_micros((turn.as_micros() / ring::COMET_TICKS as u128) as u64)
+}
+
+/// 彗尾此刻转到哪里（整圈为 1）：转一圈要 `turn`，已转了 `elapsed`。
+pub fn head(elapsed: Duration, turn: Duration) -> f32 {
+    elapsed.as_secs_f32() / turn.as_secs_f32()
+}
 
 /// 圆盘里一行说明最宽多少：两行时仍在圆盘里。
 pub const TEXT_WIDTH: f32 = 240.;
 /// 背光：表盘后面一个看不见的圆投下的大片柔光，直径与模糊半径。
 const LIGHT: f32 = 300.;
 const LIGHT_BLUR: f32 = 200.;
-/// 背光平时的强度（0 到 1）：只在舱底上透出一层颜色，不抢刻度。
+/// 背光平时的强度（0 到 1）：只在窗口底色上透出一层颜色，不抢刻度。
 pub const LIGHT_STRENGTH: f32 = 0.09;
+/// 大字的字号：数字（百分比、时长、状态码）与一句话（「粘贴链接开始」、主机名）。
+const FIGURE_SIZE: f32 = 66.;
+const PHRASE_SIZE: f32 = 26.;
+
+/// 表盘下面垫什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    Plain,
+    /// 待机时：几圈引导环与十字线（见 [`ring::paint_scope`]，超出舞台的部分由舞台裁掉）
+    Guides,
+}
+
+/// 圆盘里的大字。
+pub enum Big {
+    /// 数字：百分比、时长、状态码
+    Figure(String),
+    /// 一句话或一个名字
+    Phrase(String),
+}
 
 /// 表盘：`light` 为背光的颜色（随状态），`figure` 为撑满整块区域的刻度，圆盘压在中间，`center` 放在圆盘里。
 pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
-    lit_dial(light, LIGHT_STRENGTH, false, figure, center)
+    lit_dial(light, LIGHT_STRENGTH, Backdrop::Plain, figure, center)
 }
 
-/// [`dial`]，背光的强度为 `strength`（0 到 1）；`scope` 时下面垫一层待机的刻度面（见 [`ring::paint_scope`]，超出舞台的
-/// 部分由舞台裁掉）。
+/// [`dial`]，背光的强度为 `strength`（0 到 1），下面垫 `backdrop`。
 pub fn lit_dial(
     light: Hsla,
     strength: f32,
-    scope: bool,
+    backdrop: Backdrop,
     figure: AnyElement,
     center: impl IntoElement,
 ) -> Div {
@@ -50,7 +80,7 @@ pub fn lit_dial(
             .left(px(DISC_INSET))
             .size(px(disc))
     };
-    lit_face(light, strength, scope)
+    lit_face(light, strength, backdrop)
         .child(figure)
         .child(
             place()
@@ -71,16 +101,16 @@ pub fn lit_dial(
 
 /// 没有圆盘的表盘（直播钟面的指针扫过圆心）：背光与表圈，`figure` 与其余的字由调用方叠上去。
 pub fn face(light: Hsla) -> Div {
-    lit_face(light, LIGHT_STRENGTH, false)
+    lit_face(light, LIGHT_STRENGTH, Backdrop::Plain)
 }
 
-fn lit_face(light: Hsla, strength: f32, scope: bool) -> Div {
+fn lit_face(light: Hsla, strength: f32, backdrop: Backdrop) -> Div {
     let offset = (AREA - LIGHT) / 2.;
     div()
         .relative()
         .size(px(AREA))
         .flex_none()
-        .when(scope, |face| {
+        .when(backdrop == Backdrop::Guides, |face| {
             face.child(figure(|bounds, window, _| {
                 ring::paint_scope(bounds, window)
             }))
@@ -116,4 +146,52 @@ pub fn figure(
     .absolute()
     .size_full()
     .into_any_element()
+}
+
+/// 圆盘里的字：`state`（颜色 `color`）、大字 `big` 与下面最多两行的说明 `line`。
+pub fn readout(
+    state: impl Into<SharedString>,
+    color: Hsla,
+    big: Big,
+    line: impl Into<SharedString>,
+) -> Div {
+    let big = match big {
+        Big::Figure(text) => ui::num(
+            div()
+                .text_size(px(FIGURE_SIZE))
+                .line_height(px(FIGURE_SIZE))
+                .font_weight(FontWeight::BOLD)
+                .child(text),
+        ),
+        Big::Phrase(text) => ui::num(
+            div()
+                .max_w(px(TEXT_WIDTH))
+                .text_size(px(PHRASE_SIZE))
+                .font_weight(FontWeight::BOLD)
+                .truncate()
+                .child(text),
+        ),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(10.))
+        .text_center()
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(color)
+                .child(state.into()),
+        )
+        .child(big)
+        .child(ui::num(
+            div()
+                .max_w(px(TEXT_WIDTH))
+                .text_size(px(13.))
+                .line_height(px(ui::TEXT_LINE))
+                .text_color(theme::muted())
+                .line_clamp(2)
+                .child(line.into()),
+        ))
 }

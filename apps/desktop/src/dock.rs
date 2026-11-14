@@ -1,15 +1,16 @@
-//! 粘贴栏：舞台底部的链接输入。回车或点「探测」发出 [`DockEvent::Probe`]；探测着的正是框里的链接时，右边写新建页
-//! 探测到哪一步；外面拒绝了输入（不是链接）时右边写原因，改了内容即清掉。任务页、待机页与新建页的舞台里各放一份同
-//! 一个视图。
+//! 粘贴栏：舞台底部的链接输入。回车或点「探测」发出 [`DockEvent::Probe`]；外面告诉它正在探测的链接
+//! （[`Dock::set_probing`]），框里正是它时右边写探测到哪一步；外面拒绝了输入（不是链接）时右边写原因，改了内容即
+//! 清掉。任务页、待机页与新建页的舞台里放的是同一个视图。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
     AppContext as _, Context, EventEmitter, Focusable as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, WeakEntity, Window, div, px,
+    Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
+use hs_m3u8_core::Url;
+
 use crate::links::http_url;
-use crate::new_task::NewTask;
 use crate::theme;
 use crate::ui::{self, DOCK_HEIGHT, Tone};
 
@@ -26,7 +27,7 @@ pub struct Dock {
     /// 外面拒绝这次输入的原因；改了内容时清掉
     refused: Option<String>,
     /// 显示着的新建页：探测的正是框里的链接时，右边写它探测到哪一步
-    new_task: Option<WeakEntity<NewTask>>,
+    probing: Option<(Url, &'static str)>,
     _typed: Subscription,
 }
 
@@ -52,7 +53,7 @@ impl Dock {
         Dock {
             input,
             refused: None,
-            new_task: None,
+            probing: None,
             _typed: typed,
         }
     }
@@ -86,10 +87,12 @@ impl Dock {
         cx.notify();
     }
 
-    /// 显示着的新建页换了（没有新建页时为 None）。
-    pub fn set_new_task(&mut self, view: Option<WeakEntity<NewTask>>, cx: &mut Context<Self>) {
-        self.new_task = view;
-        cx.notify();
+    /// 正在探测的链接与探测到哪一步（显示着的新建页报的；没有新建页时为 None）：框里正是这个链接时右边写这一步。
+    pub fn set_probing(&mut self, probing: Option<(Url, &'static str)>, cx: &mut Context<Self>) {
+        if self.probing != probing {
+            self.probing = probing;
+            cx.notify();
+        }
     }
 }
 
@@ -99,13 +102,10 @@ impl Render for Dock {
         let focused = self.typing(window, cx);
         let typed = http_url(&value);
         let probing = self
-            .new_task
+            .probing
             .as_ref()
-            .and_then(WeakEntity::upgrade)
-            .and_then(|view| {
-                let view = view.read(cx);
-                (typed.as_ref() == Some(view.url())).then(|| view.phase().label())
-            });
+            .filter(|(url, _)| typed.as_ref() == Some(url))
+            .map(|(_, phase)| *phase);
         let trailing = if let Some(reason) = &self.refused {
             ui::error_text(reason.clone())
                 .pr(px(14.))

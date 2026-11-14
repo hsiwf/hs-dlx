@@ -28,8 +28,10 @@ pub const INSPECTOR_WIDTH: f32 = 344.;
 pub const INSPECTOR_MIN_WIDTH: f32 = 296.;
 /// 粘贴栏的高。
 pub const DOCK_HEIGHT: f32 = 52.;
-/// 舞台里表盘与下面（提示、粘贴栏）的最小间距。
+/// 舞台里表盘与粘贴栏的最小间距。
 pub const DOCK_GAP: f32 = 18.;
+/// 舞台里表盘下面各行（提示、按键说明、粘贴栏）之间的间距。
+const STAGE_GAP: f32 = 12.;
 /// 粘贴栏离舞台底边多远。
 pub const DOCK_BOTTOM: f32 = 4.;
 /// 按钮的高度。
@@ -52,31 +54,39 @@ pub const fn max(a: f32, b: f32) -> f32 {
 pub enum Tone {
     /// 描边，深色底
     Plain,
-    /// 发光的青色实心：每屏最该按的那一个
+    /// 发光的青色实心：每屏最该按的那一个（在检查面板里时用主操作 [`primary`]）
     Glow,
-    /// 红色实心：停止录制
-    Rec,
-    /// 橙色实心：要处理时最该按的那一个
-    Amber,
     /// 只有文字：退出当前流程
     Ghost,
 }
 
-/// 实心按钮的底色、悬停时的底色与上面的字色；描边与只有文字的为 None。
-fn solid(tone: Tone) -> Option<(Hsla, Hsla, Hsla)> {
-    match tone {
-        Tone::Glow => Some((theme::cyan(), theme::cyan_pale(), theme::on_cyan())),
-        Tone::Rec => Some((
-            theme::red(),
-            theme::alpha(theme::red(), 0.85),
-            gpui_kit::white(),
-        )),
-        Tone::Amber => Some((
-            theme::orange(),
-            theme::alpha(theme::orange(), 0.85),
-            theme::on_amber(),
-        )),
-        Tone::Plain | Tone::Ghost => None,
+/// 实心的样子：按钮的三种实心，也是主操作（[`primary`]）能用的全部样子。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Solid {
+    /// 青色：每屏最该按的那一个
+    Glow,
+    /// 橙色：要处理时最该按的那一个
+    Amber,
+    /// 红色：停止录制
+    Rec,
+}
+
+impl Solid {
+    /// 底色、悬停时的底色与上面的字色。
+    fn colors(self) -> (Hsla, Hsla, Hsla) {
+        match self {
+            Solid::Glow => (theme::cyan(), theme::cyan_pale(), theme::on_cyan()),
+            Solid::Rec => (
+                theme::red(),
+                theme::alpha(theme::red(), 0.85),
+                gpui_kit::white(),
+            ),
+            Solid::Amber => (
+                theme::orange(),
+                theme::alpha(theme::orange(), 0.85),
+                theme::on_amber(),
+            ),
+        }
     }
 }
 
@@ -100,7 +110,8 @@ pub fn button(
         .cursor_pointer()
         .on_click(on_click)
         .child(label.into());
-    if let Some((bg, hover, text)) = solid(tone) {
+    if tone == Tone::Glow {
+        let (bg, hover, text) = Solid::Glow.colors();
         return base
             .bg(bg)
             .text_color(text)
@@ -122,16 +133,16 @@ pub fn button(
 }
 
 /// 当前对象的主操作：整宽、两行（做什么与它的后果，如「开始下载 · 1080p」「约 1.9 GB · MP4」），放在检查面板底栏的
-/// 最前面。`tone` 为实心的三种之一；`enabled` 为 false 时变淡、不可点。
+/// 最前面。`enabled` 为 false 时变淡、不可点。
 pub fn primary(
     id: impl Into<ElementId>,
     title: impl Into<SharedString>,
     detail: Option<SharedString>,
-    tone: Tone,
+    solid: Solid,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    let (bg, hover, text) = solid(tone).expect("主操作是实心的");
+    let (bg, hover, text) = solid.colors();
     let base = div()
         .id(id)
         .w_full()
@@ -429,8 +440,8 @@ pub fn steps(items: impl IntoIterator<Item = (SharedString, Step)>) -> Div {
         }))
 }
 
-/// 只读的一格（如保存位置）：与输入框同样的外观，放不下时截断。
-pub fn field(text: impl Into<SharedString>) -> Div {
+/// 输入框的外框（里面放 `Input`，或只读的字，见 [`field`]）：比面板暗一层的底、细边。
+pub fn input_frame() -> Div {
     div()
         .min_w_0()
         .h(px(FIELD_HEIGHT))
@@ -442,31 +453,39 @@ pub fn field(text: impl Into<SharedString>) -> Div {
         .border_1()
         .border_color(theme::ring_idle())
         .text_size(px(13.))
+}
+
+/// 只读的一格（如保存位置）：与输入框同样的外观，放不下时截断。
+pub fn field(text: impl Into<SharedString>) -> Div {
+    input_frame()
         .text_color(theme::soft())
         .child(num(div().min_w_0().truncate()).child(text.into()))
 }
 
-/// 面板里的一段说明：`warn` 时为要处理的（橙色描边）。
-pub fn note(text: impl Into<SharedString>, warn: bool) -> Div {
+/// 面板里抬起的一块（读数格之外的卡片：说明、流、网页要做的事）：读数格的底色、细边、圆角。
+pub fn well() -> Div {
     div()
+        .rounded(px(14.))
+        .bg(theme::cell())
+        .border_1()
+        .border_color(theme::deck_edge())
+}
+
+/// 面板里的一段说明：`warn` 时为要处理的（橙色描边、暖色底）。
+pub fn note(text: impl Into<SharedString>, warn: bool) -> Div {
+    let note = well()
         .px(px(14.))
         .py(px(12.))
-        .rounded(px(14.))
-        .border_1()
-        .border_color(if warn {
-            theme::warn_edge()
-        } else {
-            theme::deck_edge()
-        })
-        .bg(if warn {
-            theme::warn_ground()
-        } else {
-            theme::cell()
-        })
         .text_size(px(13.))
         .line_height(px(20.))
         .text_color(theme::soft())
-        .child(text.into())
+        .child(text.into());
+    if warn {
+        note.border_color(theme::warn_edge())
+            .bg(theme::warn_ground())
+    } else {
+        note
+    }
 }
 
 /// 状态胶囊：发光的小圆点与一句状态（标题栏里用）。
@@ -541,8 +560,8 @@ pub fn card(edge: Hsla) -> Div {
         .line_height(px(19.))
 }
 
-/// 舞台：两块面板之间、直接在舱底上的一栏。`figure`（表盘、同心环）在剩下的高里居中，下面依次是 `below`（如剪贴板
-/// 里的链接）与粘贴栏 `dock`。`min_width` 为放得下 `figure` 的宽：窗口窄时先收两侧的面板。
+/// 舞台：两块面板之间、直接在窗口底色上的一栏。`figure`（表盘、同心环）在剩下的高里居中，下面依次是 `below`（如
+/// 剪贴板里的链接、按键说明）与粘贴栏 `dock`。`min_width` 为放得下 `figure` 的宽：窗口窄时先收两侧的面板。
 pub fn stage(
     min_width: f32,
     figure: impl IntoElement,
@@ -553,12 +572,12 @@ pub fn stage(
         .flex_1()
         .min_w(px(min_width))
         .min_h_0()
-        // 表盘的背光与待机的刻度面不画出舞台
+        // 表盘的背光与待机的引导线不画出舞台
         .overflow_hidden()
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(12.))
+        .gap(px(STAGE_GAP))
         .pb(px(DOCK_BOTTOM))
         .child(
             div()
@@ -568,16 +587,22 @@ pub fn stage(
                 .flex()
                 .items_center()
                 .justify_center()
-                .pb(px(DOCK_GAP - 12.))
+                .pb(px(DOCK_GAP - STAGE_GAP))
                 .child(figure),
         )
         .children(below)
         .child(dock)
 }
 
-/// 舞台最少要多高：`figure` 高 `figure_height` 时，加上与粘贴栏的间距、粘贴栏与它的下边距。
-pub const fn stage_height(figure_height: f32) -> f32 {
-    figure_height + DOCK_GAP + DOCK_HEIGHT + DOCK_BOTTOM
+/// 舞台最少要多高：`figure` 高 `figure_height`、下面的 `below` 合计高 `below_height`（没有时为 0）时，加上它们与粘贴栏
+/// 之间的间距、粘贴栏与它的下边距。
+pub const fn stage_height(figure_height: f32, below_height: f32) -> f32 {
+    let below = if below_height > 0. {
+        below_height + STAGE_GAP
+    } else {
+        0.
+    };
+    figure_height + below + DOCK_GAP + DOCK_HEIGHT + DOCK_BOTTOM
 }
 
 /// 任务栏的一项：横排；选中时有底色与描边，否则悬停时有底色。
