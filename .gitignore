@@ -1,0 +1,22 @@
+# python generated files
+__pycache__/
+*.py[oc]
+
+# venv
+.venv
+
+# uv python pin 写的本地 Python 版本；开发用的版本由 Makefile 的 UV_PYTHON 定
+.python-version
+
+# pycharm
+.idea
+
+# Mac
+.DS_Store
+
+# rust
+target/
+
+# FFmpeg 的源码与静态库，由 third_party/ffmpeg/build.sh 生成
+third_party/ffmpeg/build/
+third_party/ffmpeg/dist/

@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-hs-m3u8-core = { path = "../core" }
+hs-m3u8-core.workspace = true
 icu_normalizer.workspace = true
 percent-encoding.workspace = true
 rusqlite.workspace = true

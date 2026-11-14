@@ -1,0 +1,88 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 固定镜像版本，升级时显式修改
+        os: [macos-26, windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: MSVC 环境（Windows）
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/msvc-env
+
+      - name: MSYS2（Windows）
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: false
+          install: make diffutils xz
+
+      # 桌面应用（GPUI）链接的系统库：fontconfig（构建脚本经 pkg-config 找，连带 freetype）、xkbcommon 与它的 X11 部分；
+      # 嗅探页的网页（wry）要 WebKitGTK 4.1 与 GTK 3
+      - name: 桌面界面的系统库（Linux）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: FFmpeg
+        uses: ./.github/actions/ffmpeg
+        with:
+          cache-key: ${{ runner.os }}-${{ runner.arch }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # 仓库里 Python 脚本（第三方声明、图标）的开发工具；uv 的版本取 pyproject.toml 的 required-version
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # 检查项定义在 Makefile 里。依赖图、许可证、覆盖率与 Python 脚本的检查与平台无关，只在 Linux 上查；格式、clippy、
+      # 文档与测试涉及各平台专属的代码（cfg 下的），三个平台都查
+      - name: 安装 cargo-deny 与 cargo-llvm-cov（Linux）
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2,cargo-llvm-cov@0.9.1
+
+      - name: 全部检查（Linux）
+        if: runner.os == 'Linux'
+        run: make check
+
+      - name: 格式、clippy、文档、测试（macOS）
+        if: runner.os == 'macOS'
+        run: make rs_fmt rs_clippy rs_doc rs_test
+
+      # Windows 的 make 只在 MSYS2 里，而 MSYS2 的 link.exe 会遮住 MSVC 的链接器，所以直接运行与 Makefile 的
+      # rs_fmt、rs_clippy、rs_doc、rs_test 相同的命令。每条命令单独一步：PowerShell 里一步跑几条命令时，只有最后一条的
+      # 退出码算数
+      - name: 格式（Windows）
+        if: runner.os == 'Windows'
+        run: cargo fmt --all --check
+
+      - name: clippy（Windows）
+        if: runner.os == 'Windows'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 文档（Windows）
+        if: runner.os == 'Windows'
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: 测试（Windows）
+        if: runner.os == 'Windows'
+        run: cargo test --workspace

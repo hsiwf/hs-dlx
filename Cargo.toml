@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["apps/desktop", "crates/app", "crates/instance", "crates/macos", "crates/relay", "crates/webview"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/x-haose/hs-dlx"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+axum = "0.8.9"
+# 桌面界面的事件时刻按本地时区显示
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+dirs = "7.0.0"
+# 顶栏显示保存目录所在盘的可用空间
+fs4 = { version = "1.1.0", default-features = false }
+# 桌面界面：gpui-kit 精确锁定它所用的 GPUI 快照（gpui-pre），升级时两者一起改
+gpui-kit = "=0.9.1"
+# Linux 上嵌网页用的 GTK 3 绑定，与 wry 0.57.2 用的同一版
+gtk = "0.18"
+# HLS 的探测、下载、直播录制与转封装（hs-m3u8 的核心库）。
+# 简化：用本机旁边的 hs-m3u8 源码目录，hs-m3u8 推送并打标签后换成钉在标签上的 git 依赖
+hs-m3u8-core = { path = "../hs-m3u8/crates/core" }
+# 比较路径时统一 Unicode 写法（NFC）
+icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
+# 新建任务时把地址里的路径段解码成标题
+percent-encoding = "2.3.2"
+# 嗅探页判断网页与视频流是否同一站点（决定带哪些 Cookie）：公共后缀列表编进 crate，几乎每天随列表发布
+psl = "2.1.253"
+# bundled：随应用编译 SQLite，不依赖系统里的版本
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = "1.54.1"
+tokio-rustls = "0.26.6"
+tokio-util = "0.7.20"
+url = "2.5.8"
+# 嗅探页嵌网页；与嵌入层（源自 gpui-webview）一起精确锁定，升级时一起改
+wry = "=0.57.2"
+
+[patch.crates-io]
+# hs-m3u8 对 ffmpeg-sys-next 的本地修改（与上游的差异见那里的 PATCHED.md）：依赖方的 patch 不会传过来，这里照样打上
+ffmpeg-sys-next = { path = "../hs-m3u8/third_party/ffmpeg-sys-next" }

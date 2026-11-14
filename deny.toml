@@ -1,0 +1,73 @@
+# cargo-deny 0.20 配置：Rust 依赖的安全公告、许可证白名单、禁用包与来源。make check 与 CI 执行。
+# 静态链接的 FFmpeg 不是 crate：build.sh 确认配置出的是 LGPL，随安装包分发的声明见 apps/desktop/LICENSES/NOTICE.txt。
+
+[graph]
+# 发布安装包的平台；scripts/licenses.py 按它们汇总第三方声明
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# 漏洞公告一律报错；被撤回的版本报错；unsound 覆盖传递依赖；unmaintained 只看工作区的直接依赖，
+# 传递依赖是否换掉由上游决定
+yanked = "deny"
+unsound = "all"
+unmaintained = "workspace"
+ignore = [
+    # glib 0.18 的 VariantStrIter 迭代时不健全。它只经 wry 0.57.2 在 Linux 上依赖的 gtk 0.18 进来（wry 锁着 GTK 3
+    # 这一代绑定，升不到修好的 0.20）；依赖链上的 wry、webkit2gtk、gtk、gdk、gio、soup3 与本仓库都不调用这个迭代器
+    # （array_iter_str），只有 glib 自己的测试与文档用。wry 换到新的 glib 时去掉
+    { id = "RUSTSEC-2024-0429", reason = "只在 glib 自己的测试里调用，见上" },
+]
+
+[licenses]
+# 识别依赖自带许可证文本时的置信度下限（默认 0.8）。调高后，近似匹配不算识别成功，按无法识别报错、交人核对，
+# 不让一份改动过的许可证文本被当成白名单里的某一种
+confidence-threshold = 0.93
+# 只允许宽松许可证：桌面应用静态链接分发，copyleft 依赖会改变整个产物的许可义务
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "WTFPL", # ffmpeg-next、ffmpeg-sys-next
+    "Zlib", # foldhash（hashbrown 的默认哈希，经 rusqlite 引入）
+]
+# 只对下列包放行白名单之外的宽松许可证
+exceptions = [
+    # Linux 上 GTK 绑定的构建脚本（system-deps 经 cfg-expr）用，不进产物；LLVM 例外只是多给权利
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "target-lexicon" },
+    # GPUI 的 Linux 后端（zed-xim 经 ahash 的 const-random）在编译期生成随机数的过程宏用，不进产物；CC0 即放弃版权
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    # 桌面界面（gpui-kit）监视文件变化用；CC0 即放弃版权
+    { allow = ["CC0-1.0"], crate = "notify" },
+    # MPL-2.0 的 copyleft 只及于该 crate 自己的源文件，不改变整个产物的许可义务；分发桌面应用时须告知这些文件的源码出处。
+    # cbindgen 是 GPUI 的构建脚本用，不进产物；dwrote 为 GPUI 的 Windows 字体后端；option-ext 经 dirs 引入
+    { allow = ["MPL-2.0"], crate = "cbindgen" },
+    { allow = ["MPL-2.0"], crate = "dwrote" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    # Linux 的托盘（tray-icon 的 ksni 后端）；Unlicense 即放弃版权
+    { allow = ["Unlicense"], crate = "ksni" },
+]
+
+[bans]
+# 同一包的多个版本来自上游各自的版本约束，本项目无法消除，只影响体积与编译时间
+multiple-versions = "allow"
+wildcards = "deny"
+# 工作区内的 path 依赖不发布，不带版本号
+allow-wildcard-paths = true
+deny = [
+    # TLS 用 rustls；系统 OpenSSL 会破坏静态分发
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

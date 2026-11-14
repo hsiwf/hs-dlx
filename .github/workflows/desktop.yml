@@ -1,0 +1,72 @@
+name: desktop
+
+# 桌面应用的安装包：macOS 出 .dmg，Windows 出 NSIS 安装程序，Linux 出 deb（配置见 apps/desktop/Cargo.toml 的
+# package.metadata.packager），作为本次运行的构建产物上传。没有签名与公证。不出 AppImage：它会带上打包机器的
+# WebKitGTK，而 WebKitGTK 按编译时写死的路径起辅助进程，在别的发行版上网页起不来。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 固定镜像版本，升级时显式修改；与 check.yml 相同。各平台的格式与 Makefile 的 PACKAGE_FORMATS 一致（Windows 的
+        # make 只在 MSYS2 里，它的 link.exe 会遮住 MSVC 的链接器，所以这里不经 make 打包）
+        include:
+          - os: macos-26
+            formats: app,dmg
+          - os: windows-2025
+            formats: nsis
+          - os: ubuntu-24.04
+            formats: deb
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: MSVC 环境（Windows）
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/msvc-env
+
+      - name: MSYS2（Windows）
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: false
+          install: make diffutils xz
+
+      # 与 check.yml 相同的桌面界面系统库
+      - name: 桌面界面的系统库（Linux）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: FFmpeg
+        uses: ./.github/actions/ffmpeg
+        with:
+          cache-key: ${{ runner.os }}-${{ runner.arch }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # cargo-packager 的版本只写在这里。从源码装：它不在 install-action 内置的工具里，那边会退回 cargo-binstall
+      # 去取别人预编译的程序
+      - name: cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      - name: 打包
+        working-directory: apps/desktop
+        run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hs-m3u8-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: error
+          path: |
+            target/release/*.dmg
+            target/release/*-setup.exe
+            target/release/*.deb

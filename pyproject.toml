@@ -1,0 +1,72 @@
+# 只为仓库里的 Python 脚本（scripts/：第三方声明、图标）与它们的测试提供开发工具；本项目不是 Python 包
+[project]
+name = "hs-dlx-tools"
+version = "0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+# 开发工具固定版本：类型检查与格式的结果随版本变化
+dev = [
+    "basedpyright==1.40.2",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "ruff==0.17.0",
+]
+
+[tool.uv]
+# uv 的版本：本地不符时 uv 报错，CI 的 setup-uv 照它安装
+required-version = "==0.13.0"
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["scripts", "tests/scripts"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # 与 ruff format 冲突
+    "COM812",
+    # 文档字符串用中文，首行不按英文句号断句
+    "D400",
+    "D415",
+    # D203/D213 与 D211/D212 互斥，取后者
+    "D203",
+    "D213",
+    # 中文文本用全角标点
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 许可证写在 LICENSE，文件头不放版权声明
+    "CPY001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试用 assert 断言；测试函数的名字即说明
+"tests/scripts/**" = ["S101", "D103"]
+# 运行 PATH 里的 cargo（与 Makefile 一样），参数是写死的与 deny.toml 里的平台
+"scripts/licenses.py" = ["S603", "S607"]
+
+[tool.mypy]
+strict = true
+files = ["scripts", "tests/scripts"]
+# tests/scripts 下的测试按顶层模块导入 scripts 下的脚本
+mypy_path = ["scripts"]
+python_version = "3.12"
+
+[tool.basedpyright]
+include = ["scripts", "tests/scripts"]
+extraPaths = ["scripts"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/scripts"]
+# tests/scripts 下的测试导入 scripts 下的脚本
+pythonpath = ["scripts"]
+addopts = ["--strict-markers", "--strict-config"]
+# 警告即失败；预期的警告用 pytest.warns 断言
+filterwarnings = ["error"]
+xfail_strict = true
