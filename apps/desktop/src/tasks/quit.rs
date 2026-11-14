@@ -6,14 +6,27 @@ use hs_m3u8_app::Status;
 use super::Tasks;
 use super::row::Row;
 
+/// 要走时该怎么办（见 [`Tasks::departure`]）。
+pub enum Departure {
+    /// 照办，不用问：已决定退出，或没有要等的任务、状态都已写进存储
+    Now,
+    /// 已在问或在等任务停下：这次不再问
+    Underway,
+    /// 没有要等的任务，但有任务的状态写不进存储：问要不要仍然退出
+    Unsaved(hs_m3u8_app::Error),
+    /// 有 `busy` 个任务没停下；`recording` 为其中有在录的直播
+    Busy { busy: usize, recording: bool },
+}
+
 /// 退出进行到哪一步。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Quit {
     Staying,
-    /// 正在问要不要退出（提示框开着）：再来的退出请求不再问；`reopened` 为期间再次打开过应用（接手了转交），选了
-    /// 退出也不退出
+    /// 正在问要不要退出（提示框开着）：再来的请求不再问。`reopened` 为期间再次打开过应用（接手了转交），选了退出也
+    /// 不退出；`quit_requested` 为问的是关窗、期间又要退出应用（托盘、程序坞、注销），答完要按退出应用再问
     Asking {
         reopened: bool,
+        quit_requested: bool,
     },
     /// 用户选了退出：等运行中的任务都停下就退出；期间不开始新的运行，出了要用户看的事就不退出
     Waiting,
@@ -46,23 +59,42 @@ impl Tasks {
         matches!(self.quit, Quit::Waiting | Quit::Leaving)
     }
 
-    /// 退出不用问：已决定退出，或没在问、没在等、没有要等的任务且状态都已写进存储（补写在这里做）。
-    pub fn quits_without_asking(&self) -> bool {
+    /// 要走（关窗或退出应用）时该怎么办。没有要等的任务时先把没写进存储的状态补写进去。
+    pub fn departure(&self) -> Departure {
         match self.quit {
-            Quit::Leaving => true,
-            Quit::Asking { .. } | Quit::Waiting => false,
-            Quit::Staying => self.busy() == 0 && self.service.flush().is_ok(),
+            Quit::Leaving => Departure::Now,
+            Quit::Asking { .. } | Quit::Waiting => Departure::Underway,
+            Quit::Staying => match self.busy() {
+                0 => match self.service.flush() {
+                    Ok(()) => Departure::Now,
+                    Err(error) => Departure::Unsaved(error),
+                },
+                busy => Departure::Busy {
+                    busy,
+                    recording: self.recording(),
+                },
+            },
         }
-    }
-
-    /// 把没写进存储的任务状态补写进去。
-    pub fn flush(&self) -> Result<(), hs_m3u8_app::Error> {
-        self.service.flush()
     }
 
     /// 开始问要不要退出（窗口里的提示框开着）。
     pub fn ask(&mut self) {
-        self.quit = Quit::Asking { reopened: false };
+        self.quit = Quit::Asking {
+            reopened: false,
+            quit_requested: false,
+        };
+    }
+
+    /// 正在问时又要退出应用：记下，答完按退出应用再问（见 [`Quit::Asking`]）。没在问时什么也不做。
+    pub fn request_quit_while_asking(&mut self) {
+        if let Quit::Asking { quit_requested, .. } = &mut self.quit {
+            *quit_requested = true;
+        }
+    }
+
+    /// 问完了、接着要再问一次（退出应用）：回到没在问，不答复在等的系统退出请求（再问的答案去答复它）。
+    pub fn asked(&mut self) {
+        self.quit = Quit::Staying;
     }
 
     /// 选了退出：暂停运行中的任务（`stop_recordings` 时直播录制改为停止并写出），等都停下（继续、放弃与新建也做完）
@@ -93,7 +125,7 @@ impl Tasks {
 
     /// 选了退出时，提示框开着期间再次打开过应用（见 [`Tasks::receive`]）：不退出了，提示原因。
     pub fn reopened_while_asking(&mut self) -> bool {
-        let reopened = matches!(self.quit, Quit::Asking { reopened: true });
+        let reopened = matches!(self.quit, Quit::Asking { reopened: true, .. });
         if reopened {
             self.stay();
             self.add_notice("提示框开着时再次打开了应用，没有退出".to_owned());

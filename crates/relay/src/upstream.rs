@@ -53,12 +53,8 @@ async fn connect_now(upstream: &Upstream, target: &Target) -> Result<Stream, Str
         }
         Upstream::Proxy(proxy) => proxy,
     };
-    let proxy_host = proxy
-        .host_str()
-        .ok_or_else(|| "代理地址没有主机".to_owned())?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let socks = (proxy_host, proxy.port().unwrap_or(SOCKS_PORT));
+    let proxy_host = proxy_host(proxy)?;
+    let socks = (proxy_host.as_str(), proxy.port().unwrap_or(SOCKS_PORT));
     let failed = |error: tokio_socks::Error| format!("经 SOCKS 代理连不上 {host}:{port}：{error}");
     if is_http(proxy) {
         let mut stream = open_now(proxy).await?;
@@ -122,6 +118,16 @@ async fn resolve(host: &str, port: u16, ipv4: bool) -> Result<std::net::SocketAd
         .ok_or_else(|| format!("{host} 没有{}地址", if ipv4 { " IPv4 " } else { "" }))
 }
 
+/// 代理地址里的主机，连接用的写法（IPv6 不带方括号）。
+fn proxy_host(proxy: &Url) -> Result<String, String> {
+    match proxy.host() {
+        Some(url::Host::Domain(domain)) => Ok(domain.to_owned()),
+        Some(url::Host::Ipv4(address)) => Ok(address.to_string()),
+        Some(url::Host::Ipv6(address)) => Ok(address.to_string()),
+        None => Err("代理地址没有主机".to_owned()),
+    }
+}
+
 /// 上游是 HTTP 或 HTTPS 代理。
 pub(crate) fn is_http(proxy: &Url) -> bool {
     matches!(proxy.scheme(), "http" | "https")
@@ -137,12 +143,7 @@ pub(crate) async fn open_proxy(proxy: &Url) -> Result<Stream, String> {
 }
 
 async fn open_now(proxy: &Url) -> Result<Stream, String> {
-    let host = proxy
-        .host_str()
-        .ok_or_else(|| "代理地址没有主机".to_owned())?
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_owned();
+    let host = proxy_host(proxy)?;
     let port = proxy
         .port_or_known_default()
         .ok_or_else(|| "代理地址没有端口".to_owned())?;

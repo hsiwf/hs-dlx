@@ -169,8 +169,8 @@ impl Tasks {
         .detach();
     }
 
-    /// 继续：先读出任务目录里已有的，作本次运行的起点，再开始；读的期间这一行不能再操作。退出中不继续。开始了时为
-    /// true（下同）。
+    /// 继续：先读出任务目录里已有的，作本次运行的起点，再开始；读的期间这一行不能再操作。退出中不继续。发起了（开始
+    /// 读目录）时为 true；读完后开始不了的原因写进提示。
     pub fn resume(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         if self.quitting() {
             self.tell("正在退出，不再继续任务".to_owned(), cx);
@@ -188,7 +188,7 @@ impl Tasks {
         true
     }
 
-    /// 不再续录，只把直播录制已录的写成输出；退出中不开始。
+    /// 不再续录，只把直播录制已录的写成输出；退出中不开始。开始写出了时为 true，没开始的原因写进提示。
     pub fn write_recorded(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         let title = self.title(id);
         if self.quitting() {
@@ -220,7 +220,8 @@ impl Tasks {
         started
     }
 
-    /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。
+    /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。改了并发起了再跑时为 true，没成的
+    /// 原因写进提示。
     pub fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
         let title = self.title(id);
         if self.quitting() {

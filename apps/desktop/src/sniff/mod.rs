@@ -167,7 +167,10 @@ impl SniffView {
         let relay_failures = cx.subscribe(&route, |this: &mut Self, _, failure, cx| {
             this.on_relay_failure(failure, cx)
         });
-        let acquired = route.update(cx, |route, _| route.acquire(&service));
+        let acquired = service
+            .settings()
+            .map_err(|error| format!("读不出设置：{error}"))
+            .and_then(|settings| route.update(cx, |route, _| route.acquire(&settings.proxy)));
         let failed = {
             let inbox = inbox.clone();
             move |failure| {
@@ -366,11 +369,17 @@ impl SniffView {
         }
     }
 
-    /// 中转连不过去：打开的地址还没开始显示、连的正是它时，网页打不开（网页引擎拿到中转的 502 不报原因）；页面里别的
-    /// 请求、别的嗅探页的连不过去由页面自己处理。
+    /// 中转连不过去：打开的地址还没开始显示、连的正是它的主机与端口时，网页打不开（网页引擎拿到中转的 502 不报
+    /// 原因）；页面里别的请求连不过去由页面自己处理。
+    ///
+    /// 简化：中转是开着的网页共用的，分不出连接来自哪个网页；另一个嗅探页恰在这时连同一主机与端口失败，也会算到这里。
+    /// 要分开时给每个网页一个只认它的口令（引擎不收代理口令，要换成按网页区分的端口或数据存储）。
     fn on_relay_failure(&mut self, failure: &RelayFailure, cx: &mut Context<Self>) {
         let opened = self.opened.host().map(|host| host.to_owned());
-        if self.load.shown.is_some() || opened.as_ref() != Some(&failure.target.host) {
+        if self.load.shown.is_some()
+            || opened.as_ref() != Some(&failure.target.host)
+            || self.opened.port_or_known_default() != Some(failure.target.port)
+        {
             return;
         }
         self.failure = Some(failure.reason.clone());
@@ -378,6 +387,11 @@ impl SniffView {
             cx.emit(SniffEvent::Decided);
         }
         cx.notify();
+    }
+
+    /// 不再持有网页的出口（这个视图要被换掉）：之后建的网页按此刻的设置定出口，不照这个旧的。
+    pub fn release_route(&mut self) {
+        self._lease = None;
     }
 
     /// 加进列表并排队探测；同一个框架又报来的同一条流换成新地址（见 [`Found::renew`]），满了的只计数。

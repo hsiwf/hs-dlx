@@ -254,8 +254,11 @@ impl Shell {
         self.new_task() == Some(view)
     }
 
-    /// 在嗅探页里打开网页 `url`（已开着的换成这个）。
+    /// 在嗅探页里打开网页 `url`（已开着的换成这个：先放掉它的出口，新网页按此刻的设置定）。
     fn open_sniff(&mut self, url: Url, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((old, _)) = &self.sniff {
+            old.update(cx, |old, _| old.release_route());
+        }
         let service = self.tasks.read(cx).service().clone();
         let view = cx.new(|cx| SniffView::new(service, url, window, cx));
         self.adopt_sniff(view, window, cx);

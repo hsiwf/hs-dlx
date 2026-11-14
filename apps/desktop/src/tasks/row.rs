@@ -131,6 +131,31 @@ impl Row {
         self.reading += 1;
     }
 
+    /// 正在写出时写出的比例（0 到 1，按写出的文件数）；不在写出阶段时为 None。
+    pub fn written_share(&self) -> Option<f32> {
+        let progress = self.progress.as_ref()?;
+        if progress.stage != Stage::Writing {
+            return None;
+        }
+        let writing = progress.writing?;
+        let count = writing.mp4.or(writing.hls);
+        Some(count.map_or(0.0, |c| {
+            (c.done as f32 / c.total.max(1) as f32).clamp(0.0, 1.0)
+        }))
+    }
+
+    /// 在运行的点播此刻的进度（0 到 1）：写出时为写出的比例，下载时为已下的片数比例（还不知道合计时为 0）。不是在运行
+    /// 的点播（停着的、录直播的、只写出已录的）时为 None。
+    pub fn download_share(&self) -> Option<f32> {
+        if self.task.status != Status::Running || self.task.write_only || self.recording() {
+            return None;
+        }
+        Some(
+            self.written_share()
+                .unwrap_or_else(|| Amount::of(self).map_or(0.0, |amount| amount.fraction())),
+        )
+    }
+
     /// 是直播的录制：运行中过了准备阶段的按阶段；其余（停下的、还在准备的）按任务目录里的记录（继续前读到的），
     /// 没读到时按新建时的选择。按直播新建、实际是点播的，进度到了下载阶段或读到任务目录后就不算。
     pub fn recording(&self) -> bool {

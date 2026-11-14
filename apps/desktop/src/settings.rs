@@ -15,6 +15,7 @@ use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme;
 use crate::ui::{self, BOTTOM, Tone};
+use crate::web_route::WebRoute;
 
 /// 设置一栏的最大宽度。
 const MAX_WIDTH: f32 = 640.;
@@ -130,6 +131,7 @@ impl SettingsView {
     fn save(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
         match self.tasks.read(cx).service().set_proxy(&proxy) {
             Ok(()) => {
+                WebRoute::get(cx).update(cx, |route, _| route.setting_changed(&proxy));
                 self.mode = mode_of(&proxy);
                 self.proxy = proxy;
             }
@@ -170,10 +172,18 @@ impl SettingsView {
     }
 
     fn render_proxy(&self, cx: &mut Context<Self>) -> Div {
-        // 选了指定代理、还没存进地址：写明此刻照旧按什么走
+        // 选了指定代理、还没存进地址，或改了地址还没保存：写明此刻照旧按什么走
+        let typed = self.address.read(cx).value().trim().to_owned();
         let unsaved = match (self.mode, &self.proxy) {
-            (Mode::Custom, Proxy::System) => Some("保存之前照旧跟随系统"),
-            (Mode::Custom, Proxy::Direct) => Some("保存之前照旧直连"),
+            (Mode::Custom, Proxy::System) => Some("保存之前照旧跟随系统".to_owned()),
+            (Mode::Custom, Proxy::Direct) => Some("保存之前照旧直连".to_owned()),
+            // 按解析后的比，写法不同而地址相同（如末尾的斜杠）不算改了
+            (Mode::Custom, Proxy::Url(url)) if Url::parse(&typed).ok().as_ref() != Some(url) => {
+                Some(format!(
+                    "改的地址还没保存，照旧经 {}",
+                    hs_m3u8_core::bare_url(url)
+                ))
+            }
             _ => None,
         };
         let chip = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
@@ -247,7 +257,7 @@ impl SettingsView {
             .children(self.proxy_error.clone().map(ui::error_text))
             .child(ui::caption(
                 match hs_m3u8_webview::custom_proxy_supported() {
-                    Ok(()) => "在下的任务暂停再继续、嗅探页的网页都关掉再打开后才换".to_owned(),
+                    Ok(()) => "在下的任务暂停再继续后才换；嗅探页开着的网页在直连与指定代理之间立即换，与跟随系统之间换要都关掉再开".to_owned(),
                     Err(reason) => format!(
                         "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
                     ),

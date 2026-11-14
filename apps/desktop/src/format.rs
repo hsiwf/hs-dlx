@@ -5,6 +5,17 @@ use std::time::Duration;
 
 use hs_m3u8_core::VariantInfo;
 
+/// 在运行的任务数与合计速度（「2 个进行中 · ↓ 18.4 MB/s」）；没有在运行的任务时为 None。
+pub fn activity(activity: &crate::tasks::Activity) -> Option<String> {
+    (activity.running > 0).then(|| {
+        format!(
+            "{} 个进行中 · ↓ {}/s",
+            activity.running,
+            bytes(activity.speed as u64)
+        )
+    })
+}
+
 /// 字节数：1000 进制，保留一位小数（`812 B`、`1.9 GB`）；四舍五入后到 1000 的进到下一级。
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];

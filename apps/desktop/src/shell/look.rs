@@ -233,9 +233,7 @@ fn running(row: &Row, amount: Amount, now: Instant) -> Look {
             },
             None => ("写出", None),
         };
-        let written = count.map_or(0.0, |c| {
-            (c.done as f32 / c.total.max(1) as f32).clamp(0.0, 1.0)
-        });
+        let written = row.written_share().unwrap_or(0.0);
         let percent = percent(written);
         let ticks = Ticks::of(amount.total, amount.done, false);
         return Look {

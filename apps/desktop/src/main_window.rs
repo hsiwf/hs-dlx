@@ -4,12 +4,13 @@
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Entity, Global, TitlebarOptions, WeakEntity,
-    WindowBounds, WindowOptions, point, px, size,
+    Window, WindowBounds, WindowOptions, point, px, size,
 };
 use hs_m3u8_instance::Handoff;
 
 use crate::shell::{Leave, MIN_HEIGHT, MIN_WIDTH, Shell};
-use crate::tasks::{Tasks, TasksEvent};
+use crate::tasks::{Departure, Quit, Tasks, TasksEvent};
+use crate::tray::Tray;
 use crate::ui::TITLE_HEIGHT;
 
 /// 任务状态与开着的主窗口（同时最多一个；Shell 已释放即窗口已关）。
@@ -77,6 +78,13 @@ pub fn show(
         cx.new(|cx| Shell::new(tasks, link, window, cx))
     });
     if let Ok((handle, shell)) = &opened {
+        let view = shell.downgrade();
+        let watched = handle.update(cx, |_, window, cx| {
+            window.on_window_should_close(cx, move |window, cx| should_close(&view, window, cx))
+        });
+        if let Err(error) = watched {
+            return Some(Err(error));
+        }
         cx.global_mut::<MainWindow>().open = Some((*handle, shell.downgrade()));
     }
     Some(opened)
@@ -111,13 +119,58 @@ fn tell(text: String, cx: &mut App) {
     }
 }
 
-/// 要退出应用：不用问时（见 [`Tasks::quits_without_asking`]）为 true；要问时把主窗口带到前面（关着时重新打开）问，为
-/// false，问完由 Tasks 退出或留下。开不了窗口、问不了时为 true：照常退出，任务在退出时暂停（见 `Tasks::new`）。
+/// 用户要关主窗口：要问时问（有路回到窗口时可以在后台继续，见 [`back`]）；没有要等的照办，关窗即退出（等窗口关掉之后
+/// 再发出，不在关窗的回调里退出）。视图已不在时照常关。
+fn should_close(view: &WeakEntity<Shell>, window: &mut Window, cx: &mut App) -> bool {
+    let (Some(shell), Some(tasks)) = (view.upgrade(), tasks(cx)) else {
+        return true;
+    };
+    let departure = tasks.read(cx).departure();
+    let leave = Leave::Window { back: back(cx) };
+    let close = shell.update(cx, |shell, cx| shell.leave(leave, departure, window, cx));
+    if close {
+        cx.defer(move |cx| {
+            tasks.update(cx, |tasks, cx| {
+                if tasks.quit() != Quit::Leaving {
+                    tasks.leave(cx);
+                }
+            })
+        });
+    }
+    close
+}
+
+/// 主窗口关掉后怎么回来（写进关窗时的提示）；回不来时为 None（不给在后台继续）。macOS 上总能点程序坞里的图标；
+/// Linux 上托盘建得起也可能看不见（桌面没有托盘宿主），只算再次打开应用（要收得了转交）。
+fn back(cx: &App) -> Option<&'static str> {
+    let tray = Tray::installed(cx);
+    let reopen = tasks(cx).is_some_and(|tasks| tasks.read(cx).receives_handoffs());
+    if cfg!(target_os = "macos") {
+        return Some(if tray {
+            "点菜单栏或程序坞里的图标回到窗口"
+        } else {
+            "点程序坞里的图标回到窗口"
+        });
+    }
+    match (tray, reopen) {
+        (true, true) if cfg!(target_os = "windows") => {
+            Some("点通知区域的图标或再次打开应用回到窗口")
+        }
+        (true, false) if cfg!(target_os = "windows") => Some("点通知区域的图标回到窗口"),
+        (true, true) => Some("点托盘图标或再次打开应用回到窗口"),
+        (_, true) => Some("再次打开应用回到窗口"),
+        (_, false) => None,
+    }
+}
+
+/// 要退出应用：不用问时（见 [`Tasks::departure`]）为 true；要问时把主窗口带到前面（关着时重新打开）问，为 false，问完
+/// 由 Tasks 退出、留下或再问。开不了窗口、问不了时为 true：照常退出，任务在退出时暂停（见 `Tasks::new`）。
 pub fn may_quit(cx: &mut App) -> bool {
     let Some(tasks) = tasks(cx) else {
         return true;
     };
-    if tasks.read(cx).quits_without_asking() {
+    let departure = tasks.read(cx).departure();
+    if matches!(departure, Departure::Now) {
         return true;
     }
     let Some(Ok((handle, shell))) = show(None, cx) else {
@@ -125,7 +178,9 @@ pub fn may_quit(cx: &mut App) -> bool {
     };
     handle
         .update(cx, |_, window, cx| {
-            shell.update(cx, |shell, cx| shell.should_leave(Leave::App, window, cx))
+            shell.update(cx, |shell, cx| {
+                shell.leave(Leave::App, departure, window, cx)
+            })
         })
         .unwrap_or(true)
 }

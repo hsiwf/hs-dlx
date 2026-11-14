@@ -1,5 +1,6 @@
 //! 桌面应用的入口：打开任务存储、启动任务服务、建托盘、开主窗口；任务存储已被开着的应用占着时，把启动参数里的链接
-//! 转交给它后退出（见 hs-m3u8-instance）。关掉主窗口不退出（任务可以在后台继续），退出由主窗口的询问或托盘发出。
+//! 转交给它后退出（见 hs-m3u8-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
+//! main_window）。
 
 mod format;
 mod headers;
@@ -142,7 +143,7 @@ fn main() {
             match started {
                 Ok(None) => cx.quit(),
                 Ok(Some((service, events, folder, handoffs))) => {
-                    // 关掉主窗口不退出：有任务在跑时可以在后台继续，退出都经询问（见 Shell::should_leave）
+                    // 最后一个窗口关掉不自动退出：在后台继续时窗口关着、应用照跑；退出由 main_window 发出
                     cx.set_quit_mode(QuitMode::Explicit);
                     let tasks = cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
                     main_window::install(tasks.clone(), cx);

@@ -15,10 +15,9 @@ use crate::tasks::Tasks;
 use crate::ui::{self, TITLE_HEIGHT};
 use crate::{format, ring, theme};
 
-/// 标志：一段四分之三圈的小环。边长、环宽与画到哪里（0 到 1）。
+/// 标志的小环（画到 [`ring::LOGO_ARC`]）的边长与环宽。
 const LOGO: f32 = 17.;
 const LOGO_WIDTH: f32 = 2.5;
-const LOGO_ARC: f32 = 0.72;
 /// 标志离红绿灯多远、与名字的间距、右边状态离窗口边多远。
 const LOGO_MARGIN: f32 = 14.;
 const LOGO_GAP: f32 = 10.;
@@ -35,7 +34,7 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let activity = tasks.activity(now).summary();
+        let activity = format::activity(&tasks.activity(now));
         // 可用空间：不足或读不出时标橙色，只标这一段
         let space = tasks.free_space().map(|free| match free {
             Ok(bytes) => (
@@ -61,7 +60,7 @@ impl Shell {
                                 ring::paint_arc(
                                     bounds,
                                     LOGO_WIDTH,
-                                    LOGO_ARC,
+                                    ring::LOGO_ARC,
                                     theme::cyan(),
                                     theme::line(),
                                     window,

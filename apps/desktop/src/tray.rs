@@ -1,6 +1,6 @@
 //! 托盘图标（macOS 菜单栏、Windows 通知区域、Linux 的 StatusNotifierItem）：一个环，空闲时是应用的标志，在下点播时
-//! 按它们的平均进度走，在录直播时中间加一个实心点；macOS 在图标旁写百分比与 REC，别处写进悬停提示。菜单里是进行中的
-//! 数量与速度、待看的提示、打开窗口与退出；Windows、Linux 上左键点图标即打开窗口。
+//! 按它们的平均进度走，在录直播时中间加一个实心点；macOS 在图标旁写百分比与 REC。菜单与悬停提示里是进行中的数量与
+//! 速度、要处理的失败；菜单里还有待看的提示（点了打开窗口）、打开窗口与退出。Windows、Linux 上左键点图标即打开窗口。
 //!
 //! Linux 上桌面没有托盘宿主（如没装扩展的 GNOME）时图标建得起却看不见，所以它不是回到窗口的唯一入口：再次打开应用
 //! 也会回到窗口（见 hs-m3u8-instance）。
@@ -12,13 +12,12 @@ use tokio::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+use crate::ring::LOGO_ARC;
 use crate::tasks::Tasks;
-use crate::theme;
+use crate::{format, theme};
 
 /// 两次刷新托盘之间至少隔多久：进度每秒变好几次，菜单栏重画与 D-Bus 往返都不必跟这么快。
 const REFRESH: Duration = Duration::from_secs(1);
-/// 空闲时的环画到哪里：与顶栏的标志相同。
-const LOGO_ARC: f32 = 0.72;
 /// 图标的边长（像素）：macOS 菜单栏高 22 点，按 2 倍屏画；别处系统再缩放。
 #[cfg(target_os = "macos")]
 const ICON: u32 = 44;
@@ -31,10 +30,10 @@ enum Action {
     Quit,
 }
 
-/// 托盘此刻显示的内容；与上次相同的部分不再推给系统。
+/// 托盘此刻显示的内容；与上次推给系统的相同的部分不再推。
 #[derive(Clone, PartialEq)]
 struct Shown {
-    /// 环画到哪里，按百分之一取整；None 为空闲时的标志
+    /// 环画到哪里，向下取整到百分之一（与主窗口一致：没做完不写 100%）；None 为空闲时的标志
     percent: Option<u8>,
     recording: bool,
     status: String,
@@ -52,19 +51,27 @@ pub struct Tray {
     icon: TrayIcon,
     menu: Menu,
     status: MenuItem,
-    /// 「N 条提示待看」：有提示时插在状态那一行下面
+    /// 「N 条提示待看」：有提示时插在状态那一行下面，点了打开窗口
     notices: MenuItem,
+    /// `notices` 此刻在菜单里
+    notices_listed: bool,
+    /// 上次推给系统的；推的时候出错时为 None，下次整份重推
     shown: Option<Shown>,
     refreshed_at: Option<Instant>,
     /// 还没到刷新间隔时，到点再刷新的那一次
     pending: Option<Task<()>>,
-    /// 托盘出过错：之后不再刷新（原因已提示一次）
-    broken: bool,
+    /// 出错已提示、还没恢复：再出错不再提示
+    reported: bool,
     _actions: Task<()>,
     _tasks: Subscription,
 }
 
 impl Tray {
+    /// 托盘建起来了（Linux 上建得起也可能看不见，见模块说明）。
+    pub fn installed(cx: &App) -> bool {
+        cx.has_global::<Installed>()
+    }
+
     /// 建托盘图标并留到应用退出，跟着 `tasks` 刷新；点「打开」时调 `open`，点「退出」时调 `quit`。要在应用跑起来之后
     /// 调（GPUI 在主线程上调 `run` 的回调）。建不起（如 Linux 上没有 D-Bus 会话）时为原因。
     pub fn install(
@@ -74,7 +81,7 @@ impl Tray {
         cx: &mut App,
     ) -> Result<(), String> {
         let status = MenuItem::new("", false, None);
-        let notices = MenuItem::new("", false, None);
+        let notices = MenuItem::new("", true, None);
         let opening = MenuItem::new("打开 hs-m3u8", true, None);
         let quitting = MenuItem::new("退出 hs-m3u8", true, None);
         let menu = Menu::new();
@@ -103,10 +110,13 @@ impl Tray {
         // 系统在自己的线程或回调里报点击：转进通道，在界面线程上处理。通道随应用存在，发送不会失败；收的一方先
         // 不在时（应用正在退出）丢掉即可
         let (sender, mut actions) = mpsc::unbounded_channel();
-        let (open_id, quit_id) = (opening.id().clone(), quitting.id().clone());
+        let (open_ids, quit_id) = (
+            [opening.id().clone(), notices.id().clone()],
+            quitting.id().clone(),
+        );
         let menu_sender = sender.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            let action = if event.id == open_id {
+            let action = if open_ids.contains(&event.id) {
                 Action::Open
             } else if event.id == quit_id {
                 Action::Quit
@@ -115,18 +125,19 @@ impl Tray {
             };
             let _closing = menu_sender.send(action);
         }));
-        if !cfg!(target_os = "macos") {
-            TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } = event
-                {
-                    let _closing = sender.send(Action::Open);
-                }
-            }));
-        }
+        // 不设处理函数时事件积在 tray-icon 的全局通道里没人取（macOS 上鼠标移过图标也有事件）；macOS 上点图标照例弹
+        // 菜单，事件都不用
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+                && !cfg!(target_os = "macos")
+            {
+                let _closing = sender.send(Action::Open);
+            }
+        }));
         let tray = cx.new(|cx| {
             let handling = cx.spawn(async move |_, cx| {
                 while let Some(action) = actions.recv().await {
@@ -143,10 +154,11 @@ impl Tray {
                 menu,
                 status,
                 notices,
+                notices_listed: false,
                 shown: None,
                 refreshed_at: None,
                 pending: None,
-                broken: false,
+                reported: false,
                 _actions: handling,
                 _tasks: observing,
             };
@@ -179,36 +191,44 @@ impl Tray {
         }));
     }
 
-    /// 按此刻的任务刷新图标、标题、提示与菜单；出错时提示一次，之后不再刷新。
+    /// 按此刻的任务刷新图标、标题、提示与菜单。推给系统出错时（如 Windows 资源管理器重启的那一会儿）下次整份重推，
+    /// 原因提示一次，恢复之后再出错再提示。
     fn refresh(&mut self, tasks: &Entity<Tasks>, cx: &mut Context<Self>) {
-        if self.broken {
-            return;
-        }
         self.refreshed_at = Some(Instant::now());
         let read = tasks.read(cx);
         let activity = read.activity(Instant::now());
+        let mut status =
+            format::activity(&activity).unwrap_or_else(|| "没有进行中的任务".to_owned());
+        if activity.failed > 0 {
+            status.push_str(&format!(" · {} 个需要处理", activity.failed));
+        }
         let shown = Shown {
             percent: activity
                 .progress
-                .map(|progress| (progress.clamp(0., 1.) * 100.).round() as u8),
+                .map(|progress| (progress.clamp(0., 1.) * 100.).floor() as u8),
             recording: activity.recording,
-            status: activity
-                .summary()
-                .unwrap_or_else(|| "没有进行中的任务".to_owned()),
+            status,
             notices: read.notices().len(),
         };
-        if let Err(error) = self.apply(&shown) {
-            self.broken = true;
-            tasks.update(cx, |tasks, cx| {
-                tasks.tell(format!("托盘图标出错，之后不再更新：{error}"), cx)
-            });
-            return;
+        match self.apply(&shown) {
+            Ok(()) => {
+                self.shown = Some(shown);
+                self.reported = false;
+            }
+            Err(error) => {
+                self.shown = None;
+                if !self.reported {
+                    self.reported = true;
+                    tasks.update(cx, |tasks, cx| {
+                        tasks.tell(format!("托盘图标没能更新：{error}"), cx)
+                    });
+                }
+            }
         }
-        self.shown = Some(shown);
     }
 
-    /// 把 `shown` 与上次不同的部分推给系统。
-    fn apply(&self, shown: &Shown) -> Result<(), String> {
+    /// 把 `shown` 与上次推给系统的不同的部分推过去。
+    fn apply(&mut self, shown: &Shown) -> Result<(), String> {
         let was = self.shown.as_ref();
         if was.is_none_or(|was| (was.percent, was.recording) != (shown.percent, shown.recording)) {
             let arc = shown
@@ -235,21 +255,24 @@ impl Tray {
                 .set_tooltip(Some(format!("hs-m3u8 · {}", shown.status)))
                 .map_err(|error| error.to_string())?;
         }
-        let had = was.map_or(0, |was| was.notices);
-        if had != shown.notices {
+        if was.is_none_or(|was| was.notices != shown.notices) {
             self.notices
                 .set_text(format!("{} 条提示待看", shown.notices));
-            match (had, shown.notices) {
-                (0, _) => self
-                    .menu
+        }
+        match (self.notices_listed, shown.notices > 0) {
+            (false, true) => {
+                self.menu
                     .insert(&self.notices, 1)
-                    .map_err(|error| error.to_string())?,
-                (_, 0) => self
-                    .menu
-                    .remove(&self.notices)
-                    .map_err(|error| error.to_string())?,
-                _ => {}
+                    .map_err(|error| error.to_string())?;
+                self.notices_listed = true;
             }
+            (true, false) => {
+                self.menu
+                    .remove(&self.notices)
+                    .map_err(|error| error.to_string())?;
+                self.notices_listed = false;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -263,7 +286,10 @@ fn ring_icon(arc: f32, dot: bool) -> Result<Icon, String> {
     } else {
         (
             rgba8(theme::cyan()),
-            [140, 147, 166, 150],
+            {
+                let [r, g, b, _] = rgba8(theme::muted());
+                [r, g, b, 150]
+            },
             rgba8(theme::red()),
         )
     };

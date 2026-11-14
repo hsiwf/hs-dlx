@@ -1,16 +1,16 @@
-//! 退出时的询问：关主窗口（有任务在跑时可以在后台继续）或退出应用（托盘、macOS 的程序坞与菜单、注销、关机）时问，
-//! 选了退出就交给 [`crate::tasks::Tasks`] 等任务停下、补写状态后退出。
+//! 退出时的询问：关主窗口（有任务在跑时可以在后台继续）或退出应用（托盘、macOS 的程序坞与菜单、注销、关机）时在
+//! 窗口里问；要不要问由 [`Tasks::departure`] 定，选了退出就交给 Tasks 等任务停下、补写状态后退出。
 
 use gpui_kit::{Context, PromptButton, PromptLevel, Window};
 
 use super::Shell;
-use crate::tasks::{Quit, Tasks};
+use crate::tasks::{Departure, Quit, Tasks};
 
 /// 要走的是什么。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Leave {
-    /// 关主窗口：有任务在跑时可以在后台继续
-    Window,
+    /// 关主窗口；`back` 为关掉后怎么回到窗口（写进提示），有路回来时才能在后台继续
+    Window { back: Option<&'static str> },
     /// 退出应用
     App,
 }
@@ -24,65 +24,89 @@ enum Choice {
     Cancel,
 }
 
-/// 在后台继续时怎么回到窗口。
-#[cfg(target_os = "macos")]
-const BACK: &str = "点菜单栏或程序坞里的图标回到窗口";
-#[cfg(target_os = "windows")]
-const BACK: &str = "点通知区域的图标或再次打开应用回到窗口";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const BACK: &str = "点托盘图标或再次打开应用回到窗口";
+/// 答完之后窗口这边还要做的。
+enum After {
+    Nothing,
+    /// 在后台继续：关掉窗口
+    Close,
+    /// 问的期间又要退出应用：按退出应用再问
+    AskQuit,
+}
 
 impl Shell {
-    /// 走之前：已决定退出的照常走；有任务在运行时问一句（关窗时第一项是在后台继续：窗口关掉、任务照跑），选了退出就
-    /// 暂停（或停止录制并写出）它们，等都停下再退出。没有任务在运行时先把没写进存储的状态补写进去，补写不进时问要不要
-    /// 仍然退出。正在问、在等任务停下时不再问。返回 true 时调用方立即照办（关窗即退出）。
-    pub fn should_leave(
+    /// 要走（`leave`），`departure` 为调用方刚从 Tasks 取的。照办时为 true（调用方随即关窗或退出）；要问时在这个窗口里
+    /// 问，为 false，问完由 Tasks 退出、留下或再问。已在问、在等任务停下时不再问（退出应用的请求记下，答完再问）。
+    pub fn leave(
         &mut self,
         leave: Leave,
+        departure: Departure,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let tasks = self.tasks.read(cx);
-        match tasks.quit() {
-            Quit::Leaving => return true,
-            // 已在问；或已在等任务停下，右上角的提示里可以立即退出
-            Quit::Asking { .. } | Quit::Waiting => return false,
-            Quit::Staying => {}
+        match departure {
+            Departure::Now => true,
+            Departure::Underway => {
+                if leave == Leave::App {
+                    self.tasks
+                        .update(cx, |tasks, _| tasks.request_quit_while_asking());
+                }
+                false
+            }
+            Departure::Unsaved(error) => {
+                self.ask_unsaved(&error.to_string(), window, cx);
+                false
+            }
+            Departure::Busy { busy, recording } => {
+                self.ask_busy(leave, busy, recording, window, cx);
+                false
+            }
         }
-        let busy = tasks.busy();
-        if busy == 0 {
-            let Err(error) = tasks.flush() else {
-                return true;
-            };
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                "有任务的状态没能写进存储",
-                Some(&format!(
-                    "现在退出，这些任务下次打开时显示为暂停。原因：{error}"
-                )),
-                &[PromptButton::new("仍然退出"), PromptButton::cancel("取消")],
-                cx,
-            );
-            self.tasks.update(cx, |tasks, _| tasks.ask());
-            let tasks = self.tasks.clone();
-            cx.spawn(async move |_, cx| {
-                let leave = matches!(answer.await, Ok(0));
-                tasks.update(cx, |tasks, cx| {
-                    if !leave {
-                        tasks.stay();
-                    } else if !tasks.reopened_while_asking() {
-                        tasks.leave(cx);
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-            return false;
-        }
-        let recording = tasks.recording();
+    }
+
+    /// 没有要等的任务、但有任务的状态写不进存储：问要不要仍然退出。
+    fn ask_unsaved(&mut self, error: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "有任务的状态没能写进存储",
+            Some(&format!(
+                "现在退出，这些任务下次打开时显示为暂停。原因：{error}"
+            )),
+            &[PromptButton::new("仍然退出"), PromptButton::cancel("取消")],
+            cx,
+        );
+        self.tasks.update(cx, |tasks, _| tasks.ask());
+        let tasks = self.tasks.clone();
+        cx.spawn(async move |_, cx| {
+            let leave = matches!(answer.await, Ok(0));
+            tasks.update(cx, |tasks, cx| {
+                if !leave {
+                    tasks.stay();
+                } else if !tasks.reopened_while_asking() {
+                    tasks.leave(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 还有 `busy` 个任务没停下（`recording` 为有在录的直播）：问在后台继续（关窗且有路回来时）、全部暂停或停止
+    /// 录制并写出后退出，还是取消。
+    fn ask_busy(
+        &mut self,
+        leave: Leave,
+        busy: usize,
+        recording: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 回车选第一项：能撤回的（在后台继续、暂停）在前；「取消」是取消按钮，Esc 即它
+        let back = match leave {
+            Leave::Window { back } => back,
+            Leave::App => None,
+        };
         let mut choices = Vec::new();
-        if leave == Leave::Window {
+        if back.is_some() {
             choices.push((PromptButton::new("在后台继续"), Choice::Background));
         }
         choices.push((PromptButton::new("全部暂停并退出"), Choice::Pause));
@@ -98,9 +122,9 @@ impl Shell {
         } else {
             "暂停的任务下次打开后可以继续。"
         };
-        let detail = match leave {
-            Leave::Window => format!("在后台继续时任务接着跑，{BACK}；{paused}"),
-            Leave::App => paused.to_owned(),
+        let detail = match back {
+            Some(back) => format!("在后台继续时任务接着跑，{back}；{paused}"),
+            None => paused.to_owned(),
         };
         let (buttons, choices): (Vec<_>, Vec<_>) = choices.into_iter().unzip();
         let answer = window.prompt(
@@ -119,37 +143,60 @@ impl Shell {
                 .ok()
                 .and_then(|index| choices.get(index).copied())
                 .unwrap_or(Choice::Cancel);
-            let close = tasks.update(cx, |tasks, cx| answered(tasks, choice, cx));
-            if close {
+            match tasks.update(cx, |tasks, cx| answered(tasks, choice, cx)) {
+                After::Nothing => {}
                 // 窗口已不在时没有要关的
-                let _closed = this.update_in(cx, |_, window, _| window.remove_window());
+                After::Close => {
+                    let _closed = this.update_in(cx, |_, window, _| window.remove_window());
+                }
+                After::AskQuit => {
+                    let asked = this.update_in(cx, |this, window, cx| {
+                        let departure = this.tasks.read(cx).departure();
+                        if this.leave(Leave::App, departure, window, cx) {
+                            this.tasks.update(cx, |tasks, cx| tasks.leave(cx));
+                        }
+                    });
+                    // 窗口已不在、问不了：不退出，在等的系统退出请求随之取消
+                    if asked.is_err() {
+                        tasks.update(cx, |tasks, _| tasks.stay());
+                    }
+                }
             }
         })
         .detach();
-        false
     }
 }
 
-/// 有任务在跑时问出了 `choice`：照办，要在后台继续时为 true（由调用方关窗）。提示框开着期间再次打开过应用的，在后台
-/// 继续即留着窗口，选了退出也不退出。
-fn answered(tasks: &mut Tasks, choice: Choice, cx: &mut Context<Tasks>) -> bool {
-    let close = match choice {
-        Choice::Cancel => {
-            tasks.stay();
-            false
-        }
-        Choice::Background => {
-            let reopened = tasks.quit() == (Quit::Asking { reopened: true });
-            tasks.stay();
-            !reopened
-        }
+/// 有任务在跑时问出了 `choice`：照办，返回窗口这边还要做的。提示框开着期间再次打开过应用的，选了退出也不退出、在后台
+/// 继续也不关窗；期间又要退出应用的（问的是关窗），在后台继续与取消都改为按退出应用再问。
+fn answered(tasks: &mut Tasks, choice: Choice, cx: &mut Context<Tasks>) -> After {
+    let (reopened, quit_requested) = match tasks.quit() {
+        Quit::Asking {
+            reopened,
+            quit_requested,
+        } => (reopened, quit_requested),
+        Quit::Staying | Quit::Waiting | Quit::Leaving => (false, false),
+    };
+    let after = match choice {
         Choice::Pause | Choice::StopRecordings => {
             if !tasks.reopened_while_asking() {
                 tasks.quit_after_stopping(choice == Choice::StopRecordings, cx);
             }
-            false
+            After::Nothing
+        }
+        Choice::Background | Choice::Cancel if quit_requested && !reopened => {
+            tasks.asked();
+            After::AskQuit
+        }
+        Choice::Background if !reopened => {
+            tasks.stay();
+            After::Close
+        }
+        Choice::Background | Choice::Cancel => {
+            tasks.stay();
+            After::Nothing
         }
     };
     cx.notify();
-    close
+    after
 }

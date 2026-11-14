@@ -16,7 +16,7 @@ use hs_m3u8_core::Stage;
 use hs_m3u8_instance::{Handoff, Handoffs, Received};
 
 pub use self::operations::resume_label;
-pub use self::quit::Quit;
+pub use self::quit::{Departure, Quit};
 #[cfg(test)]
 pub use self::row::sample;
 pub use self::row::{Amount, Disk, Row, finished_text};
@@ -46,28 +46,18 @@ pub enum TasksEvent {
     HandedOver(Handoff),
 }
 
-/// 此刻在运行的任务合起来的样子（顶栏与托盘用）。
+/// 任务此刻合起来的样子。
 pub struct Activity {
+    /// 在运行的任务数
     pub running: usize,
     /// 合计下载速度（字节每秒）
     pub speed: f64,
-    /// 在下的点播的平均进度（0 到 1）；没有在下的点播时为 None
+    /// 在运行的点播的平均进度（0 到 1，见 [`Row::download_share`]）；没有时为 None
     pub progress: Option<f32>,
     /// 有在录的直播
     pub recording: bool,
-}
-
-impl Activity {
-    /// 「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
-    pub fn summary(&self) -> Option<String> {
-        (self.running > 0).then(|| {
-            format!(
-                "{} 个进行中 · ↓ {}/s",
-                self.running,
-                crate::format::bytes(self.speed as u64)
-            )
-        })
-    }
+    /// 失败了、停着等处理的任务数
+    pub failed: usize,
 }
 
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
@@ -91,6 +81,8 @@ pub struct Tasks {
     early: Vec<Event>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
+    /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）
+    receives_handoffs: bool,
     _events: Task<()>,
     _handoffs: Task<()>,
     _ticker: Task<()>,
@@ -126,6 +118,7 @@ impl Tasks {
             let _unsaved = this.service.close();
             async {}
         });
+        let receives_handoffs = handoffs.is_ok();
         let handing = match handoffs {
             Ok(mut handoffs) => cx.spawn(async move |this, cx| {
                 while let Some(received) = handoffs.recv().await {
@@ -173,6 +166,7 @@ impl Tasks {
             creating: 0,
             early: Vec::new(),
             free_space: None,
+            receives_handoffs,
             _events: receiving,
             _handoffs: handing,
             _ticker: ticker,
@@ -200,7 +194,7 @@ impl Tasks {
                 let Some(handoff) = delivery.accept() else {
                     return;
                 };
-                if let Quit::Asking { reopened } = &mut self.quit {
+                if let Quit::Asking { reopened, .. } = &mut self.quit {
                     *reopened = true;
                 }
                 if self.quitting() {
@@ -361,17 +355,16 @@ impl Tasks {
         });
     }
 
-    /// 此刻在运行的任务合起来的样子；速度按 `now` 时的时间窗算。
+    /// 任务此刻合起来的样子；速度按 `now` 时的时间窗算。
     pub fn activity(&self, now: Instant) -> Activity {
         let running: Vec<&Row> = self
             .rows
             .iter()
             .filter(|row| row.task.status == Status::Running)
             .collect();
-        let downloading: Vec<f32> = running
+        let shares: Vec<f32> = running
             .iter()
-            .filter(|row| !row.recording())
-            .map(|row| Amount::of(row).map_or(0., |amount| amount.fraction()))
+            .filter_map(|row| row.download_share())
             .collect();
         Activity {
             running: running.len(),
@@ -379,10 +372,20 @@ impl Tasks {
                 .iter()
                 .map(|row| row.rate.bytes_per_second(now))
                 .sum(),
-            progress: (!downloading.is_empty())
-                .then(|| downloading.iter().sum::<f32>() / downloading.len() as f32),
+            progress: (!shares.is_empty())
+                .then(|| shares.iter().sum::<f32>() / shares.len() as f32),
             recording: running.iter().any(|row| row.recording()),
+            failed: self
+                .rows
+                .iter()
+                .filter(|row| matches!(row.task.status, Status::Failed(_)))
+                .count(),
         }
+    }
+
+    /// 收得了后打开的实例转交来的：再次打开应用会回到窗口。
+    pub fn receives_handoffs(&self) -> bool {
+        self.receives_handoffs
     }
 
     pub fn service(&self) -> &Rc<Service> {
