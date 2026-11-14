@@ -136,7 +136,9 @@ impl SettingsView {
     fn save(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
         match self.tasks.read(cx).service().set_proxy(&proxy) {
             Ok(()) => {
-                WebRoute::get(cx).update(cx, |route, _| route.setting_changed(&proxy));
+                if let Some(route) = WebRoute::existing(cx) {
+                    route.update(cx, |route, _| route.setting_changed(&proxy));
+                }
                 self.mode = mode_of(&proxy);
                 self.proxy = proxy;
             }

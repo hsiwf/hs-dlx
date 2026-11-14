@@ -403,11 +403,6 @@ impl SniffView {
         cx.notify();
     }
 
-    /// 不再持有网页的出口（这个视图要被换掉）：之后建的网页按此刻的设置定出口，不照这个旧的。
-    pub fn release_route(&mut self) {
-        self.lease = None;
-    }
-
     /// 加进列表并排队探测；同一个框架又报来的同一条流换成新地址（见 [`Found::renew`]），满了的只计数。
     fn add(&mut self, found: Found, cx: &mut Context<Self>) {
         if let Some(known) = self.found.iter_mut().find(|known| known.same(&found)) {
