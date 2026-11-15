@@ -94,6 +94,7 @@ fn placed_files_download_and_resume_without_peers() {
 
     let metadata = describe(&resume).unwrap();
     assert_eq!((metadata.name.as_str(), metadata.private), ("album", false));
+    assert!(metadata.files.iter().all(|f| f.wanted));
     let mut paths: Vec<(String, i64)> = metadata
         .files
         .iter()
@@ -153,6 +154,20 @@ fn placed_files_download_and_resume_without_peers() {
     // 写到磁盘后看文件；再写出续传数据，换一个不连任何节点的会话恢复
     flushed(&fetcher, &id);
     let saved = resume_data(&fetcher, &id);
+    // 续传数据里：没选的文件不要，已有的块落在要下的文件里的字节即两个文件的全部
+    let described = describe(&saved).unwrap();
+    let unwanted: Vec<&str> = described
+        .files
+        .iter()
+        .filter(|f| !f.wanted)
+        .map(|f| f.path.as_str())
+        .collect();
+    assert!(
+        unwanted.len() == 1 && unwanted[0].ends_with("b.bin"),
+        "{unwanted:?}"
+    );
+    assert_eq!(described.done, 100_000 + 250_000);
+    assert_eq!(describe(&placed).unwrap().done, 0);
     assert_file(&fetch_dir, "专辑/a.bin", &files[0].1);
     assert_file(&fetch_dir, "专辑/extra/c.bin", &files[2].1);
     assert!(!fetch_dir.join("专辑/b.bin").exists());

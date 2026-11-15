@@ -246,6 +246,41 @@ pub fn output_for(
     Ok((stem, output))
 }
 
+/// 在 `folder` 里给 BT 内容的根选名字并拼出路径，返回根名与路径。`name` 为种子名，先整理成能用的名字：单文件的照
+/// [`file_name`] 的规则（保留扩展名），多文件的（根是目录）照标题的规则、整个当主名；什么都不剩时用 `fallback`（种子的
+/// 编号）。根名在磁盘上已存在、或键（[`path_key`]）在 `taken` 里即算占用，这时主名后依次加 ` 2`、` 3`……
+pub fn torrent_root_for(
+    folder: &Path,
+    name: &str,
+    single_file: bool,
+    fallback: &str,
+    taken: &HashSet<String>,
+) -> Result<(String, PathBuf), Error> {
+    let cleaned = if single_file {
+        clean_file_name(name)
+    } else {
+        clean_title(name)
+    };
+    let cleaned = if cleaned.is_empty() {
+        fallback.to_owned()
+    } else {
+        cleaned
+    };
+    let (stem, extension) = if single_file {
+        split_extension(&cleaned)
+    } else {
+        (cleaned.as_str(), None)
+    };
+    let named = |stem: &str| match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem.to_owned(),
+    };
+    let stem = free_stem(folder, stem, taken, |stem| vec![named(stem)])?;
+    let root = named(&stem);
+    let path = folder.join(&root);
+    Ok((root, path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +372,39 @@ mod tests {
         assert_eq!(
             file_output_for(&dir, "b", &taken).unwrap(),
             ("b 2".to_owned(), dir.join("b 2"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn torrent_roots_skip_names_and_keep_dots_in_directories() {
+        let dir =
+            std::env::temp_dir().join(format!("hs-dlx-app-torrent-naming-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("Show.S01")).unwrap();
+        std::fs::write(dir.join("movie.mkv"), b"").unwrap();
+        let none = HashSet::new();
+        // 目录名里的点不当扩展名
+        assert_eq!(
+            torrent_root_for(&dir, "Show.S01", false, "h", &none).unwrap(),
+            ("Show.S01 2".to_owned(), dir.join("Show.S01 2"))
+        );
+        assert_eq!(
+            torrent_root_for(&dir, "movie.mkv", true, "h", &none).unwrap(),
+            ("movie 2.mkv".to_owned(), dir.join("movie 2.mkv"))
+        );
+        let taken = HashSet::from([path_key(&dir.join("A_B").to_string_lossy())]);
+        assert_eq!(
+            torrent_root_for(&dir, "a:b", false, "h", &taken).unwrap().0,
+            "a_b 2"
+        );
+        assert_eq!(
+            torrent_root_for(&dir, " .. ", false, "abc123", &none)
+                .unwrap()
+                .0,
+            "abc123"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

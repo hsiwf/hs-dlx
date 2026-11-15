@@ -24,3 +24,13 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 4. Space Grotesk 字体（© The Space Grotesk Project Authors，https://github.com/floriankarsten/space-grotesk），按 SIL
    Open Font License 1.1 授权，全文见 OFL.txt。
+
+5. libtorrent 2.1.2（https://libtorrent.org，© Arvid Norberg 等），按 BSD 3-Clause 授权；静态链接，源码
+   未作修改。它的许可证与其中收录的别人的代码（puff、ed25519、SHA-1、SHA-256 等）的声明全文见
+   libtorrent-LICENSE.txt。
+
+6. OpenSSL 3.5.9（https://www.openssl.org），按 Apache License 2.0 授权，全文见 OpenSSL-LICENSE.txt；
+   libtorrent 用它连加密的 tracker 与 web seed、算哈希。静态链接，源码未作修改。
+
+7. Boost 1.92.0（https://www.boost.org），按 Boost Software License 1.0 授权，全文见 Boost-LICENSE_1_0.txt；
+   libtorrent 用到它的头文件，未作修改。

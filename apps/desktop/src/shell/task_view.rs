@@ -235,7 +235,14 @@ impl Shell {
             .editing_headers
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
-        stopped_plan(failure, row.recording(), row.task.write_only, editing)
+        let headers = row.task.spec.torrent().is_none();
+        stopped_plan(
+            failure,
+            row.recording(),
+            row.task.write_only,
+            headers,
+            editing,
+        )
     }
 
     /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
@@ -366,11 +373,16 @@ impl Shell {
                 primary: None,
                 rest: vec![pause(cx), discard(cx)],
             },
-            // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录
-            Status::Paused | Status::Failed(_) if row.task.work_dir.is_none() => Foot {
-                primary: None,
-                rest: vec![forget(Tone::Plain, cx).flex_1()],
-            },
+            // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录。BT 任务本就
+            // 没有任务目录
+            Status::Paused | Status::Failed(_)
+                if row.task.work_dir.is_none() && row.task.spec.torrent().is_none() =>
+            {
+                Foot {
+                    primary: None,
+                    rest: vec![forget(Tone::Plain, cx).flex_1()],
+                }
+            }
             Status::Paused | Status::Failed(_) => self.stopped_foot(row, discard(cx), cx),
             Status::Done => {
                 // 输出在不在是完成时与打开应用时在后台查的；还没查完时先不给这两个按钮
@@ -427,6 +439,9 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         }
         cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
         return cells;
+    }
+    if row.task.spec.torrent().is_some() {
+        return torrent_reads(row, now);
     }
     if row.task.spec.hls().is_none() {
         return file_reads(row, now);
@@ -504,6 +519,51 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         _ => vec![
             cell("已下", format::bytes(amount.bytes)),
             cell("大小", size),
+        ],
+    }
+}
+
+/// BT 任务的 [`reads`]（完成的除外）：在下时为下载与上传的速度、剩余、已下与节点数（其中做种的），停着的为已下与
+/// 要下的大小；还没有内容时为空。
+fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let Some(amount) = FileAmount::of(row) else {
+        return Vec::new();
+    };
+    let wanted = amount.total.unwrap_or(0);
+    match (&row.task.status, &row.torrent_progress) {
+        (Status::Running, Some(progress)) => {
+            let speed = row.rate.bytes_per_second(now);
+            // 按最近几秒的速度估：剩下的字节除以速度
+            let left = if speed > 0.0 {
+                let left = wanted.saturating_sub(amount.bytes);
+                format::duration(Duration::from_secs_f64(left as f64 / speed))
+            } else {
+                "—".to_owned()
+            };
+            vec![
+                cell("速度", format!("{}/s", format::bytes(speed as u64))),
+                cell("剩余", left),
+                cell(
+                    "已下",
+                    format!(
+                        "{} / {}",
+                        format::bytes(amount.bytes),
+                        format::bytes(wanted)
+                    ),
+                ),
+                cell(
+                    "节点",
+                    format!("{}（做种 {}）", progress.peers, progress.seeds),
+                ),
+                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+            ]
+        }
+        (Status::Running, None) => Vec::new(),
+        _ if amount.bytes == 0 => Vec::new(),
+        _ => vec![
+            cell("已下", format::bytes(amount.bytes)),
+            cell("大小", format::bytes(wanted)),
         ],
     }
 }

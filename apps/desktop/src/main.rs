@@ -35,7 +35,7 @@ use gpui_kit::{
     AppContext as _, Bounds, FontWeight, ParentElement as _, QuitMode, Render, SharedString,
     Styled as _, WindowBounds, WindowOptions, div, px, size,
 };
-use hs_dlx_app::{Service, Store};
+use hs_dlx_app::{Service, Store, TorrentNetwork};
 use hs_dlx_instance::HandOverError;
 
 use crate::tasks::Tasks;
@@ -137,7 +137,7 @@ fn main() {
                         Err(error) => return Err(Failure::new("启动失败", error.to_string())),
                     };
                     let handoffs = hs_dlx_instance::listen(&path);
-                    let (service, events) = Service::new(store, MAX_REQUESTS)
+                    let (service, events) = Service::new(store, MAX_REQUESTS, TorrentNetwork::Internet)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
                     let settings = service
                         .settings()

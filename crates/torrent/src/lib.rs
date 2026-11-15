@@ -33,6 +33,8 @@ mod ffi {
     struct Status {
         /// libtorrent 的 `torrent_status::state_t`，见 [`crate::State`]
         state: u8,
+        /// 这一状态做到哪，百万分之几：校验时为校验了的，下载时为已下的
+        progress_ppm: i32,
         /// 已取得种子信息（磁力链接要先从节点那里取）
         has_metadata: bool,
         paused: bool,
@@ -46,6 +48,8 @@ mod ffi {
         /// 其中已下完并校验过的；可能还在内存里没写到磁盘（libtorrent 先校验、再异步写盘），要确认已落盘用
         /// [`Session::flush`]
         total_wanted_done: i64,
+        /// 这次加入会话以来收到的内容字节数（含校验没过、丢掉的）
+        downloaded: i64,
         /// 下载与上传的速度，字节每秒，只算内容
         download_rate: i32,
         upload_rate: i32,
@@ -104,6 +108,8 @@ mod ffi {
         path: String,
         /// 字节数
         size: i64,
+        /// 要下载（续传数据里的文件优先级不为「不下载」，没记优先级时都要）
+        wanted: bool,
     }
 
     /// 由续传数据加入种子时的选择。
@@ -125,6 +131,8 @@ mod ffi {
         /// 私有种子：只经种子里的 tracker 找节点，libtorrent 不用 DHT、节点交换与本地发现
         private_torrent: bool,
         files: Vec<FileEntry>,
+        /// 续传数据里记的已有的块落在要下的文件里的字节数
+        done: i64,
     }
 
     /// 一个事件。
@@ -368,6 +376,8 @@ pub struct Metadata {
     pub private: bool,
     /// 各文件，路径照续传数据里的改名
     pub files: Vec<FileEntry>,
+    /// 续传数据里记的已有的块落在要下的文件里的字节数
+    pub done: u64,
 }
 
 /// 读出续传数据里的种子信息；没有种子信息（磁力链接还没取到）或读不出时报错。
@@ -378,6 +388,7 @@ pub fn describe(resume: &[u8]) -> Result<Metadata, Error> {
         name: described.name,
         private: described.private_torrent,
         files: described.files,
+        done: u64::try_from(described.done).expect("字节数由各块落在文件里的长度相加，不为负"),
     })
 }
 

@@ -160,7 +160,12 @@ fn create(rt: &Runtime, service: &Service, draft: Draft) -> hs_dlx_app::Task {
 }
 
 fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
-    Service::new(Store::open(store).unwrap(), NonZeroUsize::new(8).unwrap()).unwrap()
+    Service::new(
+        Store::open(store).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+        hs_dlx_app::TorrentNetwork::Loopback,
+    )
+    .unwrap()
 }
 
 /// 等到任务 `id` 停下，返回它的状态与没写进存储的原因；中途的进度事件交给 `on_progress`。

@@ -60,12 +60,20 @@ pub enum DraftKind {
         /// 每个请求最多取多少字节；None 时不限（见 [`FileSpec::chunk_size`]）
         chunk_size: Option<NonZeroU64>,
     },
+    /// BT：[`Draft::url`] 为磁力链接或种子文件的 `file:` 地址，没有请求头
+    Torrent {
+        /// 种子的续传数据：种子文件转成的（[`crate::torrent_from_file`]）或磁力链接取到的
+        /// （[`crate::Service::fetch_metadata`]）
+        resume: Vec<u8>,
+        /// 要下的文件（[`crate::TorrentFile::index`]），至少一个
+        wanted: Vec<i32>,
+    },
 }
 
 /// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Service::set_headers`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
-    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名
+    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名
     pub title: String,
     pub url: Url,
     /// 额外的请求头，原样存储（含凭据时同样明文，存储文件只有本人可读写）
@@ -78,6 +86,7 @@ pub struct TaskSpec {
 pub enum Kind {
     Hls(HlsSpec),
     File(FileSpec),
+    Torrent(TorrentSpec),
 }
 
 /// HLS 任务特有的内容。
@@ -100,6 +109,16 @@ pub struct FileSpec {
     pub chunk_size: Option<NonZeroU64>,
 }
 
+/// BT 任务特有的内容；种子的续传数据另存（不随任务读出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentSpec {
+    /// 种子的编号：信息哈希的十六进制，40 个小写字母与数字
+    pub info_hash: String,
+    /// 内容的根：保存目录下种子的文件（单文件的）或目录（多文件的），以文件名结尾的绝对路径；种子里的文件下到它的
+    /// 所在目录
+    pub root: PathBuf,
+}
+
 /// 新建前认出地址是文件时服务器报的（响应头原样）。总字节数、ETag、Last-Modified、Content-Type 都没有时第一次下载
 /// 无从核对。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -114,8 +133,8 @@ pub struct Expected {
 }
 
 impl TaskSpec {
-    /// 输出占用的路径（以文件名结尾的绝对路径）：HLS 为 MP4 与本地 HLS 目录中要的那些（MP4 在前），文件任务为文件。
-    /// 首项是主要的那个：显示的文件名、所在的目录取它。
+    /// 输出占用的路径（以文件名结尾的绝对路径）：HLS 为 MP4 与本地 HLS 目录中要的那些（MP4 在前），文件任务为文件，
+    /// BT 为内容的根。首项是主要的那个：显示的文件名、所在的目录取它。
     pub fn outputs(&self) -> Vec<&std::path::Path> {
         match &self.kind {
             Kind::Hls(hls) => match &hls.output {
@@ -123,22 +142,31 @@ impl TaskSpec {
                 OutputSpec::Both { mp4, hls } => vec![mp4, hls],
             },
             Kind::File(file) => vec![&file.path],
+            Kind::Torrent(torrent) => vec![&torrent.root],
         }
     }
 
-    /// HLS 任务特有的内容；文件任务为 None。
+    /// HLS 任务特有的内容；别的任务为 None。
     pub fn hls(&self) -> Option<&HlsSpec> {
         match &self.kind {
             Kind::Hls(hls) => Some(hls),
-            Kind::File(_) => None,
+            Kind::File(_) | Kind::Torrent(_) => None,
         }
     }
 
-    /// 文件任务特有的内容；HLS 任务为 None。
+    /// 文件任务特有的内容；别的任务为 None。
     pub fn file(&self) -> Option<&FileSpec> {
         match &self.kind {
-            Kind::Hls(_) => None,
             Kind::File(file) => Some(file),
+            Kind::Hls(_) | Kind::Torrent(_) => None,
+        }
+    }
+
+    /// BT 任务特有的内容；别的任务为 None。
+    pub fn torrent(&self) -> Option<&TorrentSpec> {
+        match &self.kind {
+            Kind::Torrent(torrent) => Some(torrent),
+            Kind::Hls(_) | Kind::File(_) => None,
         }
     }
 }
@@ -184,8 +212,9 @@ pub struct Task {
     pub id: TaskId,
     pub spec: TaskSpec,
     pub status: Status,
-    /// 任务目录（绝对路径），新建时定下、之后不变。None 时任务没有自己的任务目录：旧版本存储里已完成的，或与别的任务
-    /// 共用任务目录、迁移时让给了那个任务的（状态为失败）；这样的任务不能继续，只能从列表移除
+    /// 任务目录（绝对路径），新建时定下、之后不变。BT 任务没有任务目录（内容直接下到保存目录，续传数据存在存储里），
+    /// 总是 None；HLS 与文件任务为 None 时没有自己的任务目录：旧版本存储里已完成的，或与别的任务共用任务目录、迁移时
+    /// 让给了那个任务的（状态为失败），这样的任务不能继续，只能从列表移除
     pub work_dir: Option<PathBuf>,
     /// 新建时间，Unix 秒
     pub created_at: i64,
@@ -204,7 +233,7 @@ pub struct Task {
 pub struct Finished {
     /// MP4 里视频流的时长，没有 MP4 或没有视频流时为第 0 条轨分片的声明时长之和；都没有时与文件任务为 None
     pub duration: Option<std::time::Duration>,
-    /// HLS 为写出的分片与 init 段的字节数（解密后），文件任务为文件的字节数
+    /// HLS 为写出的分片与 init 段的字节数（解密后），文件任务为文件的字节数，BT 为选了的文件的字节数
     pub bytes: u64,
     /// MP4 里视频流的宽与高；没有时与文件任务为 None
     pub resolution: Option<(u32, u32)>,

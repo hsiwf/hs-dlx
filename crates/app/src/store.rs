@@ -11,22 +11,24 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use hs_m3u8_core::{Proxy, Url};
 
 use crate::preference::StoredPreference;
+use crate::torrent::{Resume, SessionState};
 use crate::{
     Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
-    Status, Task, TaskId, TaskSpec, Theme, naming,
+    Status, Task, TaskId, TaskSpec, Theme, TorrentSpec, naming,
 };
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
     rebuild_with_kinds,
     add_theme,
     rebuild_with_ranges,
+    rebuild_with_torrents,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -324,6 +326,85 @@ fn rebuild_with_ranges(tx: &Transaction<'_>) -> Result<(), Error> {
     keep_task_counter(tx, counter)
 }
 
+/// 第 7 版：
+/// - 重建任务表，加种类 `torrent`（BT）：种子的编号（信息哈希的十六进制，40 个小写字母与数字，不同任务不重复）、内容的
+///   根（绝对路径）、续传数据（libtorrent 的格式，含种子信息）、续传数据记的已有块是否可信（见
+///   [`crate::torrent::Resume::trusted`]）四列必有且只用于它；BT 任务没有任务目录与请求头（`[]`）。HLS 与文件的约束
+///   不变。
+/// - 设置加 BT 会话的监听端口（1 到 65535，没监听过为 NULL）与 DHT 状态（libtorrent 的格式，没存过为 NULL）。
+fn rebuild_with_torrents(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file', 'torrent')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            torrent_info_hash TEXT UNIQUE CHECK (length(torrent_info_hash) = 40
+                                                 AND torrent_info_hash NOT GLOB '*[^0-9a-f]*'),
+            torrent_root TEXT,
+            torrent_resume BLOB,
+            torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (kind != 'hls' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL)),
+            CHECK ((kind = 'torrent') = (torrent_info_hash IS NOT NULL AND torrent_root IS NOT NULL
+                                         AND torrent_resume IS NOT NULL AND torrent_trusted IS NOT NULL)),
+            CHECK (kind = 'torrent' OR (torrent_info_hash IS NULL AND torrent_root IS NULL AND torrent_resume IS NULL
+                                        AND torrent_trusted IS NULL)),
+            CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]'))
+        ) STRICT;
+        INSERT INTO task_v7 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                             file_length, file_accepts_ranges, file_etag, file_last_modified, file_content_type,
+                             chunk_size, work_dir, status, error, failure, created_at, total, duration_ms, bytes, width,
+                             height, write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                   file_length, file_accepts_ranges, file_etag, file_last_modified, file_content_type, chunk_size,
+                   work_dir, status, error, failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v7 RENAME TO task;
+        ALTER TABLE settings ADD COLUMN torrent_port INTEGER CHECK (torrent_port BETWEEN 1 AND 65535);
+        ALTER TABLE settings ADD COLUMN torrent_dht BLOB;",
+    )?;
+    keep_task_counter(tx, counter)
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -426,24 +507,29 @@ impl Store {
 const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path, \
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
-                       file_accepts_ranges";
+                       file_accepts_ranges, torrent_info_hash, torrent_root";
 
-/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录
-/// 相同（按 [`naming::path_key`] 比较）时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；
-/// 共用输出时，后写出的那个要到写出时才失败。
+/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
+/// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
+/// 时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；共用输出时，后写出的那个要到写出时
+/// 才失败。BT 任务的种子已在别的任务里时报 [`Error::TorrentTaken`]。
 pub fn insert(
     tx: &Transaction<'_>,
     spec: &TaskSpec,
-    work_dir: &Path,
+    work_dir: Option<&Path>,
+    resume: Option<&[u8]>,
     created_at: i64,
 ) -> Result<TaskId, Error> {
-    let work_dir_text = utf8(work_dir)?;
-    if !work_dir.is_absolute() {
+    let work_dir_text = work_dir.map(utf8).transpose()?;
+    if let Some(dir) = work_dir
+        && !dir.is_absolute()
+    {
         return Err(Error::InvalidInput(format!(
-            "任务目录不是绝对路径：{work_dir_text}"
+            "任务目录不是绝对路径：{}",
+            dir.display()
         )));
     }
-    // 只属于另一种任务的列为 NULL（表上的 CHECK 按种类核对）
+    // 只属于别的种类的列为 NULL（表上的 CHECK 按种类核对）
     let (preference, output_kind, mp4, hls, live) = match &spec.kind {
         Kind::Hls(spec) => {
             let (kind, mp4, hls) = output_columns(&spec.output)?;
@@ -455,12 +541,12 @@ pub fn insert(
                 Some(spec.live),
             )
         }
-        Kind::File(_) => (None, None, None, None, None),
+        Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None),
     };
     let (file_path, length, accepts_ranges, etag, last_modified, content_type, chunk) = match &spec
         .kind
     {
-        Kind::Hls(_) => (None, None, None, None, None, None, None),
+        Kind::Hls(_) | Kind::Torrent(_) => (None, None, None, None, None, None, None),
         Kind::File(file) => (
             Some(named_utf8(&file.path)?),
             // 服务器报的，可能大得离谱
@@ -480,11 +566,31 @@ pub fn insert(
                 .map(|size| i64::try_from(size.get()).expect("每个请求的字节数远小于 i64 的上限")),
         ),
     };
+    let (info_hash, root, trusted) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) => (None, None, None),
+        Kind::Torrent(torrent) => {
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT id FROM task WHERE torrent_info_hash = ?1",
+                    [&torrent.info_hash],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                return Err(Error::TorrentTaken(TaskId(existing)));
+            }
+            // 新建时的续传数据还没有已有的块
+            (
+                Some(torrent.info_hash.as_str()),
+                Some(named_utf8(&torrent.root)?),
+                Some(true),
+            )
+        }
+    };
     let taken = taken_paths(tx)?;
-    for path in [&mp4, &hls, &file_path]
+    for path in [&mp4, &hls, &file_path, &root, &work_dir_text]
         .into_iter()
         .flatten()
-        .chain([&work_dir_text])
     {
         if taken.contains(&naming::path_key(path)) {
             return Err(Error::PathTaken(path.into()));
@@ -493,8 +599,10 @@ pub fn insert(
     tx.execute(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
-                           status, created_at, file_accepts_ranges)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18)",
+                           status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
+                           torrent_trusted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
+                 ?21, ?22)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -514,6 +622,10 @@ pub fn insert(
             work_dir_text,
             created_at,
             accepts_ranges,
+            info_hash,
+            root,
+            resume,
+            trusted,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -538,7 +650,7 @@ pub fn get(tx: &Transaction<'_>, id: TaskId) -> Result<Option<Task>, Error> {
     .transpose()
 }
 
-/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录、文件与任务目录。新建任务选主名时避开
+/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录、文件、BT 内容的根与任务目录。新建任务选主名时避开
 /// 它们。
 pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
     taken_except(tx, None)
@@ -547,7 +659,7 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
 /// 除任务 `except` 之外的任务占用的路径的比较键；`except` 为 None 时为全部任务的。
 fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<String>, Error> {
     let mut statement = tx.prepare(
-        "SELECT mp4_path, hls_path, file_path, work_dir FROM task WHERE ?1 IS NULL OR id != ?1",
+        "SELECT mp4_path, hls_path, file_path, torrent_root, work_dir FROM task WHERE ?1 IS NULL OR id != ?1",
     )?;
     let rows = statement.query_map([except.map(|id| id.0)], |row| {
         Ok([
@@ -555,6 +667,7 @@ fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ])
     })?;
     let mut taken = HashSet::new();
@@ -670,12 +783,67 @@ pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(
     Ok(())
 }
 
-/// 把还标着运行中的任务改为暂停：应用上次异常退出时没来得及改；返回改了几个。
+/// 把还标着运行中的任务改为暂停：应用上次异常退出时没来得及改；返回改了几个。其中 BT 任务的续传数据改为不可信：
+/// 运行中下了的块没记进去，而存的续传数据可能比磁盘上的多（写盘与改文件在它之后）。
 pub fn pause_interrupted(tx: &Transaction<'_>) -> Result<usize, Error> {
+    tx.execute(
+        "UPDATE task SET torrent_trusted = 0 WHERE status = 'running' AND kind = 'torrent'",
+        [],
+    )?;
     Ok(tx.execute(
         "UPDATE task SET status = 'paused' WHERE status = 'running'",
         [],
     )?)
+}
+
+/// BT 任务的续传数据；没有这个 BT 任务时报 [`Error::NotFound`]。
+pub fn torrent_resume(tx: &Transaction<'_>, id: TaskId) -> Result<Resume, Error> {
+    tx.query_row(
+        "SELECT torrent_resume, torrent_trusted FROM task WHERE id = ?1 AND kind = 'torrent'",
+        [id.0],
+        |row| {
+            Ok(Resume {
+                data: row.get(0)?,
+                trusted: row.get(1)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(Error::NotFound(id))
+}
+
+/// 换掉 BT 任务的续传数据；没有这个 BT 任务时报 [`Error::NotFound`]。
+pub fn set_torrent_resume(tx: &Transaction<'_>, id: TaskId, resume: &Resume) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET torrent_resume = ?2, torrent_trusted = ?3 WHERE id = ?1 AND kind = 'torrent'",
+        params![id.0, resume.data, resume.trusted],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 上次关闭时存下的 BT 会话状态；没存过的为空（端口为 None、DHT 状态为空）。
+pub fn torrent_session(tx: &Transaction<'_>) -> Result<SessionState, Error> {
+    let (port, dht): (Option<u16>, Option<Vec<u8>>) = tx.query_row(
+        "SELECT torrent_port, torrent_dht FROM settings WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(SessionState {
+        port,
+        dht: dht.unwrap_or_default(),
+    })
+}
+
+/// 记下关闭时的 BT 会话状态。
+pub fn set_torrent_session(tx: &Transaction<'_>, state: &SessionState) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET torrent_port = ?1, torrent_dht = ?2 WHERE id = 1",
+        params![state.port, state.dht],
+    )?;
+    Ok(())
 }
 
 /// 删除任务；没有时报 [`Error::NotFound`]。
@@ -716,6 +884,8 @@ struct Row {
     height: Option<u32>,
     write_only: bool,
     file_accepts_ranges: Option<bool>,
+    torrent_info_hash: Option<String>,
+    torrent_root: Option<String>,
 }
 
 impl Row {
@@ -749,6 +919,8 @@ impl Row {
             height: row.get(25)?,
             write_only: row.get(26)?,
             file_accepts_ranges: row.get(27)?,
+            torrent_info_hash: row.get(28)?,
+            torrent_root: row.get(29)?,
         })
     }
 
@@ -765,8 +937,10 @@ impl Row {
             self.live,
             self.file_path,
             self.file_accepts_ranges,
+            self.torrent_info_hash,
+            self.torrent_root,
         ) {
-            ("hls", Some(preference), Some(output_kind), Some(live), None, None) => {
+            ("hls", Some(preference), Some(output_kind), Some(live), None, None, None, None) => {
                 let preference: StoredPreference =
                     serde_json::from_str(&preference).map_err(|_| corrupt("选轨偏好"))?;
                 let output = output_spec(&output_kind, self.mp4_path, self.hls_path)
@@ -777,7 +951,7 @@ impl Row {
                     live,
                 })
             }
-            ("file", None, None, None, Some(path), Some(accepts_ranges)) => {
+            ("file", None, None, None, Some(path), Some(accepts_ranges), None, None) => {
                 let path = PathBuf::from(path);
                 if !named_absolute(&path) {
                     return Err(corrupt("输出"));
@@ -803,6 +977,13 @@ impl Row {
                     },
                     chunk_size,
                 })
+            }
+            ("torrent", None, None, None, None, None, Some(info_hash), Some(root)) => {
+                let root = PathBuf::from(root);
+                if !named_absolute(&root) {
+                    return Err(corrupt("内容的根"));
+                }
+                Kind::Torrent(TorrentSpec { info_hash, root })
             }
             _ => return Err(corrupt("种类")),
         };
@@ -885,6 +1066,7 @@ fn kind_code(kind: &Kind) -> &'static str {
     match kind {
         Kind::Hls(_) => "hls",
         Kind::File(_) => "file",
+        Kind::Torrent(_) => "torrent",
     }
 }
 
@@ -1117,7 +1299,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
         let spec = file_spec(m("数据.zip"));
-        let id = insert(&tx, &spec, &m("数据.hsdl"), 1).unwrap();
+        let id = insert(&tx, &spec, Some(&m("数据.hsdl")), None, 1).unwrap();
         let task = get(&tx, id).unwrap().unwrap();
         assert_eq!(
             (task.spec, task.total, task.write_only),
@@ -1128,7 +1310,7 @@ mod tests {
             assert!(taken.contains(&naming::path_key(&text(name))), "{name}");
         }
         assert!(matches!(
-            insert(&tx, &file_spec(m("数据.ZIP")), &m("x.hsdl"), 2),
+            insert(&tx, &file_spec(m("数据.ZIP")), Some(&m("x.hsdl")), None, 2),
             Err(Error::PathTaken(_))
         ));
         // 只属于 HLS 的不记到文件任务上
@@ -1215,10 +1397,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 第 6 版的 HLS 与文件任务升到第 7 版后原样读回，编号计数照旧。
+    #[test]
+    fn rebuilding_for_torrents_keeps_rows_and_the_id_counter() {
+        let dir = scratch("v6-rows");
+        let path = dir.join("tasks.sqlite");
+        let (hls, file) = (spec(OutputSpec::Mp4(m("甲.mp4"))), file_spec(m("数据.zip")));
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..6] {
+                migration(&tx).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, live, work_dir,
+                                   status, failure, error, created_at, total)
+                 VALUES ('hls', ?1, ?2, ?3, ?4, 'mp4', ?5, 1, ?6, 'failed', 'status:403', 'HTTP 403', 7, 12)",
+                params![
+                    hls.title,
+                    hls.url.as_str(),
+                    to_json(&hls.headers),
+                    to_json(&hls.hls().unwrap().preference),
+                    text("甲.mp4"),
+                    text("甲.hsdl"),
+                ],
+            )
+            .unwrap();
+            let expected = &file.file().unwrap().expected;
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, file_path, file_length, file_accepts_ranges, file_etag,
+                                   file_content_type, chunk_size, work_dir, status, created_at, bytes)
+                 VALUES ('file', ?1, ?2, '[]', ?3, ?4, 1, ?5, ?6, ?7, ?8, 'done', 8, 5)",
+                params![
+                    file.title,
+                    file.url.as_str(),
+                    text("数据.zip"),
+                    i64::try_from(expected.length.unwrap()).unwrap(),
+                    expected.etag,
+                    expected.content_type,
+                    10 << 20,
+                    text("数据.zip.hsdl"),
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, file_path, file_accepts_ranges, status, created_at)
+                 VALUES ('file', 'x', 'https://a/x', '[]', ?1, 0, 'paused', 9)",
+                params![text("x")],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM task WHERE title = 'x'", [])
+                .unwrap();
+            tx.pragma_update(None, "user_version", 6).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let tx = store.transaction().unwrap();
+        let tasks = list(&tx).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!((&tasks[0].spec, tasks[0].total), (&hls, Some(12)));
+        assert_eq!(
+            tasks[0].status,
+            Status::Failed(Failure {
+                kind: FailureKind::Status(403),
+                message: "HTTP 403".into()
+            })
+        );
+        assert_eq!(
+            (&tasks[1].spec, tasks[1].result.as_ref().map(|r| r.bytes)),
+            (&file, Some(5))
+        );
+        assert_eq!(
+            tasks[1].work_dir.as_deref(),
+            Some(m("数据.zip.hsdl").as_path())
+        );
+        let next = add(&tx, OutputSpec::Mp4(m("乙.mp4")), 10).unwrap();
+        assert_eq!(next.0, 4);
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// 新建任务，任务目录取核心的默认位置。
     fn add(tx: &Transaction<'_>, output: OutputSpec, created_at: i64) -> Result<TaskId, Error> {
         let work_dir = output.options().resolved_work_dir().unwrap();
-        insert(tx, &spec(output), &work_dir, created_at)
+        insert(tx, &spec(output), Some(&work_dir), None, created_at)
     }
 
     #[test]
@@ -1282,6 +1545,113 @@ mod tests {
         assert_eq!(pause_interrupted(&tx).unwrap(), 1);
         assert_eq!(get(&tx, running).unwrap().unwrap().status, Status::Paused);
         assert_eq!(get(&tx, done).unwrap().unwrap().status, Status::Done);
+    }
+
+    fn torrent_spec(info_hash: &str, root: PathBuf) -> TaskSpec {
+        TaskSpec {
+            title: "专辑".into(),
+            url: format!("magnet:?xt=urn:btih:{info_hash}").parse().unwrap(),
+            headers: Vec::new(),
+            kind: Kind::Torrent(TorrentSpec {
+                info_hash: info_hash.into(),
+                root,
+            }),
+        }
+    }
+
+    /// BT 任务读回写入的内容，续传数据另读另写；内容的根算占用，同一个种子不能有两个任务；异常退出时还在运行的，续传
+    /// 数据改为不可信。
+    #[test]
+    fn torrent_tasks_round_trip() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let spec = torrent_spec(hash, m("专辑"));
+        let id = insert(&tx, &spec, None, Some(b"resume"), 1).unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!((task.spec, task.work_dir), (spec, None));
+        assert_eq!(
+            torrent_resume(&tx, id).unwrap(),
+            Resume {
+                data: b"resume".to_vec(),
+                trusted: true
+            }
+        );
+        assert!(
+            taken_paths(&tx)
+                .unwrap()
+                .contains(&naming::path_key(&text("专辑")))
+        );
+        assert!(matches!(
+            insert(&tx, &torrent_spec(hash, m("别处")), None, Some(b"r"), 2),
+            Err(Error::TorrentTaken(at)) if at == id
+        ));
+        let other = "1123456789abcdef0123456789abcdef01234567";
+        assert!(matches!(
+            insert(&tx, &torrent_spec(other, m("专辑")), None, Some(b"r"), 2),
+            Err(Error::PathTaken(_))
+        ));
+        let paused = Resume {
+            data: b"paused".to_vec(),
+            trusted: true,
+        };
+        set_torrent_resume(&tx, id, &paused).unwrap();
+        assert_eq!(torrent_resume(&tx, id).unwrap(), paused);
+        assert_eq!(pause_interrupted(&tx).unwrap(), 1);
+        assert_eq!(get(&tx, id).unwrap().unwrap().status, Status::Paused);
+        assert!(!torrent_resume(&tx, id).unwrap().trusted);
+        // 别的任务没有续传数据
+        let hls = add(&tx, OutputSpec::Mp4(m("a.mp4")), 3).unwrap();
+        assert!(matches!(torrent_resume(&tx, hls), Err(Error::NotFound(_))));
+        assert!(matches!(
+            set_torrent_resume(&tx, hls, &paused),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// BT 的四列必有且只用于它；它没有任务目录与请求头；编号是 40 个小写十六进制数字。
+    #[test]
+    fn torrent_columns_must_agree() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let hash = "'0123456789abcdef0123456789abcdef01234567'";
+        let insert = |kind: &str, columns: &str, values: &str| {
+            tx.execute(
+                &format!(
+                    "INSERT INTO task (kind, title, url, headers, status, created_at{columns})
+                     VALUES ('{kind}', 'x', 'magnet:?', '[]', 'paused', 1{values})"
+                ),
+                [],
+            )
+        };
+        let all = ", torrent_info_hash, torrent_root, torrent_resume, torrent_trusted";
+        insert("torrent", all, &format!(", {hash}, '/m/a', x'00', 1")).unwrap();
+        tx.execute("DELETE FROM task", []).unwrap();
+        for (kind, columns, values) in [
+            ("torrent", all, ", '0123', '/m/a', x'00', 1".to_owned()),
+            (
+                "torrent",
+                all,
+                ", '0123456789ABCDEF0123456789ABCDEF01234567', '/m/a', x'00', 1".to_owned(),
+            ),
+            (
+                "torrent",
+                ", torrent_info_hash, torrent_root, torrent_trusted",
+                format!(", {hash}, '/m/a', 1"),
+            ),
+            (
+                "torrent",
+                &format!("{all}, work_dir"),
+                format!(", {hash}, '/m/a', x'00', 1, '/m/a.hsdl'"),
+            ),
+            (
+                "hls",
+                ", preference, output_kind, live, torrent_root",
+                ", '{}', 'mp4', 0, '/m/a'".to_owned(),
+            ),
+        ] {
+            assert!(insert(kind, columns, &values).is_err(), "{kind}{columns}");
+        }
     }
 
     /// 删掉编号最大的任务后，新任务也不拿它的编号。
@@ -1446,6 +1816,18 @@ mod tests {
             tx.execute("UPDATE settings SET theme = 'aurora' WHERE id = 1", [])
                 .is_err()
         );
+        let empty = torrent_session(&tx).unwrap();
+        assert_eq!((empty.port, empty.dht.is_empty()), (None, true));
+        set_torrent_session(
+            &tx,
+            &SessionState {
+                port: Some(51413),
+                dht: b"dht".to_vec(),
+            },
+        )
+        .unwrap();
+        let saved = torrent_session(&tx).unwrap();
+        assert_eq!((saved.port, saved.dht), (Some(51413), b"dht".to_vec()));
     }
 
     /// 同一份存储同时只能被一个进程（这里是同一进程里的第二个连接）打开；先打开的释放后才能再开。

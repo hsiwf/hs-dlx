@@ -101,7 +101,8 @@ impl Tasks {
         self.service.stop(id);
     }
 
-    /// 任务不在运行时：暂停与失败的读一次任务目录，完成的查一次输出在不在；放弃中的什么也不做（目录正在删）。
+    /// 任务不在运行时：暂停与失败的读一次任务目录（BT 为存着的续传数据），完成的查一次输出在不在；放弃中的什么也不做
+    /// （目录正在删）。
     pub(super) fn after_stop(&mut self, id: TaskId, cx: &mut Context<Self>) {
         let Some(row) = self.row(id) else {
             return;
@@ -112,7 +113,7 @@ impl Tasks {
         match &row.task.status {
             Status::Paused | Status::Failed(_) => self.inspect(id, false, cx),
             Status::Done => {
-                // HLS 为 MP4 与本地 HLS 目录，文件任务为文件
+                // HLS 为 MP4 与本地 HLS 目录，文件任务为文件，BT 为内容的根
                 let (mp4, other) = match &row.task.spec.kind {
                     Kind::Hls(hls) => {
                         let target = hls.output.options().target;
@@ -122,6 +123,7 @@ impl Tasks {
                         )
                     }
                     Kind::File(file) => (None, Some(file.path.clone())),
+                    Kind::Torrent(torrent) => (None, Some(torrent.root.clone())),
                 };
                 let checking = cx.background_executor().spawn(async move {
                     let mp4 = mp4.filter(|p| p.is_file());
@@ -145,19 +147,30 @@ impl Tasks {
         }
     }
 
-    /// 读任务目录里已完成的内容；`then_resume` 时读完即继续，读到的片数作本次运行的起点（读不出时不估剩余时间）。
-    /// 读完（及继续）后，选了退出、都已停下的即退出。
+    /// 读任务目录里已完成的内容（BT 任务读存着的续传数据）；`then_resume` 时读完即继续，读到的片数作本次运行的起点
+    /// （读不出时不估剩余时间）。读完（及继续）后，选了退出、都已停下的即退出。
     fn inspect(&mut self, id: TaskId, then_resume: bool, cx: &mut Context<Self>) {
-        let Some(reading) = self.row(id).map(|row| row.reading) else {
+        let Some((reading, torrent)) = self
+            .row(id)
+            .map(|row| (row.reading, row.task.spec.torrent().is_some()))
+        else {
             return;
         };
-        let handle = self.service.inspect(id);
+        let read = if torrent {
+            let handle = self.service.inspect_torrent(id);
+            cx.background_executor()
+                .spawn(async move { handle.await.map(|result| result.map(Disk::Torrent)) })
+        } else {
+            let handle = self.service.inspect(id);
+            cx.background_executor()
+                .spawn(async move { handle.await.map(|result| result.map(Disk::Read)) })
+        };
         cx.spawn(async move |this, cx| {
-            let result = handle.await;
+            let result = read.await;
             // 等待期间应用退出时不再需要结果
             let _gone = this.update(cx, |this, cx| {
                 let disk = match result {
-                    Ok(Ok(saved)) => Disk::Read(saved),
+                    Ok(Ok(disk)) => disk,
                     Ok(Err(error)) => Disk::Unreadable(error.to_string()),
                     Err(join) => Disk::Unreadable(format!("读的过程中出错：{join}")),
                 };
@@ -283,6 +296,14 @@ impl Tasks {
                 (saved.bytes > 0).then(|| format::bytes(saved.bytes)),
             ),
             Disk::Read(None) => (Some(0), Some(Duration::ZERO), None),
+            Disk::Torrent(saved) if !saved.trusted => {
+                (Some(0), None, Some("待校验的文件，先校验".to_owned()))
+            }
+            Disk::Torrent(saved) => (
+                Some(0),
+                None,
+                (saved.info.done > 0).then(|| format::bytes(saved.info.done)),
+            ),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
@@ -295,6 +316,7 @@ impl Tasks {
                 row.task = task;
                 row.progress = None;
                 row.file_progress = None;
+                row.torrent_progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);

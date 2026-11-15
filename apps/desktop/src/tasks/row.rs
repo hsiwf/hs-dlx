@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
-use hs_dlx_app::{Finished, Kind, OutputSpec, Status, Task, TaskSpec};
+use hs_dlx_app::{
+    Finished, Kind, OutputSpec, SavedTorrent, Status, Task, TaskSpec, TorrentProgress,
+};
 use hs_m3u8_core::{FileCount, FileProgress, Progress, Saved, Stage};
 
 use crate::format;
@@ -19,13 +21,15 @@ pub enum Output {
     Hls,
 }
 
-/// 任务目录里已完成的内容读到了哪一步。
+/// 任务目录里已完成的内容（BT 任务为存着的续传数据）读到了哪一步。
 pub enum Disk {
     Unread,
     /// 读不出：原因
     Unreadable(String),
-    /// 读到了；目录或其中的记录不在时为 None
+    /// HLS 与文件任务读到了；目录或其中的记录不在时为 None
     Read(Option<Saved>),
+    /// BT 任务读到了
+    Torrent(SavedTorrent),
 }
 
 /// 完成任务的输出此刻在不在：完成时与打开应用时在后台查一次，渲染时不碰文件系统。
@@ -42,6 +46,8 @@ pub struct Row {
     pub progress: Option<Progress>,
     /// 文件任务这次运行最近的进度；继续时清掉
     pub file_progress: Option<FileProgress>,
+    /// BT 任务这次运行最近的进度；继续时清掉
+    pub torrent_progress: Option<TorrentProgress>,
     /// 任务不在运行时任务目录里已完成的内容；停下时作废重读，运行中留着继续前读到的
     pub disk: Disk,
     /// 读任务目录的代次：每次作废 `disk` 时加一，只收发起时代次相同的结果
@@ -91,6 +97,7 @@ impl Row {
             task,
             progress: None,
             file_progress: None,
+            torrent_progress: None,
             disk: Disk::Unread,
             reading: 0,
             present: None,
@@ -192,7 +199,7 @@ impl Row {
         }
         match &self.disk {
             Disk::Read(Some(Saved::Hls(saved))) => saved.live,
-            Disk::Read(Some(Saved::File(_))) => false,
+            Disk::Read(Some(Saved::File(_))) | Disk::Torrent(_) => false,
             _ => self.task.spec.hls().is_some_and(|hls| hls.live),
         }
     }
@@ -230,7 +237,7 @@ impl Amount {
                 duration: saved.duration,
             }),
             // 存储里是 HLS 任务、目录里却是文件任务的：服务按种类开始任务，读到时核心已报目录种类不符
-            Disk::Read(Some(Saved::File(_)) | None) => None,
+            Disk::Read(Some(Saved::File(_)) | None) | Disk::Torrent(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.progress.as_ref().map(from_progress),
         }
     }
@@ -245,7 +252,7 @@ impl Amount {
     }
 }
 
-/// 文件任务已下的与总字节数。
+/// 文件与 BT 任务已下的与总字节数（BT 只算选了的文件）。
 pub struct FileAmount {
     pub bytes: u64,
     /// 服务器没给出时为 None
@@ -253,12 +260,17 @@ pub struct FileAmount {
 }
 
 impl FileAmount {
-    /// 文件任务的：运行中取这次运行的进度；停下的取任务目录里读到的，还没读到时取这次运行留下的进度。HLS 任务为
-    /// None（见 [`Amount`]）。
+    /// 文件与 BT 任务的：运行中取这次运行的进度；停下的取任务目录里（BT 为续传数据里）读到的，还没读到时取这次运行
+    /// 留下的进度。BT 任务上次没正常停下、已有的块待校验时为 None。HLS 任务为 None（见 [`Amount`]）。
     pub fn of(row: &Row) -> Option<FileAmount> {
-        if row.task.spec.hls().is_some() {
-            return None;
+        match &row.task.spec.kind {
+            Kind::Hls(_) => None,
+            Kind::File(_) => Self::of_file(row),
+            Kind::Torrent(_) => Self::of_torrent(row),
         }
+    }
+
+    fn of_file(row: &Row) -> Option<FileAmount> {
         let from_progress = |p: &FileProgress| FileAmount {
             bytes: p.bytes,
             total: p.total,
@@ -271,8 +283,26 @@ impl FileAmount {
                 bytes: saved.bytes,
                 total: saved.total,
             }),
-            Disk::Read(Some(Saved::Hls(_)) | None) => None,
+            Disk::Read(Some(Saved::Hls(_)) | None) | Disk::Torrent(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.file_progress.as_ref().map(from_progress),
+        }
+    }
+
+    fn of_torrent(row: &Row) -> Option<FileAmount> {
+        let from_progress = |p: &TorrentProgress| FileAmount {
+            bytes: p.done,
+            total: Some(p.wanted),
+        };
+        if row.task.status == Status::Running {
+            return row.torrent_progress.as_ref().map(from_progress);
+        }
+        match &row.disk {
+            Disk::Torrent(saved) => saved.trusted.then(|| FileAmount {
+                bytes: saved.info.done,
+                total: Some(saved.info.wanted()),
+            }),
+            Disk::Read(_) => None,
+            Disk::Unread | Disk::Unreadable(_) => row.torrent_progress.as_ref().map(from_progress),
         }
     }
 
@@ -301,7 +331,7 @@ pub fn main_output(spec: &TaskSpec) -> &Path {
         .expect("每种任务都至少有一个输出")
 }
 
-/// 存成了什么：HLS 为输出的种类，文件任务为「文件」。
+/// 存成了什么：HLS 为输出的种类，文件任务为「文件」，BT 任务为「BT」。
 pub fn saved_as(spec: &TaskSpec) -> &'static str {
     match &spec.kind {
         Kind::Hls(hls) => match hls.output {
@@ -310,6 +340,7 @@ pub fn saved_as(spec: &TaskSpec) -> &'static str {
             OutputSpec::Both { .. } => "MP4 与本地 HLS",
         },
         Kind::File(_) => "文件",
+        Kind::Torrent(_) => "BT",
     }
 }
 

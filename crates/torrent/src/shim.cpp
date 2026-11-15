@@ -206,12 +206,14 @@ Status Session::status(rust::Str id) const {
 	lt::torrent_status s = h.status(lt::torrent_handle::query_pieces | lt::torrent_handle::query_name);
 	Status out;
 	out.state = static_cast<std::uint8_t>(s.state);
+	out.progress_ppm = s.progress_ppm;
 	out.has_metadata = s.has_metadata;
 	out.paused = static_cast<bool>(s.flags & lt::torrent_flags::paused);
 	out.held = static_cast<bool>(s.flags & lt::torrent_flags::upload_mode);
 	out.name = text_of(s.name);
 	out.total_wanted = s.total_wanted;
 	out.total_wanted_done = s.total_wanted_done;
+	out.downloaded = s.total_payload_download;
 	out.download_rate = s.download_payload_rate;
 	out.upload_rate = s.upload_payload_rate;
 	out.peers = s.num_peers;
@@ -364,6 +366,12 @@ lt::add_torrent_params with_metadata(rust::Slice<std::uint8_t const> resume) {
 Described describe(rust::Slice<std::uint8_t const> resume) {
 	lt::add_torrent_params const params = with_metadata(resume);
 	lt::file_storage const& layout = params.ti->layout();
+	// 没记文件优先级时都要下
+	auto const wanted = [&](lt::file_index_t const i) {
+		return !layout.pad_file_at(i)
+			&& (std::size_t(static_cast<int>(i)) >= params.file_priorities.size()
+				|| params.file_priorities[std::size_t(static_cast<int>(i))] != lt::dont_download);
+	};
 	Described out;
 	out.id = rust::String(canonical(params.ti->info_hashes()));
 	out.name = text_of(layout.name());
@@ -376,7 +384,15 @@ Described describe(rust::Slice<std::uint8_t const> resume) {
 		entry.index = static_cast<std::int32_t>(i);
 		entry.path = text_of(renamed == params.renamed_files.end() ? layout.file_path(i) : renamed->second);
 		entry.size = layout.file_size(i);
+		entry.wanted = wanted(i);
 		out.files.push_back(std::move(entry));
+	}
+	out.done = 0;
+	for (lt::piece_index_t const piece : layout.piece_range()) {
+		if (piece >= params.have_pieces.end_index() || !params.have_pieces[piece]) continue;
+		for (lt::file_slice const& slice : layout.map_block(piece, 0, layout.piece_size(piece))) {
+			if (wanted(slice.file_index)) out.done += slice.size;
+		}
 	}
 	return out;
 }

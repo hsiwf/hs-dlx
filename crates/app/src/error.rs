@@ -68,6 +68,15 @@ pub enum Error {
     /// 核心库报的错误
     #[error(transparent)]
     Core(#[from] hs_m3u8_core::Error),
+    /// BT 引擎（libtorrent）报的错误，或等它一步的结果超时；说明里 libtorrent 的部分为英文
+    #[error("BT：{0}")]
+    Torrent(String),
+    /// 新建的 BT 任务的种子已在这个任务里：两个任务会写同一批文件
+    #[error("这个种子已在{0}里")]
+    TorrentTaken(TaskId),
+    /// 放弃 BT 任务时下了的文件没删干净（里面有不是这个种子的文件，或删除出错）：任务留在存储里，处理后可再放弃
+    #[error("{id}下了的文件没删干净，任务留在列表里：{cause}")]
+    ContentLeft { id: TaskId, cause: Box<Error> },
     /// 文件系统或系统资源的操作失败：建存储所在的目录、设权限、给存储加锁、取名时检查路径是否已存在、启动 tokio
     /// 运行时；照原样报出
     #[error("{action} {path} 失败：{cause}")]

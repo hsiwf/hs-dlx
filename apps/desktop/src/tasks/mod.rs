@@ -247,6 +247,18 @@ impl Tasks {
                     row.file_progress = Some(*progress);
                 }
             }
+            Event::TorrentProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    // 没有片数：剩余时间另按字节算
+                    row.rate.update(Instant::now(), progress.received, 0);
+                    for (level, text) in
+                        crate::signals::between_torrent(row.torrent_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.torrent_progress = Some(*progress);
+                }
+            }
             Event::Ended {
                 id,
                 status,
@@ -485,6 +497,9 @@ fn ended_signal(
                 (Some(r), None) => format!("下载完成 · {}", crate::format::bytes(r.bytes)),
             },
         ),
+        Status::Paused if spec.torrent().is_some() => {
+            (Level::Info, "已暂停，已下的保留".to_owned())
+        }
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),
         Status::Running | Status::DiscardUnfinished => {

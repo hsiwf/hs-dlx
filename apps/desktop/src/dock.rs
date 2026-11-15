@@ -1,4 +1,5 @@
-//! 粘贴栏：舞台底部的链接或 curl 命令的输入。回车或点「探测」发出 [`DockEvent::Probe`]。框里空着或全选时粘贴的 curl
+//! 粘贴栏：舞台底部的链接、磁力链接或 curl 命令的输入。回车或点「探测」发出 [`DockEvent::Probe`]；点「种子文件」选一个
+//! `.torrent` 文件，框里换成它的 `file:` 地址并发出。框里空着或全选时粘贴的 curl
 //! 命令不经输入框（单行的框会删掉换行，续行就断了），交给 [`Dock::put`] 并立即发出。外面告诉它正在探测的链接
 //! （[`Dock::set_probing`]），框里正是它时右边写探测到哪一步；外面拒绝了输入时右边写原因，改了内容即清掉。任务页、
 //! 待机页与新建页的舞台里放的是同一个视图。描边上有一段主色的流光绕着走（[`paint_sweep`]）。
@@ -9,8 +10,8 @@ use std::time::Duration;
 
 use gpui_kit::{
     AppContext as _, Bounds, Context, EventEmitter, Focusable as _, IntoElement,
-    ParentElement as _, PathBuilder, Pixels, Point, Render, SharedString, Styled as _,
-    Subscription, Window, canvas, div, point, px,
+    ParentElement as _, PathBuilder, PathPromptOptions, Pixels, Point, Render, SharedString,
+    Styled as _, Subscription, Window, canvas, div, point, px,
 };
 
 use hs_dlx_app::curl;
@@ -45,8 +46,9 @@ impl EventEmitter<DockEvent> for Dock {}
 
 impl Dock {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("粘贴链接或 curl 命令，回车探测"));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("粘贴链接、磁力链接或 curl 命令，回车探测")
+        });
         let typed = cx.subscribe_in(
             &input,
             window,
@@ -115,6 +117,40 @@ impl Dock {
     /// 键盘焦点在探测框里（用户可能正在输入）。
     pub fn typing(&self, window: &Window, cx: &gpui_kit::App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// 选一个种子文件：选了 `.torrent` 结尾的，框里换成它的 `file:` 地址并发出 [`DockEvent::Probe`]；别的在右边写原因。
+    fn open_torrent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("打开".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = picked.await;
+            // 选择期间视图被释放时不再需要结果
+            let _gone = this.update_in(cx, |this, window, cx| {
+                let path = match result {
+                    Ok(Ok(Some(mut paths))) if !paths.is_empty() => paths.swap_remove(0),
+                    Ok(Ok(_)) => return,
+                    Ok(Err(error)) => return this.refuse(format!("打不开文件选择：{error}"), cx),
+                    Err(_) => return this.refuse("文件选择没有返回结果".to_owned(), cx),
+                };
+                let url = Url::from_file_path(&path)
+                    .ok()
+                    .and_then(|url| links::torrent_url(url.as_str()));
+                match url {
+                    Some(url) => {
+                        let text = url.to_string();
+                        this.set_text(text.clone(), window, cx);
+                        cx.emit(DockEvent::Probe(text));
+                    }
+                    None => this.refuse("要选 .torrent 结尾的种子文件".to_owned(), cx),
+                }
+            });
+        })
+        .detach();
     }
 
     /// 外面拒绝了这次输入：右边写 `reason`，改了内容时清掉。
@@ -238,6 +274,16 @@ impl Render for Dock {
                     }
                 }),
             ))
+            .child(
+                ui::button(
+                    "open-torrent",
+                    "种子文件",
+                    Tone::Ghost,
+                    cx.listener(|this, _, window, cx| this.open_torrent(window, cx)),
+                )
+                .h(px(DOCK_HEIGHT - 14.))
+                .rounded_full(),
+            )
             .child(trailing)
             .children(motion::turn(SWEEP).map(|head| {
                 canvas(

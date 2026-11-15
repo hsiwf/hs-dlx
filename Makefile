@@ -53,7 +53,7 @@ PACKAGE_FORMATS := app,dmg
 else
 PACKAGE_FORMATS := deb
 endif
-package: ffmpeg_present
+package: ffmpeg_present libtorrent_present
 	@cargo packager --version >/dev/null 2>&1 || { echo "缺少 cargo-packager，版本见 .github/workflows/desktop.yml"; exit 1; }
 	cd apps/desktop && cargo packager --release --formats $(PACKAGE_FORMATS)
 
@@ -68,7 +68,7 @@ rs_test: ffmpeg_present libtorrent_present
 	cargo test --workspace
 
 # 任务存储与生命周期（app）的行覆盖不低于 80%
-rs_cov: ffmpeg_present
+rs_cov: ffmpeg_present libtorrent_present
 	@cargo llvm-cov --version >/dev/null 2>&1 || { echo "缺少 cargo-llvm-cov，版本见 .github/workflows/check.yml"; exit 1; }
 	# 源码改动后旧的插桩产物会混进统计，先清掉
 	cargo llvm-cov clean --workspace

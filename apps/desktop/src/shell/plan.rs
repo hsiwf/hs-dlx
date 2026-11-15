@@ -29,19 +29,22 @@ pub(super) struct Plan {
 }
 
 /// 停着的任务的操作。`failure` 为失败的种类（暂停的为 None），`live` 为直播录制，`write_only` 为选了只写出已录的
-/// （[`hs_dlx_app::Task::write_only`]），`editing` 为正在改请求头（那时编辑卡片里有保存的按钮，这里不再给改请求头）。
+/// （[`hs_dlx_app::Task::write_only`]），`headers` 为任务有请求头（BT 任务没有），`editing` 为正在改请求头（那时编辑
+/// 卡片里有保存的按钮，这里不再给改请求头）。
 ///
 /// - 再跑一次：选了只写出的写出，其余续传续录；没有可写出的改为续录。
 /// - 被拒或取到错误页的，先改请求头；放不进 MP4 的，先改存本地 HLS，此前再跑只会同样失败。
 /// - 直播接不上之前录的、来源已没有（404/410）或停滞的，先写出已录的：续录多半不成。
 /// - 再试也一样的不给再跑；改了请求头可能不一样的（[`FailureKind::headers_can_change_outcome`]），保存后接着跑。
-/// - 直播停着时都能写出已录的，选了只写出的也能改回续录；任何停着的任务都能改请求头。
+/// - 直播停着时都能写出已录的，选了只写出的也能改回续录；有请求头的停着的任务都能改请求头。
 pub(super) fn stopped_plan(
     failure: Option<FailureKind>,
     live: bool,
     write_only: bool,
+    headers: bool,
     editing: bool,
 ) -> Plan {
+    let offer_headers = headers && !editing;
     let mp4 = failure == Some(FailureKind::Mp4Unsupported);
     let rerun = if write_only && failure != Some(FailureKind::NothingToWrite) {
         Action::WriteRecorded
@@ -62,7 +65,7 @@ pub(super) fn stopped_plan(
             actions.push(action);
         }
     };
-    if headers_first && !editing {
+    if headers_first && offer_headers {
         add(Action::EditHeaders);
     }
     if mp4 {
@@ -83,7 +86,7 @@ pub(super) fn stopped_plan(
             add(Action::Resume);
         }
     }
-    if !editing {
+    if offer_headers {
         add(Action::EditHeaders);
     }
     if failure == Some(FailureKind::OutputTaken) {
@@ -102,7 +105,7 @@ mod tests {
     use super::*;
 
     fn actions(failure: Option<FailureKind>, live: bool, write_only: bool) -> Vec<Action> {
-        stopped_plan(failure, live, write_only, false).actions
+        stopped_plan(failure, live, write_only, true, false).actions
     }
 
     #[test]
@@ -112,11 +115,11 @@ mod tests {
         // 403：先改请求头，保存后重试；正在改时不再给
         let forbidden = Some(FailureKind::Status(403));
         assert_eq!(actions(forbidden, false, false), [EditHeaders]);
-        let editing = stopped_plan(forbidden, false, false, true);
+        let editing = stopped_plan(forbidden, false, false, true, true);
         assert_eq!(editing.actions, []);
         assert!(editing.resume_after_headers);
         // 放不进 MP4：先改存本地 HLS，此前写出、重试都会同样失败
-        let mp4 = stopped_plan(Some(FailureKind::Mp4Unsupported), true, false, false);
+        let mp4 = stopped_plan(Some(FailureKind::Mp4Unsupported), true, false, true, false);
         assert_eq!(mp4.actions, [SwitchToHls, EditHeaders]);
         assert!(!mp4.resume_after_headers);
         // 直播来源没了：先写出已录的，不给重试
@@ -130,22 +133,26 @@ mod tests {
             [Resume, EditHeaders, OpenFolder]
         );
         // 再试也一样的点播：只剩改请求头（放弃另给），改了请求头也只保存
-        let stuck = stopped_plan(Some(FailureKind::Unrecoverable), false, false, false);
+        let stuck = stopped_plan(Some(FailureKind::Unrecoverable), false, false, true, false);
         assert_eq!(stuck.actions, [EditHeaders]);
         assert!(!stuck.resume_after_headers);
+        // 没有请求头的（BT）：只有继续，写盘出错时也是
+        let torrent = |failure| stopped_plan(failure, false, false, false, false).actions;
+        assert_eq!(torrent(None), [Resume]);
+        assert_eq!(torrent(Some(FailureKind::Disk)), [Resume]);
     }
 
     #[test]
     fn writing_only_reruns_as_writing_until_there_is_nothing_to_write() {
         // 只写出时盘满：腾出空间后再跑也只写出，也能改回续录；改了请求头只保存
-        let disk = stopped_plan(Some(FailureKind::Disk), true, true, false);
+        let disk = stopped_plan(Some(FailureKind::Disk), true, true, true, false);
         assert_eq!(disk.actions, [WriteRecorded, Resume, EditHeaders]);
         assert!(!disk.resume_after_headers);
         // 证书不受信任：改请求头也没用，只保存
-        let certificate = stopped_plan(Some(FailureKind::Certificate), false, false, false);
+        let certificate = stopped_plan(Some(FailureKind::Certificate), false, false, true, false);
         assert!(!certificate.resume_after_headers);
         // 没有可写出的：改为续录，不再给写出
-        let nothing = stopped_plan(Some(FailureKind::NothingToWrite), true, true, false);
+        let nothing = stopped_plan(Some(FailureKind::NothingToWrite), true, true, true, false);
         assert_eq!(nothing.actions, [Resume, EditHeaders]);
         assert!(nothing.resume_after_headers);
     }
