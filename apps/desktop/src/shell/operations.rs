@@ -48,15 +48,11 @@ impl Shell {
 
     /// 打开停着的任务 `id` 的请求头编辑框，填上它现在的请求头。
     pub(super) fn edit_headers(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(headers) = self
-            .tasks
-            .read(cx)
-            .row(id)
-            .map(|row| row.task.spec.headers.clone())
-        else {
+        let Some(spec) = self.tasks.read(cx).row(id).map(|row| row.task.spec.clone()) else {
             return;
         };
-        let editor = cx.new(|cx| HeadersEditor::new(headers, window, cx));
+        let editor =
+            cx.new(|cx| HeadersEditor::new(spec.url, spec.headers, Vec::new(), window, cx));
         editor.update(cx, |editor, cx| editor.focus(window, cx));
         self.editing_headers = Some((id, editor));
         cx.notify();

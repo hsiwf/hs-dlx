@@ -1,5 +1,6 @@
 //! 桌面应用的业务层：任务与设置的存储、任务的生命周期与节流后的进度，建在 hs-m3u8-core 之上，不依赖界面框架。
 
+pub mod curl;
 mod error;
 mod failure;
 mod naming;

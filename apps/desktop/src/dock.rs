@@ -1,6 +1,7 @@
-//! 粘贴栏：舞台底部的链接输入。回车或点「探测」发出 [`DockEvent::Probe`]；外面告诉它正在探测的链接
-//! （[`Dock::set_probing`]），框里正是它时右边写探测到哪一步；外面拒绝了输入（不是链接）时右边写原因，改了内容即
-//! 清掉。任务页、待机页与新建页的舞台里放的是同一个视图。
+//! 粘贴栏：舞台底部的链接输入。回车或点「探测」发出 [`DockEvent::Probe`]；粘贴的是 curl 命令时不放进框里（单行的框
+//! 会删掉换行，续行就断了），原样立即发出。外面告诉它正在探测的链接（[`Dock::set_probing`]），框里正是它时右边写
+//! 探测到哪一步；外面拒绝了输入（不是链接、命令认不出）时右边写原因，改了内容即清掉。任务页、待机页与新建页的舞台
+//! 里放的是同一个视图。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -8,9 +9,10 @@ use gpui_kit::{
     Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
+use hs_dlx_app::curl;
 use hs_m3u8_core::Url;
 
-use crate::links::http_url;
+use crate::links;
 use crate::theme;
 use crate::ui::{self, DOCK_HEIGHT, Tone};
 
@@ -18,7 +20,7 @@ use crate::ui::{self, DOCK_HEIGHT, Tone};
 const MAX_WIDTH: f32 = 760.;
 
 pub enum DockEvent {
-    /// 探测框里（或剪贴板里）的这段文字
+    /// 探测框里的这段文字，或粘贴的 curl 命令（原样，含换行）
     Probe(String),
 }
 
@@ -35,7 +37,8 @@ impl EventEmitter<DockEvent> for Dock {}
 
 impl Dock {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("粘贴链接，回车探测"));
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("粘贴链接或 curl 命令，回车探测"));
         let typed = cx.subscribe_in(
             &input,
             window,
@@ -100,7 +103,7 @@ impl Render for Dock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let value = self.input.read(cx).value();
         let focused = self.typing(window, cx);
-        let typed = http_url(&value);
+        let typed = links::target(&value);
         let probing = self
             .probing
             .as_ref()
@@ -174,13 +177,19 @@ impl Render for Dock {
                 .collect(),
             )
             .child(ui::dot(theme::cyan(), 8.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(14.))
-                    .child(Input::new(&self.input).appearance(false)),
-            )
+            .child(div().flex_1().min_w_0().text_size(px(14.)).child(
+                Input::new(&self.input).appearance(false).on_paste({
+                    let dock = cx.entity().downgrade();
+                    move |item, _, cx| {
+                        let Some(text) = item.text().filter(|text| curl::is_command(text)) else {
+                            return false;
+                        };
+                        // 视图已释放时照常粘贴
+                        dock.update(cx, |_, cx| cx.emit(DockEvent::Probe(text)))
+                            .is_ok()
+                    }
+                }),
+            ))
             .child(trailing)
     }
 }

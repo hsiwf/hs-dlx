@@ -1,7 +1,7 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::Draft;
+use hs_dlx_app::{Draft, curl};
 use hs_m3u8_core::Url;
 
 use super::{Page, Shell};
@@ -10,17 +10,26 @@ use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
 use crate::sniff::{SniffEvent, SniffView, Verdict};
 
 impl Shell {
+    /// 探测 `text`：链接，或 curl 命令（地址与请求头一起交给新建页，粘贴栏里换成地址）；都不是时在粘贴栏里写原因。
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(url) = links::http_url(text) else {
-            // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：回任务页，原因才看得见
-            if matches!(self.page, Page::Sniff(_) | Page::Settings { .. }) {
-                self.show(Page::Task, cx);
+        let request = match links::request(text) {
+            Ok(request) => request,
+            Err(reason) => {
+                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：回任务页，原因才看得见
+                if matches!(self.page, Page::Sniff(_) | Page::Settings { .. }) {
+                    self.show(Page::Task, cx);
+                }
+                self.dock.update(cx, |dock, cx| dock.refuse(reason, cx));
+                return;
             }
-            self.dock
-                .update(cx, |dock, cx| dock.refuse(links::NOT_HTTP.to_owned(), cx));
-            return;
         };
-        self.dock.update(cx, |dock, cx| dock.accepted(cx));
+        let url = request.url;
+        self.dock.update(cx, |dock, cx| {
+            if curl::is_command(text) {
+                dock.set_text(url.to_string(), window, cx);
+            }
+            dock.accepted(cx)
+        });
         self.confirm_discard = None;
         if self.clipboard.as_ref() == Some(&url) {
             self.clipboard = None;
@@ -29,7 +38,8 @@ impl Shell {
             Link {
                 url,
                 title: None,
-                headers: Vec::new(),
+                headers: request.headers,
+                dropped: request.dropped,
                 probe: None,
             },
             false,
@@ -119,7 +129,7 @@ impl Shell {
     ) {
         let dock = self.dock.read(cx);
         let typing = dock.typing(window, cx);
-        let same = links::http_url(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
+        let same = links::target(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
         if !typing || same {
             view.update(cx, |view, cx| view.focus(window, cx));
         }

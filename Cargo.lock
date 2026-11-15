@@ -3453,6 +3453,7 @@ name = "hs-dlx-app"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "hs-m3u8-core",
  "icu_normalizer",
  "percent-encoding",
@@ -3488,7 +3489,7 @@ dependencies = [
 name = "hs-dlx-relay"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "percent-encoding",
  "rustls",
  "rustls-platform-verifier",

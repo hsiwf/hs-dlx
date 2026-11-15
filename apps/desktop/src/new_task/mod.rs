@@ -42,6 +42,8 @@ pub struct Link {
     pub title: Option<String>,
     /// 探测与下载时带的请求头
     pub headers: Vec<(String, String)>,
+    /// `headers` 出自的 curl 命令里没带上的请求头名，列在请求头编辑框下面
+    pub dropped: Vec<String>,
     /// 已带着这些请求头探测好的结果（嗅探页后台探测的）：新建页不再探测；None 时新建页自己探测
     pub probe: Option<Box<Probe>>,
 }
@@ -156,9 +158,11 @@ impl NewTask {
             url,
             title: page_title,
             headers,
+            dropped,
             probe,
         } = link;
-        let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
+        let editor =
+            cx.new(|cx| HeadersEditor::new(url.clone(), headers.clone(), dropped, window, cx));
         // 读系统代理要调操作系统的接口，在后台读
         let target = url.clone();
         let proxy = service.settings().map(|settings| settings.proxy);

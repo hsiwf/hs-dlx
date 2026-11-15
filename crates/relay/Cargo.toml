@@ -9,8 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# 上游代理的 Basic 认证；与依赖树里已有的同一版
-base64 = "0.22.1"
+base64.workspace = true
 percent-encoding.workspace = true
 # 与 hs-m3u8-core 经 reqwest 用的同一套：aws-lc-rs 加系统的证书校验
 rustls = { workspace = true, features = ["aws_lc_rs"] }

@@ -11,7 +11,7 @@ use gpui_kit::{
 use hs_m3u8_core::{Proxy, bare_url};
 
 use super::Shell;
-use crate::links::{self, http_url};
+use crate::links;
 use crate::tasks::Tasks;
 use crate::ui::{self, Solid};
 use crate::{dial, format, ring, theme};
@@ -33,7 +33,7 @@ impl Shell {
         cx: &Context<Self>,
     ) -> (Div, Div) {
         let dock = self.dock.read(cx);
-        let link = http_url(&dock.text(cx));
+        let link = links::target(&dock.text(cx));
         let animate = !cx.reduce_motion();
         let elapsed = self.standby_since.elapsed();
         let breath = if animate {
