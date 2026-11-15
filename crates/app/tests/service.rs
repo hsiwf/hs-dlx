@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use hs_dlx_app::{
-    Draft, Error, Event, FailureKind, OutputKind, OutputSpec, Service, Status, Store, TaskId,
+    Draft, DraftKind, Error, Event, FailureKind, OutputKind, OutputSpec, Service, Status, Store,
+    TaskId,
 };
 use hs_m3u8_core::Url;
 use hs_m3u8_core::hls::Preference;
@@ -108,13 +109,20 @@ fn test_dir(name: &str) -> PathBuf {
 fn draft(url: Url, folder: PathBuf) -> Draft {
     Draft {
         url,
-        title: None,
-        preference: Preference::default(),
         headers: Vec::new(),
-        output: OutputKind::Mp4,
         folder,
-        live: false,
+        kind: DraftKind::Hls {
+            title: None,
+            preference: Preference::default(),
+            output: OutputKind::Mp4,
+            live: false,
+        },
     }
+}
+
+/// HLS 任务 `task` 的输出。
+fn output(task: &hs_dlx_app::Task) -> OutputSpec {
+    task.spec.hls().expect("测试只建 HLS 任务").output.clone()
 }
 
 /// 新建任务并等它存进存储。
@@ -192,7 +200,7 @@ fn a_task_downloads_and_is_recorded_as_done() {
         draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
     );
     assert_eq!(task.spec.title, "index");
-    assert_eq!(task.spec.output, OutputSpec::Mp4(folder.join("index.mp4")));
+    assert_eq!(output(&task), OutputSpec::Mp4(folder.join("index.mp4")));
     let status = rt.block_on(ended(&mut events, task.id, |_| {}));
 
     assert_eq!(status, Status::Done);
@@ -286,11 +294,8 @@ fn the_same_link_twice_gets_separate_outputs() {
     let first = create(&rt, &service, draft(url.clone(), folder.clone()));
     let second = create(&rt, &service, draft(url, folder.clone()));
 
-    assert_eq!(first.spec.output, OutputSpec::Mp4(folder.join("index.mp4")));
-    assert_eq!(
-        second.spec.output,
-        OutputSpec::Mp4(folder.join("index 2.mp4"))
-    );
+    assert_eq!(output(&first), OutputSpec::Mp4(folder.join("index.mp4")));
+    assert_eq!(output(&second), OutputSpec::Mp4(folder.join("index 2.mp4")));
     assert_eq!(second.spec.title, "index 2");
     for id in [first.id, second.id] {
         rt.block_on(service.discard(id)).unwrap().unwrap();
@@ -492,7 +497,7 @@ fn concurrent_creates_get_separate_outputs() {
     let second = service.create(draft(url.clone(), folder.join(".")), 1);
     let (first, second) = rt.block_on(async { (first.await, second.await) });
     let (first, second) = (first.unwrap().unwrap(), second.unwrap().unwrap());
-    let mut outputs = vec![first.spec.output, second.spec.output];
+    let mut outputs = vec![output(&first), output(&second)];
     outputs.sort_by_key(|output| format!("{output:?}"));
     assert_eq!(
         outputs,
@@ -562,7 +567,7 @@ fn a_paused_task_can_switch_to_local_hls() {
     assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Paused);
 
     let switched = service.switch_to_hls(id).unwrap();
-    assert_eq!(switched.spec.output, OutputSpec::Hls(folder.join("index")));
+    assert_eq!(output(&switched), OutputSpec::Hls(folder.join("index")));
     assert_eq!(service.task(id).unwrap(), switched);
     server.gate.open();
     service.resume(id).unwrap();

@@ -27,6 +27,9 @@ pub enum Error {
     /// 已完成的任务不能再继续
     #[error("{0}已完成")]
     AlreadyDone(TaskId),
+    /// 只有 HLS 任务有的操作（只写出已录的、改存本地 HLS）用在了别的任务上
+    #[error("{0}不是 HLS 任务")]
+    NotHls(TaskId),
     /// 任务没有自己的任务目录（见 [`crate::Task::work_dir`]），不能继续
     #[error("{0}没有自己的任务目录，只能从列表移除")]
     NoWorkDir(TaskId),

@@ -1,10 +1,10 @@
 //! 任务列表里的一行：存储里的任务，加上这次运行收到的进度、结果、信号与速度。界面上的样子见 `crate::shell` 的 look。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
-use hs_dlx_app::{Finished, OutputSpec, Status, Task};
+use hs_dlx_app::{Finished, Kind, OutputSpec, Status, Task, TaskSpec};
 use hs_m3u8_core::{FileCount, Progress, Saved, Stage};
 
 use crate::format;
@@ -68,7 +68,7 @@ impl Row {
             .timestamp_opt(task.created_at, 0)
             .earliest()
             .map_or_else(|| "—".to_owned(), |t| t.format("%m-%d %H:%M").to_string());
-        let file_name = file_name(&task.spec.output);
+        let file_name = file_name(&task.spec);
         let mut signals = Vec::new();
         signals::push(
             &mut signals,
@@ -102,9 +102,10 @@ impl Row {
     }
 
     /// 换上改后的输出（改存本地 HLS 之后）。
-    pub fn set_output(&mut self, output: OutputSpec) {
-        self.file_name = file_name(&output);
-        self.task.spec.output = output;
+    /// 换掉任务的内容（如改存本地 HLS 之后），显示的文件名随之更新。
+    pub fn set_spec(&mut self, spec: TaskSpec) {
+        self.file_name = file_name(&spec);
+        self.task.spec = spec;
     }
 
     pub fn signal(&mut self, level: Level, text: String) {
@@ -186,7 +187,7 @@ impl Row {
         }
         match &self.disk {
             Disk::Read(Some(saved)) => saved.live,
-            _ => self.task.spec.live,
+            _ => self.task.spec.hls().is_some_and(|hls| hls.live),
         }
     }
 }
@@ -236,26 +237,38 @@ impl Amount {
 }
 
 /// 输出的文件名（同时要 MP4 与本地 HLS 时为 MP4 的）。
-fn file_name(output: &OutputSpec) -> String {
-    let target = output.options().target;
-    target
-        .mp4()
-        .or(target.hls())
-        .expect("输出至少有 MP4 与本地 HLS 之一")
+/// 主要输出（[`TaskSpec::outputs`] 的首项）的文件名。
+fn file_name(spec: &TaskSpec) -> String {
+    main_output(spec)
         .file_name()
         .expect("存储读回任务时已校验输出路径以文件名结尾")
         .to_string_lossy()
         .into_owned()
 }
 
-/// 完成时的说明：输出的种类、视频的宽高与大小（`MP4 · 1920×1080 · 1.4 GB`）。
-pub fn finished_text(output: &OutputSpec, result: &Finished) -> String {
-    let kind = match output {
-        OutputSpec::Mp4(_) => "MP4",
-        OutputSpec::Hls(_) => "本地 HLS",
-        OutputSpec::Both { .. } => "MP4 与本地 HLS",
-    };
-    let mut parts = vec![kind.to_owned()];
+/// 主要输出（[`TaskSpec::outputs`] 的首项）。
+pub fn main_output(spec: &TaskSpec) -> &Path {
+    spec.outputs()
+        .first()
+        .copied()
+        .expect("每种任务都至少有一个输出")
+}
+
+/// 存成了什么：HLS 为输出的种类，文件任务为「文件」。
+pub fn saved_as(spec: &TaskSpec) -> &'static str {
+    match &spec.kind {
+        Kind::Hls(hls) => match hls.output {
+            OutputSpec::Mp4(_) => "MP4",
+            OutputSpec::Hls(_) => "本地 HLS",
+            OutputSpec::Both { .. } => "MP4 与本地 HLS",
+        },
+        Kind::File(_) => "文件",
+    }
+}
+
+/// 完成时的说明：存成了什么、视频的宽高与大小（`MP4 · 1920×1080 · 1.4 GB`）。
+pub fn finished_text(spec: &TaskSpec, result: &Finished) -> String {
+    let mut parts = vec![saved_as(spec).to_owned()];
     if let Some((width, height)) = result.resolution {
         parts.push(format!("{width}×{height}"));
     }
@@ -266,7 +279,7 @@ pub fn finished_text(output: &OutputSpec, result: &Finished) -> String {
 /// 测试用的行与任务目录里的内容。
 #[cfg(test)]
 pub mod sample {
-    use hs_dlx_app::{OutputSpec, Status, StoredPreference, Task, TaskId, TaskSpec};
+    use hs_dlx_app::{HlsSpec, Kind, OutputSpec, Status, StoredPreference, Task, TaskId, TaskSpec};
     use hs_m3u8_core::Saved;
     use hs_m3u8_core::hls::Preference;
     use std::time::{Duration, Instant};
@@ -279,10 +292,12 @@ pub mod sample {
             spec: TaskSpec {
                 title: "talk".into(),
                 url: "https://a.example/talk.m3u8".parse().unwrap(),
-                preference: StoredPreference::try_from(&Preference::default()).unwrap(),
                 headers: Vec::new(),
-                output: OutputSpec::Mp4("/m/talk.mp4".into()),
-                live,
+                kind: Kind::Hls(HlsSpec {
+                    preference: StoredPreference::try_from(&Preference::default()).unwrap(),
+                    output: OutputSpec::Mp4("/m/talk.mp4".into()),
+                    live,
+                }),
             },
             status,
             work_dir: Some("/m/talk.hsdl".into()),

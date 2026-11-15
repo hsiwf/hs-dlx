@@ -26,7 +26,8 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
 use crate::{
-    Draft, Error, Failure, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec, naming,
+    Draft, DraftKind, Error, Failure, Finished, HlsSpec, Kind, OutputSpec, Settings, Status, Task,
+    TaskId, TaskSpec, naming,
 };
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
@@ -285,13 +286,16 @@ impl Service {
     pub fn switch_to_hls(&self, id: TaskId) -> Result<Task, Error> {
         self.shared.write(|tx| {
             let mut task = self.shared.stopped(tx, id)?;
-            let hls = match &task.spec.output {
+            let Kind::Hls(spec) = &mut task.spec.kind else {
+                return Err(Error::NotHls(id));
+            };
+            let hls = match &spec.output {
                 OutputSpec::Hls(_) => return Ok(task),
                 OutputSpec::Mp4(mp4) => mp4.with_extension(""),
                 OutputSpec::Both { hls, .. } => hls.clone(),
             };
-            task.spec.output = OutputSpec::Hls(hls);
-            store::set_output(tx, id, &task.spec.output)?;
+            spec.output = OutputSpec::Hls(hls);
+            store::set_output(tx, id, &spec.output)?;
             Ok(task)
         })
     }
@@ -561,8 +565,19 @@ impl Shared {
             path: draft.folder.clone(),
             cause,
         })?;
-        let preference = StoredPreference::try_from(&draft.preference)?;
-        let title = naming::task_title(&draft.url, draft.title.as_deref());
+        let DraftKind::Hls {
+            title,
+            preference,
+            output: output_kind,
+            live,
+        } = &draft.kind
+        else {
+            return Err(Error::InvalidInput(
+                "单个文件的下载还没有接上引擎".to_owned(),
+            ));
+        };
+        let preference = StoredPreference::try_from(preference)?;
+        let title = naming::task_title(&draft.url, title.as_deref());
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
         loop {
@@ -572,7 +587,7 @@ impl Shared {
                 store::taken_paths(&tx)?
             };
             let seen = taken.clone();
-            let (folder, title, kind) = (folder.clone(), title.clone(), draft.output);
+            let (folder, title, kind) = (folder.clone(), title.clone(), *output_kind);
             let naming = tokio::task::spawn_blocking(move || {
                 naming::output_for(&folder, &title, kind, &taken)
             });
@@ -587,10 +602,12 @@ impl Shared {
             let spec = TaskSpec {
                 title,
                 url: draft.url.clone(),
-                preference: preference.clone(),
                 headers: draft.headers.clone(),
-                output,
-                live: draft.live,
+                kind: Kind::Hls(HlsSpec {
+                    preference: preference.clone(),
+                    output,
+                    live: *live,
+                }),
             };
             match self.insert_and_start(&spec, work_dir, created_at) {
                 Err(Error::PathTaken(path))
@@ -694,7 +711,8 @@ impl Shared {
     /// 登记运行中的任务 `task`，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。下载开始后的点播
     /// 总片数与存储里记着的不同时记下。调用方须在运行时里。
     fn track(self: &Arc<Self>, task: &Task, job: Job, run: Run) {
-        let (id, total, live) = (task.id, task.total, task.spec.live);
+        let (id, total) = (task.id, task.total);
+        let live = task.spec.hls().is_some_and(|hls| hls.live);
         let control = job.control();
         let (stopped_tx, stopped) = watch::channel(false);
         lock(&self.running).insert(
@@ -876,24 +894,26 @@ fn save_ending(tx: &Transaction<'_>, id: TaskId, ending: &Ending) -> Result<(), 
     Ok(())
 }
 
-/// 照任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是
-/// 直播时不开录制，来源是直播就报 [`hs_m3u8_core::Error::LiveNotEnabled`]。
+/// 照 HLS 任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；
+/// 不是直播时不开录制，来源是直播就报 [`hs_m3u8_core::Error::LiveNotEnabled`]。不是 HLS 任务时报 [`Error::NotHls`]。
 fn request(task: &Task, proxy: Proxy) -> Result<JobRequest, Error> {
-    let spec = &task.spec;
-    let mut source = Source::new(spec.url.clone());
-    source.preference = Preference::from(&spec.preference);
-    source.http.headers.clone_from(&spec.headers);
+    let hls = task.spec.hls().ok_or(Error::NotHls(task.id))?;
+    let mut source = Source::new(task.spec.url.clone());
+    source.preference = Preference::from(&hls.preference);
+    source.http.headers.clone_from(&task.spec.headers);
     source.http.proxy = proxy;
     let mut request = JobRequest::new(source, output_options(task)?);
-    if !spec.live {
+    if !hls.live {
         request.live = None;
     }
     Ok(request)
 }
 
-/// 任务的输出选项：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]。
+/// HLS 任务的输出选项：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是 HLS 任务时报
+/// [`Error::NotHls`]。
 fn output_options(task: &Task) -> Result<OutputOptions, Error> {
-    let mut options = task.spec.output.options();
+    let hls = task.spec.hls().ok_or(Error::NotHls(task.id))?;
+    let mut options = hls.output.options();
     options.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
     Ok(options)
 }

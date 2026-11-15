@@ -12,18 +12,19 @@ use hs_m3u8_core::{Proxy, Url};
 
 use crate::preference::StoredPreference;
 use crate::{
-    Error, Failure, FailureKind, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec,
-    naming,
+    Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
+    Status, Task, TaskId, TaskSpec, naming,
 };
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
+    rebuild_with_kinds,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -167,6 +168,66 @@ fn create_settings_table(tx: &Transaction<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// 第 4 版，重建表，任务分种类（`kind`）：
+/// - `hls`：选轨偏好、输出（种类与 MP4、本地 HLS 的路径）、是否录直播必有，总片数与只写出已录只用于它。
+/// - `file`：单个文件，输出路径必有；认出地址时服务器报的总字节数、ETag、Last-Modified、Content-Type（第一次下载按它们
+///   核对，都可无），与每个请求最多取的字节数（可无）只用于它。
+///
+/// 第 3 版的行都是 `hls`。失败种类的写法不变。
+fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
+    tx.execute_batch(
+        "CREATE TABLE task_v4 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'malformed',
+                                    'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported', 'unrecoverable',
+                                    'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK ((kind = 'hls') = (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (mp4_path IS NULL AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_length IS NULL AND file_etag IS NULL AND file_last_modified IS NULL
+                                     AND file_content_type IS NULL AND chunk_size IS NULL))
+        ) STRICT;
+        INSERT INTO task_v4 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, work_dir,
+                             status, error, failure, created_at, total, duration_ms, bytes, width, height, write_only)
+            SELECT id, 'hls', title, url, headers, preference, output_kind, mp4_path, hls_path, live, work_dir, status,
+                   error, failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v4 RENAME TO task;",
+    )?;
+    Ok(())
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -266,7 +327,8 @@ impl Store {
 }
 
 /// 读出一个任务的各列，顺序与 [`Row::read`] 一致。
-const COLUMNS: &str = "id, title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status, \
+const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path, \
+                       file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录
@@ -278,36 +340,72 @@ pub fn insert(
     work_dir: &Path,
     created_at: i64,
 ) -> Result<TaskId, Error> {
-    let (kind, mp4, hls) = output_columns(&spec.output)?;
     let work_dir_text = utf8(work_dir)?;
     if !work_dir.is_absolute() {
         return Err(Error::InvalidInput(format!(
             "任务目录不是绝对路径：{work_dir_text}"
         )));
     }
+    // 只属于另一种任务的列为 NULL（表上的 CHECK 按种类核对）
+    let (preference, output_kind, mp4, hls, live) = match &spec.kind {
+        Kind::Hls(spec) => {
+            let (kind, mp4, hls) = output_columns(&spec.output)?;
+            (
+                Some(to_json(&spec.preference)),
+                Some(kind),
+                mp4,
+                hls,
+                Some(spec.live),
+            )
+        }
+        Kind::File(_) => (None, None, None, None, None),
+    };
+    let (file_path, length, etag, last_modified, content_type, chunk) = match &spec.kind {
+        Kind::Hls(_) => (None, None, None, None, None, None),
+        Kind::File(file) => (
+            Some(named_utf8(&file.path)?),
+            file.expected
+                .length
+                .map(|length| i64::try_from(length).expect("文件字节数远小于 i64 的上限")),
+            file.expected.etag.as_deref(),
+            file.expected.last_modified.as_deref(),
+            file.expected.content_type.as_deref(),
+            file.chunk_size
+                .map(|size| i64::try_from(size.get()).expect("每个请求的字节数远小于 i64 的上限")),
+        ),
+    };
     let taken = taken_paths(tx)?;
-    for path in [mp4.as_deref(), hls.as_deref(), Some(work_dir_text.as_str())]
+    for path in [&mp4, &hls, &file_path]
         .into_iter()
         .flatten()
+        .chain([&work_dir_text])
     {
         if taken.contains(&naming::path_key(path)) {
             return Err(Error::PathTaken(path.into()));
         }
     }
     tx.execute(
-        "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, hls_path, work_dir, live, status,
-                           created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10)",
+        "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                           file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
+                           status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17)",
         params![
+            kind_code(&spec.kind),
             spec.title,
             spec.url.as_str(),
-            to_json(&spec.preference),
             to_json(&spec.headers),
-            kind,
+            preference,
+            output_kind,
             mp4,
             hls,
+            live,
+            file_path,
+            length,
+            etag,
+            last_modified,
+            content_type,
+            chunk,
             work_dir_text,
-            spec.live,
             created_at,
         ],
     )?;
@@ -333,7 +431,7 @@ pub fn get(tx: &Transaction<'_>, id: TaskId) -> Result<Option<Task>, Error> {
     .transpose()
 }
 
-/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录与任务目录。新建任务选主名时避开
+/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录、文件与任务目录。新建任务选主名时避开
 /// 它们。
 pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
     taken_except(tx, None)
@@ -341,13 +439,15 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
 
 /// 除任务 `except` 之外的任务占用的路径的比较键；`except` 为 None 时为全部任务的。
 fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<String>, Error> {
-    let mut statement =
-        tx.prepare("SELECT mp4_path, hls_path, work_dir FROM task WHERE ?1 IS NULL OR id != ?1")?;
+    let mut statement = tx.prepare(
+        "SELECT mp4_path, hls_path, file_path, work_dir FROM task WHERE ?1 IS NULL OR id != ?1",
+    )?;
     let rows = statement.query_map([except.map(|id| id.0)], |row| {
         Ok([
             row.get::<_, Option<String>>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ])
     })?;
     let mut taken = HashSet::new();
@@ -361,7 +461,7 @@ fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<
     Ok(taken)
 }
 
-/// 换掉任务的输出；新的输出路径与别的任务的输出或任务目录相同时报 [`Error::PathTaken`]，没有这个任务时报
+/// 换掉 HLS 任务的输出；新的输出路径与别的任务的输出或任务目录相同时报 [`Error::PathTaken`]，没有这个 HLS 任务时报
 /// [`Error::NotFound`]。任务目录不变。
 pub fn set_output(tx: &Transaction<'_>, id: TaskId, output: &OutputSpec) -> Result<(), Error> {
     let (kind, mp4, hls) = output_columns(output)?;
@@ -372,7 +472,7 @@ pub fn set_output(tx: &Transaction<'_>, id: TaskId, output: &OutputSpec) -> Resu
         }
     }
     if tx.execute(
-        "UPDATE task SET output_kind = ?2, mp4_path = ?3, hls_path = ?4 WHERE id = ?1",
+        "UPDATE task SET output_kind = ?2, mp4_path = ?3, hls_path = ?4 WHERE id = ?1 AND kind = 'hls'",
         params![id.0, kind, mp4, hls],
     )? == 0
     {
@@ -397,11 +497,11 @@ pub fn set_headers(
     Ok(())
 }
 
-/// 记下点播的总片数；没有这个任务时报 [`Error::NotFound`]。
+/// 记下 HLS 点播的总片数；没有这个 HLS 任务时报 [`Error::NotFound`]。
 pub fn set_total(tx: &Transaction<'_>, id: TaskId, total: usize) -> Result<(), Error> {
     let total = i64::try_from(total).expect("分片数远小于 i64 的上限");
     if tx.execute(
-        "UPDATE task SET total = ?2 WHERE id = ?1",
+        "UPDATE task SET total = ?2 WHERE id = ?1 AND kind = 'hls'",
         params![id.0, total],
     )? == 0
     {
@@ -427,7 +527,8 @@ pub fn set_result(tx: &Transaction<'_>, id: TaskId, result: &Finished) -> Result
     Ok(())
 }
 
-/// 记下继续时是否只写出已录的（见 [`Task::write_only`]）；没有这个任务时报 [`Error::NotFound`]。
+/// 记下继续时是否只写出已录的（见 [`Task::write_only`]）；没有这个任务时报 [`Error::NotFound`]。文件任务只能记为
+/// false（表上有 CHECK）。
 pub fn set_write_only(tx: &Transaction<'_>, id: TaskId, write_only: bool) -> Result<(), Error> {
     if tx.execute(
         "UPDATE task SET write_only = ?2 WHERE id = ?1",
@@ -481,15 +582,22 @@ pub fn delete(tx: &Transaction<'_>, id: TaskId) -> Result<(), Error> {
 /// 表里的一行，原样读出、未校验。
 struct Row {
     id: i64,
+    kind: String,
     title: String,
     url: String,
-    preference: String,
     headers: String,
-    output_kind: String,
+    preference: Option<String>,
+    output_kind: Option<String>,
     mp4_path: Option<String>,
     hls_path: Option<String>,
+    live: Option<bool>,
+    file_path: Option<String>,
+    file_length: Option<i64>,
+    file_etag: Option<String>,
+    file_last_modified: Option<String>,
+    file_content_type: Option<String>,
+    chunk_size: Option<i64>,
     work_dir: Option<String>,
-    live: bool,
     status: String,
     error: Option<String>,
     failure: Option<String>,
@@ -506,25 +614,32 @@ impl Row {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         Ok(Row {
             id: row.get(0)?,
-            title: row.get(1)?,
-            url: row.get(2)?,
-            preference: row.get(3)?,
+            kind: row.get(1)?,
+            title: row.get(2)?,
+            url: row.get(3)?,
             headers: row.get(4)?,
-            output_kind: row.get(5)?,
-            mp4_path: row.get(6)?,
-            hls_path: row.get(7)?,
-            work_dir: row.get(8)?,
+            preference: row.get(5)?,
+            output_kind: row.get(6)?,
+            mp4_path: row.get(7)?,
+            hls_path: row.get(8)?,
             live: row.get(9)?,
-            status: row.get(10)?,
-            error: row.get(11)?,
-            failure: row.get(12)?,
-            created_at: row.get(13)?,
-            total: row.get(14)?,
-            duration_ms: row.get(15)?,
-            bytes: row.get(16)?,
-            width: row.get(17)?,
-            height: row.get(18)?,
-            write_only: row.get(19)?,
+            file_path: row.get(10)?,
+            file_length: row.get(11)?,
+            file_etag: row.get(12)?,
+            file_last_modified: row.get(13)?,
+            file_content_type: row.get(14)?,
+            chunk_size: row.get(15)?,
+            work_dir: row.get(16)?,
+            status: row.get(17)?,
+            error: row.get(18)?,
+            failure: row.get(19)?,
+            created_at: row.get(20)?,
+            total: row.get(21)?,
+            duration_ms: row.get(22)?,
+            bytes: row.get(23)?,
+            width: row.get(24)?,
+            height: row.get(25)?,
+            write_only: row.get(26)?,
         })
     }
 
@@ -532,12 +647,54 @@ impl Row {
         let id = TaskId(self.id);
         let corrupt = |what: &str| Error::Corrupt(format!("任务 {} 的{what}", self.id));
         let url = self.url.parse().map_err(|_| corrupt("地址"))?;
-        let preference: StoredPreference =
-            serde_json::from_str(&self.preference).map_err(|_| corrupt("选轨偏好"))?;
         let headers: Vec<(String, String)> =
             serde_json::from_str(&self.headers).map_err(|_| corrupt("请求头"))?;
-        let output = output_spec(&self.output_kind, self.mp4_path, self.hls_path)
-            .ok_or_else(|| corrupt("输出"))?;
+        let kind = match (
+            self.kind.as_str(),
+            self.preference,
+            self.output_kind,
+            self.live,
+            self.file_path,
+        ) {
+            ("hls", Some(preference), Some(output_kind), Some(live), None) => {
+                let preference: StoredPreference =
+                    serde_json::from_str(&preference).map_err(|_| corrupt("选轨偏好"))?;
+                let output = output_spec(&output_kind, self.mp4_path, self.hls_path)
+                    .ok_or_else(|| corrupt("输出"))?;
+                Kind::Hls(HlsSpec {
+                    preference,
+                    output,
+                    live,
+                })
+            }
+            ("file", None, None, None, Some(path)) => {
+                let path = PathBuf::from(path);
+                if !named_absolute(&path) {
+                    return Err(corrupt("输出"));
+                }
+                let length = self
+                    .file_length
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| corrupt("文件的字节数"))?;
+                let chunk_size = self
+                    .chunk_size
+                    .map(|size| u64::try_from(size).ok().and_then(std::num::NonZeroU64::new))
+                    .map(|size| size.ok_or_else(|| corrupt("每个请求的字节数")))
+                    .transpose()?;
+                Kind::File(FileSpec {
+                    path,
+                    expected: Expected {
+                        length,
+                        etag: self.file_etag,
+                        last_modified: self.file_last_modified,
+                        content_type: self.file_content_type,
+                    },
+                    chunk_size,
+                })
+            }
+            _ => return Err(corrupt("种类")),
+        };
         let work_dir = match self.work_dir.map(PathBuf::from) {
             Some(dir) if !named_absolute(&dir) => return Err(corrupt("任务目录")),
             dir => dir,
@@ -576,10 +733,8 @@ impl Row {
             spec: TaskSpec {
                 title: self.title,
                 url,
-                preference,
                 headers,
-                output,
-                live: self.live,
+                kind,
             },
             status,
             work_dir,
@@ -612,6 +767,25 @@ fn output_spec(kind: &str, mp4: Option<String>, hls: Option<String>) -> Option<O
 /// 是以文件名结尾的绝对路径（不以 `..` 或根结尾）。
 fn named_absolute(path: &Path) -> bool {
     path.is_absolute() && path.file_name().is_some()
+}
+
+/// 种类在表里的写法（表上有 CHECK）。
+fn kind_code(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Hls(_) => "hls",
+        Kind::File(_) => "file",
+    }
+}
+
+/// 输出路径在表里的写法：须是以文件名结尾的绝对路径（读回时同样核对），且是 UTF-8。
+fn named_utf8(path: &Path) -> Result<String, Error> {
+    if !named_absolute(path) {
+        return Err(Error::InvalidInput(format!(
+            "输出不是以文件名结尾的绝对路径：{}",
+            path.display()
+        )));
+    }
+    utf8(path)
 }
 
 /// 路径在表里的写法：须是 UTF-8（核心对输出路径的要求相同）。
@@ -762,11 +936,107 @@ mod tests {
             url: "https://media.example.com/keynote/master.m3u8?token=1"
                 .parse()
                 .unwrap(),
-            preference: StoredPreference::try_from(&Preference::default()).unwrap(),
             headers: vec![("Referer".into(), "https://example.com/".into())],
-            output,
-            live: true,
+            kind: Kind::Hls(HlsSpec {
+                preference: StoredPreference::try_from(&Preference::default()).unwrap(),
+                output,
+                live: true,
+            }),
         }
+    }
+
+    fn file_spec(path: PathBuf) -> TaskSpec {
+        TaskSpec {
+            title: "数据.zip".into(),
+            url: "https://files.example.com/d/1".parse().unwrap(),
+            headers: Vec::new(),
+            kind: Kind::File(FileSpec {
+                path,
+                expected: Expected {
+                    length: Some(1 << 40),
+                    etag: Some("\"v1\"".into()),
+                    last_modified: None,
+                    content_type: Some("application/zip".into()),
+                },
+                chunk_size: std::num::NonZeroU64::new(10 << 20),
+            }),
+        }
+    }
+
+    /// 文件任务读回写入的内容；它的输出与任务目录同样算占用。
+    #[test]
+    fn file_tasks_round_trip() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let spec = file_spec(m("数据.zip"));
+        let id = insert(&tx, &spec, &m("数据.hsdl"), 1).unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!(
+            (task.spec, task.total, task.write_only),
+            (spec, None, false)
+        );
+        let taken = taken_paths(&tx).unwrap();
+        for name in ["数据.zip", "数据.hsdl"] {
+            assert!(taken.contains(&naming::path_key(&text(name))), "{name}");
+        }
+        assert!(matches!(
+            insert(&tx, &file_spec(m("数据.ZIP")), &m("x.hsdl"), 2),
+            Err(Error::PathTaken(_))
+        ));
+        // 只属于 HLS 的不记到文件任务上
+        assert!(matches!(set_total(&tx, id, 3), Err(Error::NotFound(_))));
+        assert!(set_write_only(&tx, id, true).is_err());
+        let output = OutputSpec::Mp4(m("y.mp4"));
+        assert!(matches!(
+            set_output(&tx, id, &output),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// 种类与各列对不上的行由表拦下。
+    #[test]
+    fn kinds_and_columns_must_agree() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        for (kind, extra) in [
+            // HLS 缺选轨偏好、文件缺路径
+            ("hls", ""),
+            ("file", ""),
+            // 文件带了 HLS 的列
+            ("file", ", file_path = '/m/a', live = 0"),
+            // HLS 带了文件的列
+            (
+                "hls",
+                ", preference = '{}', output_kind = 'mp4', live = 0, chunk_size = 1",
+            ),
+        ] {
+            let inserted = tx.execute(
+                &format!(
+                    "INSERT INTO task (kind, title, url, headers, status, created_at)
+                     VALUES ('{kind}', 'x', 'https://a/b', '[]', 'paused', 1)"
+                ),
+                [],
+            );
+            let updated = inserted.and_then(|_| {
+                if extra.is_empty() {
+                    Ok(0)
+                } else {
+                    tx.execute(&format!("UPDATE task SET {} WHERE 1", &extra[2..]), [])
+                }
+            });
+            assert!(
+                updated.is_err() || inserted_is_rejected(&tx),
+                "{kind}{extra}"
+            );
+            tx.execute("DELETE FROM task", []).unwrap();
+        }
+    }
+
+    /// 表里留下的行都过不了约束检查时为 true（[`kinds_and_columns_must_agree`] 里插入成功、要等补列时才拦下的情形）。
+    fn inserted_is_rejected(tx: &Transaction<'_>) -> bool {
+        tx.query_row("SELECT count(*) FROM task", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            == 0
     }
 
     /// 新建任务，任务目录取核心的默认位置。
@@ -860,8 +1130,9 @@ mod tests {
             (preference.as_str(), "m/x.mp4".into()),
         ] {
             tx.execute(
-                "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, created_at)
-                 VALUES ('x', 'https://a/b.m3u8', ?1, '[]', 'mp4', ?2, 0, 'done', 1)",
+                "INSERT INTO task (kind, title, url, preference, headers, output_kind, mp4_path, live, status,
+                                   created_at)
+                 VALUES ('hls', 'x', 'https://a/b.m3u8', ?1, '[]', 'mp4', ?2, 0, 'done', 1)",
                 params![preference, mp4],
             )
             .unwrap();

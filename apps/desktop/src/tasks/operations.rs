@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::Context;
-use hs_dlx_app::{Draft, Event, Status, TaskId};
+use hs_dlx_app::{Draft, Event, Kind, Status, TaskId};
 use tokio::sync::oneshot;
 
 use super::Tasks;
@@ -110,14 +110,20 @@ impl Tasks {
         match &row.task.status {
             Status::Paused | Status::Failed(_) => self.inspect(id, false, cx),
             Status::Done => {
-                let target = row.task.spec.output.options().target;
-                let (mp4, hls) = (
-                    target.mp4().map(PathBuf::from),
-                    target.hls().map(PathBuf::from),
-                );
+                // HLS 为 MP4 与本地 HLS 目录，文件任务为文件
+                let (mp4, other) = match &row.task.spec.kind {
+                    Kind::Hls(hls) => {
+                        let target = hls.output.options().target;
+                        (
+                            target.mp4().map(PathBuf::from),
+                            target.hls().map(PathBuf::from),
+                        )
+                    }
+                    Kind::File(file) => (None, Some(file.path.clone())),
+                };
                 let checking = cx.background_executor().spawn(async move {
                     let mp4 = mp4.filter(|p| p.is_file());
-                    let shown = mp4.clone().or_else(|| hls.filter(|p| p.exists()));
+                    let shown = mp4.clone().or_else(|| other.filter(|p| p.exists()));
                     Present { mp4, shown }
                 });
                 cx.spawn(async move |this, cx| {
@@ -234,7 +240,7 @@ impl Tasks {
         match self.service.switch_to_hls(id) {
             Ok(task) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
-                row.set_output(task.spec.output);
+                row.set_spec(task.spec);
             }
             Err(error) => {
                 self.tell(format!("「{title}」没能改存本地 HLS：{error}"), cx);

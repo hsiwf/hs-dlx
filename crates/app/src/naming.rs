@@ -1,4 +1,5 @@
-//! 新建任务的命名：从网页标题或地址得出标题，在保存目录里选一个不与已有输出、任务目录冲突的主名，拼出输出路径。
+//! 新建任务的命名：从网页标题、服务器给的文件名或地址得出标题，在保存目录里选一个不与已有输出、任务目录冲突的主名，
+//! 拼出输出路径。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -95,21 +96,63 @@ fn truncate(text: &str, limit: usize) -> &str {
     text[..end].trim_end()
 }
 
-/// 在 `folder` 里给标题 `title` 选主名并拼出输出，返回主名与输出：主名为 `title`，被占用时依次加 ` 2`、` 3`……。
-/// 主名下的 MP4、本地 HLS 目录与任务目录（`<主名>.hsdl`）在磁盘上已存在、或键（[`path_key`]）在 `taken`（存储里已有
-/// 任务的输出与任务目录）里，都算占用；这样新任务不会与已有任务共用任务目录，即使那个任务还没在磁盘上留下任何东西。
-pub fn output_for(
+/// 扩展名最多多少字节（不含点）：更长的（如地址末段里的一长串编码）不当作扩展名。
+const EXTENSION_LIMIT: usize = 16;
+
+/// 文件任务的文件名：服务器给的 `given`（Content-Disposition），没给或整理后什么都不剩时取地址路径的最后一段（百分号
+/// 解码后），再没有时用主机名。整理同标题：文件名里不能出现的字符与控制字符换成 `_`，去掉首尾的空白与 `.`，主名超过
+/// 200 字节时在字符边界截断；扩展名（最后一个 `.` 之后、不超过 16 字节、只有字母与数字的部分）保留，不计入截断。
+pub fn file_name(url: &Url, given: Option<&str>) -> String {
+    let last = url
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+        .map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned());
+    [given.map(str::to_owned), last]
+        .into_iter()
+        .flatten()
+        .map(|name| clean_file_name(&name))
+        .find(|name| !name.is_empty())
+        .unwrap_or_else(|| url.host_str().unwrap_or("文件").to_owned())
+}
+
+/// 把 `name` 整理成能用的文件名：主名照 [`clean_title`]，扩展名里不能出现在文件名里的字符换成 `_`。主名什么都不剩
+/// 时为空。
+fn clean_file_name(name: &str) -> String {
+    let (stem, extension) = split_extension(name.trim());
+    let stem = clean_title(stem);
+    match extension {
+        _ if stem.is_empty() => String::new(),
+        Some(extension) => format!("{stem}.{}", clean_title(extension)),
+        None => stem,
+    }
+}
+
+/// 拆出扩展名：最后一个 `.` 之后、不超过 [`EXTENSION_LIMIT`] 字节、只有字母与数字的部分；`.` 在开头（隐藏文件的写法）
+/// 或没有这样的部分时没有扩展名。
+fn split_extension(name: &str) -> (&str, Option<&str>) {
+    match name.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= EXTENSION_LIMIT
+                && extension.chars().all(char::is_alphanumeric) =>
+        {
+            (stem, Some(extension))
+        }
+        _ => (name, None),
+    }
+}
+
+/// `folder` 里不被占用的主名：`stem`，被占用时依次加 ` 2`、` 3`……；`names` 给出一个主名占用的各个文件名，其中任一个
+/// 在磁盘上已存在、或键（[`path_key`]）在 `taken` 里即算占用。
+fn free_stem(
     folder: &Path,
-    title: &str,
-    kind: OutputKind,
+    stem: &str,
     taken: &HashSet<String>,
-) -> Result<(String, OutputSpec), Error> {
+    names: impl Fn(&str) -> Vec<String>,
+) -> Result<String, Error> {
     let occupied = |stem: &str| -> Result<bool, Error> {
-        for name in [
-            format!("{stem}.mp4"),
-            stem.to_owned(),
-            format!("{stem}.hsdl"),
-        ] {
+        for name in names(stem) {
             let path = folder.join(name);
             if taken.contains(&path_key(&path.to_string_lossy())) {
                 return Ok(true);
@@ -125,12 +168,31 @@ pub fn output_for(
         }
         Ok(false)
     };
-    let mut stem = title.to_owned();
+    let mut chosen = stem.to_owned();
     let mut number = 1;
-    while occupied(&stem)? {
+    while occupied(&chosen)? {
         number += 1;
-        stem = format!("{title} {number}");
+        chosen = format!("{stem} {number}");
     }
+    Ok(chosen)
+}
+
+/// 在 `folder` 里给标题 `title` 选主名并拼出输出，返回主名与输出：主名为 `title`，被占用时依次加 ` 2`、` 3`……。
+/// 主名下的 MP4、本地 HLS 目录与任务目录（`<主名>.hsdl`）在磁盘上已存在、或键（[`path_key`]）在 `taken`（存储里已有
+/// 任务的输出与任务目录）里，都算占用；这样新任务不会与已有任务共用任务目录，即使那个任务还没在磁盘上留下任何东西。
+pub fn output_for(
+    folder: &Path,
+    title: &str,
+    kind: OutputKind,
+    taken: &HashSet<String>,
+) -> Result<(String, OutputSpec), Error> {
+    let stem = free_stem(folder, title, taken, |stem| {
+        vec![
+            format!("{stem}.mp4"),
+            stem.to_owned(),
+            format!("{stem}.hsdl"),
+        ]
+    })?;
     let mp4 = folder.join(format!("{stem}.mp4"));
     let hls = folder.join(&stem);
     let output = match kind {
@@ -160,6 +222,40 @@ mod tests {
         assert_eq!(title("https://a.example/a%2Fb.m3u8"), "a_b");
         assert_eq!(title("https://a.example/"), "a.example");
         assert_eq!(title("https://a.example/..m3u8"), "a.example");
+    }
+
+    #[test]
+    fn file_names_keep_their_extension() {
+        let url = |text: &str| Url::parse(text).unwrap();
+        let movie = url("https://a.example/d/%E5%BD%B1%E7%89%87.mkv?sig=1");
+        assert_eq!(file_name(&movie, None), "影片.mkv");
+        assert_eq!(
+            file_name(&movie, Some("Trailer: 4K.MP4")),
+            "Trailer_ 4K.MP4"
+        );
+        // 服务器给的名字里的路径与开头的点去掉，什么都不剩时退回地址
+        assert_eq!(
+            file_name(&movie, Some("../../etc/passwd")),
+            "_.._etc_passwd"
+        );
+        assert_eq!(file_name(&movie, Some("...")), "影片.mkv");
+        assert_eq!(file_name(&url("https://a.example/"), None), "a.example");
+        assert_eq!(
+            file_name(&url("https://a.example/get.php?id=1"), None),
+            "get.php"
+        );
+        // 不像扩展名的不当作扩展名，截短照主名的规则
+        let long = format!("{}.{}", "影".repeat(100), "x".repeat(20));
+        let name = file_name(&url("https://a.example/"), Some(&long));
+        assert!(name.len() <= STEM_LIMIT, "{}", name.len());
+        let name = file_name(
+            &url("https://a.example/"),
+            Some(&format!("{}.zip", "影".repeat(100))),
+        );
+        assert!(
+            name.ends_with(".zip") && name.len() <= STEM_LIMIT + 4,
+            "{name}"
+        );
     }
 
     #[test]

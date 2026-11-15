@@ -18,7 +18,9 @@ use gpui_kit::{
     IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
     Task, Window, div, px,
 };
-use hs_dlx_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
+use hs_dlx_app::{
+    Draft, DraftKind, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title,
+};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{Probe, Source, Url};
 
@@ -442,12 +444,14 @@ impl NewTask {
         };
         let draft = Draft {
             url: self.url.clone(),
-            title: self.page_title.clone(),
-            preference,
             headers,
-            output: self.output,
             folder: self.folder.clone(),
-            live: probe.live,
+            kind: DraftKind::Hls {
+                title: self.page_title.clone(),
+                preference,
+                output: self.output,
+                live: probe.live,
+            },
         };
         self.error = None;
         cx.emit(NewTaskEvent::Create(Box::new(draft)));

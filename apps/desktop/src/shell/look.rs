@@ -179,7 +179,7 @@ fn done_look(row: &Row) -> Look {
         big,
         line: result.map_or_else(
             || row.file_name.clone(),
-            |r| finished_text(&row.task.spec.output, r),
+            |r| finished_text(&row.task.spec, r),
         ),
         hint: None,
         fraction: 1.0,

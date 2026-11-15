@@ -7,14 +7,14 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_dlx_app::{OutputSpec, Status};
+use hs_dlx_app::Status;
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, Row, resume_label};
+use crate::tasks::{Amount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
 use crate::{dial, format, ring, theme};
 
@@ -250,7 +250,7 @@ impl Shell {
                 Action::OpenFolder => ("open-folder", "打开保存目录".to_owned(), None),
             };
             let act = *action;
-            let folder = folder_of(&row.task.spec.output);
+            let folder = folder_of(&row.task.spec);
             let on_click = cx.listener(move |this, _, window, cx| match act {
                 Action::EditHeaders => this.edit_headers(id, window, cx),
                 Action::WriteRecorded => this.write_recorded(id, cx),
@@ -401,10 +401,7 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         if let Some((width, height)) = result.resolution {
             cells.push(cell("画面", format!("{width}×{height}")));
         }
-        cells.push(cell(
-            "保存为",
-            output_kind(&row.task.spec.output).to_owned(),
-        ));
+        cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
         return cells;
     }
     let Some(amount) = Amount::of(row) else {
@@ -444,22 +441,10 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     }
 }
 
-/// 输出的种类。
-fn output_kind(output: &OutputSpec) -> &'static str {
-    match output {
-        OutputSpec::Mp4(_) => "MP4",
-        OutputSpec::Hls(_) => "本地 HLS",
-        OutputSpec::Both { .. } => "MP4 与本地 HLS",
-    }
-}
-
 /// 输出所在的目录：占着输出路径的东西就在里面。
-fn folder_of(output: &OutputSpec) -> std::path::PathBuf {
-    let target = output.options().target;
-    target
-        .mp4()
-        .or(target.hls())
-        .and_then(|path| path.parent())
+fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
+    main_output(spec)
+        .parent()
         .expect("输出是以文件名结尾的绝对路径")
         .to_path_buf()
 }

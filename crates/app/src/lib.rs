@@ -13,9 +13,12 @@ mod task;
 
 pub use error::Error;
 pub use failure::{Failure, FailureKind, not_a_playlist};
-pub use naming::{task_title, title_of};
+pub use naming::{file_name, task_title, title_of};
 pub use preference::StoredPreference;
 pub use service::{Event, Events, Service};
 pub use settings::Settings;
 pub use store::Store;
-pub use task::{Draft, Finished, OutputKind, OutputSpec, Status, Task, TaskId, TaskSpec};
+pub use task::{
+    Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec, Kind, OutputKind, OutputSpec, Status,
+    Task, TaskId, TaskSpec,
+};
