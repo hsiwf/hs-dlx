@@ -46,6 +46,8 @@ private:
 	// 加入一个种子并登记，编号为 `id`
 	rust::String add(lt::add_torrent_params params, std::string const& id, rust::Str save_path) const;
 	lt::torrent_handle handle(rust::Str id) const;
+	// 种子 `id` 有一个 flush 的请求在等写完的事件时取走它，返回 true
+	bool flush_requested(std::string const& id) const;
 	// 种子 `id` 的移除有了一个结果：`files_settled` 为删文件的结果（删完或删失败），否则为移除的事件
 	void removed(std::string const& id, bool files_settled) const;
 
@@ -68,6 +70,9 @@ private:
 	// 调了 remove、还没移除完的种子的编号与它移除到了哪一步：移除完（移除的事件，删文件时还要删的结果）之前不许再加
 	// 同一个种子，否则旧的那个还没发出的事件会带着同一个编号。事件队列满了丢了这几个事件时，这个会话里再也加不进它
 	mutable std::map<std::string, Removing> m_removing;
+	// 调了 flush、还没报来写完的次数，按编号：写完的事件按它转出，其余的（种子下完时 libtorrent 自己发的）不转。下完时
+	// 自发的那条若在请求之后才到，会被当作请求的结果：它写盘时已下的就是全部要下的，与请求的保证相同
+	mutable std::map<std::string, int> m_flush_requests;
 	// 守着上面两张表；加入时整个过程持有，取事件时查编号不会早于登记
 	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取

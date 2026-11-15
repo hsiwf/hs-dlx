@@ -232,17 +232,22 @@ fn wait_until(session: &Session, limit: Duration, mut done: impl FnMut(&Session)
 /// 把 `id` 已下的数据写到磁盘并等它报来（libtorrent 先校验、再异步写盘，下完并校验过时数据可能还在内存里）。
 fn flushed(session: &Session, id: &TorrentId) {
     session.flush(id).unwrap();
-    wait_for(session, AlertKind::CacheFlushed, "写到磁盘");
+    wait_for(session, id, AlertKind::CacheFlushed, "写到磁盘");
 }
 
 /// 写出 `id` 的续传数据并等它报来，返回续传数据。
 fn resume_data(session: &Session, id: &TorrentId) -> Vec<u8> {
     session.save_resume_data(id).unwrap();
-    wait_for(session, AlertKind::ResumeData, "续传数据").data
+    wait_for(session, id, AlertKind::ResumeData, "续传数据").data
 }
 
-/// 等到一条 `kind` 的事件（期间的别的事件丢掉）；20 秒内没等到即失败。
-fn wait_for(session: &Session, kind: AlertKind, what: &str) -> hs_dlx_torrent::Alert {
+/// 等到种子 `id` 的一条 `kind` 的事件（期间的别的事件丢掉）；20 秒内没等到即失败。
+fn wait_for(
+    session: &Session,
+    id: &TorrentId,
+    kind: AlertKind,
+    what: &str,
+) -> hs_dlx_torrent::Alert {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         assert!(Instant::now() < deadline, "没等到{what}");
@@ -250,7 +255,7 @@ fn wait_for(session: &Session, kind: AlertKind, what: &str) -> hs_dlx_torrent::A
             .pop_alerts(100)
             .unwrap()
             .into_iter()
-            .find(|a| a.kind == kind)
+            .find(|a| a.kind == kind && a.torrent == id.as_str())
         {
             return alert;
         }
@@ -286,18 +291,13 @@ fn tree(dir: &Path) -> Vec<(PathBuf, u64)> {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(at) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&at) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.metadata() {
-                Ok(meta) if meta.is_dir() => pending.push(path),
-                Ok(meta) => found.push((
-                    path.strip_prefix(dir).unwrap_or(&path).to_path_buf(),
-                    meta.len(),
-                )),
-                Err(_) => {}
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::metadata(&path).unwrap();
+            if meta.is_dir() {
+                pending.push(path);
+            } else {
+                found.push((path.strip_prefix(dir).unwrap().to_path_buf(), meta.len()));
             }
         }
     }
@@ -345,6 +345,8 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     let held = fetcher.status(&fetching).unwrap();
     assert!(held.held);
     assert_eq!(held.total_wanted_done, 0);
+    // 没下完的种子 libtorrent 不会自己发写完的事件：等得到即说明 flush 真的写了、事件转了出来
+    flushed(&fetcher, &fetching);
     fetcher.start(&fetching).unwrap();
     assert!(!fetcher.status(&fetching).unwrap().held);
     fetcher

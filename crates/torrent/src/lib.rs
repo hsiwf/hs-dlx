@@ -72,7 +72,8 @@ mod ffi {
         ResumeDataFailed,
         /// 续传数据与磁盘上的文件对不上，改为从头校验
         ResumeRejected,
-        /// [`Session::flush`] 的结果：调用那一刻已下的数据都已写到磁盘（移除种子时也会有一条）
+        /// [`Session::flush`] 的结果，每次调用一条：调用那一刻已下的数据都已交给磁盘写完。写盘出错时这条照样会来，出错
+        /// 的在它之前以 [`AlertKind::FileError`] 报来
         CacheFlushed,
         TorrentError,
         FileError,
@@ -258,8 +259,9 @@ impl Session {
         Ok(())
     }
 
-    /// 把缓存里的数据写到磁盘并关上文件，结果以 [`AlertKind::CacheFlushed`] 报来：那时调用这一刻已下的数据都已在磁盘
-    /// 上。还没有种子信息时报错（没有要写的，也不会有这个事件）。
+    /// 把缓存里的数据写到磁盘并关上文件，结果以 [`AlertKind::CacheFlushed`] 报来：那时调用这一刻已下的数据都已写过（其间
+    /// 没有这个种子的 [`AlertKind::FileError`] 即都写成了）；还在下的种子之后下的不在其内。之后移除种子不影响这条报来。
+    /// 没有这个种子、或还没有种子信息时报错（没有要写的，也不会有这个事件）。
     pub fn flush(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().flush(id.as_str())?)
     }
@@ -305,7 +307,8 @@ impl Session {
     }
 
     /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。续传数据按已校验的块
-    /// 记，不等它们写到磁盘：要与磁盘一致（退出前）时先 [`Session::flush`]、等到 [`AlertKind::CacheFlushed`] 再要。
+    /// 记，不等它们写到磁盘。要与磁盘一致（退出前）：先 [`Session::pause`] 并等它停下，再 [`Session::flush`]、等到
+    /// [`AlertKind::CacheFlushed`]（其间没有 [`AlertKind::FileError`]），然后再要；不暂停时其间新校验的块没写盘也会记进去。
     pub fn save_resume_data(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().save_resume_data(id.as_str())?)
     }

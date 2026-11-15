@@ -29,13 +29,13 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库。接下来会加入磁力、云离线、站点解析与边下边播，见[路线图](#路线图)。
 
 <p align="center">
-  <img src=".github/screenshots/new-task.png" alt="探测出五档清晰度，在同心环上选一档">
+  <img src=".github/screenshots/new-task.jpg" alt="探测出五档清晰度，在同心环上选一档">
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src=".github/screenshots/downloading.png" alt="下载中：进度环、速度、剩余时间与分片数"></td>
-    <td width="50%"><img src=".github/screenshots/finished.png" alt="下载完成：时长、大小、画面与事件记录"></td>
+    <td width="50%"><img src=".github/screenshots/downloading.jpg" alt="下载中（日蚀外观）：进度、速度、剩余时间、最近 60 秒的速度与信号"></td>
+    <td width="50%"><img src=".github/screenshots/finished.jpg" alt="下载完成（血月外观）：时长、大小、画面与信号"></td>
   </tr>
   <tr>
     <td align="center">下载中</td>
