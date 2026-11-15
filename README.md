@@ -24,13 +24,13 @@
   <a href="CONTRIBUTING.md">参与开发</a>
 </p>
 
-<p align="center">
-  <img src=".github/screenshots/new-task.png" alt="探测出五档清晰度，在同心环上选一档">
-</p>
-
 hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不是 Electron，也不是套在网页里的壳。现在专注 HLS（m3u8）：
 点播与直播录制、在网页里找视频流、断点续传，输出 MP4 或可直接播放的本地 HLS。下载引擎是
 [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库。接下来会加入磁力、云离线、站点解析与边下边播，见[路线图](#路线图)。
+
+<p align="center">
+  <img src=".github/screenshots/new-task.png" alt="探测出五档清晰度，在同心环上选一档">
+</p>
 
 <table>
   <tr>
