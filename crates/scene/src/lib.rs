@@ -66,13 +66,13 @@ pub enum Error {
     /// 画面的宽或高为 0，或超过设备允许的纹理边长
     #[error("画面大小 {width}×{height} 不能渲染（最大边长 {max}）")]
     Size { width: u32, height: u32, max: u32 },
-    /// 等 GPU 画完或读回时出错（设备丢失、超时）
+    /// GPU 报错（校验错误、显存不足、驱动内部错误）、设备丢失，或等画完、读回超时
     #[error("等 GPU 画完失败：{0}")]
     Gpu(String),
 }
 
 /// 网格的格距（逻辑点），与 scene.wgsl 里的 GRID_STEP 相同：流过的距离按它取余。
-const GRID_STEP: f32 = 46.0;
+pub const GRID_STEP: f32 = 46.0;
 /// 等一帧画完最多多久：驱动卡住时不让调用方的线程一直挂着。
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 /// 输出的格式：与界面要的 BGRA 一致，读回后不必换通道；着色器自己做 sRGB 编码。
@@ -116,67 +116,70 @@ impl Renderer {
             ..Default::default()
         }))
         .map_err(|error| Error::NoDevice(error.to_string()))?;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("scene"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("scene.wgsl"))),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scene"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+        let (pipeline, uniforms, bind_group) = scoped(&device, || {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("scene"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("scene.wgsl"))),
+            });
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("scene"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("scene params"),
+                size: UNIFORM_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scene"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                }],
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("scene"),
+                bind_group_layouts: &[Some(&layout)],
+                ..Default::default()
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("scene"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
                 },
-                count: None,
-            }],
-        });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("scene params"),
-            size: UNIFORM_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            }],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene"),
-            bind_group_layouts: &[Some(&layout)],
-            ..Default::default()
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            Ok((pipeline, uniforms, bind_group))
+        })?;
         Ok(Renderer {
             device,
             queue,
@@ -189,6 +192,11 @@ impl Renderer {
 
     /// 按 `params` 画一帧并读回；阻塞到 GPU 画完，最多等 2 秒（驱动卡住时报 [`Error::Gpu`]）。
     pub fn render(&mut self, params: &Params) -> Result<Frame, Error> {
+        let device = self.device.clone();
+        scoped(&device, || self.render_unscoped(params))
+    }
+
+    fn render_unscoped(&mut self, params: &Params) -> Result<Frame, Error> {
         let max = self.device.limits().max_texture_dimension_2d;
         if params.width == 0 || params.height == 0 || params.width > max || params.height > max {
             return Err(Error::Size {
@@ -319,6 +327,29 @@ impl Renderer {
             texture,
             readback,
         }
+    }
+}
+
+/// 在错误作用域里做 `work`：期间 GPU 报的校验错误、显存不足与内部错误收下来变成 [`Error::Gpu`]（几个都有时取第一
+/// 个），不交给 wgpu 默认的处理（它会 panic）。作用域按线程记，`work` 里的 GPU 调用都要在调用这个函数的线程上。
+fn scoped<T>(device: &wgpu::Device, work: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    let scopes = [
+        wgpu::ErrorFilter::Internal,
+        wgpu::ErrorFilter::OutOfMemory,
+        wgpu::ErrorFilter::Validation,
+    ]
+    .map(|filter| device.push_error_scope(filter));
+    let result = work();
+    // 后进先出地弹出
+    let mut captured = None;
+    for scope in scopes.into_iter().rev() {
+        if let Some(error) = pollster::block_on(scope.pop()) {
+            captured.get_or_insert(error);
+        }
+    }
+    match captured {
+        Some(error) => Err(Error::Gpu(error.to_string())),
+        None => result,
     }
 }
 

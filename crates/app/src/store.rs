@@ -174,8 +174,15 @@ fn create_settings_table(tx: &Transaction<'_>) -> Result<(), Error> {
 /// - `file`：单个文件，输出路径必有；认出地址时服务器报的总字节数、ETag、Last-Modified、Content-Type（第一次下载按它们
 ///   核对，都可无），与每个请求最多取的字节数（可无）只用于它。
 ///
-/// 第 3 版的行都是 `hls`。失败种类的写法不变。
+/// 第 3 版的行都是 `hls`。失败种类的写法不变。删掉旧表会连同删掉它的编号计数，新表的计数接着旧表的，编号照样不重用。
 fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'task'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
     tx.execute_batch(
         "CREATE TABLE task_v4 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,8 +219,9 @@ fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
             width INTEGER CHECK (width > 0),
             height INTEGER CHECK (height > 0),
             write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
-            CHECK ((kind = 'hls') = (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
-            CHECK (kind = 'hls' OR (mp4_path IS NULL AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK (kind = 'file' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
             CHECK ((kind = 'file') = (file_path IS NOT NULL)),
             CHECK (kind = 'file' OR (file_length IS NULL AND file_etag IS NULL AND file_last_modified IS NULL
                                      AND file_content_type IS NULL AND chunk_size IS NULL))
@@ -226,6 +234,18 @@ fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
         DROP TABLE task;
         ALTER TABLE task_v4 RENAME TO task;",
     )?;
+    if let Some(counter) = counter {
+        let kept = tx.execute(
+            "UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'task'",
+            params![counter],
+        )?;
+        if kept == 0 {
+            tx.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('task', ?1)",
+                params![counter],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -365,9 +385,15 @@ pub fn insert(
         Kind::Hls(_) => (None, None, None, None, None, None),
         Kind::File(file) => (
             Some(named_utf8(&file.path)?),
+            // 服务器报的，可能大得离谱
             file.expected
                 .length
-                .map(|length| i64::try_from(length).expect("文件字节数远小于 i64 的上限")),
+                .map(|length| {
+                    i64::try_from(length).map_err(|_| {
+                        Error::InvalidInput(format!("服务器报的文件大小 {length} 字节超出范围"))
+                    })
+                })
+                .transpose()?,
             file.expected.etag.as_deref(),
             file.expected.last_modified.as_deref(),
             file.expected.content_type.as_deref(),
@@ -1030,50 +1056,74 @@ mod tests {
         ));
     }
 
-    /// 种类与各列对不上的行由表拦下。
+    /// 种类与各列对不上的行由表拦下；对得上的两行能插入（说明拦下的正是多出或缺少的那一列）。
     #[test]
     fn kinds_and_columns_must_agree() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        for (kind, extra) in [
-            // HLS 缺选轨偏好、文件缺路径
-            ("hls", ""),
-            ("file", ""),
-            // 文件带了 HLS 的列
-            ("file", ", file_path = '/m/a', live = 0"),
-            // HLS 带了文件的列
-            (
-                "hls",
-                ", preference = '{}', output_kind = 'mp4', live = 0, chunk_size = 1",
-            ),
-        ] {
-            let inserted = tx.execute(
+        let hls = "'hls', '{}', 'mp4', 0";
+        let insert = |kind_columns: &str, extra_columns: &str, extra_values: &str| {
+            tx.execute(
                 &format!(
-                    "INSERT INTO task (kind, title, url, headers, status, created_at)
-                     VALUES ('{kind}', 'x', 'https://a/b', '[]', 'paused', 1)"
+                    "INSERT INTO task (kind, preference, output_kind, live, file_path, title, url, headers, status,
+                                       created_at{extra_columns})
+                     VALUES ({kind_columns}, 'x', 'https://a/b', '[]', 'paused', 1{extra_values})"
                 ),
                 [],
-            );
-            let updated = inserted.and_then(|_| {
-                if extra.is_empty() {
-                    Ok(0)
-                } else {
-                    tx.execute(&format!("UPDATE task SET {} WHERE 1", &extra[2..]), [])
-                }
-            });
+            )
+        };
+        insert(&format!("{hls}, NULL"), "", "").unwrap();
+        insert("'file', NULL, NULL, NULL, '/m/a'", "", "").unwrap();
+        for (kind_columns, extra_columns, extra_values) in [
+            // HLS 缺选轨偏好、文件缺路径
+            ("'hls', NULL, 'mp4', 0, NULL", "", ""),
+            ("'file', NULL, NULL, NULL, NULL", "", ""),
+            // 文件带了 HLS 的列
+            ("'file', NULL, NULL, 0, '/m/a'", "", ""),
+            ("'file', NULL, NULL, NULL, '/m/a'", ", total", ", 3"),
+            // HLS 带了文件的列
+            (&format!("{hls}, '/m/a'"), "", ""),
+            (&format!("{hls}, NULL"), ", chunk_size", ", 1"),
+            (&format!("{hls}, NULL"), ", file_etag", ", 'e'"),
+        ] {
             assert!(
-                updated.is_err() || inserted_is_rejected(&tx),
-                "{kind}{extra}"
+                insert(kind_columns, extra_columns, extra_values).is_err(),
+                "{kind_columns}{extra_columns}"
             );
-            tx.execute("DELETE FROM task", []).unwrap();
         }
     }
 
-    /// 表里留下的行都过不了约束检查时为 true（[`kinds_and_columns_must_agree`] 里插入成功、要等补列时才拦下的情形）。
-    fn inserted_is_rejected(tx: &Transaction<'_>) -> bool {
-        tx.query_row("SELECT count(*) FROM task", [], |row| row.get::<_, i64>(0))
-            .unwrap()
-            == 0
+    /// 第 3 版的存储升上来时编号计数照旧：删掉的最大编号不再分配。
+    #[test]
+    fn rebuilding_for_kinds_keeps_the_id_counter() {
+        let dir = scratch("v3-counter");
+        let path = dir.join("tasks.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..3] {
+                migration(&tx).unwrap();
+            }
+            for title in ["甲", "乙"] {
+                tx.execute(
+                    "INSERT INTO task (title, url, preference, headers, output_kind, mp4_path, live, status, created_at)
+                     VALUES (?1, 'https://a/b.m3u8', '{}', '[]', 'mp4', ?2, 0, 'paused', 1)",
+                    params![title, text(&format!("{title}.mp4"))],
+                )
+                .unwrap();
+            }
+            tx.execute("DELETE FROM task WHERE title = '乙'", [])
+                .unwrap();
+            tx.pragma_update(None, "user_version", 3).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let tx = store.transaction().unwrap();
+        let next = add(&tx, OutputSpec::Mp4(m("丙.mp4")), 2).unwrap();
+        assert_eq!(next.0, 3);
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 新建任务，任务目录取核心的默认位置。

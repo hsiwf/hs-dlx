@@ -14,6 +14,7 @@ use hs_m3u8_core::{Proxy, Url};
 use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme::{self, Theme};
+use crate::tray::Tray;
 use crate::ui::{self, Tone};
 use crate::web_route::WebRoute;
 
@@ -158,6 +159,7 @@ impl SettingsView {
             Ok(()) => {
                 self.theme_error = None;
                 theme::set(picked);
+                Tray::theme_changed(&self.tasks, cx);
                 cx.refresh_windows();
             }
             Err(error) => self.theme_error = Some(error.to_string()),

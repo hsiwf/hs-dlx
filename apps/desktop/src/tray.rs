@@ -40,6 +40,8 @@ struct Shown {
     /// 环画到哪里，向下取整到百分之一（与主窗口一致：没做完不写 100%）；None 为空闲时的标志
     percent: Option<u8>,
     recording: bool,
+    /// 图标的颜色随主题（macOS 上是模板图，不用主题色）
+    theme: theme::Theme,
     status: String,
     /// 有失败了、等处理的任务：状态那一行可点，点了打开窗口
     failed: bool,
@@ -48,7 +50,7 @@ struct Shown {
 
 /// 应用的托盘：建起来后一直留到应用退出，释放即从系统里移除。
 struct Installed {
-    _tray: Entity<Tray>,
+    tray: Entity<Tray>,
 }
 
 impl Global for Installed {}
@@ -80,6 +82,14 @@ impl Tray {
     /// 托盘建起来了（Linux 上建得起也可能看不见，见模块说明）。
     pub fn installed(cx: &App) -> bool {
         cx.has_global::<Installed>()
+    }
+
+    /// 主题换了：托盘装着时按 `tasks` 立即刷新一次，图标换成新主题的颜色。
+    pub fn theme_changed(tasks: &Entity<Tasks>, cx: &mut App) {
+        if let Some(installed) = cx.try_global::<Installed>() {
+            let tray = installed.tray.clone();
+            tray.update(cx, |tray, cx| tray.refresh(tasks, cx));
+        }
     }
 
     /// 建托盘图标并留到应用退出，跟着 `tasks` 刷新；点「打开」时调 `open`，点「退出」时调 `quit`。要在应用跑起来之后
@@ -181,7 +191,7 @@ impl Tray {
             tray.refresh(&tasks, cx);
             tray
         });
-        cx.set_global(Installed { _tray: tray });
+        cx.set_global(Installed { tray });
         Ok(())
     }
 
@@ -223,6 +233,7 @@ impl Tray {
                 .progress
                 .map(|progress| (progress.clamp(0., 1.) * 100.).floor() as u8),
             recording: activity.recording,
+            theme: theme::current(),
             status,
             failed: activity.failed > 0,
             notices: read.notices().len(),
@@ -257,7 +268,9 @@ impl Tray {
     /// 把 `shown` 与上次推给系统的不同的部分推过去。
     fn apply(&mut self, shown: &Shown) -> Result<(), String> {
         let was = self.shown.as_ref();
-        if was.is_none_or(|was| (was.percent, was.recording) != (shown.percent, shown.recording)) {
+        if was.is_none_or(|was| {
+            (was.percent, was.recording, was.theme) != (shown.percent, shown.recording, shown.theme)
+        }) {
             let arc = shown
                 .percent
                 .map_or(LOGO_ARC, |percent| f32::from(percent) / 100.);

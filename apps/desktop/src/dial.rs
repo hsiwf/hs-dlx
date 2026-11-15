@@ -58,7 +58,7 @@ pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
     lit_dial(light, LIGHT_STRENGTH, figure, center)
 }
 
-/// [`dial`]，背光的强度为 `strength`（0 到 1）。
+/// [`dial`]，背光的强度为 `strength`（0 到 1）。圆心报给窗口背景（[`backdrop::report_disc`]），日冕从圆盘边上放出。
 pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl IntoElement) -> Div {
     let disc = AREA - 2. * DISC_INSET;
     let place = || {
@@ -75,7 +75,14 @@ pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl Int
                 .rounded_full()
                 .bg(theme::disc())
                 .border_1()
-                .border_color(theme::hairline()),
+                .border_color(theme::hairline())
+                .child(
+                    canvas(
+                        |bounds, _, cx| backdrop::report_disc(bounds.center(), cx),
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                ),
         )
         .child(
             place()
@@ -92,21 +99,13 @@ pub fn face(light: Hsla) -> Div {
     lit_face(light, LIGHT_STRENGTH)
 }
 
-/// 表盘的底：背光、表圈；圆心报给窗口背景（[`backdrop::report_disc`]），日冕从圆盘边上放出。
+/// 表盘的底：背光、表圈。
 fn lit_face(light: Hsla, strength: f32) -> Div {
     let offset = (AREA - LIGHT) / 2.;
     div()
         .relative()
         .size(px(AREA))
         .flex_none()
-        .child(
-            canvas(
-                |bounds, _, cx| backdrop::report_disc(bounds.center(), cx),
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_full(),
-        )
         .child(
             div()
                 .absolute()

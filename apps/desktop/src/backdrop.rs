@@ -6,14 +6,13 @@
 //! 的底已在图里（光从朝圆盘的那条边漫进去）；不是时（刚换页、刚改大小、没有 GPU）面板自己涂纯色底。
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
     App, Bounds, Corners, Global, IntoElement, Pixels, Point, RenderImage, Size, Styled as _,
     canvas, fill, px,
 };
-use hs_dlx_scene::{MAX_PANELS, Palette, Params, Renderer};
+use hs_dlx_scene::{GRID_STEP, MAX_PANELS, Palette, Params, Renderer};
 
 use crate::{dial, theme};
 
@@ -32,20 +31,27 @@ const MAX_STEP: Duration = Duration::from_millis(100);
 /// 约 8 点、10 MB/s 约 12 点、100 MB/s 约 18 点；没有下载时不流。
 const FLOW_BASE: f32 = 6.;
 const FLOW_PER_DECADE: f32 = 6.;
+/// 第一次送出参数后多久还没画出第一帧，就当 GPU 用不了：取适配器、建设备在驱动卡住时没有期限。
+const FIRST_FRAME: Duration = Duration::from_secs(10);
 
-/// 背景停了的原因：建不起 GPU 渲染器，或画某一帧时出错。停了之后界面一直用纯色底。
+/// 背景停了的原因：建不起 GPU 渲染器、画某一帧时 GPU 出错、迟迟画不出第一帧，或界面放不下画好的图。停了之后界面
+/// 一直用纯色底。
 #[derive(Debug)]
-pub struct Stopped(pub hs_dlx_scene::Error);
+pub struct Stopped(pub String);
 
-/// 窗口的动态背景：后台渲染线程、动画走到哪。由主窗口的视图持有，随它释放（释放时等渲染线程画完手上的一帧退出）。
+/// 窗口的动态背景：后台渲染线程、动画走到哪。由主窗口的视图持有；释放时通知渲染线程退出（它画完手上的一帧、最多
+/// 2 秒后退出），不等它。
 pub struct Backdrop {
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
     /// 上次送参数的时刻
     last_tick: Instant,
+    /// 第一次送出参数的时刻；画出（或因画面太大跳过）过一帧后为 None
+    awaiting_first: Option<Instant>,
+    /// 画出（或跳过）过一帧
+    drawn: bool,
     /// 光芒在一个循环里走到哪（0 到 1）
     phase: f32,
-    /// 网格向外流过的距离（逻辑点，只增不减）
+    /// 网格向外流过的距离（逻辑点，0 到一个格距）
     flow: f32,
     /// 日冕的强度（0 到 1）：页面上有圆盘时向 1 走，没有时向 0 走
     strength: f32,
@@ -68,8 +74,9 @@ struct Shared {
 struct State {
     /// 等着画的一帧；渲染线程取走后为 None，界面送新的时覆盖没画的
     wanted: Option<Job>,
-    /// 画好、界面还没取走的一帧（只留最新的）；渲染出错时为错误，此后渲染线程已退出
-    finished: Option<Result<Painted, hs_dlx_scene::Error>>,
+    /// 画好、界面还没取走的一帧（只留最新的）；画面超出 GPU 允许的边长、这一帧没画时为 `Ok(None)`；渲染出错时为错误，
+    /// 此后渲染线程已退出
+    finished: Option<Result<Option<Painted>, hs_dlx_scene::Error>>,
     /// 视图释放了，渲染线程退出
     closed: bool,
 }
@@ -116,6 +123,8 @@ struct Board {
     shown: Option<Painted>,
     /// 上一帧画出去的图：换了图之后从图集里移除它
     painted: Option<Arc<RenderImage>>,
+    /// 界面放不下画好的图（图集分配不到显存）的原因：下一次 [`Backdrop::tick`] 据此停掉背景
+    broken: Option<String>,
 }
 
 impl Global for Board {}
@@ -128,7 +137,8 @@ impl Backdrop {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
         });
-        let worker = std::thread::Builder::new()
+        // 线程不等它结束：视图释放时 closed 让它退出
+        let _detached = std::thread::Builder::new()
             .name("backdrop".to_owned())
             .spawn({
                 let shared = shared.clone();
@@ -137,8 +147,9 @@ impl Backdrop {
             .expect("起一个线程只在系统资源耗尽时失败");
         Backdrop {
             shared,
-            worker: Some(worker),
             last_tick: Instant::now(),
+            awaiting_first: None,
+            drawn: false,
             phase: 0.,
             flow: 0.,
             strength: 0.,
@@ -163,17 +174,31 @@ impl Backdrop {
         let reduce_motion = cx.reduce_motion();
         let board = cx.global_mut::<Board>();
         let finished = self.shared.lock().finished.take();
-        let changed = match finished {
-            Some(Ok(painted)) => {
-                board.shown = Some(painted);
-                true
+        let late = self
+            .awaiting_first
+            .is_some_and(|sent| now.duration_since(sent) > FIRST_FRAME);
+        let failure = match (board.broken.take(), finished) {
+            (Some(reason), _) => Err(reason),
+            (None, Some(Err(error))) => Err(error.to_string()),
+            (None, Some(Ok(painted))) => {
+                self.drawn = true;
+                self.awaiting_first = None;
+                board.shown = painted;
+                Ok(true)
             }
-            Some(Err(error)) => {
+            (None, None) if late => Err(format!(
+                "GPU 在 {} 秒内没有画出第一帧",
+                FIRST_FRAME.as_secs()
+            )),
+            (None, None) => Ok(false),
+        };
+        let changed = match failure {
+            Ok(changed) => changed,
+            Err(reason) => {
                 self.stopped = true;
                 board.shown = None;
-                return Err(Stopped(error));
+                return Err(Stopped(reason));
             }
-            None => false,
         };
         let Some(viewport) = board.viewport else {
             return Ok(changed);
@@ -185,7 +210,7 @@ impl Backdrop {
         let animate = viewport.active && !reduce_motion;
         if animate {
             self.phase = (self.phase + step / LOOP.as_secs_f32()).rem_euclid(1.);
-            self.flow += step * flow_rate(speed);
+            self.flow = (self.flow + step * flow_rate(speed)).rem_euclid(GRID_STEP);
         }
         let target = if measured.disc.is_some() { 1. } else { 0. };
         self.strength = if animate {
@@ -203,6 +228,9 @@ impl Backdrop {
         let params = self.params(viewport, center, &measured.panels);
         if self.sent != Some(params) {
             self.sent = Some(params);
+            if !self.drawn && self.awaiting_first.is_none() {
+                self.awaiting_first = Some(now);
+            }
             let mut state = self.shared.lock();
             state.wanted = Some(Job {
                 params,
@@ -258,11 +286,6 @@ impl Drop for Backdrop {
     fn drop(&mut self) {
         self.shared.lock().closed = true;
         self.shared.wake.notify_one();
-        if let Some(worker) = self.worker.take()
-            && let Err(panic) = worker.join()
-        {
-            std::panic::resume_unwind(panic);
-        }
     }
 }
 
@@ -299,15 +322,20 @@ fn work(shared: &Shared) {
                     .expect("拿着这把锁时只做赋值与取值，不会 panic");
             }
         };
-        let result = renderer.render(&job.params).map(|frame| {
-            let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
-                .expect("渲染器交回的像素正好是宽乘高乘 4 字节");
-            Painted {
-                image: Arc::new(RenderImage::new([image::Frame::new(buffer)])),
-                measured: job.measured,
-                size: job.size,
+        let result = match renderer.render(&job.params) {
+            Ok(frame) => {
+                let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
+                    .expect("渲染器交回的像素正好是宽乘高乘 4 字节");
+                Ok(Some(Painted {
+                    image: Arc::new(RenderImage::new([image::Frame::new(buffer)])),
+                    measured: job.measured,
+                    size: job.size,
+                }))
             }
-        });
+            // 窗口比 GPU 允许的纹理边长还大：这一帧不画，窗口改小后照常
+            Err(hs_dlx_scene::Error::Size { .. }) => Ok(None),
+            Err(error) => Err(error),
+        };
         let failed = result.is_err();
         shared.lock().finished = Some(result);
         if failed {
@@ -381,9 +409,14 @@ pub fn layer() -> impl IntoElement {
             }
             if let Some((image, size)) = shown {
                 let bounds = Bounds::new(bounds.origin, size);
-                window
-                    .paint_image(bounds, bounds, Corners::default(), image, 0, false)
-                    .expect("背景图只有一帧，第 0 帧总在");
+                // 图集分配不到显存：不铺，面板改涂纯色底，下一次送参数时停掉背景
+                if let Err(error) =
+                    window.paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                {
+                    let board = cx.global_mut::<Board>();
+                    board.shown = None;
+                    board.broken = Some(format!("界面放不下背景图：{error}"));
+                }
             }
         },
     )

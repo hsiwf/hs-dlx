@@ -101,7 +101,6 @@ impl Row {
         }
     }
 
-    /// 换上改后的输出（改存本地 HLS 之后）。
     /// 换掉任务的内容（如改存本地 HLS 之后），显示的文件名随之更新。
     pub fn set_spec(&mut self, spec: TaskSpec) {
         self.file_name = file_name(&spec);
@@ -236,7 +235,6 @@ impl Amount {
     }
 }
 
-/// 输出的文件名（同时要 MP4 与本地 HLS 时为 MP4 的）。
 /// 主要输出（[`TaskSpec::outputs`] 的首项）的文件名。
 fn file_name(spec: &TaskSpec) -> String {
     main_output(spec)
