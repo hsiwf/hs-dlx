@@ -21,6 +21,8 @@ mod ffi {
         user_agent: String,
         /// 节点 ID 的前缀，标明客户端（如 `-HD0100-`）
         peer_fingerprint: String,
+        /// 上次 [`Session::session_state`] 写出的 DHT 状态（路由表里的节点），启动时载入就不必从头找节点；空时从头找
+        state: Vec<u8>,
     }
 
     /// 一个种子此刻的状态。
@@ -69,6 +71,16 @@ mod ffi {
         PortMapFailed,
     }
 
+    /// 种子里的一个文件（不含对齐用的填充文件）。
+    struct FileEntry {
+        /// 在种子里的序号，选文件时用它
+        index: i32,
+        /// 在种子里的相对路径（多文件的种子以种子名的目录开头）
+        path: String,
+        /// 字节数
+        size: i64,
+    }
+
     /// 一个事件。
     struct Alert {
         kind: AlertKind,
@@ -88,6 +100,10 @@ mod ffi {
         fn new_session(config: &SessionConfig) -> Result<UniquePtr<Session>>;
         fn add_magnet(self: &Session, uri: &str, save_path: &str) -> Result<String>;
         fn add_torrent(self: &Session, torrent: &[u8], save_path: &str) -> Result<String>;
+        fn add_resume(self: &Session, resume: &[u8], save_path: &str) -> Result<String>;
+        fn files(self: &Session, id: &str) -> Result<Vec<FileEntry>>;
+        fn select_files(self: &Session, id: &str, wanted: &[i32]) -> Result<()>;
+        fn session_state(self: &Session) -> Vec<u8>;
         fn status(self: &Session, id: &str) -> Result<Status>;
         fn connect_peer(self: &Session, id: &str, ip: &str, port: u16) -> Result<()>;
         fn pause(self: &Session, id: &str) -> Result<()>;
@@ -100,7 +116,7 @@ mod ffi {
     }
 }
 
-pub use ffi::{Alert, AlertKind, SessionConfig, Status};
+pub use ffi::{Alert, AlertKind, FileEntry, SessionConfig, Status};
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
 // messages to the network thread」）；C++ 那一层自己的状态（种子表、取事件）各有一把锁。
@@ -196,6 +212,27 @@ impl Session {
 
     pub fn status(&self, id: &TorrentId) -> Result<Status, Error> {
         Ok(self.inner().status(id.as_str())?)
+    }
+
+    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复种子，下到 `save_path` 下：已下完的块不再校验、不重下。
+    pub fn add_resume(&self, resume: &[u8], save_path: &str) -> Result<TorrentId, Error> {
+        Ok(TorrentId(self.inner().add_resume(resume, save_path)?))
+    }
+
+    /// 种子里的文件；还没有种子信息时报错。
+    pub fn files(&self, id: &TorrentId) -> Result<Vec<FileEntry>, Error> {
+        Ok(self.inner().files(id.as_str())?)
+    }
+
+    /// 只下载序号在 `wanted` 里的文件（[`FileEntry::index`]），其余不下载；还没有种子信息、或序号不是种子里的文件时
+    /// 报错。
+    pub fn select_files(&self, id: &TorrentId, wanted: &[i32]) -> Result<(), Error> {
+        Ok(self.inner().select_files(id.as_str(), wanted)?)
+    }
+
+    /// DHT 的状态（路由表里的节点），存起来下次建会话时放进 [`SessionConfig::state`]。
+    pub fn session_state(&self) -> Vec<u8> {
+        self.inner().session_state()
     }
 
     /// 主动连一个节点（`ip` 为 IPv4 或 IPv6 的写法）。

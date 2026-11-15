@@ -13,6 +13,8 @@
 #include <libtorrent/hex.hpp>
 #include <libtorrent/load_torrent.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/read_resume_data.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/write_resume_data.hpp>
@@ -61,8 +63,28 @@ Alert alert_of(AlertKind kind, lt::alert const& alert, std::string torrent) {
 
 } // namespace
 
+namespace {
+
+// 会话的参数：`config.state` 为上次 session_state() 写出的（只取 DHT 的状态），空时从头开始；设置一律取 `config`
+lt::session_params params_of(SessionConfig const& config) {
+	lt::session_params params;
+	if (!config.state.empty()) {
+		params = lt::read_session_params(
+			lt::span<char const>(reinterpret_cast<char const*>(config.state.data()), static_cast<std::ptrdiff_t>(config.state.size())),
+			lt::session::save_dht_state);
+	}
+	params.settings = settings_of(config);
+	return params;
+}
+
+lt::span<char const> bytes_of(rust::Slice<std::uint8_t const> data) {
+	return lt::span<char const>(reinterpret_cast<char const*>(data.data()), static_cast<std::ptrdiff_t>(data.size()));
+}
+
+} // namespace
+
 Session::Session(SessionConfig const& config)
-	: m_session(lt::session_params(settings_of(config)))
+	: m_session(params_of(config))
 {}
 
 std::unique_ptr<Session> new_session(SessionConfig const& config) {
@@ -90,10 +112,54 @@ rust::String Session::add_magnet(rust::Str uri, rust::Str save_path) const {
 }
 
 rust::String Session::add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const {
-	lt::add_torrent_params params = lt::load_torrent_buffer(
-		lt::span<char const>(reinterpret_cast<char const*>(torrent.data()), static_cast<std::ptrdiff_t>(torrent.size())));
+	lt::add_torrent_params params = lt::load_torrent_buffer(bytes_of(torrent));
 	params.save_path = string_of(save_path);
 	return remember(m_session.add_torrent(std::move(params)));
+}
+
+rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::Str save_path) const {
+	lt::add_torrent_params params = lt::read_resume_data(bytes_of(resume));
+	params.save_path = string_of(save_path);
+	return remember(m_session.add_torrent(std::move(params)));
+}
+
+rust::Vec<FileEntry> Session::files(rust::Str id) const {
+	std::shared_ptr<lt::torrent_info const> info = handle(id).torrent_file();
+	if (!info) throw std::runtime_error("还没有种子信息：" + string_of(id));
+	lt::file_storage const& layout = info->layout();
+	rust::Vec<FileEntry> out;
+	for (lt::file_index_t const i : layout.file_range()) {
+		// 对齐用的填充文件不是内容，不下载、不列出
+		if (layout.pad_file_at(i)) continue;
+		FileEntry entry;
+		entry.index = static_cast<std::int32_t>(i);
+		entry.path = rust::String(layout.file_path(i));
+		entry.size = layout.file_size(i);
+		out.push_back(std::move(entry));
+	}
+	return out;
+}
+
+void Session::select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const {
+	lt::torrent_handle h = handle(id);
+	std::shared_ptr<lt::torrent_info const> info = h.torrent_file();
+	if (!info) throw std::runtime_error("还没有种子信息：" + string_of(id));
+	lt::file_storage const& layout = info->layout();
+	std::vector<lt::download_priority_t> list(std::size_t(layout.num_files()), lt::dont_download);
+	for (std::int32_t index : wanted) {
+		if (index < 0 || index >= layout.num_files() || layout.pad_file_at(lt::file_index_t(index)))
+			throw std::invalid_argument("没有这个文件：" + std::to_string(index));
+		list[std::size_t(index)] = lt::default_priority;
+	}
+	h.prioritize_files(list);
+}
+
+rust::Vec<std::uint8_t> Session::session_state() const {
+	std::vector<char> buffer = lt::write_session_params_buf(m_session.session_state(lt::session::save_dht_state));
+	rust::Vec<std::uint8_t> out;
+	out.reserve(buffer.size());
+	for (char c : buffer) out.push_back(static_cast<std::uint8_t>(c));
+	return out;
 }
 
 Status Session::status(rust::Str id) const {

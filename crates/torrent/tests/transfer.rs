@@ -26,8 +26,137 @@ fn local_session() -> Session {
         lsd: false,
         user_agent: "hs-dlx-test".into(),
         peer_fingerprint: "-HD0000-".into(),
+        state: Vec::new(),
     })
     .unwrap()
+}
+
+/// `len` 字节的内容，按 `seed` 变化：不同的文件内容不同。
+fn content(len: u32, seed: u32) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+/// 做种：`path`（`dir` 里的文件或目录）建种子、在新会话里做种，等它可以连；返回会话、种子与种子文件。
+fn seed(dir: &Path, path: &Path) -> (Session, TorrentId, Vec<u8>) {
+    let torrent = create_torrent(path_str(path), 16 << 10).unwrap();
+    let seeder = local_session();
+    let id = seeder.add_torrent(&torrent, path_str(dir)).unwrap();
+    wait_until(&seeder, Duration::from_secs(20), |s| {
+        s.status(&id).unwrap().state() == Some(State::Seeding) && s.listen_port() != 0
+    });
+    (seeder, id, torrent)
+}
+
+/// 下完选了的文件（要下的字节都下完并校验过）。
+fn done(session: &Session, id: &TorrentId) -> bool {
+    let status = session.status(id).unwrap();
+    status.has_metadata && status.pieces > 0 && status.total_wanted_done == status.total_wanted
+}
+
+/// 多文件的种子只下选了的文件；从续传数据恢复的会话不重下、也不连节点就是完成的。
+#[test]
+fn selected_files_download_and_resume_without_peers() {
+    let seed_dir = scratch("multi-seed");
+    let fetch_dir = scratch("multi-fetch");
+    let album = seed_dir.join("album");
+    std::fs::create_dir_all(album.join("extra")).unwrap();
+    let files = [
+        ("album/a.bin", content(100_000, 1)),
+        ("album/b.bin", content(70_001, 2)),
+        ("album/extra/c.bin", content(250_000, 3)),
+    ];
+    for (path, data) in &files {
+        std::fs::write(seed_dir.join(path), data).unwrap();
+    }
+    let (seeder, id, torrent) = seed(&seed_dir, &album);
+
+    let fetcher = local_session();
+    fetcher.add_torrent(&torrent, path_str(&fetch_dir)).unwrap();
+    // 先全不下，选好再连节点
+    let listed = fetcher.files(&id).unwrap();
+    let mut paths: Vec<(String, i64)> = listed
+        .iter()
+        .map(|f| (f.path.replace('\\', "/"), f.size))
+        .collect();
+    paths.sort();
+    let expected: Vec<(String, i64)> = files
+        .iter()
+        .map(|(path, data)| ((*path).to_owned(), i64::try_from(data.len()).unwrap()))
+        .collect();
+    assert_eq!(paths, expected);
+    let wanted: Vec<i32> = listed
+        .iter()
+        .filter(|f| !f.path.ends_with("b.bin"))
+        .map(|f| f.index)
+        .collect();
+    fetcher.select_files(&id, &wanted).unwrap();
+    assert!(fetcher.select_files(&id, &[99]).is_err());
+    fetcher
+        .connect_peer(&id, "127.0.0.1", seeder.listen_port())
+        .unwrap();
+    wait_until(&fetcher, Duration::from_secs(60), |s| done(s, &id));
+    assert_eq!(fetcher.status(&id).unwrap().total_wanted, 100_000 + 250_000);
+    for (path, data) in [&files[0], &files[2]] {
+        assert_eq!(
+            &std::fs::read(fetch_dir.join(path)).unwrap(),
+            data,
+            "{path}"
+        );
+    }
+    assert!(!fetch_dir.join("album/b.bin").exists());
+
+    // 写出续传数据，换一个不连任何节点的会话恢复
+    fetcher.save_resume_data(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let resume = loop {
+        assert!(Instant::now() < deadline, "没等到续传数据");
+        if let Some(alert) = fetcher
+            .pop_alerts(100)
+            .into_iter()
+            .find(|a| a.kind == AlertKind::ResumeData)
+        {
+            break alert.data;
+        }
+    };
+    drop(fetcher);
+    drop(seeder);
+    let restored = local_session();
+    assert_eq!(
+        restored.add_resume(&resume, path_str(&fetch_dir)).unwrap(),
+        id
+    );
+    wait_until(&restored, Duration::from_secs(20), |s| done(s, &id));
+    assert_eq!(restored.status(&id).unwrap().peers, 0);
+    assert!(
+        local_session()
+            .add_resume(b"not bencode", path_str(&fetch_dir))
+            .is_err()
+    );
+
+    drop(restored);
+    std::fs::remove_dir_all(&seed_dir).unwrap();
+    std::fs::remove_dir_all(&fetch_dir).unwrap();
+}
+
+/// DHT 的状态写得出、下次建会话时载得进。
+#[test]
+fn session_state_round_trips() {
+    let state = local_session().session_state();
+    assert!(!state.is_empty());
+    let config = |state: Vec<u8>| SessionConfig {
+        listen_interfaces: "127.0.0.1:0".into(),
+        dht: false,
+        upnp: false,
+        natpmp: false,
+        lsd: false,
+        user_agent: "hs-dlx-test".into(),
+        peer_fingerprint: "-HD0000-".into(),
+        state,
+    };
+    Session::new(&config(state)).unwrap();
+    assert!(Session::new(&config(b"not bencode".to_vec())).is_err());
 }
 
 /// 等到 `done` 成立，期间不断取走事件（不取时 libtorrent 的事件队列会满）；超过 `limit` 即失败。

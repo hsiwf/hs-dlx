@@ -19,6 +19,7 @@ namespace hsdlx {
 struct SessionConfig;
 struct Status;
 struct Alert;
+struct FileEntry;
 
 class Session {
 public:
@@ -26,6 +27,10 @@ public:
 
 	rust::String add_magnet(rust::Str uri, rust::Str save_path) const;
 	rust::String add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const;
+	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str save_path) const;
+	rust::Vec<FileEntry> files(rust::Str id) const;
+	void select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const;
+	rust::Vec<std::uint8_t> session_state() const;
 	Status status(rust::Str id) const;
 	void connect_peer(rust::Str id, rust::Str ip, std::uint16_t port) const;
 	void pause(rust::Str id) const;
