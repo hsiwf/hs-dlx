@@ -99,11 +99,14 @@ pub struct FileSpec {
     pub chunk_size: Option<NonZeroU64>,
 }
 
-/// 新建前认出地址是文件时服务器报的（响应头原样）。都没有时第一次下载无从核对。
+/// 新建前认出地址是文件时服务器报的（响应头原样）。总字节数、ETag、Last-Modified、Content-Type 都没有时第一次下载
+/// 无从核对。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Expected {
     /// 总字节数
     pub length: Option<u64>,
+    /// 支持范围请求：第一次下载据此带 If-Range 核对验证器（不支持的服务器一律回整个文件）
+    pub accepts_ranges: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub content_type: Option<String>,
@@ -127,6 +130,14 @@ impl TaskSpec {
         match &self.kind {
             Kind::Hls(hls) => Some(hls),
             Kind::File(_) => None,
+        }
+    }
+
+    /// 文件任务特有的内容；HLS 任务为 None。
+    pub fn file(&self) -> Option<&FileSpec> {
+        match &self.kind {
+            Kind::Hls(_) => None,
+            Kind::File(file) => Some(file),
         }
     }
 }
@@ -196,4 +207,28 @@ pub struct Finished {
     pub bytes: u64,
     /// MP4 里视频流的宽与高；没有时与文件任务为 None
     pub resolution: Option<(u32, u32)>,
+}
+
+impl From<&hs_m3u8_core::FileInfo> for Expected {
+    fn from(info: &hs_m3u8_core::FileInfo) -> Self {
+        Expected {
+            length: info.length,
+            accepts_ranges: info.accepts_ranges,
+            etag: info.etag.clone(),
+            last_modified: info.last_modified.clone(),
+            content_type: info.content_type.clone(),
+        }
+    }
+}
+
+impl From<&Expected> for hs_m3u8_core::Expected {
+    fn from(expected: &Expected) -> Self {
+        hs_m3u8_core::Expected {
+            length: expected.length,
+            accepts_ranges: expected.accepts_ranges,
+            etag: expected.etag.clone(),
+            last_modified: expected.last_modified.clone(),
+            content_type: expected.content_type.clone(),
+        }
+    }
 }

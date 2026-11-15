@@ -2033,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=89c2a54215206396017207879f1c00c842c3217e#89c2a54215206396017207879f1c00c842c3217e"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
 dependencies = [
  "bindgen",
  "cc",
@@ -3629,10 +3629,11 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-core"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=89c2a54215206396017207879f1c00c842c3217e#89c2a54215206396017207879f1c00c842c3217e"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
 dependencies = [
  "aes 0.9.3",
  "cbc 0.2.1",
+ "fs4",
  "hs-m3u8-hls",
  "hs-m3u8-remux",
  "hs-m3u8-sysproxy",
@@ -3652,7 +3653,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-hls"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=89c2a54215206396017207879f1c00c842c3217e#89c2a54215206396017207879f1c00c842c3217e"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
 dependencies = [
  "thiserror 2.0.21",
  "url",
@@ -3661,7 +3662,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-remux"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=89c2a54215206396017207879f1c00c842c3217e#89c2a54215206396017207879f1c00c842c3217e"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -3671,7 +3672,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-sysproxy"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=89c2a54215206396017207879f1c00c842c3217e#89c2a54215206396017207879f1c00c842c3217e"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
 dependencies = [
  "system-configuration 0.7.0",
  "windows-registry 0.6.1",

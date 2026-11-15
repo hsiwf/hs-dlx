@@ -20,12 +20,13 @@ use crate::{
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
     rebuild_with_kinds,
     add_theme,
+    rebuild_with_ranges,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -176,13 +177,7 @@ fn create_settings_table(tx: &Transaction<'_>) -> Result<(), Error> {
 ///
 /// 第 3 版的行都是 `hls`。失败种类的写法不变。删掉旧表会连同删掉它的编号计数，新表的计数接着旧表的，编号照样不重用。
 fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
-    let counter: Option<i64> = tx
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'task'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let counter = task_counter(tx)?;
     tx.execute_batch(
         "CREATE TABLE task_v4 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,6 +229,23 @@ fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
         DROP TABLE task;
         ALTER TABLE task_v4 RENAME TO task;",
     )?;
+    keep_task_counter(tx, counter)
+}
+
+/// 任务表的编号计数（AUTOINCREMENT 记在 sqlite_sequence 里）；还没分配过编号时为 None。重建任务表前读出，重建后由
+/// [`keep_task_counter`] 接上：删掉旧表会连同删掉它的计数。
+fn task_counter(tx: &Transaction<'_>) -> Result<Option<i64>, Error> {
+    Ok(tx
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'task'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// 重建后的任务表的编号计数接着重建前的 `counter`（[`task_counter`]）。
+fn keep_task_counter(tx: &Transaction<'_>, counter: Option<i64>) -> Result<(), Error> {
     if let Some(counter) = counter {
         let kept = tx.execute(
             "UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'task'",
@@ -247,6 +259,68 @@ fn rebuild_with_kinds(tx: &Transaction<'_>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// 第 6 版，重建任务表：
+/// - 文件任务加 `file_accepts_ranges`（认出地址时服务器支持范围请求，第一次下载按它决定带不带 If-Range 核对），只用于
+///   文件任务且必有。第 5 版没有文件任务（服务拒绝新建）；有的话补不出这一列，迁移按约束失败。
+/// - 失败的种类加 `not-expected`（[`crate::FailureKind::NotExpected`]）。
+fn rebuild_with_ranges(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v6 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (kind = 'file' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL))
+        ) STRICT;
+        INSERT INTO task_v6 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, work_dir,
+                             status, error, failure, created_at, total, duration_ms, bytes, width, height, write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, work_dir, status,
+                   error, failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v6 RENAME TO task;",
+    )?;
+    keep_task_counter(tx, counter)
 }
 
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
@@ -350,7 +424,8 @@ impl Store {
 /// 读出一个任务的各列，顺序与 [`Row::read`] 一致。
 const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path, \
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
-                       error, failure, created_at, total, duration_ms, bytes, width, height, write_only";
+                       error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
+                       file_accepts_ranges";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录
 /// 相同（按 [`naming::path_key`] 比较）时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；
@@ -381,8 +456,10 @@ pub fn insert(
         }
         Kind::File(_) => (None, None, None, None, None),
     };
-    let (file_path, length, etag, last_modified, content_type, chunk) = match &spec.kind {
-        Kind::Hls(_) => (None, None, None, None, None, None),
+    let (file_path, length, accepts_ranges, etag, last_modified, content_type, chunk) = match &spec
+        .kind
+    {
+        Kind::Hls(_) => (None, None, None, None, None, None, None),
         Kind::File(file) => (
             Some(named_utf8(&file.path)?),
             // 服务器报的，可能大得离谱
@@ -394,6 +471,7 @@ pub fn insert(
                     })
                 })
                 .transpose()?,
+            Some(file.expected.accepts_ranges),
             file.expected.etag.as_deref(),
             file.expected.last_modified.as_deref(),
             file.expected.content_type.as_deref(),
@@ -414,8 +492,8 @@ pub fn insert(
     tx.execute(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
-                           status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17)",
+                           status, created_at, file_accepts_ranges)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -434,6 +512,7 @@ pub fn insert(
             chunk,
             work_dir_text,
             created_at,
+            accepts_ranges,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -635,6 +714,7 @@ struct Row {
     width: Option<u32>,
     height: Option<u32>,
     write_only: bool,
+    file_accepts_ranges: Option<bool>,
 }
 
 impl Row {
@@ -667,6 +747,7 @@ impl Row {
             width: row.get(24)?,
             height: row.get(25)?,
             write_only: row.get(26)?,
+            file_accepts_ranges: row.get(27)?,
         })
     }
 
@@ -682,8 +763,9 @@ impl Row {
             self.output_kind,
             self.live,
             self.file_path,
+            self.file_accepts_ranges,
         ) {
-            ("hls", Some(preference), Some(output_kind), Some(live), None) => {
+            ("hls", Some(preference), Some(output_kind), Some(live), None, None) => {
                 let preference: StoredPreference =
                     serde_json::from_str(&preference).map_err(|_| corrupt("选轨偏好"))?;
                 let output = output_spec(&output_kind, self.mp4_path, self.hls_path)
@@ -694,7 +776,7 @@ impl Row {
                     live,
                 })
             }
-            ("file", None, None, None, Some(path)) => {
+            ("file", None, None, None, Some(path), Some(accepts_ranges)) => {
                 let path = PathBuf::from(path);
                 if !named_absolute(&path) {
                     return Err(corrupt("输出"));
@@ -713,6 +795,7 @@ impl Row {
                     path,
                     expected: Expected {
                         length,
+                        accepts_ranges,
                         etag: self.file_etag,
                         last_modified: self.file_last_modified,
                         content_type: self.file_content_type,
@@ -1017,6 +1100,7 @@ mod tests {
                 path,
                 expected: Expected {
                     length: Some(1 << 40),
+                    accepts_ranges: true,
                     etag: Some("\"v1\"".into()),
                     last_modified: None,
                     content_type: Some("application/zip".into()),
@@ -1061,30 +1145,34 @@ mod tests {
     fn kinds_and_columns_must_agree() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let hls = "'hls', '{}', 'mp4', 0";
+        // 种类、选轨偏好、输出种类、是否录直播、文件路径、是否支持范围请求
+        let hls = "'hls', '{}', 'mp4', 0, NULL, NULL";
+        let file = "'file', NULL, NULL, NULL, '/m/a', 1";
         let insert = |kind_columns: &str, extra_columns: &str, extra_values: &str| {
             tx.execute(
                 &format!(
-                    "INSERT INTO task (kind, preference, output_kind, live, file_path, title, url, headers, status,
-                                       created_at{extra_columns})
+                    "INSERT INTO task (kind, preference, output_kind, live, file_path, file_accepts_ranges, title,
+                                       url, headers, status, created_at{extra_columns})
                      VALUES ({kind_columns}, 'x', 'https://a/b', '[]', 'paused', 1{extra_values})"
                 ),
                 [],
             )
         };
-        insert(&format!("{hls}, NULL"), "", "").unwrap();
-        insert("'file', NULL, NULL, NULL, '/m/a'", "", "").unwrap();
+        insert(hls, "", "").unwrap();
+        insert(file, "", "").unwrap();
         for (kind_columns, extra_columns, extra_values) in [
-            // HLS 缺选轨偏好、文件缺路径
-            ("'hls', NULL, 'mp4', 0, NULL", "", ""),
-            ("'file', NULL, NULL, NULL, NULL", "", ""),
+            // HLS 缺选轨偏好；文件缺路径、缺是否支持范围请求
+            ("'hls', NULL, 'mp4', 0, NULL, NULL", "", ""),
+            ("'file', NULL, NULL, NULL, NULL, 1", "", ""),
+            ("'file', NULL, NULL, NULL, '/m/a', NULL", "", ""),
             // 文件带了 HLS 的列
-            ("'file', NULL, NULL, 0, '/m/a'", "", ""),
-            ("'file', NULL, NULL, NULL, '/m/a'", ", total", ", 3"),
+            ("'file', NULL, NULL, 0, '/m/a', 1", "", ""),
+            (file, ", total", ", 3"),
             // HLS 带了文件的列
-            (&format!("{hls}, '/m/a'"), "", ""),
-            (&format!("{hls}, NULL"), ", chunk_size", ", 1"),
-            (&format!("{hls}, NULL"), ", file_etag", ", 'e'"),
+            ("'hls', '{}', 'mp4', 0, '/m/a', NULL", "", ""),
+            ("'hls', '{}', 'mp4', 0, NULL, 0", "", ""),
+            (hls, ", chunk_size", ", 1"),
+            (hls, ", file_etag", ", 'e'"),
         ] {
             assert!(
                 insert(kind_columns, extra_columns, extra_values).is_err(),

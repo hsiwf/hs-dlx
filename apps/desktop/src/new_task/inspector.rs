@@ -1,12 +1,12 @@
-//! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；探测完成为探测结果的读数、清晰度之外的
-//! 选择（音轨、输出、保存位置、请求头）与开始；探测失败为错误与能做的事（改请求头重新探测、重新探测、在网页里找
-//! 视频流）。
+//! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
+//! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
+//! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）。
 
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
 use hs_dlx_app::{Failure, OutputKind};
-use hs_m3u8_core::Probe;
+use hs_m3u8_core::{FileInfo, Probe};
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, duration_of};
 use crate::format;
@@ -36,6 +36,7 @@ impl NewTask {
             ),
             Probing::Failed(failure) => self.failed_inspector(title, host, failure, cx),
             Probing::Ready(probe) => self.ready_inspector(title, host, probe, cx),
+            Probing::File(info) => self.file_inspector(title, host, info, cx),
         }
     }
 
@@ -145,6 +146,91 @@ impl NewTask {
     }
 
     /// 探测完成：读数、选择（多了可以滚动）与开始。
+    /// 认出文件时：大小、类型、能否续传与网络的读数，保存位置、请求头，开始。
+    fn file_inspector(
+        &self,
+        title: String,
+        host: String,
+        info: &FileInfo,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let cells: Vec<(SharedString, SharedString)> = vec![
+            (
+                "大小".into(),
+                info.length
+                    .map_or_else(|| "不知道".to_owned(), format::bytes)
+                    .into(),
+            ),
+            (
+                "类型".into(),
+                info.content_type
+                    .clone()
+                    .unwrap_or_else(|| "不知道".to_owned())
+                    .into(),
+            ),
+            (
+                "续传".into(),
+                if info.accepts_ranges {
+                    "支持，可多个连接".into()
+                } else {
+                    "不支持，中断后从头下".into()
+                },
+            ),
+        ];
+        let mut body: Vec<AnyElement> = self.reads_with_route(cells).into_iter().collect();
+        body.push(self.folder_group(cx).into_any_element());
+        body.push(group("请求头", [self.headers.clone().into_any_element()]).into_any_element());
+        let headline = if self.creating {
+            "正在开始…".to_owned()
+        } else {
+            "开始下载".to_owned()
+        };
+        let detail = match info.length {
+            Some(length) => format!("{} · {}", self.title, format::bytes(length)),
+            None => self.title.clone(),
+        };
+        let mut foot: Vec<AnyElement> = self
+            .error
+            .clone()
+            .map(|error| ui::error_text(error).into_any_element())
+            .into_iter()
+            .collect();
+        foot.push(
+            ui::primary(
+                "start",
+                headline,
+                Some(detail.into()),
+                Solid::Glow,
+                !self.creating,
+                cx.listener(|this, _, window, cx| this.start(window, cx)),
+            )
+            .into_any_element(),
+        );
+        if !self.creating {
+            foot.push(self.cancel(Tone::Ghost, cx));
+        }
+        ui::inspector(title, host, body, foot)
+    }
+
+    /// 「保存到」一组：现在的保存位置与更改。
+    fn folder_group(&self, cx: &mut Context<Self>) -> Div {
+        group(
+            "保存到",
+            [div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(ui::field(format::path(&self.folder, self.home.as_deref())).flex_1())
+                .child(ui::button(
+                    "folder",
+                    "更改",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.change_folder(cx)),
+                ))
+                .into_any_element()],
+        )
+    }
+
     fn ready_inspector(
         &self,
         title: String,
@@ -228,24 +314,7 @@ impl NewTask {
             .into_any_element()
         });
         body.push(group("输出", [chips_row(outputs)]).into_any_element());
-        body.push(
-            group(
-                "保存到",
-                [div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(ui::field(format::path(&self.folder, self.home.as_deref())).flex_1())
-                    .child(ui::button(
-                        "folder",
-                        "更改",
-                        Tone::Plain,
-                        cx.listener(|this, _, _, cx| this.change_folder(cx)),
-                    ))
-                    .into_any_element()],
-            )
-            .into_any_element(),
-        );
+        body.push(self.folder_group(cx).into_any_element());
         body.push(group("请求头", [self.headers.clone().into_any_element()]).into_any_element());
 
         let picked = master.map(|m| &m.variants[self.variant]);

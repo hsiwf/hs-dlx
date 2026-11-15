@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
 use hs_dlx_app::{Finished, Kind, OutputSpec, Status, Task, TaskSpec};
-use hs_m3u8_core::{FileCount, Progress, Saved, Stage};
+use hs_m3u8_core::{FileCount, FileProgress, Progress, Saved, Stage};
 
 use crate::format;
 use crate::live::Timeline;
@@ -38,8 +38,10 @@ pub struct Present {
 
 pub struct Row {
     pub task: Task,
-    /// 这次运行最近的进度；继续时清掉
+    /// HLS 任务这次运行最近的进度；继续时清掉
     pub progress: Option<Progress>,
+    /// 文件任务这次运行最近的进度；继续时清掉
+    pub file_progress: Option<FileProgress>,
     /// 任务不在运行时任务目录里已完成的内容；停下时作废重读，运行中留着继续前读到的
     pub disk: Disk,
     /// 读任务目录的代次：每次作废 `disk` 时加一，只收发起时代次相同的结果
@@ -88,6 +90,7 @@ impl Row {
         Row {
             task,
             progress: None,
+            file_progress: None,
             disk: Disk::Unread,
             reading: 0,
             present: None,
@@ -157,11 +160,14 @@ impl Row {
         }))
     }
 
-    /// 在运行的点播此刻的进度（0 到 1）：写出时为写出的比例，下载时为已下的片数比例（还不知道合计时为 0）。不是在运行
-    /// 的点播（停着的、录直播的、只写出已录的）时为 None。
+    /// 在运行的点播或文件此刻的进度（0 到 1）：点播写出时为写出的比例，下载时为已下的片数比例；文件为已下的字节比例；
+    /// 还不知道合计时为 0。不是在运行的点播或文件（停着的、录直播的、只写出已录的）时为 None。
     pub fn progress_share(&self) -> Option<f32> {
         if self.task.status != Status::Running || self.task.write_only || self.recording() {
             return None;
+        }
+        if let Some(amount) = FileAmount::of(self) {
+            return Some(amount.fraction().unwrap_or(0.0));
         }
         Some(
             self.written_share()
@@ -185,7 +191,8 @@ impl Row {
             }
         }
         match &self.disk {
-            Disk::Read(Some(saved)) => saved.live,
+            Disk::Read(Some(Saved::Hls(saved))) => saved.live,
+            Disk::Read(Some(Saved::File(_))) => false,
             _ => self.task.spec.hls().is_some_and(|hls| hls.live),
         }
     }
@@ -202,8 +209,10 @@ pub struct Amount {
 }
 
 impl Amount {
-    /// 运行中取这次运行的进度；停下的取任务目录里读到的（与存储里的总片数），还没读到时取这次运行留下的进度。
+    /// HLS 任务的：运行中取这次运行的进度；停下的取任务目录里读到的（与存储里的总片数），还没读到时取这次运行留下的
+    /// 进度。文件任务为 None（见 [`FileAmount`]）。
     pub fn of(row: &Row) -> Option<Amount> {
+        row.task.spec.hls()?;
         let from_progress = |p: &Progress| Amount {
             done: p.segments.done,
             total: p.segments.total,
@@ -214,13 +223,14 @@ impl Amount {
             return row.progress.as_ref().map(from_progress);
         }
         match &row.disk {
-            Disk::Read(Some(saved)) => Some(Amount {
+            Disk::Read(Some(Saved::Hls(saved))) => Some(Amount {
                 done: saved.segments,
                 total: row.task.total.unwrap_or(0),
                 bytes: saved.bytes,
                 duration: saved.duration,
             }),
-            Disk::Read(None) => None,
+            // 存储里是 HLS 任务、目录里却是文件任务的：服务按种类开始任务，读到时核心已报目录种类不符
+            Disk::Read(Some(Saved::File(_)) | None) => None,
             Disk::Unread | Disk::Unreadable(_) => row.progress.as_ref().map(from_progress),
         }
     }
@@ -232,6 +242,45 @@ impl Amount {
         } else {
             (self.done as f32 / self.total as f32).min(1.0)
         }
+    }
+}
+
+/// 文件任务已下的与总字节数。
+pub struct FileAmount {
+    pub bytes: u64,
+    /// 服务器没给出时为 None
+    pub total: Option<u64>,
+}
+
+impl FileAmount {
+    /// 文件任务的：运行中取这次运行的进度；停下的取任务目录里读到的，还没读到时取这次运行留下的进度。HLS 任务为
+    /// None（见 [`Amount`]）。
+    pub fn of(row: &Row) -> Option<FileAmount> {
+        if row.task.spec.hls().is_some() {
+            return None;
+        }
+        let from_progress = |p: &FileProgress| FileAmount {
+            bytes: p.bytes,
+            total: p.total,
+        };
+        if row.task.status == Status::Running {
+            return row.file_progress.as_ref().map(from_progress);
+        }
+        match &row.disk {
+            Disk::Read(Some(Saved::File(saved))) => Some(FileAmount {
+                bytes: saved.bytes,
+                total: saved.total,
+            }),
+            Disk::Read(Some(Saved::Hls(_)) | None) => None,
+            Disk::Unread | Disk::Unreadable(_) => row.file_progress.as_ref().map(from_progress),
+        }
+    }
+
+    /// 已下的比例（0 到 1）；不知道总字节数时为 None。
+    pub fn fraction(&self) -> Option<f32> {
+        self.total
+            .filter(|&total| total > 0)
+            .map(|total| (self.bytes as f64 / total as f64).min(1.0) as f32)
     }
 }
 
@@ -278,8 +327,8 @@ pub fn finished_text(spec: &TaskSpec, result: &Finished) -> String {
 #[cfg(test)]
 pub mod sample {
     use hs_dlx_app::{HlsSpec, Kind, OutputSpec, Status, StoredPreference, Task, TaskId, TaskSpec};
-    use hs_m3u8_core::Saved;
     use hs_m3u8_core::hls::Preference;
+    use hs_m3u8_core::{HlsSaved, Saved};
     use std::time::{Duration, Instant};
 
     use super::Row;
@@ -308,12 +357,12 @@ pub mod sample {
     }
 
     pub fn saved(segments: usize, live: bool) -> Saved {
-        Saved {
+        Saved::Hls(HlsSaved {
             live,
             segments,
             bytes: 4_000_000,
             duration: Duration::from_secs(40),
-        }
+        })
     }
 }
 

@@ -46,8 +46,12 @@ pub enum FailureKind {
     Disk,
     /// 输出路径、或要用的任务目录上已有别的东西
     OutputTaken,
-    /// 来源与任务目录里已下载的不是同一份内容（换了内容、换了一档、轨道变了、直播接不上之前录的）
+    /// 来源与任务目录里已下载的不是同一份内容（换了内容、换了一档、轨道变了、直播接不上之前录的；文件任务续传时文件
+    /// 变了）：已下的不能沿用，只能放弃后重新下载
     SourceChanged,
+    /// 文件任务第一次下载时，地址回的已不是新建前认出的那个文件：多为签名地址过期或登录状态失效后换成了错误页、登录页。
+    /// 更新请求头（Cookie 等）或换一个新链接重新新建
+    NotExpected,
     /// 取到的不是播放列表、分片或 key 该有的样子：多为源站返回了错误页或登录页
     Malformed,
     /// 直播长时间录不到新分片
@@ -85,7 +89,10 @@ impl FailureKind {
                 | StallReason::TrackStopped(_) => FailureKind::Stalled,
             },
             CoreError::Incomplete { .. } | CoreError::SystemProxy(_) => FailureKind::Network,
-            CoreError::Io { .. } | CoreError::VolumeUnavailable { .. } => FailureKind::Disk,
+            CoreError::Io { .. }
+            | CoreError::VolumeUnavailable { .. }
+            | CoreError::NoSpace { .. } => FailureKind::Disk,
+            CoreError::NotExpected { .. } => FailureKind::NotExpected,
             CoreError::Remux(error) => FailureKind::of_remux(error),
             CoreError::OutputExists(_) | CoreError::OutputOccupied { .. } => {
                 FailureKind::OutputTaken
@@ -98,6 +105,7 @@ impl FailureKind {
                 | WorkDirProblem::PlanChanged
                 | WorkDirProblem::SelectionGone
                 | WorkDirProblem::SourceUnverified
+                | WorkDirProblem::FileChanged
                 | WorkDirProblem::Unaligned { .. } => FailureKind::SourceChanged,
                 WorkDirProblem::Locked => FailureKind::Other,
                 WorkDirProblem::NotLiveRecording => FailureKind::NothingToWrite,
@@ -194,6 +202,7 @@ impl FailureKind {
             | FailureKind::Other => true,
             FailureKind::Certificate
             | FailureKind::SourceChanged
+            | FailureKind::NotExpected
             | FailureKind::Malformed
             | FailureKind::Mp4Unsupported
             | FailureKind::NothingToWrite
@@ -208,6 +217,7 @@ impl FailureKind {
         match self {
             FailureKind::Status(_)
             | FailureKind::Malformed
+            | FailureKind::NotExpected
             | FailureKind::Network
             | FailureKind::Stalled
             | FailureKind::NothingToWrite
@@ -222,12 +232,13 @@ impl FailureKind {
         }
     }
 
-    /// 多半要先改请求头（补上 Referer、Cookie、Authorization）：被服务器拒绝，或取到的是错误页、登录页、重定向打转。
+    /// 多半要先改请求头（补上 Referer、Cookie、Authorization）：被服务器拒绝，或取到的是错误页、登录页、重定向打转，
+    /// 或文件任务的地址回的已不是之前的文件（登录状态失效）。
     /// 是 [`FailureKind::headers_can_change_outcome`] 的一部分：这里为真的，那里一定为真。
     pub fn headers_likely_missing(self) -> bool {
         matches!(
             self,
-            FailureKind::Status(401 | 403) | FailureKind::Malformed
+            FailureKind::Status(401 | 403) | FailureKind::Malformed | FailureKind::NotExpected
         )
     }
 
@@ -241,6 +252,7 @@ impl FailureKind {
             FailureKind::Disk => "disk".into(),
             FailureKind::OutputTaken => "output-taken".into(),
             FailureKind::SourceChanged => "source-changed".into(),
+            FailureKind::NotExpected => "not-expected".into(),
             FailureKind::Mp4Unsupported => "mp4-unsupported".into(),
             FailureKind::Unrecoverable => "unrecoverable".into(),
             FailureKind::Malformed => "malformed".into(),
@@ -259,6 +271,7 @@ impl FailureKind {
             "disk" => FailureKind::Disk,
             "output-taken" => FailureKind::OutputTaken,
             "source-changed" => FailureKind::SourceChanged,
+            "not-expected" => FailureKind::NotExpected,
             "mp4-unsupported" => FailureKind::Mp4Unsupported,
             "unrecoverable" => FailureKind::Unrecoverable,
             "malformed" => FailureKind::Malformed,
@@ -282,6 +295,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::Disk,
         FailureKind::OutputTaken,
         FailureKind::SourceChanged,
+        FailureKind::NotExpected,
         FailureKind::Malformed,
         FailureKind::Stalled,
         FailureKind::NothingToWrite,
@@ -298,6 +312,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::Disk
             | FailureKind::OutputTaken
             | FailureKind::SourceChanged
+            | FailureKind::NotExpected
             | FailureKind::Malformed
             | FailureKind::Stalled
             | FailureKind::NothingToWrite

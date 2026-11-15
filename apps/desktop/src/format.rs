@@ -117,6 +117,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
             "不兼容".into(),
             "内容放不进 MP4：改存本地 HLS，已下的照样用",
         ),
+        FailureKind::NotExpected => (
+            "已变".into(),
+            "地址回的已不是之前看到的文件，多为链接过期或登录失效：换一个新链接，或更新 Cookie 等请求头",
+        ),
         FailureKind::NothingToWrite => {
             ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")
         }

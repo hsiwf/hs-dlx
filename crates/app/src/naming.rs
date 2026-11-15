@@ -2,7 +2,7 @@
 //! 拼出输出路径。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use hs_m3u8_core::Url;
 use icu_normalizer::ComposingNormalizerBorrowed;
@@ -143,6 +143,27 @@ fn split_extension(name: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// 在 `folder` 里给文件名 `name`（[`file_name`] 整理过的）选一个文件名并拼出输出路径，返回选定的文件名与路径：为
+/// `name`，被占用时主名后依次加 ` 2`、` 3`……。这个文件名与它的任务目录（`<主名>.hsdl`）在磁盘上已存在、或键在
+/// `taken` 里，都算占用（同 [`output_for`]）。
+pub fn file_output_for(
+    folder: &Path,
+    name: &str,
+    taken: &HashSet<String>,
+) -> Result<(String, PathBuf), Error> {
+    let (stem, extension) = split_extension(name);
+    let named = |stem: &str| match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem.to_owned(),
+    };
+    let stem = free_stem(folder, stem, taken, |stem| {
+        vec![named(stem), format!("{stem}.hsdl")]
+    })?;
+    let name = named(&stem);
+    let path = folder.join(&name);
+    Ok((name, path))
+}
+
 /// `folder` 里不被占用的主名：`stem`，被占用时依次加 ` 2`、` 3`……；`names` 给出一个主名占用的各个文件名，其中任一个
 /// 在磁盘上已存在、或键（[`path_key`]）在 `taken` 里即算占用。
 fn free_stem(
@@ -256,6 +277,28 @@ mod tests {
             name.ends_with(".zip") && name.len() <= STEM_LIMIT + 4,
             "{name}"
         );
+    }
+
+    #[test]
+    fn file_outputs_skip_names_and_work_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("hs-dlx-app-file-naming-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("a.hsdl")).unwrap();
+        std::fs::write(dir.join("a 2.zip"), b"").unwrap();
+        let none = HashSet::new();
+        assert_eq!(
+            file_output_for(&dir, "a.zip", &none).unwrap(),
+            ("a 3.zip".to_owned(), dir.join("a 3.zip"))
+        );
+        let taken = HashSet::from([path_key(&dir.join("B").to_string_lossy())]);
+        assert_eq!(
+            file_output_for(&dir, "b", &taken).unwrap(),
+            ("b 2".to_owned(), dir.join("b 2"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

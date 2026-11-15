@@ -15,7 +15,7 @@ use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, Row, main_output, resume_label, saved_as};
+use crate::tasks::{Amount, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
 use crate::{dial, format, motion, ring, theme};
 
@@ -412,20 +412,24 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         let Some(result) = row.task.result.as_ref() else {
             return Vec::new();
         };
-        let mut cells = vec![
-            cell(
+        let mut cells = Vec::new();
+        if row.task.spec.hls().is_some() {
+            cells.push(cell(
                 "时长",
                 result
                     .duration
                     .map_or_else(|| "—".to_owned(), format::clock),
-            ),
-            cell("大小", format::bytes(result.bytes)),
-        ];
+            ));
+        }
+        cells.push(cell("大小", format::bytes(result.bytes)));
         if let Some((width, height)) = result.resolution {
             cells.push(cell("画面", format!("{width}×{height}")));
         }
         cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
         return cells;
+    }
+    if row.task.spec.hls().is_none() {
+        return file_reads(row, now);
     }
     let Some(amount) = Amount::of(row) else {
         return Vec::new();
@@ -460,6 +464,46 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         _ => vec![
             cell("已下", format!("{segments} 片")),
             cell("大小", format::bytes(bytes)),
+        ],
+    }
+}
+
+/// 文件任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下与连接数，停着的为已下与总大小；还没有内容时为空。
+fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let Some(amount) = FileAmount::of(row) else {
+        return Vec::new();
+    };
+    let size = amount
+        .total
+        .map_or_else(|| "不知道".to_owned(), format::bytes);
+    match (&row.task.status, &row.file_progress) {
+        (Status::Running, Some(progress)) if progress.limit > 0 => {
+            let speed = row.rate.bytes_per_second(now);
+            // 按最近几秒的速度估：剩下的字节除以速度
+            let left = amount
+                .total
+                .map(|total| total.saturating_sub(amount.bytes))
+                .filter(|_| speed > 0.0)
+                .map_or_else(
+                    || "—".to_owned(),
+                    |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
+                );
+            vec![
+                cell("速度", format!("{}/s", format::bytes(speed as u64))),
+                cell("剩余", left),
+                cell("已下", format::bytes(amount.bytes)),
+                cell(
+                    "连接",
+                    format!("{} / {}", progress.connections, progress.limit),
+                ),
+            ]
+        }
+        (Status::Running, _) => Vec::new(),
+        _ if amount.bytes == 0 => Vec::new(),
+        _ => vec![
+            cell("已下", format::bytes(amount.bytes)),
+            cell("大小", size),
         ],
     }
 }

@@ -1,4 +1,4 @@
-//! 任务服务的端到端测试：真实的 SQLite 文件、测试内的本地 HLS 服务（分片取自 tests/fixtures/media/ts_a）。
+//! 任务服务的端到端测试：真实的 SQLite 文件、测试内的本地 HLS 与文件服务（分片取自 tests/fixtures/media/ts_a）。
 //! 服务自带 tokio 运行时，在测试自己的运行时外面建、外面丢弃；等事件与本地服务在测试的运行时里。
 
 use std::collections::HashMap;
@@ -9,18 +9,19 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use hs_dlx_app::{
-    Draft, DraftKind, Error, Event, FailureKind, OutputKind, OutputSpec, Service, Status, Store,
-    TaskId,
+    Draft, DraftKind, Error, Event, Expected, FailureKind, Kind, OutputKind, OutputSpec, Service,
+    Status, Store, TaskId,
 };
-use hs_m3u8_core::Url;
 use hs_m3u8_core::hls::Preference;
+use hs_m3u8_core::{Saved, Url};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc};
 
 const PLAYLIST: &str =
     "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg0.ts\n#EXTINF:1,\nseg1.ts\n#EXT-X-ENDLIST\n";
 
-/// 本地 HLS 服务：index.m3u8 与 ts_a 的两个分片；`gate` 打开前 seg1.ts 的请求挂着不回。
+/// 本地 HLS 与文件服务：index.m3u8 与 ts_a 的两个分片，一个文件 file.bin（[`FILE`]，不支持范围请求）；`gate` 打开前
+/// seg1.ts 的请求挂着不回。
 struct Server {
     base: Url,
     gate: Arc<Gate>,
@@ -77,6 +78,7 @@ impl Server {
                 "seg1.ts".to_owned(),
                 std::fs::read(fixtures.join("seg1.ts")).unwrap(),
             ),
+            ("file.bin".to_owned(), file_body()),
         ]);
         let gate = Arc::new(Gate::default());
         if gate_open {
@@ -91,6 +93,33 @@ impl Server {
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Server { base, gate }
+    }
+}
+
+/// file.bin 的字节数。
+const FILE: usize = 300_007;
+
+/// file.bin 的内容。
+fn file_body() -> Vec<u8> {
+    (0..FILE as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+/// 下载 file.bin 的草稿：服务器给的文件名为 `name`，新建前看到的总字节数为 `length`。
+fn file_draft(server: &Server, folder: PathBuf, name: &str, length: u64) -> Draft {
+    Draft {
+        url: server.base.join("file.bin").unwrap(),
+        headers: Vec::new(),
+        folder,
+        kind: DraftKind::File {
+            name: Some(name.to_owned()),
+            expected: Expected {
+                length: Some(length),
+                ..Expected::default()
+            },
+            chunk_size: None,
+        },
     }
 }
 
@@ -259,7 +288,9 @@ fn a_paused_task_resumes_after_reopening() {
     assert_eq!((task.status, task.total), (Status::Paused, Some(2)));
     // 没完成的任务不能只从列表移除，任务目录要一起放弃
     assert!(matches!(service.forget(id), Err(Error::NotFinished(_))));
-    let saved = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap();
+    let Saved::Hls(saved) = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap() else {
+        panic!("HLS 任务的任务目录");
+    };
     assert_eq!((saved.segments, saved.live), (1, false));
     // 停着时可以改请求头，不合要求的拒收
     let bad = vec![("Bad Name".to_owned(), "x".to_owned())];
@@ -658,4 +689,94 @@ fn the_proxy_setting_applies_to_probes_and_new_tasks() {
     let probed = rt.block_on(service.probe(hs_m3u8_core::Source::new(playlist)).unwrap());
     assert!(probed.unwrap().is_ok());
     assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+/// 文件任务：文件名取服务器给的，下完装到保存目录、删掉任务目录，记下字节数；同名的第二个加编号。
+#[test]
+fn a_file_task_downloads_into_the_folder() {
+    let dir = test_dir("file");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+
+    let task = create(
+        &rt,
+        &service,
+        file_draft(&server, folder.clone(), "报告.pdf", FILE as u64),
+    );
+    assert_eq!(task.spec.title, "报告.pdf");
+    let Kind::File(file) = &task.spec.kind else {
+        panic!("新建的是文件任务");
+    };
+    assert_eq!(file.path, folder.join("报告.pdf"));
+    let mut progressed = false;
+    let status = rt.block_on(async {
+        loop {
+            match events.recv().await.expect("服务还在，事件通道不会关闭") {
+                Event::FileProgress { id, .. } if id == task.id => progressed = true,
+                Event::Ended {
+                    id,
+                    status,
+                    unsaved,
+                    ..
+                } if id == task.id => {
+                    assert!(unsaved.is_none());
+                    return status;
+                }
+                _ => {}
+            }
+        }
+    });
+    assert_eq!(status, Status::Done);
+    assert!(progressed, "下载中发了进度");
+    assert_eq!(std::fs::read(folder.join("报告.pdf")).unwrap(), file_body());
+    assert!(!folder.join("报告.hsdl").exists());
+    let done = service.tasks().unwrap().remove(0);
+    assert_eq!(done.result.map(|r| r.bytes), Some(FILE as u64));
+
+    let second = create(
+        &rt,
+        &service,
+        file_draft(&server, folder.clone(), "报告.pdf", FILE as u64),
+    );
+    assert_eq!(second.spec.title, "报告 2.pdf");
+    assert_eq!(
+        rt.block_on(ended(&mut events, second.id, |_| {})),
+        Status::Done
+    );
+}
+
+/// 第一次下载时地址回的与新建前看到的不是同一个文件（大小不同）：以「不是之前的文件」失败，任务目录留着。
+#[test]
+fn a_file_that_changed_since_it_was_seen_fails_visibly() {
+    let dir = test_dir("file-changed");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+
+    let task = create(
+        &rt,
+        &service,
+        file_draft(&server, folder.clone(), "a.bin", FILE as u64 + 1),
+    );
+    let status = rt.block_on(ended(&mut events, task.id, |_| {}));
+    assert!(
+        matches!(&status, Status::Failed(f) if f.kind == FailureKind::NotExpected),
+        "{status:?}"
+    );
+    assert!(!folder.join("a.bin").exists());
+    // 停着的文件任务不能只写出已录的，也不能改存本地 HLS
+    assert!(matches!(
+        service.write_recorded(task.id),
+        Err(Error::NotHls(_))
+    ));
+    assert!(matches!(
+        service.switch_to_hls(task.id),
+        Err(Error::NotHls(_))
+    ));
+    let leftovers = rt.block_on(service.discard(task.id)).unwrap().unwrap();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    assert!(!folder.join("a.hsdl").exists());
 }

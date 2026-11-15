@@ -6,10 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::Context;
 use hs_dlx_app::{Draft, Event, Kind, Status, TaskId};
+use hs_m3u8_core::Saved;
 use tokio::sync::oneshot;
 
 use super::Tasks;
 use super::row::{Disk, Present, Row};
+use crate::format;
 use crate::rate::Rate;
 use crate::signals::Level;
 
@@ -268,12 +270,20 @@ impl Tasks {
             self.add_notice(format!("正在退出，「{title}」没有继续"));
             return;
         }
-        let (baseline, start) = match &row.disk {
-            Disk::Read(saved) => (
-                Some(saved.as_ref().map_or(0, |s| s.segments)),
-                Some(saved.as_ref().map_or(Duration::ZERO, |s| s.duration)),
+        // 续传的起点：HLS 为已完成的片数与已录时长；文件的剩余时间按字节算，不用片数
+        let (baseline, start, already) = match &row.disk {
+            Disk::Read(Some(Saved::Hls(saved))) => (
+                Some(saved.segments),
+                Some(saved.duration),
+                (saved.segments > 0).then(|| format!("{} 片", saved.segments)),
             ),
-            Disk::Unread | Disk::Unreadable(_) => (None, None),
+            Disk::Read(Some(Saved::File(saved))) => (
+                Some(0),
+                None,
+                (saved.bytes > 0).then(|| format::bytes(saved.bytes)),
+            ),
+            Disk::Read(None) => (Some(0), Some(Duration::ZERO), None),
+            Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
             matches!(row.task.status, Status::Failed(_)),
@@ -284,13 +294,14 @@ impl Tasks {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 row.task = task;
                 row.progress = None;
+                row.file_progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
                 }
-                let text = match baseline {
-                    Some(n) if n > 0 => format!("{label}：任务目录里已有 {n} 片"),
-                    _ => label.to_owned(),
+                let text = match already {
+                    Some(already) => format!("{label}：任务目录里已有 {already}"),
+                    None => label.to_owned(),
                 };
                 row.signal(Level::Info, text);
             }

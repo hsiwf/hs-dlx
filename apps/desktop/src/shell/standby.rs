@@ -5,8 +5,8 @@
 use std::f32::consts::TAU;
 
 use gpui_kit::{
-    AnyElement, Context, Div, FontWeight, IntoElement, ParentElement as _, Styled as _, Window,
-    div, px,
+    AnyElement, Context, Div, FontWeight, IntoElement, ParentElement as _, PathBuilder,
+    Styled as _, Window, canvas, div, point, px,
 };
 use hs_m3u8_core::{Proxy, bare_url};
 
@@ -71,13 +71,13 @@ impl Shell {
                 "认出链接",
                 theme::accent(),
                 dial::Big::Phrase(url.host_str().unwrap_or_default().to_owned()),
-                "回车探测；是网页就在后台找视频流",
+                "回车探测；是网页就在后台找视频流，是文件就下载",
             ),
             None => dial::readout(
                 "就绪",
                 theme::accent(),
                 dial::Big::Phrase("粘贴链接开始".to_owned()),
-                "m3u8 地址，或有视频的网页",
+                "m3u8 地址、有视频的网页，或文件",
             ),
         };
         let figure = dial::lit_dial(
@@ -90,7 +90,7 @@ impl Shell {
         (stage, self.standby_inspector(tasks, cx))
     }
 
-    /// 待机页的检查面板：新任务照着开始的保存位置、可用空间与网络，与支持哪两种链接；剪贴板里有链接时底栏是探测它。
+    /// 待机页的检查面板：新任务照着开始的保存位置、可用空间与网络，与支持哪几种链接；剪贴板里有链接时底栏是探测它。
     fn standby_inspector(&self, tasks: &Tasks, cx: &Context<Self>) -> Div {
         let (free, no_space) = match tasks.free_space() {
             None => ("—".to_owned(), None),
@@ -138,6 +138,11 @@ impl Shell {
                     "有视频的网页",
                     "在后台打开，找出里面的视频流",
                 ))
+                .child(kind(
+                    file_icon(),
+                    "文件",
+                    "服务器支持时分段并行下载、断点续传",
+                ))
                 .into_any_element(),
         );
         let foot = self.clipboard.clone().map(|url| {
@@ -179,6 +184,31 @@ fn kind(icon: AnyElement, name: &'static str, does: &'static str) -> Div {
 }
 
 /// 网页的小图形：圆角方框里两道横线。
+/// 「文件」的小图形：一个往下的箭头落在一条横线上。
+fn file_icon() -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        |bounds, (), window, _| {
+            let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+            let mut path = PathBuilder::stroke(px(2.));
+            path.move_to(at(14., 5.));
+            path.line_to(at(14., 18.));
+            path.move_to(at(9., 13.));
+            path.line_to(at(14., 18.));
+            path.line_to(at(19., 13.));
+            path.move_to(at(6., 23.));
+            path.line_to(at(22., 23.));
+            let path = path
+                .build()
+                .expect("几条线段的描边，顶点远低于曲面细分的上限");
+            window.paint_path(path, theme::hover_edge());
+        },
+    )
+    .size(px(KIND_ICON))
+    .flex_none()
+    .into_any_element()
+}
+
 fn page_icon() -> AnyElement {
     let bar = |width: f32| div().h(px(2.)).w(px(width)).bg(theme::hover_edge());
     div()
