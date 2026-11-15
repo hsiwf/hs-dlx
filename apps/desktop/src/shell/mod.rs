@@ -89,7 +89,8 @@ pub struct Shell {
     /// 窗口的动态背景
     backdrop: Backdrop,
     /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图，并让窗口重画（装饰动效的节拍，见
-    /// [`crate::motion`]）：窗口在前台、系统没要求减少动态效果时每次都重画，否则只在背景换了图时重画
+    /// [`crate::motion`]）：窗口在前台、系统没要求减少动态效果时每次都重画，否则只在背景换了图时重画。
+    /// 简化：整窗每次都重画（任务栏每一项的小环都重新细分），任务很多、机器很弱时成为瓶颈再把任务栏拆成缓存的视图
     _frames: Task<()>,
     /// 这次进入待机页的时刻：彗尾与背光按它走
     standby_since: Instant,
@@ -138,17 +139,19 @@ impl Shell {
             loop {
                 cx.background_executor().timer(backdrop::FRAME).await;
                 let ticked = this.update_in(cx, |this, window, cx| {
-                    let still = cx.reduce_motion();
-                    motion::set_still(still);
-                    let speed = this.tasks.read(cx).activity(Instant::now()).speed;
-                    let changed = match this.backdrop.tick(speed, cx) {
-                        Ok(changed) => changed,
-                        Err(backdrop::Stopped(error)) => {
-                            this.tell(format!("动态背景没有启用，界面改用纯色底：{error}"), cx);
-                            true
+                    let changed = if this.backdrop.stopped() {
+                        false
+                    } else {
+                        let speed = this.tasks.read(cx).activity(Instant::now()).speed;
+                        match this.backdrop.tick(speed, cx) {
+                            Ok(changed) => changed,
+                            Err(backdrop::Stopped(error)) => {
+                                this.tell(format!("动态背景没有启用，界面改用纯色底：{error}"), cx);
+                                true
+                            }
                         }
                     };
-                    if changed || (window.is_window_active() && !still) {
+                    if changed || (window.is_window_active() && !cx.reduce_motion()) {
                         cx.notify();
                     }
                 });
@@ -359,6 +362,7 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
+        motion::set_still(cx.reduce_motion());
         let cx = &*cx;
         let tasks = self.tasks.read(cx);
         let mut body = div()

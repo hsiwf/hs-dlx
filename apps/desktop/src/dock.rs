@@ -254,14 +254,14 @@ impl Render for Dock {
     }
 }
 
-/// 胶囊形（`bounds` 里两端为半圆）的描边上，沿边走到 `head`（一圈为 1，从上边左端起顺时针）处的一段流光：前后各约
-/// 一成周长由暗到亮再到暗，最亮处在 `head` 稍后。
+/// 粘贴栏 1 点宽的描边上（`bounds` 为描边以内），沿边走到 `head`（一圈为 1，从上边左端起顺时针）处的一段流光：前后
+/// 各约一成周长由暗到亮再到暗，最亮处在 `head`。
 fn paint_sweep(bounds: Bounds<Pixels>, head: f32, window: &mut Window) {
     /// 流光在 `head` 前后各占周长的多少，与分几段画。
     const BEFORE: f32 = 0.13;
     const AFTER: f32 = 0.12;
     const STEPS: usize = 48;
-    let edge = Stadium::inside(bounds);
+    let edge = Stadium::around(bounds);
     let accent = theme::accent();
     for step in 0..STEPS {
         let from = step as f32 / STEPS as f32;
@@ -274,6 +274,10 @@ fn paint_sweep(bounds: Bounds<Pixels>, head: f32, window: &mut Window) {
         } else {
             (1. - middle) / (1. - peak)
         };
+        // 两端几乎看不见的几段不画
+        if strength < 0.1 {
+            continue;
+        }
         let at = |t: f32| edge.at(head - BEFORE + t * (BEFORE + AFTER));
         for (width, alpha) in [(4., 0.25), (1.5, 0.9)] {
             let mut path = PathBuilder::stroke(px(width));
@@ -293,12 +297,12 @@ struct Stadium {
 }
 
 impl Stadium {
-    /// `bounds` 里 1 点宽的描边的中线。
-    fn inside(bounds: Bounds<Pixels>) -> Stadium {
+    /// 紧贴 `bounds` 外面的 1 点宽的描边的中线。
+    fn around(bounds: Bounds<Pixels>) -> Stadium {
         Stadium {
-            origin: point(bounds.origin.x + px(0.5), bounds.origin.y + px(0.5)),
-            width: f32::from(bounds.size.width) - 1.,
-            radius: (f32::from(bounds.size.height) - 1.) / 2.,
+            origin: point(bounds.origin.x - px(0.5), bounds.origin.y - px(0.5)),
+            width: f32::from(bounds.size.width) + 1.,
+            radius: (f32::from(bounds.size.height) + 1.) / 2.,
         }
     }
 

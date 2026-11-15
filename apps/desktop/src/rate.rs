@@ -22,7 +22,8 @@ pub struct Rate {
     done: usize,
     /// 最近一次进度里本次运行读到的字节数
     received: u64,
-    /// 速度表的格：(从开始算第几格, 这一格里读到的字节数)，按先后，只留最近的 [`BARS`] 格；没读到字节的格不记
+    /// 速度表的格：(从开始算第几格, 这一格里读到的字节数)，按先后，只留最近的 [`BARS`] 格与正在走的一格；没读到字节的
+    /// 格不记
     bars: VecDeque<(u64, u64)>,
 }
 
@@ -59,7 +60,7 @@ impl Rate {
             while self
                 .bars
                 .front()
-                .is_some_and(|(first, _)| first + BARS as u64 <= bar)
+                .is_some_and(|(first, _)| first + (BARS as u64) < bar)
             {
                 self.bars.pop_front();
             }
@@ -161,8 +162,10 @@ mod tests {
         assert!(history[..BARS - 3].iter().all(|&v| v == 0.0));
         // 还在第 0 格里时一格也没走完
         assert!(rate.history(at(1400)).iter().all(|&v| v == 0.0));
+        // 第 40 格里读到 1.5 MB：速度表里最旧的仍是第 0 格
+        rate.update(at(60_100), 6_000_000, 4);
+        assert_eq!(rate.history(at(60_500))[0], 2_000_000.0);
         // 第 41 格时最旧的是第 1 格，第 0 格已移出速度表
-        rate.update(at(61_000), 6_000_000, 4);
         let later = rate.history(at(61_600));
         assert_eq!(later[0], 1_000_000.0);
         assert_eq!(later[BARS - 1], 1_000_000.0);

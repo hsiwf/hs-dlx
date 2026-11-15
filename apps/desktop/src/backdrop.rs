@@ -5,7 +5,9 @@
 //! （[`report_disc`]、[`panel_floor`]），下一次送参数时用。面板自己不涂底色：铺着的图是按它现在的位置画的时，面板
 //! 的底已在图里（光从朝圆盘的那条边漫进去）；不是时（刚换页、刚改大小、没有 GPU）面板自己涂纯色底。
 
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::cell::Cell;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
@@ -31,24 +33,27 @@ const MAX_STEP: Duration = Duration::from_millis(100);
 /// 约 8 点、10 MB/s 约 12 点、100 MB/s 约 18 点；没有下载时不流。
 const FLOW_BASE: f32 = 6.;
 const FLOW_PER_DECADE: f32 = 6.;
-/// 第一次送出参数后多久还没画出第一帧，就当 GPU 用不了：取适配器、建设备在驱动卡住时没有期限。
-const FIRST_FRAME: Duration = Duration::from_secs(10);
+/// 送出的参数多久还没画出来，就当 GPU 用不了：取适配器、建设备与驱动的其他调用卡住时没有期限，画一帧正常时在几十
+/// 毫秒内。
+const STALL: Duration = Duration::from_secs(10);
 
-/// 背景停了的原因：建不起 GPU 渲染器、画某一帧时 GPU 出错、迟迟画不出第一帧，或界面放不下画好的图。停了之后界面
-/// 一直用纯色底。
+/// 背景停了的原因：建不起 GPU 渲染器、画某一帧时 GPU 出错，或渲染线程卡住。停了之后这个进程里的窗口都用纯色底，
+/// 重开窗口也不再试。
 #[derive(Debug)]
 pub struct Stopped(pub String);
 
-/// 窗口的动态背景：后台渲染线程、动画走到哪。由主窗口的视图持有；释放时通知渲染线程退出（它画完手上的一帧、最多
-/// 2 秒后退出），不等它。
+/// 背景在这个进程里停了的原因；没停时为空。
+static GIVEN_UP: OnceLock<String> = OnceLock::new();
+
+/// 窗口的动态背景：后台渲染线程、动画走到哪。由主窗口的视图持有；释放时通知渲染线程退出，不等它：正在画的一帧最多
+/// 约 4 秒（等画完与等读回各 2 秒）后退出；卡在驱动里时一直不退出，此时背景已因 [`STALL`] 停掉，这个进程不再起新的
+/// 渲染线程，所以至多留下一个。
 pub struct Backdrop {
     shared: Arc<Shared>,
     /// 上次送参数的时刻
     last_tick: Instant,
-    /// 第一次送出参数的时刻；画出（或因画面太大跳过）过一帧后为 None
-    awaiting_first: Option<Instant>,
-    /// 画出（或跳过）过一帧
-    drawn: bool,
+    /// 送出、还没画出的参数里最早的那次的时刻；都画出了时为 None
+    waiting_since: Option<Instant>,
     /// 光芒在一个循环里走到哪（0 到 1）
     phase: f32,
     /// 网格向外流过的距离（逻辑点，0 到一个格距）
@@ -123,40 +128,46 @@ struct Board {
     shown: Option<Painted>,
     /// 上一帧画出去的图：换了图之后从图集里移除它
     painted: Option<Arc<RenderImage>>,
-    /// 界面放不下画好的图（图集分配不到显存）的原因：下一次 [`Backdrop::tick`] 据此停掉背景
-    broken: Option<String>,
 }
 
 impl Global for Board {}
 
 impl Backdrop {
-    /// 起渲染线程（在线程里建 GPU 渲染器，建不起时第一次 [`Backdrop::tick`] 报出原因），重置布局的交接。
+    /// 起渲染线程（在线程里建 GPU 渲染器，建不起时 [`Backdrop::tick`] 报出原因），重置布局的交接。这个进程里背景
+    /// 已停过时不起线程，一直是纯色底（原因当时已报过）。
     pub fn new(cx: &mut App) -> Backdrop {
         cx.set_global(Board::default());
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
         });
-        // 线程不等它结束：视图释放时 closed 让它退出
-        let _detached = std::thread::Builder::new()
-            .name("backdrop".to_owned())
-            .spawn({
-                let shared = shared.clone();
-                move || work(&shared)
-            })
-            .expect("起一个线程只在系统资源耗尽时失败");
+        let stopped = GIVEN_UP.get().is_some();
+        if !stopped {
+            // 不等它结束：视图释放时 closed 让它退出
+            let _detached = std::thread::Builder::new()
+                .name("backdrop".to_owned())
+                .spawn({
+                    let shared = shared.clone();
+                    move || work(&shared)
+                })
+                .expect("起一个线程只在系统资源耗尽时失败");
+        }
         Backdrop {
             shared,
             last_tick: Instant::now(),
-            awaiting_first: None,
-            drawn: false,
+            waiting_since: None,
             phase: 0.,
             flow: 0.,
             strength: 0.,
             disc: None,
             sent: None,
-            stopped: false,
+            stopped,
         }
+    }
+
+    /// 背景已停。
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// 走一步动画、按上一帧的布局送参数、取走画好的图。`speed` 为所有任务合计的下载速度（字节每秒）。返回是否换了
@@ -173,30 +184,32 @@ impl Backdrop {
         self.last_tick = now;
         let reduce_motion = cx.reduce_motion();
         let board = cx.global_mut::<Board>();
-        let finished = self.shared.lock().finished.take();
-        let late = self
-            .awaiting_first
-            .is_some_and(|sent| now.duration_since(sent) > FIRST_FRAME);
-        let failure = match (board.broken.take(), finished) {
-            (Some(reason), _) => Err(reason),
-            (None, Some(Err(error))) => Err(error.to_string()),
-            (None, Some(Ok(painted))) => {
-                self.drawn = true;
-                self.awaiting_first = None;
+        let (finished, queued) = {
+            let mut state = self.shared.lock();
+            (state.finished.take(), state.wanted.is_some())
+        };
+        let outcome = match finished {
+            Some(Err(error)) => Err(error.to_string()),
+            Some(Ok(painted)) => {
+                // 画出了一帧；后面还排着一帧时从现在起等它
+                self.waiting_since = queued.then_some(now);
                 board.shown = painted;
                 Ok(true)
             }
-            (None, None) if late => Err(format!(
-                "GPU 在 {} 秒内没有画出第一帧",
-                FIRST_FRAME.as_secs()
-            )),
-            (None, None) => Ok(false),
+            None if self
+                .waiting_since
+                .is_some_and(|since| now.duration_since(since) > STALL) =>
+            {
+                Err(format!("GPU {} 秒没有画出一帧", STALL.as_secs()))
+            }
+            None => Ok(false),
         };
-        let changed = match failure {
+        let changed = match outcome {
             Ok(changed) => changed,
             Err(reason) => {
                 self.stopped = true;
                 board.shown = None;
+                let _first = GIVEN_UP.set(reason.clone());
                 return Err(Stopped(reason));
             }
         };
@@ -228,9 +241,7 @@ impl Backdrop {
         let params = self.params(viewport, center, &measured.panels);
         if self.sent != Some(params) {
             self.sent = Some(params);
-            if !self.drawn && self.awaiting_first.is_none() {
-                self.awaiting_first = Some(now);
-            }
+            self.waiting_since.get_or_insert(now);
             let mut state = self.shared.lock();
             state.wanted = Some(Job {
                 params,
@@ -299,7 +310,8 @@ impl Shared {
 
 /// 渲染线程：建渲染器，等参数、画、交回，直到视图释放或出错。
 fn work(shared: &Shared) {
-    let mut renderer = match Renderer::new() {
+    CONTAINED.set(true);
+    let mut renderer = match guarded(Renderer::new) {
         Ok(renderer) => renderer,
         Err(error) => {
             shared.lock().finished = Some(Err(error));
@@ -322,7 +334,7 @@ fn work(shared: &Shared) {
                     .expect("拿着这把锁时只做赋值与取值，不会 panic");
             }
         };
-        let result = match renderer.render(&job.params) {
+        let result = match guarded(|| renderer.render(&job.params)) {
             Ok(frame) => {
                 let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
                     .expect("渲染器交回的像素正好是宽乘高乘 4 字节");
@@ -342,6 +354,33 @@ fn work(shared: &Shared) {
             return;
         }
     }
+}
+
+thread_local! {
+    /// 这个线程上的 panic 由 [`guarded`] 收住，不中止进程：只在渲染线程上为真
+    static CONTAINED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 当前线程上的 panic 会被收住、转成背景停了（见 [`guarded`]）；应用的 panic 钩子据此不中止进程。
+pub fn contains_panics() -> bool {
+    CONTAINED.get()
+}
+
+/// 调 wgpu：它遇到它认为致命的错误时 panic（如等 GPU 画完时设备丢失），这里收住、转成 [`hs_dlx_scene::Error::Gpu`]。
+/// 渲染线程只持有自己的渲染器，panic 时不拿着与界面共享的锁，收住后丢掉渲染器、线程退出，不留下坏掉的状态。
+fn guarded<T>(
+    work: impl FnOnce() -> Result<T, hs_dlx_scene::Error>,
+) -> Result<T, hs_dlx_scene::Error> {
+    std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("没有说明");
+        Err(hs_dlx_scene::Error::Gpu(format!(
+            "GPU 驱动出了致命错误：{reason}"
+        )))
+    })
 }
 
 /// 网格每秒向外流过的逻辑点（见 [`FLOW_BASE`]）。
@@ -409,13 +448,13 @@ pub fn layer() -> impl IntoElement {
             }
             if let Some((image, size)) = shown {
                 let bounds = Bounds::new(bounds.origin, size);
-                // 图集分配不到显存：不铺，面板改涂纯色底，下一次送参数时停掉背景
-                if let Err(error) =
-                    window.paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                // 界面的图集放不下（图比界面的 GPU 允许的最大纹理还大，或分配不到显存）：这一帧不铺，面板改涂纯色底；
+                // 窗口改小后照常
+                if window
+                    .paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                    .is_err()
                 {
-                    let board = cx.global_mut::<Board>();
-                    board.shown = None;
-                    board.broken = Some(format!("界面放不下背景图：{error}"));
+                    cx.global_mut::<Board>().shown = None;
                 }
             }
         },

@@ -472,8 +472,9 @@ fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点：最新一条的节点实心发光、缓缓呼吸，要留意与失败
-/// 级别的那一条整行带同色的淡底与描边，较早的（第 [`SIGNAL_FRESH`] 条往后）变淡。每条下面一行是时刻与连续发生的次数。
+/// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点。要留意与失败级别的各条整行带同色的淡底与描边，
+/// 节点是同色的空心圈；其余的节点是暗的空心圈，最新一条是一般级别时它的节点实心发光、缓缓呼吸。较早的（第
+/// [`SIGNAL_FRESH`] 条往后）变淡。每条下面一行是时刻与连续发生的次数。
 fn signals(signals: &[Signal]) -> Div {
     let accent = theme::accent();
     let last = signals.len().saturating_sub(1);

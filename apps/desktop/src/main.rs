@@ -75,12 +75,15 @@ fn application() -> gpui_kit::Application {
 }
 
 fn main() {
-    // 任何线程上的 panic 都是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务
-    // 悄悄消失；存储里还标着运行中的任务下次打开时按暂停处理
+    // panic 是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务悄悄消失；存储里
+    // 还标着运行中的任务下次打开时按暂停处理。背景的渲染线程除外：wgpu 把驱动的致命错误当 panic 报，那里收住后只停掉
+    // 背景（见 backdrop::contains_panics）
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         report(info);
-        std::process::abort();
+        if !backdrop::contains_panics() {
+            std::process::abort();
+        }
     }));
     // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调见 main_window）
     #[cfg(target_os = "macos")]
