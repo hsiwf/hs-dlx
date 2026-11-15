@@ -10,6 +10,7 @@
 - 粘贴 curl 命令：浏览器开发者工具里「复制为 cURL」的内容（Chrome、Firefox、Safari；bash 与 Windows cmd 两种写法）
   贴进粘贴栏即探测，地址、请求头、Cookie、`-u` 的用户名口令一起带上；贴进「改请求头」也认。由下载器或连接决定的
   请求头（Accept-Encoding、Range、Host 等）不带，在请求头下面列出；POST 等带请求体的请求、不认识的参数会写明原因
+- 认迅雷 `thunder://`、QQ 旋风 `qqdl://`、快车 `flashget://` 链接，取出里面的地址探测
 
 ## [0.1.0] - 2026-11-15
 

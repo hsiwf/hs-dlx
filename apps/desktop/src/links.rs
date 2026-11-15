@@ -1,6 +1,6 @@
 //! 什么文字算链接：粘贴栏、剪贴板、启动参数与再次打开应用时转交来的。
 
-use hs_dlx_app::curl;
+use hs_dlx_app::{curl, special_link};
 use hs_m3u8_core::Url;
 
 /// 不是 http(s) 链接时给用户的说法。
@@ -13,13 +13,20 @@ pub fn http_url(text: &str) -> Option<Url> {
         .filter(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-/// 要探测的请求：`text` 是 curl 命令时按命令拆（见 [`curl::parse`]），否则要是 http(s) 链接（不带请求头）；都不是时
-/// 为给用户的原因。
+/// 要探测的请求：`text` 是 curl 命令时按命令拆（见 [`curl::parse`]），是迅雷等的专用链接时取里面的地址（见
+/// [`special_link::unwrap`]），否则要是 http(s) 链接（不带请求头）；都不是时为给用户的原因。
 pub fn request(text: &str) -> Result<curl::Request, String> {
     if curl::is_command(text) {
         return curl::parse(text).map_err(|error| error.to_string());
     }
-    let url = http_url(text).ok_or_else(|| NOT_HTTP.to_owned())?;
+    let inner = special_link::unwrap(text)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let url = match inner {
+        Some(inner) => http_url(&inner)
+            .ok_or_else(|| format!("专用链接里的地址不是 http 或 https：{inner}"))?,
+        None => http_url(text).ok_or_else(|| NOT_HTTP.to_owned())?,
+    };
     Ok(curl::Request {
         url,
         headers: Vec::new(),

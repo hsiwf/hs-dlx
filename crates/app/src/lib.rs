@@ -7,6 +7,7 @@ mod naming;
 mod preference;
 mod service;
 mod settings;
+pub mod special_link;
 mod store;
 mod task;
 
