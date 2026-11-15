@@ -5,6 +5,8 @@
 //! 调用。
 
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 /// 一套光的颜色（各通道线性的 0 到 1）。
@@ -269,12 +271,14 @@ impl Renderer {
             // 接收端在下面等着，发送失败只会是这个函数已经因超时返回
             let _waited = sender.send(result);
         });
-        self.device
-            .poll(wgpu::PollType::Wait {
+        let device = &self.device;
+        contained(|| {
+            device.poll(wgpu::PollType::Wait {
                 submission_index: Some(submission),
                 timeout: Some(FRAME_TIMEOUT),
             })
-            .map_err(|error| Error::Gpu(error.to_string()))?;
+        })?
+        .map_err(|error| Error::Gpu(error.to_string()))?;
         receiver
             .recv_timeout(FRAME_TIMEOUT)
             .map_err(|_| Error::Gpu("读回没有完成".to_owned()))?
@@ -328,6 +332,34 @@ impl Renderer {
             readback,
         }
     }
+}
+
+thread_local! {
+    /// 当前线程正在 [`contained`] 里
+    static CONTAINED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 当前线程上此刻发生的 panic 会被渲染器收住、转成 [`Error::Gpu`]：只在等 GPU 画完的那一刻为真。应用把 panic 当不变量
+/// 被破坏、中止进程时，据此放过这一种。
+pub fn panics_contained() -> bool {
+    CONTAINED.get()
+}
+
+/// 做 `work`，期间的 panic 收住、转成 [`Error::Gpu`]。只用在等 GPU 画完上：wgpu 等待时遇到设备丢失、显存不足等它认为
+/// 致命的错误不返回错误而是 panic，那是外部的故障，不是本库的不变量被破坏。panic 时 wgpu 不拿着会中毒的锁（它的锁
+/// 不中毒），收住后这个渲染器的设备照样能用或照样报错。
+fn contained<T>(work: impl FnOnce() -> T) -> Result<T, Error> {
+    CONTAINED.set(true);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(work));
+    CONTAINED.set(false);
+    result.map_err(|panic| {
+        let reason = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("没有说明");
+        Error::Gpu(format!("等 GPU 画完时设备出错：{reason}"))
+    })
 }
 
 /// 在错误作用域里做 `work`：期间 GPU 报的校验错误、显存不足与内部错误收下来变成 [`Error::Gpu`]（几个都有时取第一
