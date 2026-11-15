@@ -331,7 +331,7 @@ impl NewTask {
                 // 取的那一端随句柄释放而丢弃，这里随之结束
                 self._metadata = cx.spawn(async move |this, cx| {
                     while progress.changed().await.is_ok() {
-                        let now = *progress.borrow_and_update();
+                        let now = progress.borrow_and_update().clone();
                         let shown = this.update(cx, |this, cx| {
                             if let Probing::Metadata(at) = &mut this.probing {
                                 *at = now;

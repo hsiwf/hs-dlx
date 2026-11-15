@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle as ThreadHandle;
 use std::time::Duration;
 
-use hs_dlx_torrent::{AddOptions, Alert, AlertKind, Session, SessionConfig, State, TorrentId};
+use hs_dlx_torrent::{
+    AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, State, TorrentId,
+};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +26,12 @@ const PUMP_WAIT_MS: u32 = 250;
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 /// 等 libtorrent 一步的结果（续传数据、写完缓存、移除完、删完文件）最多等多久：都只是本机的操作。
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 连着节点而凑不齐全部内容要连续这么多次状态（每次 [`STATUS_INTERVAL`]，共 3 秒）才算资源不足：刚连上的节点在报来
+/// 它有哪些块之前也计入节点数，开始时会短暂凑不齐。
+const SCARCE_TICKS: u32 = 6;
+/// 操作系统在用户打开过的目录里自己建的文件（访达的显示设置、Windows 资源管理器的缩略图与目录设置）：放弃 BT 任务时
+/// 随下了的文件一起删，不算用户放进去的东西。
+const OS_LITTER: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
 
 /// BT 会话连哪里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,10 +130,12 @@ pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// 磁力链接取种子信息的进度。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetadataProgress {
     /// 连着的节点数
     pub peers: u32,
+    /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None
+    pub tracker_error: Option<String>,
 }
 
 /// 运行中的 BT 任务在做什么。
@@ -158,6 +168,11 @@ pub struct TorrentProgress {
     /// 要下的块数，其中能凑齐的（自己已有，或在线的节点里至少有一个有）：少于 `pieces` 时眼下的节点凑不齐全部内容
     pub pieces: u32,
     pub reachable: u32,
+    /// 资源不足：下载中连着节点，凑不齐全部内容已持续 3 秒以上
+    pub scarce: bool,
+    /// 这次运行里最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None。私有种子只经
+    /// tracker 找节点，它报错时多半一直连不上节点
+    pub tracker_error: Option<String>,
 }
 
 impl TorrentProgress {
@@ -184,6 +199,8 @@ impl TorrentProgress {
             seeds: count(status.seeds),
             pieces: count(status.pieces),
             reachable: count(status.reachable_pieces),
+            scarce: false,
+            tracker_error: None,
         }
     }
 }
@@ -356,13 +373,12 @@ impl Owner {
             .map_err(|_| Error::Torrent(format!("10 秒内没等到{what}（种子 {}）", self.id)))?
     }
 
-    /// 从会话里移除（`delete_files` 时连同文件一起删）并等它移除完；删文件失败时报 [`Error::Torrent`]，说明为
-    /// libtorrent 的。
-    async fn remove(&mut self, delete_files: bool) -> Result<(), Error> {
+    /// 从会话里移除（照 `removal` 连带删文件）并等它移除完；删文件失败时报 [`Error::Torrent`]，说明为 libtorrent 的。
+    async fn remove(&mut self, removal: Removal) -> Result<(), Error> {
         self.session()
-            .remove(&self.id, delete_files)
+            .remove(&self.id, removal)
             .map_err(self.libtorrent("移除"))?;
-        let (mut removed, mut deleted) = (false, !delete_files);
+        let (mut removed, mut deleted) = (false, removal == Removal::Keep);
         let mut failed = None;
         while !(removed && deleted) {
             let alert = self
@@ -396,6 +412,8 @@ impl Owner {
 /// 引擎的持有者：第一次用到时建会话与取事件的线程，关闭时收掉。
 pub(crate) struct Bt {
     network: TorrentNetwork,
+    /// 关闭了（[`Bt::close`]）：不再建会话
+    closed: AtomicBool,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     running: Mutex<Option<Running>>,
@@ -418,14 +436,19 @@ impl Bt {
     pub fn new(network: TorrentNetwork) -> Bt {
         Bt {
             network,
+            closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
             running: Mutex::new(None),
         }
     }
 
-    /// 引擎；还没有时照上次存下的 `saved`（端口与 DHT 状态）建会话。会话建不出时报 [`Error::Torrent`]。
+    /// 引擎；还没有时照上次存下的 `saved`（端口与 DHT 状态）建会话。已关闭时报 [`Error::Closed`]，会话建不出时报
+    /// [`Error::Torrent`]。
     pub fn engine(&self, saved: SessionState) -> Result<Arc<Engine>, Error> {
         let mut running = lock(&self.running);
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
         if let Some(running) = &*running {
             return Ok(running.engine.clone());
         }
@@ -473,7 +496,12 @@ impl Bt {
     /// 关闭：停下取事件的线程（最多等 [`PUMP_WAIT_MS`]），返回要存下的会话状态；没建过会话时为 None。会话随最后一个
     /// 持有引擎的释放而关，释放时阻塞（见 [`Session`]）。
     pub fn close(&self) -> Result<Option<SessionState>, Error> {
-        let Some(running) = lock(&self.running).take() else {
+        let taken = {
+            let mut running = lock(&self.running);
+            self.closed.store(true, Ordering::Relaxed);
+            running.take()
+        };
+        let Some(running) = taken else {
             return Ok(None);
         };
         running.engine.stop.store(true, Ordering::Relaxed);
@@ -528,6 +556,7 @@ pub(crate) async fn fetch_metadata(
     // 加进去之后才登记：同一个种子已在会话里时上面就报错了，不会抢别人的事件
     let mut owner = engine.own(&id)?;
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
+    let mut tracker_error = None;
     // 登记之前已取到的，事件不会再来：每次先看状态
     loop {
         let status = owner
@@ -539,10 +568,17 @@ pub(crate) async fn fetch_metadata(
         }
         progress.send_replace(MetadataProgress {
             peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
+            tracker_error: tracker_error.clone(),
         });
         // 取到种子信息的事件丢了也不要紧：每次都看状态
         tokio::select! {
-            _routed = owner.next() => {}
+            routed = owner.next() => {
+                if let Routed::Alert(alert) = routed
+                    && alert.kind == AlertKind::TrackerError
+                {
+                    tracker_error = Some(alert.message);
+                }
+            }
             _ = ticks.tick() => {}
         }
     }
@@ -582,7 +618,7 @@ struct Probe {
 impl Drop for Probe {
     fn drop(&mut self) {
         // 移除不了只在它已不在会话里时：那正是要的结果
-        let _absent = self.engine.session.remove(&self.id, false);
+        let _absent = self.engine.session.remove(&self.id, Removal::Keep);
     }
 }
 
@@ -621,7 +657,16 @@ pub(crate) async fn run(
     };
     let id = match TorrentId::parse(info_hash) {
         Ok(id) => id,
-        Err(error) => return failed(Error::Corrupt(format!("种子的编号：{error}"))),
+        // 存储里读出的编号认不出：再试也一样
+        Err(error) => {
+            return Ended {
+                outcome: Outcome::Failed(Failure {
+                    kind: FailureKind::Unrecoverable,
+                    message: Error::Corrupt(format!("种子的编号：{error}")).to_string(),
+                }),
+                resume: None,
+            };
+        }
     };
     let mut owner = match engine.own(&id) {
         Ok(owner) => owner,
@@ -644,7 +689,8 @@ pub(crate) async fn run(
         return failed(error);
     }
     let outcome = drive(&mut owner, &cancel, &mut each).await;
-    let (resume, stopped) = stop(&mut owner).await;
+    let finished = matches!(outcome, Outcome::Finished(_));
+    let (resume, stopped) = stop(&mut owner, finished).await;
     // 停下时写盘出错或等不到结果：已下的不一定都在磁盘上、之后不一定立即加得进，下完与暂停都改报这个失败
     let outcome = match (outcome, stopped) {
         (Outcome::Failed(failure), _) => Outcome::Failed(failure),
@@ -661,18 +707,28 @@ async fn drive(
     each: &mut impl FnMut(TorrentProgress),
 ) -> Outcome {
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
+    // 连续几次状态凑不齐全部内容（见 SCARCE_TICKS）
+    let mut short = 0;
+    let mut tracker_error = None;
     loop {
         tokio::select! {
             () = cancel.cancelled() => return Outcome::Paused,
             routed = owner.next() => match routed {
                 Routed::Alert(alert) => match alert.kind {
                     AlertKind::Finished => return finished(owner),
-                    AlertKind::FileError | AlertKind::TorrentError => {
+                    AlertKind::FileError => {
                         return Outcome::Failed(Failure {
                             kind: FailureKind::Disk,
-                            message: format!("BT 下载写文件出错：{}", alert.message),
+                            message: format!("BT 下载读写文件出错：{}", alert.message),
                         });
                     }
+                    AlertKind::TorrentError => {
+                        return Outcome::Failed(Failure {
+                            kind: FailureKind::Other,
+                            message: format!("BT 种子出错：{}", alert.message),
+                        });
+                    }
+                    AlertKind::TrackerError => tracker_error = Some(alert.message),
                     // 续传数据与磁盘对不上时 libtorrent 自己改为整体校验，照常运行
                     _ => {}
                 },
@@ -685,10 +741,16 @@ async fn drive(
             },
             _ = ticks.tick() => match owner.session().status(&owner.id) {
                 Ok(status) => {
-                    let progress = TorrentProgress::of(&status);
+                    let mut progress = TorrentProgress::of(&status);
                     if progress.phase == TorrentPhase::Finishing {
                         return finished(owner);
                     }
+                    let shortfall = progress.phase == TorrentPhase::Downloading
+                        && progress.peers > 0
+                        && progress.reachable < progress.pieces;
+                    short = if shortfall { short + 1 } else { 0 };
+                    progress.scarce = short >= SCARCE_TICKS;
+                    progress.tracker_error.clone_from(&tracker_error);
                     each(progress);
                 }
                 Err(error) => {
@@ -713,22 +775,42 @@ fn finished(owner: &Owner) -> Outcome {
     }
 }
 
-/// 停下：要续传数据、紧接着把缓存写到磁盘，等两者都回来，再从会话里移除并等它移除完。返回要存的续传数据（没要到时为
-/// None），与停下时出的问题：写盘出错（[`FailureKind::Disk`]），或要不到、等不到结果。
-async fn stop(owner: &mut Owner) -> (Option<Resume>, Result<(), Failure>) {
+/// 停下：要续传数据、紧接着把缓存写到磁盘，等两者都回来，再从会话里移除并等它移除完（`finished` 时连带删掉存不要的
+/// 文件的部分块的 `.parts` 文件：下完了不做种，它不再有用）。还没校验完已有的文件就停下的（libtorrent 这时写出的续传
+/// 数据里一块也没有，torrent.cpp 的 write_resume_data 按已校验到哪写），不要续传数据，存储里的照旧；这时也还没开始下，
+/// 没有要写盘的。返回要存的续传数据（不要或没要到时为 None），与停下时出的问题：写盘出错（[`FailureKind::Disk`]），或
+/// 要不到、等不到结果。
+async fn stop(owner: &mut Owner, finished: bool) -> (Option<Resume>, Result<(), Failure>) {
     let other = |error: Error| Failure {
         kind: FailureKind::Other,
         message: format!("BT 任务停下时出错：{error}"),
     };
     let mut problem = None;
     let mut resume = None;
-    let requested = owner
+    let checked = owner
         .session()
-        .save_resume_data(&owner.id)
-        .and_then(|()| owner.session().flush(&owner.id));
+        .status(&owner.id)
+        .map(|status| {
+            matches!(
+                status.state(),
+                Some(State::Downloading | State::Finished | State::Seeding)
+            )
+        })
+        .map_err(owner.libtorrent("查状态"));
+    let requested = match checked {
+        Ok(true) => owner
+            .session()
+            .save_resume_data(&owner.id)
+            .and_then(|()| owner.session().flush(&owner.id))
+            .map(|()| true)
+            .map_err(owner.libtorrent("要续传数据")),
+        Ok(false) => Ok(false),
+        Err(error) => Err(error),
+    };
     match requested {
-        Err(error) => problem = Some(other(owner.libtorrent("要续传数据")(error))),
-        Ok(()) => {
+        Err(error) => problem = Some(other(error)),
+        Ok(false) => {}
+        Ok(true) => {
             // 续传数据在写盘之前取样：写完的事件来了，取样时已有的块都已在磁盘上
             let mut data = None::<Option<Vec<u8>>>;
             let mut flushed = false;
@@ -774,22 +856,31 @@ async fn stop(owner: &mut Owner) -> (Option<Resume>, Result<(), Failure>) {
             resume = data.flatten().map(|data| Resume { data, trusted });
         }
     }
-    if let Err(error) = owner.remove(false).await {
+    let removal = if finished {
+        Removal::PartFile
+    } else {
+        Removal::Keep
+    };
+    if let Err(error) = owner.remove(removal).await {
         problem.get_or_insert(other(error));
     }
     (resume, problem.map_or(Ok(()), Err))
 }
 
 /// 删掉停着的 BT 任务下了的文件：以暂停加入会话，再连同文件一起移除（libtorrent 删它建的文件、空了的目录与存不要的
-/// 文件的部分块的 `.parts` 文件）。删不干净时报 [`Error::Torrent`]。
+/// 文件的部分块的 `.parts` 文件），之后删掉内容的根 `root` 里操作系统自己建的文件（[`OS_LITTER`]）与空了的目录。根还在
+/// （里面有别的东西，或删除出错）时报 [`Error::Torrent`]，写明留下了什么与 libtorrent 报的错。
 pub(crate) async fn delete(
     engine: Arc<Engine>,
     info_hash: &str,
     resume: &[u8],
-    save_path: &Path,
+    root: &Path,
 ) -> Result<(), Error> {
     let id = TorrentId::parse(info_hash)
         .map_err(|error| Error::Corrupt(format!("种子的编号：{error}")))?;
+    let save_path = root
+        .parent()
+        .ok_or_else(|| Error::Corrupt(format!("内容的根没有所在目录：{}", root.display())))?;
     let mut owner = engine.own(&id)?;
     engine.settled(&id).await?;
     let options = AddOptions {
@@ -800,7 +891,72 @@ pub(crate) async fn delete(
         .session()
         .add_resume(resume, &id, utf8(save_path)?, options)
         .map_err(owner.libtorrent("加入"))?;
-    owner.remove(true).await
+    // 目录里有操作系统自己建的文件时 libtorrent 删不掉目录、报删除失败：那些文件下面一起删，以根还在不在为准
+    let deleted = owner.remove(Removal::Files).await;
+    drop(owner);
+    let swept = root.to_path_buf();
+    let left = tokio::task::spawn_blocking(move || sweep(&swept))
+        .await
+        .expect("清理目录不会 panic，运行时关闭时本任务也一起丢弃");
+    if left.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<String> = left
+        .iter()
+        .take(5)
+        .map(|path| path.display().to_string())
+        .collect();
+    let more = if left.len() > shown.len() {
+        format!(" 等 {} 项", left.len())
+    } else {
+        String::new()
+    };
+    let cause = deleted
+        .err()
+        .map_or_else(String::new, |error| format!("（{error}）"));
+    Err(Error::Torrent(format!(
+        "留下了 {}{more}{cause}",
+        shown.join("、")
+    )))
+}
+
+/// 删掉 `path`（BT 内容的根）下操作系统自己建的文件（[`OS_LITTER`]）与空了的目录，返回删不掉的（还在的文件、删除出错
+/// 的）。`path` 已不在时为空；符号链接不跟进，当作文件。
+fn sweep(path: &Path) -> Vec<PathBuf> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        // 不在了；在而读不了属性的，下面删的时候报出来
+        return if path.exists() {
+            vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        };
+    };
+    if !meta.is_dir() {
+        let litter = path
+            .file_name()
+            .is_some_and(|name| OS_LITTER.iter().any(|litter| name == *litter));
+        return if litter && std::fs::remove_file(path).is_ok() {
+            Vec::new()
+        } else {
+            vec![path.to_path_buf()]
+        };
+    }
+    let mut left = Vec::new();
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => left.extend(sweep(&entry.path())),
+                    Err(_) => left.push(path.to_path_buf()),
+                }
+            }
+        }
+        Err(_) => left.push(path.to_path_buf()),
+    }
+    if left.is_empty() && std::fs::remove_dir(path).is_err() {
+        left.push(path.to_path_buf());
+    }
+    left
 }
 
 fn utf8(path: &Path) -> Result<&str, Error> {

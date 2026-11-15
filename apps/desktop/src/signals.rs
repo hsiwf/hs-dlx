@@ -137,15 +137,12 @@ pub fn between_file(before: Option<&FileProgress>, now: &FileProgress) -> Vec<(L
 }
 
 /// BT 任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事：开始与校验完磁盘上已有的
-/// 文件；连着节点时凑不齐全部内容、又凑得齐了（没连上节点时只有自己的块，不算凑不齐）。
+/// 文件；资源不足（[`TorrentProgress::scarce`]）与又凑得齐了；tracker 报了新的错。
 pub fn between_torrent(
     before: Option<&TorrentProgress>,
     now: &TorrentProgress,
 ) -> Vec<(Level, String)> {
     let checking = |p: &TorrentProgress| matches!(p.phase, TorrentPhase::Checking { .. });
-    let short = |p: &TorrentProgress| {
-        p.phase == TorrentPhase::Downloading && p.peers > 0 && p.reachable < p.pieces
-    };
     let mut found = Vec::new();
     if checking(now) && !before.is_some_and(checking) {
         found.push((Level::Info, "校验磁盘上已有的文件".to_owned()));
@@ -156,12 +153,18 @@ pub fn between_torrent(
             format!("校验完 · 已有 {}", format::bytes(now.done)),
         ));
     }
-    match (before.is_some_and(short), short(now)) {
+    let scarce = |p: &TorrentProgress| p.scarce;
+    match (before.is_some_and(scarce), now.scarce) {
         (false, true) => found.push((Level::Warn, "在线的节点凑不齐全部内容".to_owned())),
-        (true, false) if now.phase == TorrentPhase::Downloading && now.peers > 0 => {
+        (true, false) if now.reachable == now.pieces => {
             found.push((Level::Info, "在线的节点又凑得齐了".to_owned()));
         }
         _ => {}
+    }
+    if let Some(error) = &now.tracker_error
+        && before.is_none_or(|b| b.tracker_error.as_ref() != Some(error))
+    {
+        found.push((Level::Warn, format!("tracker 报错：{error}")));
     }
     found
 }

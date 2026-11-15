@@ -389,12 +389,18 @@ impl Service {
             let resume = {
                 let mut store = lock(&shared.store);
                 let tx = store.transaction()?;
-                store::torrent_resume(&tx, id)?
+                let stored = store::torrent_resume(&tx, id)?;
+                // 停下时要到的还没写进存储的（待补写）比存储里的新
+                lock(&shared.unsaved)
+                    .get(&id)
+                    .and_then(|ending| ending.resume.clone())
+                    .unwrap_or(stored)
             };
-            // 读种子信息要解析整个续传数据（大种子有几 MB），在阻塞线程上做
+            // 读种子信息要解析整个续传数据（大种子有几 MB），在阻塞线程上做；存储里的读不出即被改动过
             let info = tokio::task::spawn_blocking(move || TorrentInfo::of(&resume.data))
                 .await
-                .expect("读种子信息不会 panic，运行时关闭时本任务也一起丢弃")?;
+                .expect("读种子信息不会 panic，运行时关闭时本任务也一起丢弃")
+                .map_err(|error| Error::Corrupt(format!("{id}的续传数据：{error}")))?;
             Ok(SavedTorrent {
                 info,
                 trusted: resume.trusted,
@@ -615,7 +621,7 @@ async fn run_discard(
             store::torrent_resume(&tx, id)?
         };
         let engine = shared.bt_engine()?;
-        torrent::delete(engine, &spec.info_hash, &resume.data, &torrent_folder(spec))
+        torrent::delete(engine, &spec.info_hash, &resume.data, &spec.root)
             .await
             .map_err(|cause| Error::ContentLeft {
                 id,
@@ -759,7 +765,16 @@ impl Shared {
             cause,
         })?;
         let info = match &draft.kind {
-            DraftKind::Torrent { resume, wanted } => Some(torrent_draft(&draft, resume, wanted)?),
+            DraftKind::Torrent { resume, wanted } => {
+                // 解析整个续传数据（大种子有几 MB），在阻塞线程上做
+                let (headers, resume, wanted) =
+                    (draft.headers.is_empty(), resume.clone(), wanted.clone());
+                let info =
+                    tokio::task::spawn_blocking(move || torrent_draft(headers, &resume, &wanted))
+                        .await
+                        .expect("读种子信息不会 panic，运行时关闭时本任务也一起丢弃")?;
+                Some(info)
+            }
             DraftKind::Hls { .. } | DraftKind::File { .. } => None,
         };
         let base = match (&draft.kind, &info) {
@@ -823,7 +838,13 @@ impl Shared {
                         naming::torrent_root_for(&folder, &base, single, &fallback, &taken)
                     })
                     .await?;
-                    let placed = torrent::place(resume, &root_name, wanted)?;
+                    let (resume, root_named, wanted) =
+                        (resume.clone(), root_name.clone(), wanted.clone());
+                    let placed = tokio::task::spawn_blocking(move || {
+                        torrent::place(&resume, &root_named, &wanted)
+                    })
+                    .await
+                    .expect("改根名不会 panic，运行时关闭时本任务也一起丢弃")?;
                     let kind = Kind::Torrent(TorrentSpec { info_hash, root });
                     (root_name, None, Some(placed), kind)
                 }
@@ -968,13 +989,11 @@ impl Shared {
                 Launched::Torrent(run) => {
                     // 已取消：结果只能是暂停或出错，任务都已不要
                     let _ended = run.done.await;
-                    let folder = run.root.parent().map(Path::to_path_buf);
-                    let deleted = match (shared.bt_engine(), folder) {
-                        (Ok(engine), Some(folder)) => {
-                            torrent::delete(engine, &run.info_hash, &run.resume, &folder).await
+                    let deleted = match shared.bt_engine() {
+                        Ok(engine) => {
+                            torrent::delete(engine, &run.info_hash, &run.resume, &run.root).await
                         }
-                        (Err(error), _) => Err(error),
-                        (_, None) => unreachable!("内容的根是以文件名结尾的绝对路径"),
+                        Err(error) => Err(error),
                     };
                     if let Err(error) = deleted {
                         // 同下
@@ -1197,10 +1216,10 @@ impl Shared {
     }
 }
 
-/// 新建 BT 任务的草稿 `draft`（种类为 [`DraftKind::Torrent`]）读出的种子信息；没有请求头、至少选了一个文件且都是种子里
-/// 的，不然报 [`Error::InvalidInput`]。
-fn torrent_draft(draft: &Draft, resume: &[u8], wanted: &[i32]) -> Result<TorrentInfo, Error> {
-    if !draft.headers.is_empty() {
+/// 新建 BT 任务的草稿（种类为 [`DraftKind::Torrent`]）里续传数据 `resume` 的种子信息；草稿要没有请求头（`no_headers`）、
+/// `wanted` 至少选了一个文件且都是种子里的，不然报 [`Error::InvalidInput`]。
+fn torrent_draft(no_headers: bool, resume: &[u8], wanted: &[i32]) -> Result<TorrentInfo, Error> {
+    if !no_headers {
         return Err(Error::InvalidInput("BT 任务没有请求头".to_owned()));
     }
     let info = TorrentInfo::of(resume)?;

@@ -81,7 +81,9 @@ mod ffi {
         /// [`Session::flush`] 的结果，每次调用一条：调用那一刻已下的数据都已交给磁盘写完。写盘出错时这条照样会来，出错
         /// 的在它之前以 [`AlertKind::FileError`] 报来
         CacheFlushed,
+        /// 种子本身出错（种子信息不对、内存不够等）；读写文件出的错报为 [`AlertKind::FileError`]
         TorrentError,
+        /// 读写文件出错（磁盘满、没权限、只读、文件太大）
         FileError,
         /// 从会话里去掉了；要删文件时另有 [`AlertKind::Deleted`] 或 [`AlertKind::DeleteFailed`]，与这条先后不定
         /// （libtorrent 2.1 先发删的结果）
@@ -89,13 +91,15 @@ mod ffi {
         Deleted,
         DeleteFailed,
         /// 事件来得太快、队列满了丢了一些：哪些种子的说不清（libtorrent 只给出丢了哪几类，这里没转出来），可能有续传
-        /// 数据、移除的结果。会话里靠事件维持的状态不再可信：要重新要续传数据，并在之后重建会话（移除的结果丢了的种子，
-        /// 这个会话里再也加不进）
+        /// 数据、写完缓存、移除的结果，在等的那一步可能再也等不到。已移除完的种子不再算移除中（[`Session::removing`]），
+        /// 移除还没完的照常等它的事件
         AlertsDropped,
         ListenSucceeded,
         ListenFailed,
         PortMapped,
         PortMapFailed,
+        /// tracker 回了错误或连不上：`message` 里有 tracker 的地址与原因
+        TrackerError,
     }
 
     /// 种子里的一个文件（不含对齐用的填充文件）。
@@ -110,6 +114,17 @@ mod ffi {
         size: i64,
         /// 要下载（续传数据里的文件优先级不为「不下载」，没记优先级时都要）
         wanted: bool,
+    }
+
+    /// 从会话里去掉种子时连带删什么。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Removal {
+        /// 不删
+        Keep,
+        /// 只删存不要的文件的部分块的 `.parts` 文件（在保存目录里，名字为 `.<信息哈希>.parts`）
+        PartFile,
+        /// 删下了的文件、空了的目录与 `.parts` 文件
+        Files,
     }
 
     /// 由续传数据加入种子时的选择。
@@ -168,7 +183,7 @@ mod ffi {
         fn connect_peer(self: &Session, id: &str, ip: &str, port: u16) -> Result<()>;
         fn pause(self: &Session, id: &str) -> Result<()>;
         fn resume(self: &Session, id: &str) -> Result<()>;
-        fn remove(self: &Session, id: &str, delete_files: bool) -> Result<()>;
+        fn remove(self: &Session, id: &str, removal: Removal) -> Result<()>;
         fn save_resume_data(self: &Session, id: &str) -> Result<()>;
         fn listen_port(self: &Session) -> u16;
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
@@ -179,7 +194,7 @@ mod ffi {
     }
 }
 
-pub use ffi::{AddOptions, Alert, AlertKind, FileEntry, SessionConfig, Status};
+pub use ffi::{AddOptions, Alert, AlertKind, FileEntry, Removal, SessionConfig, Status};
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
 // messages to the network thread」）；C++ 那一层自己的状态（种子表、取事件）各有一把锁。
@@ -262,7 +277,7 @@ impl Status {
 }
 
 /// 一个 BT 会话：监听端口、连节点、管理加进来的种子。释放会阻塞：等 libtorrent 关好会话，其中向 tracker 报告停止最多
-/// 等 2 秒，此外还有写完缓存在内存里的数据、关闭文件；不要在界面线程上释放。
+/// 等 2 秒，此外还有写完缓存在内存里的数据、关闭文件：界面还要响应时不在界面线程上释放（退出时等它写完是要的）。
 pub struct Session(cxx::UniquePtr<ffi::Session>);
 
 impl Session {
@@ -337,14 +352,15 @@ impl Session {
         Ok(self.inner().resume(id.as_str())?)
     }
 
-    /// 从会话里去掉；`delete_files` 时连同下了的文件一起删。结果见 [`AlertKind::Removed`]。
-    pub fn remove(&self, id: &TorrentId, delete_files: bool) -> Result<(), Error> {
-        Ok(self.inner().remove(id.as_str(), delete_files)?)
+    /// 从会话里去掉，照 `removal` 连带删文件。结果见 [`AlertKind::Removed`]；删了文件的另有 [`AlertKind::Deleted`] 或
+    /// [`AlertKind::DeleteFailed`]。
+    pub fn remove(&self, id: &TorrentId, removal: Removal) -> Result<(), Error> {
+        Ok(self.inner().remove(id.as_str(), removal)?)
     }
 
-    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。续传数据按已校验的块
-    /// 记，不等它们写到磁盘。要与磁盘一致（退出前）：先 [`Session::pause`] 并等它停下，再 [`Session::flush`]、等到
-    /// [`AlertKind::CacheFlushed`]（其间没有 [`AlertKind::FileError`]），然后再要；不暂停时其间新校验的块没写盘也会记进去。
+    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。续传数据只记已校验并
+    /// 交给磁盘写完的块（torrent.cpp 的 write_resume_data 按 is_piece_flushed）；还没校验完已有的文件时一块也不记（在
+    /// 校验中的记到校验到的那块）。
     pub fn save_resume_data(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().save_resume_data(id.as_str())?)
     }

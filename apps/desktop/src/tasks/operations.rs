@@ -296,14 +296,8 @@ impl Tasks {
                 (saved.bytes > 0).then(|| format::bytes(saved.bytes)),
             ),
             Disk::Read(None) => (Some(0), Some(Duration::ZERO), None),
-            Disk::Torrent(saved) if !saved.trusted => {
-                (Some(0), None, Some("待校验的文件，先校验".to_owned()))
-            }
-            Disk::Torrent(saved) => (
-                Some(0),
-                None,
-                (saved.info.done > 0).then(|| format::bytes(saved.info.done)),
-            ),
+            // BT 的说法另写，见下面
+            Disk::Torrent(_) => (Some(0), None, None),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
@@ -321,9 +315,15 @@ impl Tasks {
                 if let Some(start) = start {
                     row.timeline.begin(start);
                 }
-                let text = match already {
-                    Some(already) => format!("{label}：任务目录里已有 {already}"),
-                    None => label.to_owned(),
+                let text = match (&row.disk, already) {
+                    (Disk::Torrent(saved), _) if !saved.trusted => {
+                        format!("{label}：先重新校验已下的文件")
+                    }
+                    (Disk::Torrent(saved), _) if saved.info.done > 0 => {
+                        format!("{label}：已有 {}", format::bytes(saved.info.done))
+                    }
+                    (_, Some(already)) => format!("{label}：任务目录里已有 {already}"),
+                    (_, None) => label.to_owned(),
                 };
                 row.signal(Level::Info, text);
             }

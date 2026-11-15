@@ -118,7 +118,7 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> Div {
-        let host = row.task.spec.url.host_str().unwrap_or_default().to_owned();
+        let host = crate::links::source(&row.task.spec.url);
         let mut body: Vec<AnyElement> = Vec::new();
         if let Some(card) = self.headers_card(row, cx) {
             body.push(card.into_any_element());
@@ -523,8 +523,8 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     }
 }
 
-/// BT 任务的 [`reads`]（完成的除外）：在下时为下载与上传的速度、剩余、已下与节点数（其中做种的），停着的为已下与
-/// 要下的大小；还没有内容时为空。
+/// BT 任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下、要下的大小、节点数（其中做种的）与上传速度，停着的
+/// 为已下与要下的大小；还没有内容时为空。
 fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
     let Some(amount) = FileAmount::of(row) else {
@@ -544,14 +544,8 @@ fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             vec![
                 cell("速度", format!("{}/s", format::bytes(speed as u64))),
                 cell("剩余", left),
-                cell(
-                    "已下",
-                    format!(
-                        "{} / {}",
-                        format::bytes(amount.bytes),
-                        format::bytes(wanted)
-                    ),
-                ),
+                cell("已下", format::bytes(amount.bytes)),
+                cell("大小", format::bytes(wanted)),
                 cell(
                     "节点",
                     format!("{}（做种 {}）", progress.peers, progress.seeds),

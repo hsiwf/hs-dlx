@@ -54,6 +54,15 @@ pub fn request(text: &str) -> Result<curl::Request, String> {
     })
 }
 
+/// 面板标题下写的来源：磁力链接、种子文件，其余为地址的主机。
+pub fn source(url: &Url) -> String {
+    match url.scheme() {
+        "magnet" => "磁力链接".to_owned(),
+        "file" => "种子文件".to_owned(),
+        _ => url.host_str().unwrap_or_default().to_owned(),
+    }
+}
+
 /// `text` 作为要探测的请求时的地址；不是链接也不是认得出的 curl 命令时为 None。
 pub fn target(text: &str) -> Option<Url> {
     request(text).ok().map(|request| request.url)

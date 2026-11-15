@@ -49,7 +49,7 @@ pub fn look(row: &Row) -> Look {
         Status::DiscardUnfinished if torrent => discarding(
             row,
             "放弃没做完",
-            "已下的文件可能删了一部分，再放弃一次即可",
+            "已下的文件没删干净：处理提示里留下的，再放弃一次",
         ),
         Status::DiscardUnfinished => discarding(
             row,
@@ -221,9 +221,7 @@ fn kept_torrent(row: &Row, paused: bool) -> Kept {
     let then = if paused { " · 继续时接着下" } else { "" };
     let line = match (&amount, &row.disk) {
         (_, Disk::Unreadable(reason)) => format!("读不出存着的进度：{reason}"),
-        (_, Disk::Torrent(saved)) if !saved.trusted => {
-            "上次没正常退出：继续时先校验已下的文件".to_owned()
-        }
+        (_, Disk::Torrent(saved)) if !saved.trusted => "已下的要等继续时重新校验".to_owned(),
         (Some(a), _) if a.bytes > 0 => format!(
             "已下 {} / {}{then}",
             format::bytes(a.bytes),
@@ -262,7 +260,7 @@ fn running_torrent(row: &Row) -> Look {
             color: theme::accent(),
             ticks: Ticks::of(0, 0, true),
             big: "—".to_owned(),
-            line: "加入 BT 会话".to_owned(),
+            line: String::new(),
             hint: None,
             fraction: 0.0,
             orb: theme::accent(),
@@ -282,7 +280,7 @@ fn running_torrent(row: &Row) -> Look {
             theme::accent(),
             1.0,
             "100%".to_owned(),
-            "存下进度，从 BT 会话里移除".to_owned(),
+            String::new(),
         ),
         TorrentPhase::Downloading => {
             let fraction = if progress.wanted > 0 {
@@ -296,15 +294,21 @@ fn running_torrent(row: &Row) -> Look {
                 format::bytes(progress.wanted)
             );
             if progress.peers == 0 {
+                // 私有种子只经 tracker 找节点：它报错时多半一直连不上，原因在信号里
+                let why = if progress.tracker_error.is_some() {
+                    "tracker 报错"
+                } else {
+                    "还没连上节点"
+                };
                 return look(
                     "找节点",
                     theme::accent(),
                     fraction,
                     percent(fraction),
-                    format!("{amount} · 还没连上节点"),
+                    format!("{amount} · {why}"),
                 );
             }
-            if progress.reachable < progress.pieces {
+            if progress.scarce {
                 let share = progress.reachable as f32 / progress.pieces as f32;
                 return look(
                     "资源不足",

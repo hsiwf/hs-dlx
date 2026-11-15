@@ -214,6 +214,11 @@ fn a_magnet_link_downloads_the_chosen_file() {
     service.forget(task.id).unwrap();
 
     service.close().unwrap();
+    // 关闭后不再建 BT 会话
+    assert!(matches!(
+        service.fetch_metadata(uri.clone()),
+        Err(Error::Closed)
+    ));
     drop(service);
     let conn = rusqlite::Connection::open(&store).unwrap();
     let (port, dht): (Option<i64>, Option<Vec<u8>>) = conn
@@ -285,9 +290,36 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
         true
     }));
     assert_eq!(first.unwrap().done, have);
+    // 从续传数据里记的节点连回做种的一方
+    let reconnected = rt.block_on(until(&mut events, task.id, |progress| {
+        progress.peers > 0 && progress.reachable == 7
+    }));
+    assert_eq!(reconnected, None, "继续后的任务停下了");
 
+    // 连着节点而凑不齐，持续一阵才算资源不足
+    let scarce = rt.block_on(until(&mut events, task.id, |progress| progress.scarce));
+    assert_eq!(scarce, None, "继续后的任务停下了");
+
+    // 根里有用户自己放的文件：删不干净，写明留下了什么，任务留着
     let root = folder.join("album");
     assert!(root.join("a.bin").exists());
+    std::fs::write(root.join("笔记.txt"), b"mine").unwrap();
+    std::fs::write(root.join(".DS_Store"), b"finder").unwrap();
+    let left = rt.block_on(service.discard(task.id)).unwrap();
+    match left {
+        Err(Error::ContentLeft { id, cause }) => {
+            assert_eq!(id, task.id);
+            assert!(cause.to_string().contains("笔记.txt"), "{cause}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        service.task(task.id).unwrap().status,
+        Status::DiscardUnfinished
+    );
+    assert!(!root.join("a.bin").exists());
+    // 拿走自己的文件后再放弃：操作系统建的文件（.DS_Store）一起删掉
+    std::fs::remove_file(root.join("笔记.txt")).unwrap();
     let leftovers = rt.block_on(service.discard(task.id)).unwrap().unwrap();
     assert!(leftovers.is_empty());
     assert!(!root.exists(), "下了的文件与目录都删掉了");

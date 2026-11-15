@@ -17,14 +17,10 @@ use crate::ui::{self, Solid, Step, Tone};
 
 impl NewTask {
     pub(super) fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
-        let host = match self.url.scheme() {
-            "magnet" => "磁力链接".to_owned(),
-            "file" => "种子文件".to_owned(),
-            _ => self.url.host_str().unwrap_or_default().to_owned(),
-        };
+        let host = crate::links::source(&self.url);
         let title = self.title.clone();
         match &self.probing {
-            Probing::Metadata(progress) => self.metadata_inspector(title, host, *progress, cx),
+            Probing::Metadata(progress) => self.metadata_inspector(title, host, progress, cx),
             Probing::Torrent(choice) => self.torrent_inspector(title, host, choice, cx),
             Probing::Failed(failure) if self.is_torrent() => {
                 self.torrent_failed_inspector(title, host, failure, cx)
@@ -228,7 +224,7 @@ impl NewTask {
         &self,
         title: String,
         host: String,
-        progress: MetadataProgress,
+        progress: &MetadataProgress,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut body = Vec::new();
@@ -243,6 +239,9 @@ impl NewTask {
             body.push(
                 ui::note("没有节点有这个种子时会一直找，可随时取消", false).into_any_element(),
             );
+            if let Some(error) = &progress.tracker_error {
+                body.push(ui::note(format!("tracker 报错：{error}"), true).into_any_element());
+            }
         }
         ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
     }

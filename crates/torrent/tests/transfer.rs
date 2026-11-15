@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hs_dlx_torrent::{
-    AddOptions, AlertKind, Session, SessionConfig, State, TorrentId, create_torrent, describe,
-    place, resume_from_torrent_file,
+    AddOptions, AlertKind, Removal, Session, SessionConfig, State, TorrentId, create_torrent,
+    describe, place, resume_from_torrent_file,
 };
 
 /// 照续传数据里记的已有块，加入后就运行。
@@ -187,7 +187,7 @@ fn placed_files_download_and_resume_without_peers() {
     wait_until(&restored, Duration::from_secs(20), |s| done(s, &id));
     assert_eq!(restored.status(&id).unwrap().peers, 0);
     // 移除完（移除的事件）之前不许再加同一个种子，之后可以
-    restored.remove(&id, false).unwrap();
+    restored.remove(&id, Removal::Keep).unwrap();
     assert!(restored.status(&id).is_err());
     assert!(restored.removing(&id));
     assert!(
@@ -212,8 +212,15 @@ fn placed_files_download_and_resume_without_peers() {
         restored.status(&id).unwrap().total_wanted_done,
         100_000 + 250_000 - (16 << 10)
     );
-    restored.remove(&id, false).unwrap();
+    restored.remove(&id, Removal::Keep).unwrap();
     removed(&restored, &id, false);
+    // 只删 .parts 时同样等到删的结果才算移除完，下了的文件留着
+    restored
+        .add_resume(&saved, &id, path_str(&fetch_dir), TRUSTED)
+        .unwrap();
+    restored.remove(&id, Removal::PartFile).unwrap();
+    removed(&restored, &id, true);
+    assert!(fetch_dir.join("专辑").join("a.bin").exists());
     // 加入时暂停
     restored
         .add_resume(
@@ -228,7 +235,7 @@ fn placed_files_download_and_resume_without_peers() {
         .unwrap();
     assert!(restored.status(&id).unwrap().paused);
     // 连文件一起删：libtorrent 先发删的结果、后发移除的事件，两个都到了才算移除完
-    restored.remove(&id, true).unwrap();
+    restored.remove(&id, Removal::Files).unwrap();
     removed(&restored, &id, true);
     assert!(!fetch_dir.join("专辑").exists(), "文件与目录都删掉了");
     restored
@@ -417,7 +424,7 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     // 没下完的种子 libtorrent 不会自己发写完的事件：等得到即说明 flush 真的写了、事件转了出来
     flushed(&fetcher, &fetching);
     let probed = resume_data(&fetcher, &fetching);
-    fetcher.remove(&fetching, false).unwrap();
+    fetcher.remove(&fetching, Removal::Keep).unwrap();
     removed(&fetcher, &fetching, false);
     assert!(
         !fetch_dir.join("sample.bin").exists(),

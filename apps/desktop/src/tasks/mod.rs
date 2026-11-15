@@ -133,7 +133,9 @@ impl Tasks {
                 }
             }),
             Err(reason) => {
-                problems.push(format!("收不了再次打开应用时转交的链接：{reason}"));
+                problems.push(format!(
+                    "之后再打开应用（如在浏览器里点链接）时，链接交不到这个窗口：{reason}"
+                ));
                 Task::ready(())
             }
         };
@@ -205,7 +207,7 @@ impl Tasks {
                 }
                 cx.emit(TasksEvent::HandedOver(handoff));
             }
-            Err(reason) => self.add_notice(format!("再次打开应用时转交的链接没收到：{reason}")),
+            Err(reason) => self.add_notice(format!("再次打开应用时带来的链接没收到：{reason}")),
         }
         cx.notify();
     }

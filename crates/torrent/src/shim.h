@@ -22,6 +22,7 @@ struct Alert;
 struct FileEntry;
 struct AddOptions;
 struct Described;
+enum class Removal : std::uint8_t;
 
 class Session {
 public:
@@ -38,7 +39,7 @@ public:
 	void connect_peer(rust::Str id, rust::Str ip, std::uint16_t port) const;
 	void pause(rust::Str id) const;
 	void resume(rust::Str id) const;
-	void remove(rust::Str id, bool delete_files) const;
+	void remove(rust::Str id, Removal removal) const;
 	void save_resume_data(rust::Str id) const;
 	std::uint16_t listen_port() const;
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
@@ -54,10 +55,13 @@ private:
 
 	// 一个还没移除完的种子：移除的事件来了没有；要删文件时删的结果来了没有（libtorrent 先发删的结果，后发移除的事件）
 	struct Removing {
+		lt::torrent_handle handle;
 		bool deleting = false;
 		bool removed = false;
 		bool files_settled = false;
 	};
+	// 事件丢了一些之后：种子对象已不在了的（移除与删文件都已做完，删文件的磁盘任务持有种子对象直到做完），不再算移除中
+	void prune_removing() const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
 

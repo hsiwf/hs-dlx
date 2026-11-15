@@ -192,7 +192,7 @@ impl Shell {
             if self.new_task().is_some() {
                 self.dock.update(cx, |dock, cx| dock.put(&link, window, cx));
                 self.tell(
-                    "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
+                    "再次打开应用时带来的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
                         .to_owned(),
                     cx,
                 );

@@ -154,7 +154,8 @@ rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::S
 	std::string const expected = string_of(id);
 	if (!names(hashes, expected)) throw std::invalid_argument("续传数据不是这个种子的：" + expected);
 	if (!options.trust_pieces) {
-		// 没有已有块的记录时，libtorrent 发现磁盘上有这个种子的文件就整体校验（mmap_disk_io.cpp 的 do_check_fastresume）
+		// 没有已有块的记录时，libtorrent 发现磁盘上有这个种子的文件就整体校验（pread_disk_io.cpp 与 mmap_disk_io.cpp 的
+		// do_check_fastresume）
 		params.have_pieces.clear();
 		params.verified_pieces.clear();
 		params.unfinished_pieces.clear();
@@ -250,15 +251,19 @@ void Session::pause(rust::Str id) const { handle(id).pause(lt::torrent_handle::g
 
 void Session::resume(rust::Str id) const { handle(id).resume(); }
 
-void Session::remove(rust::Str id, bool delete_files) const {
+void Session::remove(rust::Str id, Removal removal) const {
 	// 整个过程持有锁：别的线程不能在这期间加入同一个种子
 	std::lock_guard<std::mutex> lock(m_mutex);
 	std::string const key = string_of(id);
 	auto found = m_handles.find(key);
 	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
-	m_session.remove_torrent(found->second, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+	lt::remove_flags_t flags{};
+	if (removal == Removal::PartFile) flags = lt::session::delete_partfile;
+	if (removal == Removal::Files) flags = lt::session::delete_files;
+	m_session.remove_torrent(found->second, flags);
+	// 删文件（含只删 .parts）时 libtorrent 另发删的结果（torrent.cpp 的 on_files_deleted）
+	m_removing[key] = Removing{found->second, flags != lt::remove_flags_t{}, false, false};
 	m_handles.erase(found);
-	m_removing[key] = Removing{delete_files, false, false};
 }
 
 void Session::removed(std::string const& id, bool files_settled) const {
@@ -273,6 +278,17 @@ void Session::removed(std::string const& id, bool files_settled) const {
 	}
 	// 移除的事件与（要删文件时）删的结果都来了才算移除完，两者先后不定
 	if (removing.removed && (!removing.deleting || removing.files_settled)) m_removing.erase(found);
+}
+
+void Session::prune_removing() const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	for (auto it = m_removing.begin(); it != m_removing.end();) {
+		if (it->second.handle.is_valid()) {
+			++it;
+		} else {
+			it = m_removing.erase(it);
+		}
+	}
 }
 
 void Session::save_resume_data(rust::Str id) const {
@@ -311,7 +327,10 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeRejected, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_error_alert>(a)) {
-			out.push_back(alert_of(AlertKind::TorrentError, *a, id_of(t->handle)));
+			// 操作系统报的错（读写、建目录、校验时读文件）即文件出错，其余为种子本身的（种子信息不对、内存不够等）
+			bool const os = t->error.category() == boost::system::system_category()
+				|| t->error.category() == boost::system::generic_category();
+			out.push_back(alert_of(os ? AlertKind::FileError : AlertKind::TorrentError, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::file_error_alert>(a)) {
 			out.push_back(alert_of(AlertKind::FileError, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_removed_alert>(a)) {
@@ -326,7 +345,11 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			std::string const id = id_of(t->handle);
 			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
 			removed(id, true);
+		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
+			out.push_back(alert_of(AlertKind::TrackerError, *a, id_of(t->handle)));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
+			// 丢的可能有移除的事件：已移除完的不再挡着再加入
+			prune_removing();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
@@ -407,6 +430,8 @@ rust::Vec<std::uint8_t> place(rust::Slice<std::uint8_t const> resume, rust::Str 
 	params.renamed_files.clear();
 	if (name != original) {
 		for (lt::file_index_t const i : layout.file_range()) {
+			// 填充文件不写到磁盘，种子里没写路径的放在 .pad/ 下、不在种子名之下（torrent_info.cpp），不改
+			if (layout.pad_file_at(i)) continue;
 			// 单文件的种子路径即种子名，多文件的以种子名的目录开头（分隔符为本平台的）
 			std::string const path = layout.file_path(i);
 			if (path == original) {
