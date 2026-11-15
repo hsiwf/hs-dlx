@@ -330,7 +330,8 @@ impl Service {
             .spawn(async move { shared.create(draft, created_at).await })
     }
 
-    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下；之前选了只写出已录的，从此改回续录
+    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的不重下（文件任务在服务器不支持范围请求或没给出
+    /// 大小时从头下）；之前选了只写出已录的，从此改回续录
     /// （[`Task::write_only`] 为否）。在运行、正在放弃、已完成、放弃没做完的报 [`Error::Running`]、[`Error::Discarding`]、
     /// [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有自己的任务目录的报 [`Error::NoWorkDir`]。返回开始后的
     /// 任务（运行中）。存储写不进时任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
@@ -677,7 +678,7 @@ impl Shared {
                         naming::file_output_for(&folder, &base, &taken)
                     })
                     .await?;
-                    let work_dir = FileOutputOptions::new(path.clone()).resolved_work_dir()?;
+                    let work_dir = naming::file_work_dir(&path);
                     let kind = Kind::File(FileSpec {
                         path,
                         expected: expected.clone(),

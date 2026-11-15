@@ -183,7 +183,6 @@ fn kind(icon: AnyElement, name: &'static str, does: &'static str) -> Div {
     )
 }
 
-/// 网页的小图形：圆角方框里两道横线。
 /// 「文件」的小图形：一个往下的箭头落在一条横线上。
 fn file_icon() -> AnyElement {
     canvas(
@@ -209,6 +208,7 @@ fn file_icon() -> AnyElement {
     .into_any_element()
 }
 
+/// 网页的小图形：圆角方框里两道横线。
 fn page_icon() -> AnyElement {
     let bar = |width: f32| div().h(px(2.)).w(px(width)).bg(theme::hover_edge());
     div()

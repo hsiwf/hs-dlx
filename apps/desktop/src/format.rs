@@ -102,7 +102,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
             "连不上服务器或传输中断，检查网络或代理后重试",
         ),
         FailureKind::Certificate => ("证书".into(), "服务器的证书不受信任"),
-        FailureKind::Disk => ("磁盘".into(), "读写本机的文件出错，或读不到所在的盘"),
+        FailureKind::Disk => (
+            "磁盘".into(),
+            "读写本机的文件出错、空间不够，或读不到所在的盘",
+        ),
         FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
         FailureKind::SourceChanged => (
             "不符".into(),

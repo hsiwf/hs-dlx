@@ -53,7 +53,8 @@ pub enum DraftKind {
     },
     /// 单个文件
     File {
-        /// 服务器给的文件名（Content-Disposition）；None 时由地址得出（见 [`crate::file_name`]）
+        /// 文件名，服务器给的（Content-Disposition）或由重定向之后的地址得出（见 [`crate::file_name`]），服务再整理一遍；
+        /// None 时由 [`Draft::url`] 得出
         name: Option<String>,
         expected: Expected,
         /// 每个请求最多取多少字节；None 时不限（见 [`FileSpec::chunk_size`]）

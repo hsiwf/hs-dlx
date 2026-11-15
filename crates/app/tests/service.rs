@@ -731,7 +731,7 @@ fn a_file_task_downloads_into_the_folder() {
     assert_eq!(status, Status::Done);
     assert!(progressed, "下载中发了进度");
     assert_eq!(std::fs::read(folder.join("报告.pdf")).unwrap(), file_body());
-    assert!(!folder.join("报告.hsdl").exists());
+    assert!(!folder.join("报告.pdf.hsdl").exists());
     let done = service.tasks().unwrap().remove(0);
     assert_eq!(done.result.map(|r| r.bytes), Some(FILE as u64));
 
@@ -747,7 +747,7 @@ fn a_file_task_downloads_into_the_folder() {
     );
 }
 
-/// 第一次下载时地址回的与新建前看到的不是同一个文件（大小不同）：以「不是之前的文件」失败，任务目录留着。
+/// 第一次下载时地址回的与新建前看到的不是同一个文件（大小不同）：以「不是之前的文件」失败；放弃后不留东西。
 #[test]
 fn a_file_that_changed_since_it_was_seen_fails_visibly() {
     let dir = test_dir("file-changed");
@@ -778,5 +778,5 @@ fn a_file_that_changed_since_it_was_seen_fails_visibly() {
     ));
     let leftovers = rt.block_on(service.discard(task.id)).unwrap().unwrap();
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    assert!(!folder.join("a.hsdl").exists());
+    assert!(!folder.join("a.bin.hsdl").exists());
 }

@@ -263,7 +263,8 @@ fn keep_task_counter(tx: &Transaction<'_>, counter: Option<i64>) -> Result<(), E
 
 /// 第 6 版，重建任务表：
 /// - 文件任务加 `file_accepts_ranges`（认出地址时服务器支持范围请求，第一次下载按它决定带不带 If-Range 核对），只用于
-///   文件任务且必有。第 5 版没有文件任务（服务拒绝新建）；有的话补不出这一列，迁移按约束失败。
+///   文件任务且必有。第 5 版没有文件任务（服务拒绝新建）；有的话照下面只拷了两种任务共有的列，文件的各列都补不出，
+///   迁移按约束失败、存储留在第 5 版。
 /// - 失败的种类加 `not-expected`（[`crate::FailureKind::NotExpected`]）。
 fn rebuild_with_ranges(tx: &Transaction<'_>) -> Result<(), Error> {
     let counter = task_counter(tx)?;

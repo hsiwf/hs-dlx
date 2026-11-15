@@ -154,12 +154,21 @@ fn kept(row: &Row, paused: bool) -> Kept {
     }
 }
 
-/// 停着的文件任务的 [`Kept`]：按任务目录里已落盘的字节数。不支持续传的服务器上，已下的不沿用，继续时从头下。
+/// 文件任务能不能续传：服务器支持范围请求、且给出了总大小（新建前认出的）。不能时已下的不沿用，继续时从头下。
+fn resumable(row: &Row) -> bool {
+    row.task
+        .spec
+        .file()
+        .is_some_and(|file| file.expected.accepts_ranges && file.expected.length.is_some())
+}
+
+/// 停着的文件任务的 [`Kept`]：按任务目录里已落盘的字节数。不能续传时（[`resumable`]）写明继续时从头下。
 fn kept_file(row: &Row, paused: bool) -> Kept {
     let amount = FileAmount::of(row);
     let fraction = amount.as_ref().and_then(FileAmount::fraction);
     let then = if paused { " · 继续时接着下" } else { "" };
     let line = match (&amount, &row.disk) {
+        _ if !resumable(row) => "服务器不支持续传：继续时从头下".to_owned(),
         (Some(a), _) if a.bytes > 0 => match a.total {
             Some(total) => format!(
                 "已下 {} / {}{then}",
@@ -170,14 +179,6 @@ fn kept_file(row: &Row, paused: bool) -> Kept {
         },
         (_, Disk::Unreadable(reason)) => format!("读不出任务目录：{reason}"),
         (_, Disk::Unread) => "正在读取任务目录".to_owned(),
-        _ if row
-            .task
-            .spec
-            .file()
-            .is_some_and(|file| !file.expected.accepts_ranges) =>
-        {
-            "服务器不支持续传：继续时从头下".to_owned()
-        }
         _ => "还没有下载内容".to_owned(),
     };
     let lit = fraction.map_or(0, |f| (f * FILE_TICKS as f32) as usize);
@@ -226,13 +227,16 @@ fn running_file(row: &Row) -> Look {
     };
     let mut ticks = Ticks::of(FILE_TICKS, lit, true);
     ticks.retrying = progress.is_some_and(|p| !p.retrying.is_empty());
-    let (big, line) = match amount.total {
+    let (big, mut line) = match amount.total {
         Some(total) => (
             percent(fraction.unwrap_or(0.0)),
             format!("{} / {}", format::bytes(amount.bytes), format::bytes(total)),
         ),
         None => (format::bytes(amount.bytes), "服务器没给出大小".to_owned()),
     };
+    if !resumable(row) {
+        line.push_str(" · 暂停后要从头下");
+    }
     Look {
         state: "下载中".to_owned(),
         color: theme::accent(),

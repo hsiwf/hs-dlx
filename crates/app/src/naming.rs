@@ -144,7 +144,7 @@ fn split_extension(name: &str) -> (&str, Option<&str>) {
 }
 
 /// 在 `folder` 里给文件名 `name`（[`file_name`] 整理过的）选一个文件名并拼出输出路径，返回选定的文件名与路径：为
-/// `name`，被占用时主名后依次加 ` 2`、` 3`……。这个文件名与它的任务目录（`<主名>.hsdl`）在磁盘上已存在、或键在
+/// `name`，被占用时主名后依次加 ` 2`、` 3`……。这个文件名与它的任务目录（[`file_work_dir`]）在磁盘上已存在、或键在
 /// `taken` 里，都算占用（同 [`output_for`]）。
 pub fn file_output_for(
     folder: &Path,
@@ -157,11 +157,28 @@ pub fn file_output_for(
         None => stem.to_owned(),
     };
     let stem = free_stem(folder, stem, taken, |stem| {
-        vec![named(stem), format!("{stem}.hsdl")]
+        let name = named(stem);
+        let work_dir = format!("{name}{WORK_DIR_SUFFIX}");
+        vec![name, work_dir]
     })?;
     let name = named(&stem);
     let path = folder.join(&name);
     Ok((name, path))
+}
+
+/// 文件任务的任务目录的后缀。
+const WORK_DIR_SUFFIX: &str = ".hsdl";
+
+/// 文件任务 `path`（以文件名结尾）的任务目录：同级的 `<文件名>.hsdl`，文件名整个保留。由应用指定，不用核心的默认位置
+/// （核心按最后一个 `.` 去掉扩展名，`app-1.2.3-linux` 与 `app-1.2.4-linux` 会落到同一个 `app-1.2.hsdl`）；取名时按它
+/// 查占用（[`file_output_for`]）。
+pub fn file_work_dir(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .expect("文件任务的输出以文件名结尾")
+        .to_os_string();
+    name.push(WORK_DIR_SUFFIX);
+    path.with_file_name(name)
 }
 
 /// `folder` 里不被占用的主名：`stem`，被占用时依次加 ` 2`、` 3`……；`names` 给出一个主名占用的各个文件名，其中任一个
@@ -286,8 +303,26 @@ mod tests {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }
-        std::fs::create_dir_all(dir.join("a.hsdl")).unwrap();
+        std::fs::create_dir_all(dir.join("a.zip.hsdl")).unwrap();
         std::fs::write(dir.join("a 2.zip"), b"").unwrap();
+        // 核心的默认位置会是 a.hsdl：不算占用
+        std::fs::create_dir_all(dir.join("c.hsdl")).unwrap();
+        assert_eq!(
+            file_output_for(&dir, "c.zip", &HashSet::new()).unwrap().0,
+            "c.zip"
+        );
+        // 最后一段不像扩展名的：任务目录照样随编号变
+        std::fs::create_dir_all(dir.join("app-1.2.3-linux.hsdl")).unwrap();
+        assert_eq!(
+            file_output_for(&dir, "app-1.2.3-linux", &HashSet::new())
+                .unwrap()
+                .0,
+            "app-1.2.3-linux 2"
+        );
+        assert_eq!(
+            file_work_dir(&dir.join("app-1.2.3-linux 2")),
+            dir.join("app-1.2.3-linux 2.hsdl")
+        );
         let none = HashSet::new();
         assert_eq!(
             file_output_for(&dir, "a.zip", &none).unwrap(),

@@ -145,7 +145,6 @@ impl NewTask {
         ui::inspector(title, host, body, foot)
     }
 
-    /// 探测完成：读数、选择（多了可以滚动）与开始。
     /// 认出文件时：大小、类型、能否续传与网络的读数，保存位置、请求头，开始。
     fn file_inspector(
         &self,
@@ -231,6 +230,7 @@ impl NewTask {
         )
     }
 
+    /// 认出播放列表：读数、选择（多了可以滚动）与开始。
     fn ready_inspector(
         &self,
         title: String,

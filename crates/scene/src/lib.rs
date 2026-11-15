@@ -85,6 +85,12 @@ const UNIFORM_SIZE: u64 = (UNIFORM_VECTORS * 16) as u64;
 
 /// 渲染背景的 GPU 设备与管线；画面大小变了时重建纹理与读回缓冲区。
 pub struct Renderer {
+    /// 只在释放时取走（见 [`Drop`] 的实现）
+    gpu: Option<Gpu>,
+}
+
+/// [`Renderer`] 持有的 GPU 对象。
+struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -101,6 +107,17 @@ struct Target {
     padded_row: u32,
     texture: wgpu::Texture,
     readback: wgpu::Buffer,
+}
+
+impl Drop for Renderer {
+    /// wgpu 释放队列时等 GPU 空闲，设备已坏（显存不足、驱动出错）时它 panic，与等画完时一样收住（见
+    /// [`panics_contained`]）。
+    /// 渲染器已不用了，这时的错误没有调用方可报，也不影响别的；画出错的原因之前已由 [`Renderer::render`] 报过。
+    fn drop(&mut self) {
+        if let Some(gpu) = self.gpu.take() {
+            let _released = contained(move || drop(gpu));
+        }
+    }
 }
 
 impl Renderer {
@@ -183,22 +200,27 @@ impl Renderer {
             Ok((pipeline, uniforms, bind_group))
         })?;
         Ok(Renderer {
-            device,
-            queue,
-            pipeline,
-            uniforms,
-            bind_group,
-            target: None,
+            gpu: Some(Gpu {
+                device,
+                queue,
+                pipeline,
+                uniforms,
+                bind_group,
+                target: None,
+            }),
         })
     }
 
     /// 按 `params` 画一帧并读回；阻塞到 GPU 画完，最多等 2 秒（驱动卡住时报 [`Error::Gpu`]）。
     pub fn render(&mut self, params: &Params) -> Result<Frame, Error> {
-        let device = self.device.clone();
-        scoped(&device, || self.render_unscoped(params))
+        let gpu = self.gpu.as_mut().expect("GPU 对象只在释放时取走");
+        let device = gpu.device.clone();
+        scoped(&device, || gpu.render(params))
     }
+}
 
-    fn render_unscoped(&mut self, params: &Params) -> Result<Frame, Error> {
+impl Gpu {
+    fn render(&mut self, params: &Params) -> Result<Frame, Error> {
         let max = self.device.limits().max_texture_dimension_2d;
         if params.width == 0 || params.height == 0 || params.width > max || params.height > max {
             return Err(Error::Size {
@@ -339,14 +361,14 @@ thread_local! {
     static CONTAINED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// 当前线程上此刻发生的 panic 会被渲染器收住、转成 [`Error::Gpu`]：只在等 GPU 画完的那一刻为真。应用把 panic 当不变量
+/// 当前线程上此刻发生的 panic 会被渲染器收住、转成 [`Error::Gpu`]：只在等 GPU 画完与释放渲染器的那一刻为真。应用把 panic 当不变量
 /// 被破坏、中止进程时，据此放过这一种。
 pub fn panics_contained() -> bool {
     CONTAINED.get()
 }
 
-/// 做 `work`，期间的 panic 收住、转成 [`Error::Gpu`]。只用在等 GPU 画完上：wgpu 等待时遇到设备丢失、显存不足等它认为
-/// 致命的错误不返回错误而是 panic，那是外部的故障，不是本库的不变量被破坏。panic 时 wgpu 不拿着会中毒的锁（它的锁
+/// 做 `work`，期间的 panic 收住、转成 [`Error::Gpu`]。只用在等 GPU 画完与释放渲染器上：这两处 wgpu 遇到设备丢失、显存
+/// 不足等它认为致命的错误时不返回错误而是 panic，那是外部的故障，不是本库的不变量被破坏。panic 时 wgpu 不拿着会中毒的锁（它的锁
 /// 不中毒），收住后这个渲染器的设备照样能用或照样报错。
 fn contained<T>(work: impl FnOnce() -> T) -> Result<T, Error> {
     CONTAINED.set(true);

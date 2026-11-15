@@ -239,10 +239,13 @@ impl NewTask {
             let (probing, not_page) = match handle.await {
                 Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
                 Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
+                // 与 HLS 取到网页时同类：多为登录页或错误页，补上 Cookie 等请求头可能就对了；也可能是有视频的网页
                 Ok(Ok(Resource::Page { content_type })) => (
                     Probing::Failed(Failure {
-                        kind: FailureKind::Unsupported,
-                        message: format!("地址回的是网页（{content_type}），不是视频流或文件"),
+                        kind: FailureKind::Malformed,
+                        message: format!(
+                            "地址回的是网页（{content_type}），不是视频流或文件：多为登录页或错误页"
+                        ),
                     }),
                     true,
                 ),
@@ -273,7 +276,8 @@ impl NewTask {
     /// 探测有了结果：播放列表选中来源默认的变体与音频，文件的标题换成文件名（服务器给的，或由地址得出）。
     fn probed(&mut self, probing: Probing) {
         if let Probing::File(info) = &probing {
-            self.title = file_name(&self.url, info.file_name.as_deref());
+            // 地址经过重定向时，最后的地址里才有真正的文件名（`/download?id=1` 跳到 `/real.zip`）
+            self.title = file_name(&info.url, info.file_name.as_deref());
         }
         if let Probing::Ready(probe) = &probing
             && let Some(master) = &probe.master
@@ -459,7 +463,7 @@ impl NewTask {
                 }
             }
             Probing::File(info) => DraftKind::File {
-                name: info.file_name.clone(),
+                name: Some(self.title.clone()),
                 expected: Expected::from(&**info),
                 chunk_size: None,
             },

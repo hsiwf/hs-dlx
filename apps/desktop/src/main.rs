@@ -76,7 +76,7 @@ fn application() -> gpui_kit::Application {
 
 fn main() {
     // panic 是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务悄悄消失；存储里
-    // 还标着运行中的任务下次打开时按暂停处理。背景渲染器等 GPU 画完的那一刻除外：wgpu 把设备丢失等外部故障当 panic
+    // 还标着运行中的任务下次打开时按暂停处理。背景渲染器等 GPU 画完与释放的那一刻除外：wgpu 把设备丢失等外部故障当 panic
     // 报，渲染器收住后只停掉背景（见 hs_dlx_scene::panics_contained）
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
