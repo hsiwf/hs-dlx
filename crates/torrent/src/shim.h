@@ -1,5 +1,5 @@
-// libtorrent 的会话包一层给 Rust 用（声明见 src/lib.rs 的 ffi）。种子用信息哈希的十六进制串（v1 的 SHA-1，只有 v2 时为
-// 截到 20 字节的 SHA-256）指认；会话对象可在多个线程上同时调用。
+// libtorrent 的会话包一层给 Rust 用（声明见 src/lib.rs 的 ffi）。种子的编号在加入时定下：有 v1 信息哈希时为它的十六进制
+// 串，否则为截到 20 字节的 v2 的；取到元数据后知道了另一种哈希也不变。会话对象可在多个线程上同时调用。
 #pragma once
 
 #include <cstdint>
@@ -27,7 +27,8 @@ public:
 
 	rust::String add_magnet(rust::Str uri, rust::Str save_path) const;
 	rust::String add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const;
-	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str save_path) const;
+	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const;
+	void start(rust::Str id) const;
 	rust::Vec<FileEntry> files(rust::Str id) const;
 	void select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const;
 	rust::Vec<std::uint8_t> session_state() const;
@@ -41,13 +42,20 @@ public:
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
 
 private:
-	// 加进来的种子；会话自己按信息哈希管，这里只为不必每次把十六进制串解回哈希
+	// 加入一个种子并登记，编号为 `id`
+	rust::String add(lt::add_torrent_params params, std::string const& id, rust::Str save_path) const;
 	lt::torrent_handle handle(rust::Str id) const;
-	rust::String remember(lt::torrent_handle const& handle) const;
+	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
+	std::string id_of(lt::torrent_handle const& handle) const;
 
 	mutable lt::session m_session;
-	mutable std::mutex m_handles_mutex;
+	// 编号到句柄：移除即去掉，之后对这个编号的操作报「没有这个种子」
 	mutable std::map<std::string, lt::torrent_handle> m_handles;
+	// 句柄到编号：句柄按 libtorrent 的 owner_before 比较，种子移除、句柄失效后照样查得到。移除了的也不去掉：移除之后
+	// 还会有它的事件（移除、删文件的结果，移除前要的续传数据的结果），每个种子一项，会话活多久留多久
+	mutable std::map<lt::torrent_handle, std::string> m_ids;
+	// 守着上面两张表；加入时整个过程持有，取事件时查编号不会早于登记
+	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取
 	mutable std::mutex m_alerts_mutex;
 };

@@ -1,5 +1,5 @@
-//! 本机两个会话互传：一个做种，另一个用磁力链接（只有信息哈希）连上它，先取种子信息再下完内容。不用 DHT、tracker 与
-//! 端口映射，不出本机。
+//! 本机两个会话互传：一个做种，另一个用磁力链接（只有信息哈希）连上它，先取种子信息、开始之后再下完内容。不用 DHT、
+//! tracker 与端口映射，不出本机。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -43,6 +43,7 @@ fn seed(dir: &Path, path: &Path) -> (Session, TorrentId, Vec<u8>) {
     let torrent = create_torrent(path_str(path), 16 << 10).unwrap();
     let seeder = local_session();
     let id = seeder.add_torrent(&torrent, path_str(dir)).unwrap();
+    seeder.start(&id).unwrap();
     wait_until(&seeder, Duration::from_secs(20), |s| {
         s.status(&id).unwrap().state() == Some(State::Seeding) && s.listen_port() != 0
     });
@@ -73,8 +74,22 @@ fn selected_files_download_and_resume_without_peers() {
     let (seeder, id, torrent) = seed(&seed_dir, &album);
 
     let fetcher = local_session();
-    fetcher.add_torrent(&torrent, path_str(&fetch_dir)).unwrap();
-    // 先全不下，选好再连节点
+    assert_eq!(
+        fetcher.add_torrent(&torrent, path_str(&fetch_dir)).unwrap(),
+        id
+    );
+    // 已在会话里的不能再加：报错，另有一条加入失败的事件
+    assert!(fetcher.add_torrent(&torrent, path_str(&fetch_dir)).is_err());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fetcher
+        .pop_alerts(100)
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::AddFailed)
+    {
+        assert!(Instant::now() < deadline, "没等到加入失败的事件");
+    }
+    // 选好再开始
     let listed = fetcher.files(&id).unwrap();
     let mut paths: Vec<(String, i64)> = listed
         .iter()
@@ -93,6 +108,7 @@ fn selected_files_download_and_resume_without_peers() {
         .collect();
     fetcher.select_files(&id, &wanted).unwrap();
     assert!(fetcher.select_files(&id, &[99]).is_err());
+    fetcher.start(&id).unwrap();
     fetcher
         .connect_peer(&id, "127.0.0.1", seeder.listen_port())
         .unwrap();
@@ -114,6 +130,7 @@ fn selected_files_download_and_resume_without_peers() {
         assert!(Instant::now() < deadline, "没等到续传数据");
         if let Some(alert) = fetcher
             .pop_alerts(100)
+            .unwrap()
             .into_iter()
             .find(|a| a.kind == AlertKind::ResumeData)
         {
@@ -123,15 +140,20 @@ fn selected_files_download_and_resume_without_peers() {
     drop(fetcher);
     drop(seeder);
     let restored = local_session();
-    assert_eq!(
-        restored.add_resume(&resume, path_str(&fetch_dir)).unwrap(),
-        id
+    let other = TorrentId::parse(&"0".repeat(40)).unwrap();
+    assert!(
+        restored
+            .add_resume(&resume, &other, path_str(&fetch_dir))
+            .is_err()
     );
+    restored
+        .add_resume(&resume, &id, path_str(&fetch_dir))
+        .unwrap();
     wait_until(&restored, Duration::from_secs(20), |s| done(s, &id));
     assert_eq!(restored.status(&id).unwrap().peers, 0);
     assert!(
         local_session()
-            .add_resume(b"not bencode", path_str(&fetch_dir))
+            .add_resume(b"not bencode", &id, path_str(&fetch_dir))
             .is_err()
     );
 
@@ -143,7 +165,7 @@ fn selected_files_download_and_resume_without_peers() {
 /// DHT 的状态写得出、下次建会话时载得进。
 #[test]
 fn session_state_round_trips() {
-    let state = local_session().session_state();
+    let state = local_session().session_state().unwrap();
     assert!(!state.is_empty());
     let config = |state: Vec<u8>| SessionConfig {
         listen_interfaces: "127.0.0.1:0".into(),
@@ -164,7 +186,7 @@ fn wait_until(session: &Session, limit: Duration, mut done: impl FnMut(&Session)
     let deadline = Instant::now() + limit;
     while !done(session) {
         assert!(Instant::now() < deadline, "超过 {limit:?} 没等到");
-        for alert in session.pop_alerts(100) {
+        for alert in session.pop_alerts(100).unwrap() {
             assert!(
                 !matches!(
                     alert.kind,
@@ -194,14 +216,27 @@ fn a_magnet_link_downloads_from_a_local_seed() {
 
     let seeder = local_session();
     let seeding = seeder.add_torrent(&torrent, path_str(&seed_dir)).unwrap();
+    seeder.start(&seeding).unwrap();
     wait_until(&seeder, Duration::from_secs(20), |s| {
         s.status(&seeding).unwrap().state() == Some(State::Seeding) && s.listen_port() != 0
     });
 
+    // 名字不是 UTF-8（%FF）：照样加得进，名字里换成替换字符
     let fetcher = local_session();
-    let magnet = format!("magnet:?xt=urn:btih:{seeding}");
+    let magnet = format!("magnet:?xt=urn:btih:{seeding}&dn=a%FFb");
     let fetching: TorrentId = fetcher.add_magnet(&magnet, path_str(&fetch_dir)).unwrap();
     assert_eq!(fetching, seeding);
+    assert_eq!(fetcher.status(&fetching).unwrap().name, "a\u{fffd}b");
+    fetcher
+        .connect_peer(&fetching, "127.0.0.1", seeder.listen_port())
+        .unwrap();
+    // 取到种子信息、校验完，还没开始：一块也不下（只上传的一方与做种的一方之后互相断开）
+    wait_until(&fetcher, Duration::from_secs(60), |s| {
+        let status = s.status(&fetching).unwrap();
+        status.has_metadata && status.state() == Some(State::Downloading)
+    });
+    assert_eq!(fetcher.status(&fetching).unwrap().total_wanted_done, 0);
+    fetcher.start(&fetching).unwrap();
     fetcher
         .connect_peer(&fetching, "127.0.0.1", seeder.listen_port())
         .unwrap();

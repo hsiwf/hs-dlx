@@ -1,8 +1,10 @@
 //! BT 引擎：静态链接的 libtorrent-rasterbar（2.1）上的一层很薄的绑定，只公开桌面应用要用的会话操作。C++ 的那一层在
 //! src/shim.cpp，库由 third_party/libtorrent/build.sh 编出。
 //!
-//! 种子用信息哈希的十六进制串（[`TorrentId`]）指认。会话的操作都交给 libtorrent 的网络线程去做，可以在任意线程上调用；
-//! 事件（[`Alert`]）由 [`Session::pop_alerts`] 取出，取出时已转成自有的数据。
+//! 种子用加入时定下的编号（[`TorrentId`]）指认。加入的种子先只取种子信息、不下内容，选好文件后 [`Session::start`]
+//! 才开始下；排队与开停由应用决定，libtorrent 不自动开停。会话的操作都交给 libtorrent 的网络线程去做，可以在任意线程
+//! 上调用；事件（[`Alert`]）由 [`Session::pop_alerts`] 取出，取出时已转成自有的数据。libtorrent 给的文字（种子名、
+//! 文件路径、说明）不是 UTF-8 的字节换成了替换字符。
 
 use std::fmt;
 
@@ -43,9 +45,9 @@ mod ffi {
         /// 连着的节点数，其中的做种者
         peers: i32,
         seeds: i32,
-        /// 总块数；没有种子信息时为 0
+        /// 要下的块数（选了的文件所在的块）；没有种子信息时为 0
         pieces: i32,
-        /// 能凑齐的块数：自己已有的，或在线的节点里至少有一个有的
+        /// 其中能凑齐的：自己已有的，或在线的节点里至少有一个有的
         reachable_pieces: i32,
         /// 种子出错的原因；没出错时为空
         error: String,
@@ -62,9 +64,16 @@ mod ffi {
         /// [`Session::save_resume_data`] 的结果：`data` 为续传数据
         ResumeData,
         ResumeDataFailed,
+        /// 续传数据与磁盘上的文件对不上，改为从头校验
+        ResumeRejected,
         TorrentError,
         FileError,
+        /// 从会话里去掉了；要删文件时之后还有 [`AlertKind::Deleted`] 或 [`AlertKind::DeleteFailed`]
         Removed,
+        Deleted,
+        DeleteFailed,
+        /// 事件来得太快、队列满了丢了一些：靠事件维持的状态要重新查一遍
+        AlertsDropped,
         ListenSucceeded,
         ListenFailed,
         PortMapped,
@@ -75,7 +84,8 @@ mod ffi {
     struct FileEntry {
         /// 在种子里的序号，选文件时用它
         index: i32,
-        /// 在种子里的相对路径（多文件的种子以种子名的目录开头）
+        /// 在种子里的相对路径（多文件的种子以种子名的目录开头）；不是 UTF-8 的字节换成了替换字符，只用于显示，选文件
+        /// 用 `index`
         path: String,
         /// 字节数
         size: i64,
@@ -100,10 +110,11 @@ mod ffi {
         fn new_session(config: &SessionConfig) -> Result<UniquePtr<Session>>;
         fn add_magnet(self: &Session, uri: &str, save_path: &str) -> Result<String>;
         fn add_torrent(self: &Session, torrent: &[u8], save_path: &str) -> Result<String>;
-        fn add_resume(self: &Session, resume: &[u8], save_path: &str) -> Result<String>;
+        fn add_resume(self: &Session, resume: &[u8], id: &str, save_path: &str) -> Result<String>;
+        fn start(self: &Session, id: &str) -> Result<()>;
         fn files(self: &Session, id: &str) -> Result<Vec<FileEntry>>;
         fn select_files(self: &Session, id: &str, wanted: &[i32]) -> Result<()>;
-        fn session_state(self: &Session) -> Vec<u8>;
+        fn session_state(self: &Session) -> Result<Vec<u8>>;
         fn status(self: &Session, id: &str) -> Result<Status>;
         fn connect_peer(self: &Session, id: &str, ip: &str, port: u16) -> Result<()>;
         fn pause(self: &Session, id: &str) -> Result<()>;
@@ -111,7 +122,7 @@ mod ffi {
         fn remove(self: &Session, id: &str, delete_files: bool) -> Result<()>;
         fn save_resume_data(self: &Session, id: &str) -> Result<()>;
         fn listen_port(self: &Session) -> u16;
-        fn pop_alerts(self: &Session, wait_ms: u32) -> Vec<Alert>;
+        fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, piece_size: i32) -> Result<Vec<u8>>;
     }
 }
@@ -124,11 +135,21 @@ unsafe impl Send for ffi::Session {}
 // SAFETY: 同上，`&Session` 上的操作在多个线程上同时调用也只是各发各的消息、各自加锁。
 unsafe impl Sync for ffi::Session {}
 
-/// 种子的指认：信息哈希的十六进制串（v1 的 SHA-1；只有 v2 时为截到 20 字节的 SHA-256）。
+/// 种子的编号：加入时的信息哈希的十六进制串，有 v1 的（SHA-1）时为它，只有 v2 时为截到 20 字节的 SHA-256。取到种子
+/// 信息后知道了另一种哈希也不变；存起来，从续传数据恢复时交回（[`Session::add_resume`]）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TorrentId(String);
 
 impl TorrentId {
+    /// 存起来的编号：40 个十六进制数字。
+    pub fn parse(text: &str) -> Result<TorrentId, Error> {
+        if text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Ok(TorrentId(text.to_ascii_lowercase()))
+        } else {
+            Err(Error(format!("不是种子的编号：{text}")))
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -200,12 +221,13 @@ impl Session {
         self.0.as_ref().expect("new_session 成功时返回的指针不为空")
     }
 
-    /// 加磁力链接，下到 `save_path` 下（种子里的文件与目录建在它里面）。
+    /// 加磁力链接，下到 `save_path` 下（种子里的文件与目录建在它里面）：只取种子信息，[`Session::start`] 之后才下内容。
+    /// 已在会话里的报错。
     pub fn add_magnet(&self, uri: &str, save_path: &str) -> Result<TorrentId, Error> {
         Ok(TorrentId(self.inner().add_magnet(uri, save_path)?))
     }
 
-    /// 加种子文件（bencode 写的内容），下到 `save_path` 下。
+    /// 加种子文件（bencode 写的内容），下到 `save_path` 下：[`Session::start`] 之后才下内容。已在会话里的报错。
     pub fn add_torrent(&self, torrent: &[u8], save_path: &str) -> Result<TorrentId, Error> {
         Ok(TorrentId(self.inner().add_torrent(torrent, save_path)?))
     }
@@ -214,9 +236,16 @@ impl Session {
         Ok(self.inner().status(id.as_str())?)
     }
 
-    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复种子，下到 `save_path` 下：已下完的块不再校验、不重下。
-    pub fn add_resume(&self, resume: &[u8], save_path: &str) -> Result<TorrentId, Error> {
-        Ok(TorrentId(self.inner().add_resume(resume, save_path)?))
+    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复编号为 `id` 的种子，下到 `save_path` 下：已下完的块不再校验、
+    /// 不重下；写续传数据时在下的照样下（不用再 [`Session::start`]）。续传数据不是这个种子的、或已在会话里时报错。
+    pub fn add_resume(&self, resume: &[u8], id: &TorrentId, save_path: &str) -> Result<(), Error> {
+        self.inner().add_resume(resume, id.as_str(), save_path)?;
+        Ok(())
+    }
+
+    /// 开始下内容（选好文件之后）。
+    pub fn start(&self, id: &TorrentId) -> Result<(), Error> {
+        Ok(self.inner().start(id.as_str())?)
     }
 
     /// 种子里的文件；还没有种子信息时报错。
@@ -231,8 +260,8 @@ impl Session {
     }
 
     /// DHT 的状态（路由表里的节点），存起来下次建会话时放进 [`SessionConfig::state`]。
-    pub fn session_state(&self) -> Vec<u8> {
-        self.inner().session_state()
+    pub fn session_state(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.inner().session_state()?)
     }
 
     /// 主动连一个节点（`ip` 为 IPv4 或 IPv6 的写法）。
@@ -264,9 +293,9 @@ impl Session {
         self.inner().listen_port()
     }
 
-    /// 取出积攒的事件；没有时最多等 `wait_ms` 毫秒。
-    pub fn pop_alerts(&self, wait_ms: u32) -> Vec<Alert> {
-        self.inner().pop_alerts(wait_ms)
+    /// 取出积攒的事件；没有时最多等 `wait_ms` 毫秒。转换出错时这一批事件丢了，报错（之后照常取）。
+    pub fn pop_alerts(&self, wait_ms: u32) -> Result<Vec<Alert>, Error> {
+        Ok(self.inner().pop_alerts(wait_ms)?)
     }
 }
 

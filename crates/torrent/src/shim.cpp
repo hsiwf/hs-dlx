@@ -25,9 +25,19 @@ namespace {
 
 std::string string_of(rust::Str text) { return std::string(text.data(), text.size()); }
 
-// 种子的指认：信息哈希的十六进制串
-std::string id_of(lt::torrent_handle const& handle) {
-	return lt::aux::to_hex(handle.info_hashes().get_best());
+// libtorrent 给的文字（种子名、文件路径、说明）不保证是 UTF-8（磁力链接的 dn、种子里的路径都是对方写的）：不是 UTF-8 的
+// 字节换成替换字符
+rust::String text_of(std::string const& text) { return rust::String::lossy(text); }
+
+// 加入时定下的编号：有 v1 信息哈希时为它，否则为截到 20 字节的 v2 的，都写成十六进制
+std::string canonical(lt::info_hash_t const& hashes) {
+	return lt::aux::to_hex(hashes.has_v1() ? hashes.v1 : hashes.get(lt::protocol_version::V2));
+}
+
+// `id` 是 `hashes` 里 v1 或（截短的）v2 信息哈希的十六进制串
+bool names(lt::info_hash_t const& hashes, std::string const& id) {
+	return (hashes.has_v1() && lt::aux::to_hex(hashes.v1) == id)
+		|| (hashes.has_v2() && lt::aux::to_hex(hashes.get(lt::protocol_version::V2)) == id);
 }
 
 lt::settings_pack settings_of(SessionConfig const& config) {
@@ -53,11 +63,11 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	return pack;
 }
 
-Alert alert_of(AlertKind kind, lt::alert const& alert, std::string torrent) {
+Alert alert_of(AlertKind kind, lt::alert const& alert, std::string const& torrent) {
 	Alert out;
 	out.kind = kind;
 	out.torrent = rust::String(torrent);
-	out.message = rust::String(alert.message());
+	out.message = text_of(alert.message());
 	return out;
 }
 
@@ -91,37 +101,60 @@ std::unique_ptr<Session> new_session(SessionConfig const& config) {
 	return std::make_unique<Session>(config);
 }
 
-rust::String Session::remember(lt::torrent_handle const& handle) const {
-	std::string id = id_of(handle);
-	std::lock_guard<std::mutex> lock(m_handles_mutex);
-	m_handles[id] = handle;
+rust::String Session::add(lt::add_torrent_params params, std::string const& id, rust::Str save_path) const {
+	params.save_path = string_of(save_path);
+	// 排队、开停由应用决定，libtorrent 不自动开停（默认的标志是「暂停 + 自动管理」，由它来开）；已在会话里的报错，不返回
+	// 原有的那个
+	params.flags &= ~lt::torrent_flags::auto_managed;
+	params.flags |= lt::torrent_flags::duplicate_is_error;
+	std::lock_guard<std::mutex> lock(m_mutex);
+	lt::torrent_handle h = m_session.add_torrent(std::move(params));
+	m_handles[id] = h;
+	m_ids[h] = id;
 	return rust::String(id);
 }
 
 lt::torrent_handle Session::handle(rust::Str id) const {
-	std::lock_guard<std::mutex> lock(m_handles_mutex);
+	std::lock_guard<std::mutex> lock(m_mutex);
 	auto found = m_handles.find(string_of(id));
 	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + string_of(id));
 	return found->second;
 }
 
+std::string Session::id_of(lt::torrent_handle const& handle) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_ids.find(handle);
+	if (found == m_ids.end()) throw std::logic_error("事件里的种子不是经这个会话加入的");
+	return found->second;
+}
+
 rust::String Session::add_magnet(rust::Str uri, rust::Str save_path) const {
 	lt::add_torrent_params params = lt::parse_magnet_uri(string_of(uri));
-	params.save_path = string_of(save_path);
-	return remember(m_session.add_torrent(std::move(params)));
+	// 不暂停（连节点、取种子信息），但只上传不下载：选好文件后 start 才开始下
+	params.flags &= ~lt::torrent_flags::paused;
+	params.flags |= lt::torrent_flags::upload_mode;
+	std::string const id = canonical(params.info_hashes);
+	return add(std::move(params), id, save_path);
 }
 
 rust::String Session::add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const {
 	lt::add_torrent_params params = lt::load_torrent_buffer(bytes_of(torrent));
-	params.save_path = string_of(save_path);
-	return remember(m_session.add_torrent(std::move(params)));
+	params.flags &= ~lt::torrent_flags::paused;
+	params.flags |= lt::torrent_flags::upload_mode;
+	std::string const id = canonical(params.ti->info_hashes());
+	return add(std::move(params), id, save_path);
 }
 
-rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::Str save_path) const {
+rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const {
 	lt::add_torrent_params params = lt::read_resume_data(bytes_of(resume));
-	params.save_path = string_of(save_path);
-	return remember(m_session.add_torrent(std::move(params)));
+	lt::info_hash_t const hashes = params.ti ? params.ti->info_hashes() : params.info_hashes;
+	std::string const expected = string_of(id);
+	if (!names(hashes, expected)) throw std::invalid_argument("续传数据不是这个种子的：" + expected);
+	// 暂停与否、是否只上传照续传数据里记的
+	return add(std::move(params), expected, save_path);
 }
+
+void Session::start(rust::Str id) const { handle(id).unset_flags(lt::torrent_flags::upload_mode); }
 
 rust::Vec<FileEntry> Session::files(rust::Str id) const {
 	std::shared_ptr<lt::torrent_info const> info = handle(id).torrent_file();
@@ -133,7 +166,7 @@ rust::Vec<FileEntry> Session::files(rust::Str id) const {
 		if (layout.pad_file_at(i)) continue;
 		FileEntry entry;
 		entry.index = static_cast<std::int32_t>(i);
-		entry.path = rust::String(layout.file_path(i));
+		entry.path = text_of(layout.file_path(i));
 		entry.size = layout.file_size(i);
 		out.push_back(std::move(entry));
 	}
@@ -169,24 +202,30 @@ Status Session::status(rust::Str id) const {
 	out.state = static_cast<std::uint8_t>(s.state);
 	out.has_metadata = s.has_metadata;
 	out.paused = static_cast<bool>(s.flags & lt::torrent_flags::paused);
-	out.name = rust::String(s.name);
+	out.name = text_of(s.name);
 	out.total_wanted = s.total_wanted;
 	out.total_wanted_done = s.total_wanted_done;
 	out.download_rate = s.download_payload_rate;
 	out.upload_rate = s.upload_payload_rate;
 	out.peers = s.num_peers;
 	out.seeds = s.num_seeds;
-	out.error = rust::String(s.errc ? s.errc.message() : std::string());
-	// 能凑齐的块：自己已有的，或在线的节点里至少有一个有的
+	out.error = text_of(s.errc ? s.errc.message() : std::string());
+	// 要下的块（选了的文件所在的块），其中能凑齐的：自己已有的，或在线的节点里至少有一个有的
 	std::vector<int> availability;
-	if (s.has_metadata) h.piece_availability(availability);
-	out.pieces = static_cast<std::int32_t>(s.pieces.size());
-	std::int32_t reachable = 0;
-	for (int i = 0; i < s.pieces.size(); ++i) {
-		lt::piece_index_t const piece(i);
-		bool const available = i < static_cast<int>(availability.size()) && availability[std::size_t(i)] > 0;
-		if (s.pieces.get_bit(piece) || available) ++reachable;
+	std::vector<lt::download_priority_t> priorities;
+	if (s.has_metadata) {
+		h.piece_availability(availability);
+		priorities = h.get_piece_priorities();
 	}
+	std::int32_t wanted = 0;
+	std::int32_t reachable = 0;
+	for (std::size_t i = 0; i < priorities.size() && i < std::size_t(s.pieces.size()); ++i) {
+		if (priorities[i] == lt::dont_download) continue;
+		++wanted;
+		bool const available = i < availability.size() && availability[i] > 0;
+		if (s.pieces.get_bit(lt::piece_index_t(static_cast<int>(i))) || available) ++reachable;
+	}
+	out.pieces = wanted;
 	out.reachable_pieces = reachable;
 	return out;
 }
@@ -205,7 +244,7 @@ void Session::resume(rust::Str id) const { handle(id).resume(); }
 void Session::remove(rust::Str id, bool delete_files) const {
 	lt::torrent_handle h = handle(id);
 	m_session.remove_torrent(h, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
-	std::lock_guard<std::mutex> lock(m_handles_mutex);
+	std::lock_guard<std::mutex> lock(m_mutex);
 	m_handles.erase(string_of(id));
 }
 
@@ -235,16 +274,25 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_alert>(a)) {
 			Alert alert = alert_of(AlertKind::ResumeData, *a, id_of(t->handle));
 			std::vector<char> data = lt::write_resume_data_buf(t->params);
+			alert.data.reserve(data.size());
 			for (char c : data) alert.data.push_back(static_cast<std::uint8_t>(c));
 			out.push_back(std::move(alert));
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeDataFailed, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
+			out.push_back(alert_of(AlertKind::ResumeRejected, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_error_alert>(a)) {
 			out.push_back(alert_of(AlertKind::TorrentError, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::file_error_alert>(a)) {
 			out.push_back(alert_of(AlertKind::FileError, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_removed_alert>(a)) {
-			out.push_back(alert_of(AlertKind::Removed, *a, lt::aux::to_hex(t->info_hashes.get_best())));
+			out.push_back(alert_of(AlertKind::Removed, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
+			out.push_back(alert_of(AlertKind::Deleted, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
+			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id_of(t->handle)));
+		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
+			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
