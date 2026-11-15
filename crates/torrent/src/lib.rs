@@ -42,7 +42,7 @@ mod ffi {
         /// 要下载的字节数（没选的文件不算）；没有种子信息时为 0
         total_wanted: i64,
         /// 其中已下完并校验过的；可能还在内存里没写到磁盘（libtorrent 先校验、再异步写盘），要确认已落盘用
-        /// [`Session::save_resume_data`]
+        /// [`Session::flush`]
         total_wanted_done: i64,
         /// 下载与上传的速度，字节每秒，只算内容
         download_rate: i32,
@@ -72,6 +72,8 @@ mod ffi {
         ResumeDataFailed,
         /// 续传数据与磁盘上的文件对不上，改为从头校验
         ResumeRejected,
+        /// [`Session::flush`] 的结果：调用那一刻已下的数据都已写到磁盘（移除种子时也会有一条）
+        CacheFlushed,
         TorrentError,
         FileError,
         /// 从会话里去掉了；要删文件时另有 [`AlertKind::Deleted`] 或 [`AlertKind::DeleteFailed`]，与这条先后不定
@@ -121,6 +123,7 @@ mod ffi {
         fn add_torrent(self: &Session, torrent: &[u8], save_path: &str) -> Result<String>;
         fn add_resume(self: &Session, resume: &[u8], id: &str, save_path: &str) -> Result<String>;
         fn start(self: &Session, id: &str) -> Result<()>;
+        fn flush(self: &Session, id: &str) -> Result<()>;
         fn files(self: &Session, id: &str) -> Result<Vec<FileEntry>>;
         fn select_files(self: &Session, id: &str, wanted: &[i32]) -> Result<()>;
         fn session_state(self: &Session) -> Result<Vec<u8>>;
@@ -255,6 +258,12 @@ impl Session {
         Ok(())
     }
 
+    /// 把缓存里的数据写到磁盘并关上文件，结果以 [`AlertKind::CacheFlushed`] 报来：那时调用这一刻已下的数据都已在磁盘
+    /// 上。还没有种子信息时报错（没有要写的，也不会有这个事件）。
+    pub fn flush(&self, id: &TorrentId) -> Result<(), Error> {
+        Ok(self.inner().flush(id.as_str())?)
+    }
+
     /// 开始下内容（选好文件之后），或写文件出错改成只上传后继续下。
     pub fn start(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().start(id.as_str())?)
@@ -295,8 +304,8 @@ impl Session {
         Ok(self.inner().remove(id.as_str(), delete_files)?)
     }
 
-    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。先把缓存里的数据写到
-    /// 磁盘：收到 [`AlertKind::ResumeData`] 时，续传数据里记为已有的块都已在磁盘上。
+    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。续传数据按已校验的块
+    /// 记，不等它们写到磁盘：要与磁盘一致（退出前）时先 [`Session::flush`]、等到 [`AlertKind::CacheFlushed`] 再要。
     pub fn save_resume_data(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().save_resume_data(id.as_str())?)
     }

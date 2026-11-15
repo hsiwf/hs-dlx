@@ -114,8 +114,9 @@ fn selected_files_download_and_resume_without_peers() {
         .unwrap();
     wait_until(&fetcher, Duration::from_secs(60), |s| done(s, &id));
     assert_eq!(fetcher.status(&id).unwrap().total_wanted, 100_000 + 250_000);
-    // 写出续传数据（数据随之落盘），再看磁盘上的文件；之后换一个不连任何节点的会话恢复
-    let resume = flushed(&fetcher, &id);
+    // 写到磁盘后看文件；再写出续传数据，换一个不连任何节点的会话恢复
+    flushed(&fetcher, &id);
+    let resume = resume_data(&fetcher, &id);
     for (path, data) in [&files[0], &files[2]] {
         assert_file(&fetch_dir, path, data);
     }
@@ -228,20 +229,30 @@ fn wait_until(session: &Session, limit: Duration, mut done: impl FnMut(&Session)
     }
 }
 
-/// 写出 `id` 的续传数据并等它报来，返回续传数据：报来时下完的块都已写到磁盘（libtorrent 先校验、再异步写盘，下完并
-/// 校验过时数据可能还在内存里）。
-fn flushed(session: &Session, id: &TorrentId) -> Vec<u8> {
+/// 把 `id` 已下的数据写到磁盘并等它报来（libtorrent 先校验、再异步写盘，下完并校验过时数据可能还在内存里）。
+fn flushed(session: &Session, id: &TorrentId) {
+    session.flush(id).unwrap();
+    wait_for(session, AlertKind::CacheFlushed, "写到磁盘");
+}
+
+/// 写出 `id` 的续传数据并等它报来，返回续传数据。
+fn resume_data(session: &Session, id: &TorrentId) -> Vec<u8> {
     session.save_resume_data(id).unwrap();
+    wait_for(session, AlertKind::ResumeData, "续传数据").data
+}
+
+/// 等到一条 `kind` 的事件（期间的别的事件丢掉）；20 秒内没等到即失败。
+fn wait_for(session: &Session, kind: AlertKind, what: &str) -> hs_dlx_torrent::Alert {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        assert!(Instant::now() < deadline, "没等到续传数据");
+        assert!(Instant::now() < deadline, "没等到{what}");
         if let Some(alert) = session
             .pop_alerts(100)
             .unwrap()
             .into_iter()
-            .find(|a| a.kind == AlertKind::ResumeData)
+            .find(|a| a.kind == kind)
         {
-            return alert.data;
+            return alert;
         }
     }
 }

@@ -159,6 +159,13 @@ rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::S
 
 void Session::start(rust::Str id) const { handle(id).unset_flags(lt::torrent_flags::upload_mode); }
 
+void Session::flush(rust::Str id) const {
+	lt::torrent_handle h = handle(id);
+	// 没有种子信息时还没有存储，libtorrent 不发写完的事件
+	if (!h.torrent_file()) throw std::invalid_argument("还没有种子信息，没有要写到磁盘的：" + string_of(id));
+	h.flush_cache();
+}
+
 rust::Vec<FileEntry> Session::files(rust::Str id) const {
 	std::shared_ptr<lt::torrent_info const> info = handle(id).torrent_file();
 	if (!info) throw std::runtime_error("还没有种子信息：" + string_of(id));
@@ -271,8 +278,7 @@ void Session::removed(std::string const& id, bool files_settled) const {
 }
 
 void Session::save_resume_data(rust::Str id) const {
-	// 先把缓存里的数据写到磁盘：续传数据记的块要都在磁盘上，崩溃后恢复时才对得上
-	handle(id).save_resume_data(lt::torrent_handle::flush_disk_cache | lt::torrent_handle::save_info_dict);
+	handle(id).save_resume_data(lt::torrent_handle::save_info_dict);
 }
 
 std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
@@ -302,6 +308,8 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(std::move(alert));
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeDataFailed, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::cache_flushed_alert>(a)) {
+			out.push_back(alert_of(AlertKind::CacheFlushed, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeRejected, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_error_alert>(a)) {

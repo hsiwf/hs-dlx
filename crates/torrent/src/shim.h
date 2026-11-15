@@ -29,6 +29,7 @@ public:
 	rust::String add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const;
 	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const;
 	void start(rust::Str id) const;
+	void flush(rust::Str id) const;
 	rust::Vec<FileEntry> files(rust::Str id) const;
 	void select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const;
 	rust::Vec<std::uint8_t> session_state() const;
