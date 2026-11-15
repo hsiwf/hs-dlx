@@ -146,8 +146,8 @@ mod ffi {
         working: bool,
         /// 正在通告
         updating: bool,
-        /// 连续失败的次数
-        fails: i32,
+        /// 连不上：每个监听地址的通告都失败过，且没有成功的
+        failed: bool,
         /// tracker 回的错误或警告，或连不上的原因（英文）；没有时为空
         message: String,
         /// tracker 报的做种与在下的人数；-1 为没报

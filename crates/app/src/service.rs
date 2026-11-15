@@ -61,6 +61,8 @@ pub enum Event {
     },
     /// 已完成的 BT 任务开始做种（下完接着做、[`Service::seed`]，或打开应用时接着上次的）
     SeedingStarted { id: TaskId },
+    /// 做种时定时存进度没存成（`reason` 为原因）：照常做种，下一次再存；这期间的上传与做种时长要等存成了才记下
+    SeedingNotSaved { id: TaskId, reason: String },
     /// 做种停了：`end` 为原因。`unsaved` 为 Some 时停下时的进度与「不再做种」没能写进存储，下次打开时照存储里的（可能
     /// 接着做种）
     SeedingEnded {
@@ -272,8 +274,7 @@ impl Service {
             shared,
             runtime: Some(runtime),
         };
-        // 上次退出时还在做种的接着做；开始不了的以做种停了报出，存储里照旧记着，下次打开再试（开始不了多是一时的，如
-        // BT 会话建不出）
+        // 上次退出时还在做种的接着做；开始不了的与做种中途开始不了的一样，以做种停了报出、记为不再做种（可再点做种）
         {
             let _entered = service.runtime().enter();
             for id in seeding {
@@ -282,7 +283,10 @@ impl Service {
                     let _closed = service.shared.events.send(Event::SeedingEnded {
                         id,
                         end: SeedEnd::Failed(error.to_string()),
-                        unsaved: None,
+                        unsaved: service
+                            .shared
+                            .write(|tx| store::set_seeding_task(tx, id, false))
+                            .err(),
                     });
                 }
             }
@@ -404,8 +408,16 @@ impl Service {
             };
             let not_running = || Error::InvalidInput("只有在下或做种的 BT 任务能诊断".to_owned());
             let spec = spec.ok_or_else(not_running)?;
-            let engine = shared.bt.existing().ok_or_else(not_running)?;
-            torrent::diagnose(&engine, &spec.info_hash, limit).await
+            let seeding = if lock(&shared.running).contains_key(&id) {
+                false
+            } else if lock(&shared.seeders).contains_key(&id) {
+                true
+            } else {
+                return Err(not_running());
+            };
+            // 在下或做种的已建过会话；关闭之后没有了
+            let engine = shared.bt.existing().ok_or(Error::Closed)?;
+            torrent::diagnose(&engine, &spec.info_hash, seeding, limit).await
         })
     }
 
@@ -418,12 +430,19 @@ impl Service {
         self.shared.start_seeding(id)
     }
 
-    /// 停止做种：存下进度、从 BT 会话里移除，记为不再做种；停下后发 [`Event::SeedingEnded`]。没在做种时什么也不做。
-    pub fn stop_seeding(&self, id: TaskId) {
-        if let Some(seeder) = lock(&self.shared.seeders).get(&id) {
+    /// 停止做种：随即记为不再做种（之后应用退出或崩溃也不再接着做），再存下进度、从 BT 会话里移除；停下后发
+    /// [`Event::SeedingEnded`]。没在做种时什么也不做；记不进存储时报错，做种照旧。
+    pub fn stop_seeding(&self, id: TaskId) -> Result<(), Error> {
+        self.shared.write(|tx| {
+            let seeders = lock(&self.shared.seeders);
+            let Some(seeder) = seeders.get(&id) else {
+                return Ok(());
+            };
+            store::set_seeding_task(tx, id, false)?;
             seeder.by_user.store(true, Ordering::Relaxed);
             seeder.cancel.cancel();
-        }
+            Ok(())
+        })
     }
 
     /// 记下外观主题。
@@ -606,7 +625,7 @@ impl Service {
     /// 文件）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们的任务目录（BT 为下了的文件）要用
     /// [`Service::discard`] 一起删。在做种的报 [`Error::Seeding`]；`.parts` 删不掉时报 [`Error::Io`]，记录留着。
     pub fn forget(&self, id: TaskId) -> Result<(), Error> {
-        self.shared.write(|tx| {
+        let part = self.shared.write(|tx| {
             if lock(&self.shared.discarding).contains(&id) {
                 return Err(Error::Discarding(id));
             }
@@ -618,27 +637,48 @@ impl Service {
             if task.status != Status::Done && unfinished {
                 return Err(Error::NotFinished(id));
             }
-            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户，随记录一起删；
-            // 删不掉时记录留着
-            if let Some(spec) = task.spec.torrent() {
-                let resume = store::torrent_resume(tx, id)?;
-                let info = TorrentInfo::of(&resume.data)
-                    .map_err(|error| Error::Corrupt(format!("{id}的续传数据：{error}")))?;
-                let part = torrent_folder(spec).join(&info.part_file);
+            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户；记录删了之后在
+            // 后台删
+            let part = match task.spec.torrent() {
+                Some(spec) => Some((torrent_folder(spec), store::torrent_resume(tx, id)?.data)),
+                None => None,
+            };
+            store::delete(tx, id)?;
+            Ok(part)
+        })?;
+        if let Some((folder, resume)) = part {
+            self.forget_part_file(folder, resume);
+        }
+        Ok(())
+    }
+
+    /// 在运行时的阻塞线程上删掉移除了的 BT 任务在保存目录 `folder` 里的 `.parts`（名字由续传数据 `resume` 得出）；删不掉
+    /// 或读不出名字时发 [`Event::Orphaned`]。
+    fn forget_part_file(&self, folder: PathBuf, resume: Vec<u8>) {
+        let events = self.shared.events.clone();
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let removed = tokio::task::spawn_blocking(move || {
+                let name = TorrentInfo::of(&resume)
+                    .map_err(|error| (folder.clone(), format!("读不出 .parts 的名字：{error}")))?
+                    .part_file;
+                let part = folder.join(name);
                 match std::fs::remove_file(&part) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(cause) => {
-                        return Err(Error::Io {
-                            action: "删除",
-                            path: part,
-                            cause,
-                        });
-                    }
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err((part, format!("删不掉：{error}"))),
                 }
+            })
+            .await
+            .expect("删文件不会 panic，运行时关闭时本任务也一起丢弃");
+            if let Err((path, reason)) = removed {
+                // 接收端随界面关闭而丢弃时没有谁能处理
+                let _closed = events.send(Event::Orphaned {
+                    paths: vec![path],
+                    reason,
+                });
             }
-            store::delete(tx, id)
-        })
+        });
     }
 
     /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）、或任务是 BT
@@ -953,7 +993,18 @@ impl Shared {
                                 progress: Box::new(progress),
                             });
                         },
-                        |resume| saving.write(|tx| store::set_torrent_resume(tx, id, &resume)),
+                        |resume| {
+                            let saved = resume.and_then(|resume| {
+                                saving
+                                    .write(|tx| store::set_torrent_resume(tx, id, &resume))
+                                    .map_err(|error| error.to_string())
+                            });
+                            if let Err(reason) = saved {
+                                // 同上
+                                let _closed =
+                                    saving.events.send(Event::SeedingNotSaved { id, reason });
+                            }
+                        },
                     )
                     .await
                 }

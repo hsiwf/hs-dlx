@@ -37,9 +37,12 @@ pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
 pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA, 0.);
 
-/// 一个 BT 任务的诊断：在诊断中，或诊断的结果（诊断不了时为原因）。
+/// 一个 BT 任务的诊断：在诊断中，或诊断的结果（诊断不了时为原因）。只对诊断时那一次运行（任务停过、开始或停止了做种
+/// 之后不再显示）。
 pub(super) struct Diagnosis {
     id: TaskId,
+    /// 诊断时任务的运行：停下的次数（[`Row::reading`]）与在不在做种
+    run: (u64, bool),
     result: Option<Result<Vec<Check>, String>>,
     _running: Task<()>,
 }
@@ -192,16 +195,17 @@ impl Shell {
             return None;
         }
         let id = row.task.id;
+        let run = (row.reading, row.task.seeding);
         let shown = self
             .diagnosis
             .as_ref()
-            .filter(|diagnosis| diagnosis.id == id);
+            .filter(|diagnosis| diagnosis.id == id && diagnosis.run == run);
         let button = |label: &'static str| {
             ui::button(
                 "diagnose",
                 label,
                 Tone::Plain,
-                cx.listener(move |this, _, _, cx| this.diagnose(id, cx)),
+                cx.listener(move |this, _, _, cx| this.diagnose(id, run, cx)),
             )
         };
         let body: AnyElement = match shown.map(|diagnosis| &diagnosis.result) {
@@ -232,8 +236,8 @@ impl Shell {
         )
     }
 
-    /// 诊断 BT 任务 `id`，结果写进诊断一节；之前的结果作废。
-    fn diagnose(&mut self, id: TaskId, cx: &mut Context<Self>) {
+    /// 诊断 BT 任务 `id`（这时的运行为 `run`），结果写进诊断一节；之前的结果作废。
+    fn diagnose(&mut self, id: TaskId, run: (u64, bool), cx: &mut Context<Self>) {
         let handle = self.tasks.read(cx).service().diagnose(id);
         let running = cx.spawn(async move |this, cx| {
             let result = match handle.await {
@@ -251,6 +255,7 @@ impl Shell {
         });
         self.diagnosis = Some(Diagnosis {
             id,
+            run,
             result: None,
             _running: running,
         });
@@ -500,7 +505,8 @@ impl Shell {
                             "停止做种",
                             Tone::Ghost,
                             cx.listener(move |this, _, _, cx| {
-                                this.tasks.read(cx).stop_seeding(id);
+                                this.tasks
+                                    .update(cx, |tasks, cx| tasks.stop_seeding(id, cx));
                                 cx.notify();
                             }),
                         ));

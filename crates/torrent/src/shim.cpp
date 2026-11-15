@@ -58,7 +58,8 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_bool(lt::settings_pack::prefer_rc4, true);
 	// 关会话时向 tracker 报告停止最多等这么久（秒）：释放会话要等它，默认 5 秒，退出应用时界面一直等着
 	pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
-	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大，诊断时另开
+	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大；诊断要的统计另由 post_session_stats 要（它的事件
+	// 不受这个设置管）
 	pack.set_int(lt::settings_pack::alert_mask,
 		static_cast<int>(static_cast<std::uint32_t>(lt::alert_category::error
 			| lt::alert_category::status
@@ -185,6 +186,14 @@ bool Session::removing(rust::Str id) const {
 void Session::mark_lost() const {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	for (auto& entry : m_removing) entry.second.lost = true;
+}
+
+bool Session::current(std::string const& id, lt::torrent_handle const& handle) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto const live = m_handles.find(id);
+	if (live != m_handles.end() && live->second == handle) return true;
+	auto const leaving = m_removing.find(id);
+	return leaving != m_removing.end() && leaving->second.handle == handle;
 }
 
 bool Session::still_removing(std::string const& id) const {
@@ -314,7 +323,7 @@ std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
 NetworkStatus Session::network() const {
 	std::lock_guard<std::mutex> lock(m_network_mutex);
 	NetworkStatus out;
-	out.listen_port = m_network.listening ? m_session.listen_port() : 0;
+	out.listen_port = m_session.listen_port();
 	out.listen_error = text_of(m_network.listen_error);
 	out.upnp_port = m_network.upnp_port;
 	out.upnp_error = text_of(m_network.upnp_error);
@@ -334,15 +343,17 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 		state.url = text_of(entry.url);
 		state.working = false;
 		state.updating = false;
-		state.fails = 0;
 		state.seeds = -1;
 		state.leechers = -1;
-		// 各监听地址、v1 与 v2 各通告一次：有一次成功就算正常，人数取最多的，说明取第一条
+		// 各监听地址（IPv4、IPv6）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上（只有
+		// IPv4 的机器上 IPv6 的那次立即失败，IPv4 的还在等）；人数取最多的，说明取第一条
+		bool every_endpoint_failed = !entry.endpoints.empty();
 		for (lt::announce_endpoint const& endpoint : entry.endpoints) {
+			bool endpoint_failed = false;
 			for (lt::announce_infohash const& ih : endpoint.info_hashes) {
 				if (ih.start_sent && ih.fails == 0) state.working = true;
+				if (ih.fails > 0) endpoint_failed = true;
 				if (ih.updating) state.updating = true;
-				state.fails = std::max(state.fails, static_cast<std::int32_t>(ih.fails));
 				state.seeds = std::max(state.seeds, ih.scrape_complete);
 				state.leechers = std::max(state.leechers, ih.scrape_incomplete);
 				if (state.message.empty()) {
@@ -351,7 +362,9 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 					state.message = text_of(message);
 				}
 			}
+			if (!endpoint_failed) every_endpoint_failed = false;
 		}
+		state.failed = !state.working && every_endpoint_failed;
 		out.push_back(std::move(state));
 	}
 	return out;
@@ -370,6 +383,11 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 	std::vector<lt::alert*> alerts;
 	m_session.pop_alerts(&alerts);
 	for (lt::alert* a : alerts) {
+		// 只转现在登记的那一份的事件：事件丢了之后，移除完的种子可能在它的移除事件取走之前就算移除完、被再加入
+		// （见 still_removing），那时取到的旧事件不该转给新加入的。加入失败的事件没有句柄，不查
+		auto const* about = dynamic_cast<lt::torrent_alert const*>(a);
+		bool const failed_add = lt::alert_cast<lt::add_torrent_alert>(a) && lt::alert_cast<lt::add_torrent_alert>(a)->error;
+		if (about && !failed_add && !current(id_of(about->handle), about->handle)) continue;
 		if (auto* added = lt::alert_cast<lt::add_torrent_alert>(a)) {
 			if (added->error) {
 				out.push_back(alert_of(AlertKind::AddFailed, *a, std::string()));
@@ -416,11 +434,7 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
-		} else if (auto* t = lt::alert_cast<lt::listen_succeeded_alert>(a)) {
-			if (t->socket_type == lt::socket_type_t::tcp) {
-				std::lock_guard<std::mutex> net(m_network_mutex);
-				m_network.listening = true;
-			}
+		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
 			{
@@ -444,9 +458,12 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::portmap_error_alert>(a)) {
 			{
 				std::lock_guard<std::mutex> net(m_network_mutex);
+				// 映射失效（租期到了没续上、路由器重启）也报这个：之前映射到的端口不再算
 				if (t->map_transport == lt::portmap_transport::upnp) {
+					m_network.upnp_port = 0;
 					m_network.upnp_error = t->error.message();
 				} else {
+					m_network.natpmp_port = 0;
 					m_network.natpmp_error = t->error.message();
 				}
 			}

@@ -269,6 +269,11 @@ impl Tasks {
                     row.signal(Level::Info, "开始做种".to_owned());
                 }
             }
+            Event::SeedingNotSaved { id, reason } => {
+                if let Some(row) = self.row_mut(id) {
+                    row.signal(Level::Warn, format!("做种的进度这次没存成：{reason}"));
+                }
+            }
             Event::SeedingEnded { id, end, unsaved } => {
                 let title = self.title(id);
                 if let Some(row) = self.row_mut(id) {

@@ -391,8 +391,13 @@ impl Tasks {
         cx.notify();
     }
 
-    pub fn stop_seeding(&self, id: TaskId) {
-        self.service.stop_seeding(id);
+    /// 停止做种；记不进存储时提示原因（做种照旧）。
+    pub fn stop_seeding(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        if let Err(error) = self.service.stop_seeding(id) {
+            let title = self.title(id);
+            self.add_notice(format!("「{title}」没能停止做种：{error}"));
+        }
+        cx.notify();
     }
 
     /// 从列表移除已完成的任务（输出归用户）与没有自己的任务目录的任务：只删记录。

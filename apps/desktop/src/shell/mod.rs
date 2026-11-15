@@ -245,6 +245,8 @@ impl Shell {
         self.selected = Some(id);
         self.confirm_discard = None;
         self.editing_headers = None;
+        // 诊断只对诊断那一刻：换了任务就不再显示
+        self.diagnosis = None;
         self.show(Page::Task, cx);
     }
 

@@ -76,6 +76,9 @@ private:
 	void mark_lost() const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
+	// `handle` 是编号 `id` 现在登记的那一份（在会话里，或移除中还没移除完）：同一个种子移除后再加入时，旧的那份的事件
+	// 不算
+	bool current(std::string const& id, lt::torrent_handle const& handle) const;
 
 	mutable lt::session m_session;
 	// 编号到句柄：移除即去掉，之后对这个编号的操作报「没有这个种子」
@@ -97,7 +100,6 @@ private:
 
 	// 取事件时记下的网络状况（见 network()）
 	struct Network {
-		bool listening = false;
 		std::string listen_error;
 		std::uint16_t upnp_port = 0;
 		std::string upnp_error;

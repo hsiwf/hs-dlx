@@ -52,6 +52,10 @@ pub(crate) struct Facts {
     pub dht_nodes: Option<u64>,
     pub incoming: bool,
     pub private: bool,
+    /// 在做种（下完了）：人数一项看有没有人要，不看凑不凑得齐
+    pub seeding: bool,
+    /// 这个种子连着的节点数
+    pub peers: u32,
     pub trackers: Vec<Tracker>,
     /// 种子的做种与在下的人数（tracker 报的，取各处最多的）；None 为没报
     pub seeds: Option<u32>,
@@ -64,13 +68,11 @@ pub(crate) struct Facts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Tracker {
     pub working: bool,
-    pub fails: u32,
+    /// 每个监听地址的通告都失败过，且没有成功的
+    pub failed: bool,
     /// tracker 回的错误或连不上的原因；没有时为空
     pub message: String,
 }
-
-/// 上传限速低于这个（字节每秒）时提醒：BT 的节点多按你传给它的多少回传。
-const LOW_UPLOAD: u32 = 100 << 10;
 
 /// 按查到的下结论，顺序同 [`CheckItem`]。
 pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
@@ -94,6 +96,7 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             format!("没在监听{why}：别人连不进来，只能主动去连别人"),
         )
     });
+    let listening = facts.listen_port > 0;
     let mapped = [("UPnP", facts.upnp_port), ("NAT-PMP", facts.natpmp_port)]
         .into_iter()
         .find(|(_, port)| *port > 0);
@@ -106,6 +109,11 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     .map(|(via, error)| format!("{via}：{error}"))
     .collect();
     checks.push(match mapped {
+        _ if !listening => check(
+            CheckItem::PortMapping,
+            CheckLevel::Warn,
+            "没在监听，不请求路由器映射端口".to_owned(),
+        ),
         Some((via, port)) => check(
             CheckItem::PortMapping,
             CheckLevel::Ok,
@@ -132,6 +140,12 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             CheckLevel::Ok,
             "有节点从外面连了进来".to_owned(),
         )
+    } else if !listening {
+        check(
+            CheckItem::Incoming,
+            CheckLevel::Warn,
+            "没在监听，别人连不进来".to_owned(),
+        )
     } else {
         check(
             CheckItem::Incoming,
@@ -148,7 +162,7 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
         ),
         (false, Some(0)) => check(
             CheckItem::Dht,
-            CheckLevel::Bad,
+            CheckLevel::Warn,
             "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有多半是网络挡了 UDP 或 DHT，只能靠 tracker 找节点"
                 .to_owned(),
         ),
@@ -165,7 +179,11 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     });
     let total = facts.trackers.len();
     let working = facts.trackers.iter().filter(|t| t.working).count();
-    let failing: Vec<&Tracker> = facts.trackers.iter().filter(|t| t.fails > 0).collect();
+    let failed: Vec<&Tracker> = facts.trackers.iter().filter(|t| t.failed).collect();
+    let why = failed
+        .iter()
+        .find(|t| !t.message.is_empty())
+        .map_or_else(String::new, |t| format!("（{}）", t.message));
     checks.push(match () {
         () if total == 0 && facts.private => check(
             CheckItem::Trackers,
@@ -177,35 +195,62 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             CheckLevel::Warn,
             "种子里没有 tracker，只靠 DHT 找节点".to_owned(),
         ),
+        // libtorrent 找到一个能用的就不再挨个试别的，回应了的往往只有一个
         () if working > 0 => check(
             CheckItem::Trackers,
             CheckLevel::Ok,
-            format!("{working} / {total} 个 tracker 正常"),
+            format!("tracker 正常（{working} 个回应了）"),
         ),
-        () if failing.len() == total => {
-            let why = failing
-                .iter()
-                .find(|t| !t.message.is_empty())
-                .map_or_else(String::new, |t| format!("：{}", t.message));
-            check(
-                CheckItem::Trackers,
-                CheckLevel::Bad,
-                format!("{total} 个 tracker 都连不上{why}"),
-            )
-        }
+        () if failed.len() == total => check(
+            CheckItem::Trackers,
+            CheckLevel::Bad,
+            format!("{total} 个 tracker 都连不上{why}"),
+        ),
+        () if !failed.is_empty() => check(
+            CheckItem::Trackers,
+            CheckLevel::Warn,
+            format!("{} 个 tracker 连不上{why}，其余的还没回应", failed.len()),
+        ),
         () => check(
             CheckItem::Trackers,
             CheckLevel::Warn,
             format!("{total} 个 tracker 还没回应"),
         ),
     });
-    checks.push(match (facts.seeds, facts.leechers) {
-        (Some(0), Some(0)) => check(
+    let counted = |seeds: u32, leechers: Option<u32>| {
+        format!(
+            "tracker 报做种 {seeds} 人{}",
+            leechers.map_or_else(String::new, |n| format!("、在下 {n} 人"))
+        )
+    };
+    checks.push(match (facts.seeding, facts.seeds, facts.leechers) {
+        (true, _, Some(0)) => check(
+            CheckItem::Swarm,
+            CheckLevel::Ok,
+            "tracker 报现在没人在下：暂时没人要你传".to_owned(),
+        ),
+        (true, Some(seeds), leechers) => {
+            check(CheckItem::Swarm, CheckLevel::Ok, counted(seeds, leechers))
+        }
+        (true, None, _) => check(
+            CheckItem::Swarm,
+            CheckLevel::Ok,
+            "tracker 没报人数".to_owned(),
+        ),
+        (false, Some(0), Some(0)) if facts.peers > 0 => check(
+            CheckItem::Swarm,
+            CheckLevel::Warn,
+            format!(
+                "tracker 报没人，可连着 {} 个节点：多半是 tracker 不统计这个种子",
+                facts.peers
+            ),
+        ),
+        (false, Some(0), Some(0)) => check(
             CheckItem::Swarm,
             CheckLevel::Bad,
             "tracker 报现在没人有这个种子".to_owned(),
         ),
-        (Some(0), leechers) => check(
+        (false, Some(0), leechers) => check(
             CheckItem::Swarm,
             CheckLevel::Warn,
             format!(
@@ -213,29 +258,20 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
                 leechers.map_or_else(String::new, |n| format!("（在下的 {n} 人）"))
             ),
         ),
-        (Some(seeds), leechers) => check(
+        (false, Some(seeds), leechers) => {
+            check(CheckItem::Swarm, CheckLevel::Ok, counted(seeds, leechers))
+        }
+        (false, None, _) => check(
             CheckItem::Swarm,
-            CheckLevel::Ok,
-            format!(
-                "tracker 报做种 {seeds} 人{}",
-                leechers.map_or_else(String::new, |n| format!("、在下 {n} 人"))
-            ),
-        ),
-        (None, _) => check(
-            CheckItem::Swarm,
-            CheckLevel::Warn,
-            "tracker 没报人数".to_owned(),
+            if facts.peers > 0 {
+                CheckLevel::Ok
+            } else {
+                CheckLevel::Warn
+            },
+            format!("tracker 没报人数，连着 {} 个节点", facts.peers),
         ),
     });
     checks.push(match facts.upload_limit {
-        Some(limit) if limit.get() < LOW_UPLOAD => check(
-            CheckItem::Upload,
-            CheckLevel::Warn,
-            format!(
-                "上传限速 {} KB/s：别人多按你传给他们的多少回传，限得太低下载也会慢",
-                limit.get() >> 10
-            ),
-        ),
         Some(limit) => check(
             CheckItem::Upload,
             CheckLevel::Ok,
@@ -261,9 +297,11 @@ mod tests {
             dht_nodes: Some(320),
             incoming: true,
             private: false,
+            seeding: false,
+            peers: 5,
             trackers: vec![Tracker {
                 working: true,
-                fails: 0,
+                failed: false,
                 message: String::new(),
             }],
             seeds: Some(12),
@@ -295,48 +333,62 @@ mod tests {
         facts.listen_port = 0;
         facts.listen_error = "address in use".into();
         assert_eq!(level(&facts, CheckItem::Listen), CheckLevel::Bad);
+        // 没在监听：映射与连入无从判断
+        facts.incoming = false;
+        let text = |facts: &Facts, item| {
+            checks(facts)
+                .into_iter()
+                .find(|check| check.item == item)
+                .unwrap()
+                .text
+        };
+        assert!(text(&facts, CheckItem::PortMapping).contains("没在监听"));
+        assert!(text(&facts, CheckItem::Incoming).contains("没在监听"));
         let mut facts = healthy();
         facts.upnp_port = 0;
         facts.upnp_error = "no router".into();
-        let mapping = checks(&facts)
-            .into_iter()
-            .find(|check| check.item == CheckItem::PortMapping)
-            .unwrap();
-        assert_eq!(mapping.level, CheckLevel::Warn);
-        assert!(mapping.text.contains("no router") && mapping.text.contains("51413"));
+        assert_eq!(level(&facts, CheckItem::PortMapping), CheckLevel::Warn);
+        let mapping = text(&facts, CheckItem::PortMapping);
+        assert!(mapping.contains("no router") && mapping.contains("51413"));
         let mut facts = healthy();
         facts.dht_nodes = Some(0);
-        assert_eq!(level(&facts, CheckItem::Dht), CheckLevel::Bad);
-        // 私有种子不用 DHT，也就不算不通
+        assert_eq!(level(&facts, CheckItem::Dht), CheckLevel::Warn);
         facts.private = true;
         assert_eq!(level(&facts, CheckItem::Dht), CheckLevel::Ok);
+        // tracker：都连不上、一部分连不上、还没回应
         let mut facts = healthy();
-        facts.trackers = vec![
-            Tracker {
-                working: false,
-                fails: 2,
-                message: "timed out".into(),
-            };
-            2
-        ];
-        let trackers = checks(&facts)
-            .into_iter()
-            .find(|check| check.item == CheckItem::Trackers)
-            .unwrap();
-        assert_eq!(trackers.level, CheckLevel::Bad);
-        assert!(trackers.text.contains("timed out"));
-        facts.trackers[0].fails = 0;
+        let tracker = |failed| Tracker {
+            working: false,
+            failed,
+            message: if failed {
+                "timed out".into()
+            } else {
+                String::new()
+            },
+        };
+        facts.trackers = vec![tracker(true), tracker(true)];
+        assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Bad);
+        assert!(text(&facts, CheckItem::Trackers).contains("timed out"));
+        facts.trackers = vec![tracker(true), tracker(false)];
         assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Warn);
+        assert!(text(&facts, CheckItem::Trackers).contains("其余的还没回应"));
+        facts.trackers = vec![tracker(false)];
+        assert!(text(&facts, CheckItem::Trackers).contains("还没回应"));
+        // 人数：没人且没连着节点为不通；tracker 报没人而连着节点的不算
         let mut facts = healthy();
         facts.seeds = Some(0);
         facts.leechers = Some(0);
+        assert_eq!(level(&facts, CheckItem::Swarm), CheckLevel::Warn);
+        facts.peers = 0;
         assert_eq!(level(&facts, CheckItem::Swarm), CheckLevel::Bad);
         facts.leechers = Some(4);
         assert_eq!(level(&facts, CheckItem::Swarm), CheckLevel::Warn);
+        // 做种时没人在下不算问题
+        facts.seeding = true;
+        facts.leechers = Some(0);
+        assert_eq!(level(&facts, CheckItem::Swarm), CheckLevel::Ok);
         let mut facts = healthy();
         facts.incoming = false;
-        facts.upload_limit = NonZeroU32::new(20 << 10);
         assert_eq!(level(&facts, CheckItem::Incoming), CheckLevel::Warn);
-        assert_eq!(level(&facts, CheckItem::Upload), CheckLevel::Warn);
     }
 }

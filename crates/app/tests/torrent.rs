@@ -315,7 +315,7 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     let level = |item| checks.iter().find(|c| c.item == item).unwrap().level;
     assert_eq!(checks.len(), 7);
     assert_eq!(level(CheckItem::Listen), CheckLevel::Ok);
-    assert_eq!(level(CheckItem::Dht), CheckLevel::Bad);
+    assert_eq!(level(CheckItem::Dht), CheckLevel::Warn);
     assert_eq!(level(CheckItem::Trackers), CheckLevel::Warn);
 
     // 根里有用户自己放的文件：删不干净，写明留下了什么，任务留着
@@ -451,7 +451,7 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     assert!(service.task(task.id).unwrap().seeding);
     assert!(matches!(service.forget(task.id), Err(Error::Seeding(_))));
     // 别的 BT 任务没在做种，不能停
-    service.stop_seeding(TaskId(task.id.0 + 100));
+    service.stop_seeding(TaskId(task.id.0 + 100)).unwrap();
 
     // 退出时停下、记着在做种，重开接着做
     service.close().unwrap();
@@ -480,7 +480,7 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     service.seed(task.id).unwrap();
     assert!(matches!(service.seed(task.id), Err(Error::Seeding(_))));
     rt.block_on(seeding(&mut events, task.id));
-    service.stop_seeding(task.id);
+    service.stop_seeding(task.id).unwrap();
     assert_eq!(
         rt.block_on(seeding_ended(&mut events, task.id)),
         SeedEnd::Stopped
@@ -501,7 +501,7 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     std::fs::copy(dir.join("seed").join("album").join("b.bin"), &b).unwrap();
     service.seed(task.id).unwrap();
     rt.block_on(seeding(&mut events, task.id));
-    service.stop_seeding(task.id);
+    service.stop_seeding(task.id).unwrap();
     assert_eq!(
         rt.block_on(seeding_ended(&mut events, task.id)),
         SeedEnd::Stopped
@@ -543,13 +543,15 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     assert!(part.exists());
     let (service, mut events) = self::service(&store);
     rt.block_on(seeding(&mut events, task.id));
-    service.stop_seeding(task.id);
+    service.stop_seeding(task.id).unwrap();
     assert_eq!(
         rt.block_on(seeding_ended(&mut events, task.id)),
         SeedEnd::Stopped
     );
     assert!(part.exists());
     service.forget(task.id).unwrap();
+    // .parts 在后台删：关闭时等后台的收尾做完
+    service.close().unwrap();
     assert!(!part.exists(), "从列表移除时删掉 .parts");
     assert!(
         folder.join("album").join("a.bin").exists(),

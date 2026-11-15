@@ -269,6 +269,8 @@ impl Engine {
                     // 接收端随管种子的异步任务结束而丢弃：那个种子已没人在等
                     let _gone = route.send(Routed::Lost);
                 }
+                // 丢的可能有移除的事件：在等移除完的重新查（绑定这时按种子对象还在不在判断）
+                self.removed.notify_waiters();
             }
             AlertKind::Stats => self.stats.notify_waiters(),
             // 监听与端口映射的结果由绑定记下、诊断时读（Session::network）；加入失败时同步的加入已报错
@@ -532,6 +534,8 @@ impl Bt {
         if let Err(panic) = running.pump.join() {
             std::panic::resume_unwind(panic);
         }
+        // 取事件的线程停了，统计不会再来：在等的诊断随即结束
+        running.engine.stats.notify_waiters();
         let session = &running.engine.session;
         let dht = session
             .session_state()
@@ -840,16 +844,16 @@ pub(crate) async fn start_seeding(
     Ok(Seeder { owner })
 }
 
-/// 做种，进度（阶段为校验或 [`TorrentPhase::Seeding`]）交给 `each`，每 [`SAVE_INTERVAL`] 存一次进度（续传数据交给
-/// `save`，存不进即停下），直到到了做种的设置 `seeding`（随时可改）停的条件、`cancel` 取消、校验出文件不全或出错；停下
-/// 时要到续传数据并从会话里移除。文件不全时不要续传数据（它记的已有块是这次没找着文件时的，存下会盖掉好的，文件回来后
-/// 也认不出），存储里的照旧。
+/// 做种，进度（阶段为校验或 [`TorrentPhase::Seeding`]）交给 `each`，文件齐全时每 [`SAVE_INTERVAL`] 存一次进度（续传数据
+/// 交给 `save`；要不到时把原因交给它，这次不存、照常做种），直到到了做种的设置 `seeding`（随时可改）停的条件、`cancel`
+/// 取消、校验出文件不全或出错；停下时要到续传数据并从会话里移除。文件不全时不要续传数据（它记的已有块是这次没找着文件
+/// 时的，存下会盖掉好的，文件回来后也认不出），存储里的照旧。
 pub(crate) async fn seed(
     seeder: Seeder,
     mut seeding: watch::Receiver<Seeding>,
     cancel: CancellationToken,
     mut each: impl FnMut(TorrentProgress),
-    mut save: impl FnMut(Resume) -> Result<(), Error>,
+    mut save: impl FnMut(Result<Resume, String>),
 ) -> Seeded {
     let mut owner = seeder.owner;
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
@@ -860,14 +864,20 @@ pub(crate) async fn seed(
         tokio::select! {
             () = cancel.cancelled() => break SeedEnd::Stopped,
             _ = saves.tick() => {
-                let (resume, problem) = snapshot(&mut owner).await;
-                if let Some(failure) = problem {
-                    break SeedEnd::Failed(failure.message);
-                }
-                if let Some(resume) = resume
-                    && let Err(error) = save(resume)
-                {
-                    break SeedEnd::Failed(format!("做种的进度存不进：{error}"));
+                // 只存文件齐全时的：校验中或刚校验出不全的不存（下一次状态即停下）
+                let whole = owner
+                    .session()
+                    .status(&owner.id)
+                    .is_ok_and(|status| {
+                        status.finished
+                            && matches!(status.state(), Some(State::Finished | State::Seeding))
+                    });
+                if whole {
+                    match snapshot(&mut owner).await {
+                        (_, Some(failure)) => save(Err(failure.message)),
+                        (Some(resume), None) => save(Ok(resume)),
+                        (None, None) => save(Err("续传数据写不出".to_owned())),
+                    }
                 }
             }
             routed = owner.next() => match routed {
@@ -887,6 +897,10 @@ pub(crate) async fn seed(
                     Ok(status) => status,
                     Err(error) => break SeedEnd::Failed(owner.libtorrent("查状态")(error).to_string()),
                 };
+                // 种子出错（事件可能在存进度时被那边收走了）
+                if !status.error.is_empty() {
+                    break SeedEnd::Failed(format!("种子出错：{}", status.error));
+                }
                 let mut progress = TorrentProgress::of(&status);
                 progress.tracker_error.clone_from(&tracker_error);
                 if matches!(progress.phase, TorrentPhase::Checking { .. }) {
@@ -1179,17 +1193,20 @@ fn sweep(path: &Path) -> Vec<PathBuf> {
     left
 }
 
-/// 诊断种子 `info_hash`：要一次会话的统计、等它到，再查网络状况、种子的状态与 tracker；上传限速为 `upload_limit`。
-/// 种子不在会话里（没在下也没在做种）时报 [`Error::InvalidInput`]，统计 [`STEP_TIMEOUT`] 内没到时报
-/// [`Error::Torrent`]。
+/// 诊断在下或做种（`seeding`）的种子 `info_hash`：要一次会话的统计、等它到，再查网络状况、种子的状态与 tracker；上传
+/// 限速为 `upload_limit`。种子不在会话里（刚开始、还没加进去）、统计 [`STEP_TIMEOUT`] 内没到时报 [`Error::Torrent`]；
+/// 等的期间 BT 会话关闭时报 [`Error::Closed`]。
 pub(crate) async fn diagnose(
     engine: &Engine,
     info_hash: &str,
+    seeding: bool,
     upload_limit: Option<NonZeroU32>,
 ) -> Result<Vec<Check>, Error> {
     let id = TorrentId::parse(info_hash)
         .map_err(|error| Error::Corrupt(format!("种子的编号：{error}")))?;
-    let absent = |_| Error::InvalidInput("只有在下或做种的 BT 任务能诊断".to_owned());
+    let absent = |_| {
+        Error::Torrent("种子还没加进 BT 会话（刚开始，或在等上次的移除），稍后再诊断".to_owned())
+    };
     let status = engine.session.status(&id).map_err(absent)?;
     let trackers = engine.session.trackers(&id).map_err(absent)?;
     let arrived = engine.stats.notified();
@@ -1199,6 +1216,9 @@ pub(crate) async fn diagnose(
     tokio::time::timeout(STEP_TIMEOUT, arrived)
         .await
         .map_err(|_| Error::Torrent("10 秒内没等到 BT 会话的统计".to_owned()))?;
+    if engine.stop.load(Ordering::Relaxed) {
+        return Err(Error::Closed);
+    }
     let network = engine.session.network();
     let count = |value: i32| u32::try_from(value).ok();
     let most =
@@ -1213,6 +1233,8 @@ pub(crate) async fn diagnose(
         dht_nodes: u64::try_from(network.dht_nodes).ok(),
         incoming: network.incoming,
         private: status.private_torrent,
+        seeding,
+        peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
         seeds: most(
             status.swarm_seeds,
             trackers.iter().map(|tracker| tracker.seeds).max(),
@@ -1225,7 +1247,7 @@ pub(crate) async fn diagnose(
             .into_iter()
             .map(|tracker| Tracker {
                 working: tracker.working,
-                fails: u32::try_from(tracker.fails).expect("连续失败的次数不为负"),
+                failed: tracker.failed,
                 message: tracker.message,
             })
             .collect(),
