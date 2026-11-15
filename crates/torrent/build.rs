@@ -34,6 +34,9 @@ fn main() {
     if target_env == "msvc" {
         // shim.cpp 里有中文的字面量：MSVC 默认按系统的代码页读源码
         build.flag("/utf-8");
+        // C++ 异常：cc 默认不开，Boost 随之定义 BOOST_NO_EXCEPTIONS，libtorrent 就不声明会抛异常的那些重载
+        // （add_torrent(params) 等）；cxx 的 Result 也靠异常把错误交回 Rust
+        build.flag("/EHsc");
     }
     for define in property(&cmake, "INTERFACE_COMPILE_DEFINITIONS") {
         if debug_only(&define) {
