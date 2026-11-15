@@ -57,12 +57,18 @@ private:
 	// 一个还没移除完的种子：移除的事件来了没有；要删文件时删的结果来了没有（libtorrent 先发删的结果，后发移除的事件）
 	struct Removing {
 		lt::torrent_handle handle;
+		// 登记之后丢过事件：移除的结果可能丢了，要按种子对象还在不在判断
+		bool lost = false;
 		bool deleting = false;
 		bool removed = false;
 		bool files_settled = false;
 	};
-	// 事件丢了一些之后：种子对象已不在了的（移除与删文件都已做完，删文件的磁盘任务持有种子对象直到做完），不再算移除中
-	void prune_removing() const;
+	// 种子 `id` 还在移除中：登记了移除、事件还没都来。登记之后丢过事件的，种子对象已不在了即算移除完（移除与删文件都
+	// 做完时它就不在了，删文件的磁盘任务持有它直到删完）；没丢过的只认事件，libtorrent 发出移除的事件后就放掉种子对象，
+	// 那时事件可能还没取走。调用方持有 m_mutex
+	bool still_removing(std::string const& id) const;
+	// 丢了事件：在移除中的都记下
+	void mark_lost() const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
 
@@ -95,7 +101,8 @@ Described describe(rust::Slice<std::uint8_t const> resume);
 // `wanted` 里的文件，去掉只上传、暂停、做种模式的标志；返回改后的续传数据。
 rust::Vec<std::uint8_t> place(rust::Slice<std::uint8_t const> resume, rust::Str root, rust::Slice<std::int32_t const> wanted);
 
-// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的种子文件。
-rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size);
+// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选），`v1_only` 时只有 v1 的信息哈希、
+// 文件不按块对齐；返回 bencode 写出的种子文件。
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size, bool v1_only);
 
 } // namespace hsdlx

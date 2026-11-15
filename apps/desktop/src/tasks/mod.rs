@@ -285,7 +285,7 @@ impl Tasks {
                         SeedEnd::Stopped => (Level::Info, "停止做种".to_owned()),
                         SeedEnd::Incomplete => (
                             Level::Warn,
-                            "磁盘上的文件不全或改过，停止做种（不补下）".to_owned(),
+                            "磁盘上的文件不全（挪走、删了或大小变了），停止做种，不补下".to_owned(),
                         ),
                         SeedEnd::Failed(message) => (Level::Error, format!("做种出错：{message}")),
                     };

@@ -459,7 +459,8 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                 cell("分享率", format::ratio(progress.uploaded, progress.wanted)),
                 cell(
                     "节点",
-                    format!("{}（做种 {}）", progress.peers, progress.seeds),
+                    // 两边都下完了的节点互相断开（libtorrent 的 close_redundant_connections），做种时连着的都是在下的
+                    progress.peers.to_string(),
                 ),
             ];
         }

@@ -58,7 +58,7 @@ fn content(len: u32, seed: u32) -> Vec<u8> {
 /// 做种：`path`（`dir` 里的文件或目录，分块 `piece_size` 字节）建种子、在新会话里校验已有的文件后做种，等它可以连；
 /// 返回会话、种子与种子文件转成的续传数据。
 fn seed(dir: &Path, path: &Path, piece_size: i32) -> (Session, TorrentId, Vec<u8>) {
-    let torrent = create_torrent(path_str(path), piece_size).unwrap();
+    let torrent = create_torrent(path_str(path), piece_size, false).unwrap();
     let resume = resume_from_torrent_file(&torrent).unwrap();
     let id = describe(&resume).unwrap().id;
     let seeder = local_session();
@@ -217,7 +217,7 @@ fn placed_files_download_and_resume_without_peers() {
     );
     restored.remove(&id, Removal::Keep).unwrap();
     removed(&restored, &id, false);
-    // 只删 .parts 时同样等到删的结果才算移除完，下了的文件留着；做种时只上传
+    // 做种时只上传
     restored
         .add_resume(
             &saved,
@@ -230,9 +230,8 @@ fn placed_files_download_and_resume_without_peers() {
         )
         .unwrap();
     assert!(restored.status(&id).unwrap().held);
-    restored.remove(&id, Removal::PartFile).unwrap();
-    removed(&restored, &id, true);
-    assert!(fetch_dir.join("专辑").join("a.bin").exists());
+    restored.remove(&id, Removal::Keep).unwrap();
+    removed(&restored, &id, false);
     // 加入时暂停
     restored
         .add_resume(

@@ -27,6 +27,8 @@ const PUMP_WAIT_MS: u32 = 250;
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 /// 等 libtorrent 一步的结果（续传数据、写完缓存、移除完、删完文件）最多等多久：都只是本机的操作。
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 做种时多久存一次进度（累计上传与做种时长随续传数据存下）：应用异常退出时最多丢这么久的统计。
+const SAVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// 连着节点而凑不齐全部内容要连续这么多次状态（每次 [`STATUS_INTERVAL`]，共 3 秒）才算资源不足：刚连上的节点在报来
 /// 它有哪些块之前也计入节点数，开始时会短暂凑不齐。
 const SCARCE_TICKS: u32 = 6;
@@ -68,6 +70,8 @@ pub struct TorrentInfo {
     pub files: Vec<TorrentFile>,
     /// 续传数据里记的已有的块落在要下的文件里的字节数
     pub done: u64,
+    /// 保存目录里存没选的文件与选了的共用的块里没选的部分的文件名（只在有这样的块时才有这个文件）
+    pub part_file: String,
 }
 
 impl TorrentInfo {
@@ -90,6 +94,7 @@ impl TorrentInfo {
                 })
                 .collect(),
             done: metadata.done,
+            part_file: metadata.part_file,
         })
     }
 
@@ -162,7 +167,7 @@ pub struct TorrentProgress {
     pub done: u64,
     /// 这次运行收到的内容字节数（含校验没过、丢掉的）：算速度用
     pub received: u64,
-    /// 累计上传的内容字节数与做种的秒数，含之前各次运行的
+    /// 累计上传的内容字节数与下完之后在会话里的秒数（做种时长），含之前各次运行的
     pub uploaded: u64,
     pub seeding_seconds: u64,
     /// 下载与上传的速度，字节每秒，只算内容
@@ -200,7 +205,7 @@ impl TorrentProgress {
             done: bytes(status.total_wanted_done),
             received: bytes(status.downloaded),
             uploaded: bytes(status.all_time_upload),
-            seeding_seconds: bytes(status.seeding_seconds),
+            seeding_seconds: bytes(status.finished_seconds),
             download_rate: bytes(status.download_rate.into()),
             upload_rate: bytes(status.upload_rate.into()),
             peers: count(status.peers),
@@ -422,6 +427,8 @@ pub(crate) struct Bt {
     network: TorrentNetwork,
     /// 关闭了（[`Bt::close`]）：不再建会话
     closed: AtomicBool,
+    /// 上传限速（字节每秒，None 为不限）：建会话时照它，之后改了随即照新的；持着 `running` 的锁改与读
+    upload_limit: Mutex<Option<NonZeroU32>>,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     running: Mutex<Option<Running>>,
@@ -441,9 +448,11 @@ pub(crate) struct SessionState {
 }
 
 impl Bt {
-    pub fn new(network: TorrentNetwork) -> Bt {
+    /// `upload_limit` 为设置里的上传限速。
+    pub fn new(network: TorrentNetwork, upload_limit: Option<NonZeroU32>) -> Bt {
         Bt {
             network,
+            upload_limit: Mutex::new(upload_limit),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
             running: Mutex::new(None),
@@ -452,12 +461,9 @@ impl Bt {
 
     /// 引擎；还没有时照上次存下的 `saved`（端口与 DHT 状态）建会话。已关闭时报 [`Error::Closed`]，会话建不出时报
     /// [`Error::Torrent`]。
-    pub fn engine(
-        &self,
-        saved: SessionState,
-        upload_limit: Option<NonZeroU32>,
-    ) -> Result<Arc<Engine>, Error> {
+    pub fn engine(&self, saved: SessionState) -> Result<Arc<Engine>, Error> {
         let mut running = lock(&self.running);
+        let upload_limit = *lock(&self.upload_limit);
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -529,9 +535,11 @@ impl Bt {
         Ok(Some(SessionState { port, dht }))
     }
 
-    /// 改上传限速（字节每秒，None 为不限）；还没建会话时什么也不做（建时照设置）。
+    /// 改上传限速（字节每秒，None 为不限）：已建的会话随即照它，之后建的也照它。
     pub fn set_upload_limit(&self, upload_limit: Option<NonZeroU32>) {
-        if let Some(running) = &*lock(&self.running) {
+        let running = lock(&self.running);
+        *lock(&self.upload_limit) = upload_limit;
+        if let Some(running) = &*running {
             running
                 .engine
                 .session
@@ -748,13 +756,8 @@ pub(crate) async fn run(
             seeder: None,
         };
     }
-    // 下完了不做种：存不要的文件的部分块的 .parts 不再有用，一起删
-    let removal = if matches!(outcome, Outcome::Finished(_)) {
-        Removal::PartFile
-    } else {
-        Removal::Keep
-    };
-    let (resume, stopped) = stop(&mut owner, removal).await;
+    // 下完了不做种时 .parts 照旧留着：之后再做种要从它读没选的文件与选了的共用的块，从列表移除时才删
+    let (resume, stopped) = stop(&mut owner, Removal::Keep).await;
     // 停下时写盘出错或等不到结果：已下的不一定都在磁盘上、之后不一定立即加得进，下完与暂停都改报这个失败
     let outcome = match (outcome, stopped) {
         (Outcome::Failed(failure), _) => Outcome::Failed(failure),
@@ -775,7 +778,7 @@ fn reached(owner: &Owner, seeding: Seeding, wanted: u64) -> bool {
         Ok(status) => seeding.reached(
             u64::try_from(status.all_time_upload).expect("字节数不为负"),
             wanted,
-            u64::try_from(status.seeding_seconds).expect("秒数不为负"),
+            u64::try_from(status.finished_seconds).expect("秒数不为负"),
         ),
         // 不接着做种，移除时照常报出问题
         Err(_) => true,
@@ -789,7 +792,7 @@ pub enum SeedEnd {
     Reached,
     /// 手动停止，或应用退出
     Stopped,
-    /// 磁盘上的文件不全（挪走、删了或改了内容）：不补下，不再做种
+    /// 磁盘上的文件不全（挪走、删了或大小变了；只改了内容、大小不变的认不出）：不补下，不再做种
     Incomplete,
     /// 出错（读文件出错、BT 会话出错等）：说明
     Failed(String),
@@ -825,20 +828,36 @@ pub(crate) async fn start_seeding(
     Ok(Seeder { owner })
 }
 
-/// 做种，进度（阶段为校验或 [`TorrentPhase::Seeding`]）交给 `each`，直到到了做种的设置 `seeding`（随时可改）停的条件、
-/// `cancel` 取消、校验出文件不全或出错；停下时要到续传数据，从会话里移除并删掉 `.parts`。
+/// 做种，进度（阶段为校验或 [`TorrentPhase::Seeding`]）交给 `each`，每 [`SAVE_INTERVAL`] 存一次进度（续传数据交给
+/// `save`，存不进即停下），直到到了做种的设置 `seeding`（随时可改）停的条件、`cancel` 取消、校验出文件不全或出错；停下
+/// 时要到续传数据并从会话里移除。文件不全时不要续传数据（它记的已有块是这次没找着文件时的，存下会盖掉好的，文件回来后
+/// 也认不出），存储里的照旧。
 pub(crate) async fn seed(
     seeder: Seeder,
     mut seeding: watch::Receiver<Seeding>,
     cancel: CancellationToken,
     mut each: impl FnMut(TorrentProgress),
+    mut save: impl FnMut(Resume) -> Result<(), Error>,
 ) -> Seeded {
     let mut owner = seeder.owner;
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
+    let mut saves =
+        tokio::time::interval_at(tokio::time::Instant::now() + SAVE_INTERVAL, SAVE_INTERVAL);
     let mut tracker_error = None;
     let end = loop {
         tokio::select! {
             () = cancel.cancelled() => break SeedEnd::Stopped,
+            _ = saves.tick() => {
+                let (resume, problem) = snapshot(&mut owner).await;
+                if let Some(failure) = problem {
+                    break SeedEnd::Failed(failure.message);
+                }
+                if let Some(resume) = resume
+                    && let Err(error) = save(resume)
+                {
+                    break SeedEnd::Failed(format!("做种的进度存不进：{error}"));
+                }
+            }
             routed = owner.next() => match routed {
                 Routed::Alert(alert) => match alert.kind {
                     AlertKind::FileError => break SeedEnd::Failed(format!("读文件出错：{}", alert.message)),
@@ -846,7 +865,8 @@ pub(crate) async fn seed(
                     AlertKind::TrackerError => tracker_error = Some(alert.message),
                     _ => {}
                 },
-                Routed::Lost => break SeedEnd::Failed("BT 会话的事件丢了".to_owned()),
+                // 做种不等哪一步的结果，状态每半秒照查，丢了事件不影响
+                Routed::Lost => {}
             },
             // 设置改了：下一次状态时按新的判
             _ = seeding.changed() => {}
@@ -873,7 +893,8 @@ pub(crate) async fn seed(
             }
         }
     };
-    let (resume, stopped) = stop(&mut owner, Removal::PartFile).await;
+    let (resume, stopped) = stop(&mut owner, Removal::Keep).await;
+    let resume = resume.filter(|_| end != SeedEnd::Incomplete);
     let end = match (end, stopped) {
         (SeedEnd::Failed(message), _) => SeedEnd::Failed(message),
         (_, Err(failure)) => SeedEnd::Failed(failure.message),

@@ -118,7 +118,7 @@ rust::String Session::add(lt::add_torrent_params params, std::string const& id, 
 	params.flags &= ~lt::torrent_flags::auto_managed;
 	params.flags |= lt::torrent_flags::duplicate_is_error;
 	std::lock_guard<std::mutex> lock(m_mutex);
-	if (m_removing.count(id)) throw std::invalid_argument("这个种子还在移除中，移除完才能再加：" + id);
+	if (still_removing(id)) throw std::invalid_argument("这个种子还在移除中，移除完才能再加：" + id);
 	lt::torrent_handle h = m_session.add_torrent(std::move(params));
 	m_handles[id] = h;
 	m_ids[h] = id;
@@ -178,7 +178,20 @@ rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::S
 
 bool Session::removing(rust::Str id) const {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	return m_removing.count(string_of(id)) != 0;
+	return still_removing(string_of(id));
+}
+
+void Session::mark_lost() const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	for (auto& entry : m_removing) entry.second.lost = true;
+}
+
+bool Session::still_removing(std::string const& id) const {
+	auto found = m_removing.find(id);
+	if (found == m_removing.end()) return false;
+	if (!found->second.lost || found->second.handle.is_valid()) return true;
+	m_removing.erase(found);
+	return false;
 }
 
 void Session::start(rust::Str id) const { handle(id).unset_flags(lt::torrent_flags::upload_mode); }
@@ -220,7 +233,7 @@ Status Session::status(rust::Str id) const {
 	out.total_wanted = s.total_wanted;
 	out.total_wanted_done = s.total_wanted_done;
 	out.all_time_upload = s.all_time_upload;
-	out.seeding_seconds = s.seeding_duration.count();
+	out.finished_seconds = s.finished_duration.count();
 	out.finished = s.is_finished;
 	out.downloaded = s.total_payload_download;
 	out.download_rate = s.download_payload_rate;
@@ -266,11 +279,10 @@ void Session::remove(rust::Str id, Removal removal) const {
 	auto found = m_handles.find(key);
 	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
 	lt::remove_flags_t flags{};
-	if (removal == Removal::PartFile) flags = lt::session::delete_partfile;
 	if (removal == Removal::Files) flags = lt::session::delete_files;
 	m_session.remove_torrent(found->second, flags);
-	// 删文件（含只删 .parts）时 libtorrent 另发删的结果（torrent.cpp 的 on_files_deleted）
-	m_removing[key] = Removing{found->second, flags != lt::remove_flags_t{}, false, false};
+	// 删文件时 libtorrent 另发删的结果（torrent.cpp 的 on_files_deleted）
+	m_removing[key] = Removing{found->second, false, flags != lt::remove_flags_t{}, false, false};
 	m_handles.erase(found);
 }
 
@@ -286,17 +298,6 @@ void Session::removed(std::string const& id, bool files_settled) const {
 	}
 	// 移除的事件与（要删文件时）删的结果都来了才算移除完，两者先后不定
 	if (removing.removed && (!removing.deleting || removing.files_settled)) m_removing.erase(found);
-}
-
-void Session::prune_removing() const {
-	std::lock_guard<std::mutex> lock(m_mutex);
-	for (auto it = m_removing.begin(); it != m_removing.end();) {
-		if (it->second.handle.is_valid()) {
-			++it;
-		} else {
-			it = m_removing.erase(it);
-		}
-	}
 }
 
 void Session::save_resume_data(rust::Str id) const {
@@ -362,8 +363,7 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
 			out.push_back(alert_of(AlertKind::TrackerError, *a, id_of(t->handle)));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
-			// 丢的可能有移除的事件：已移除完的不再挡着再加入
-			prune_removing();
+			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
@@ -378,9 +378,10 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 	return out;
 }
 
-rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size) {
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size, bool v1_only) {
 	std::filesystem::path const full = std::filesystem::absolute(string_of(path));
-	lt::create_torrent torrent(lt::list_files(full.string()), piece_size);
+	lt::create_torrent torrent(lt::list_files(full.string()), piece_size,
+		v1_only ? lt::create_torrent::v1_only : lt::create_flags_t{});
 	lt::set_piece_hashes(torrent, full.parent_path().string());
 	return bytes_out(torrent.generate_buf());
 }
@@ -413,6 +414,8 @@ Described describe(rust::Slice<std::uint8_t const> resume) {
 	out.id = rust::String(canonical(params.ti->info_hashes()));
 	out.name = text_of(layout.name());
 	out.private_torrent = params.ti->priv();
+	// 与 libtorrent 的存储起的名字相同（mmap_storage.cpp、pread_storage.cpp：按 info_hashes().get_best()）
+	out.part_file = rust::String("." + lt::aux::to_hex(params.ti->info_hashes().get_best()) + ".parts");
 	for (lt::file_index_t const i : layout.file_range()) {
 		// 对齐用的填充文件不是内容，不下载、不列出
 		if (layout.pad_file_at(i)) continue;

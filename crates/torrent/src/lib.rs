@@ -54,8 +54,9 @@ mod ffi {
         downloaded: i64,
         /// 累计上传的内容字节数，含之前各次加入时的（随续传数据存下）
         all_time_upload: i64,
-        /// 累计做种的秒数，含之前各次加入时的（随续传数据存下）
-        seeding_seconds: i64,
+        /// 选了的文件都有了之后累计在会话里（没暂停）的秒数，含之前各次加入时的（随续传数据存下）；只下了一部分文件的也
+        /// 算（libtorrent 的 seeding_duration 只算全部文件都有的）
+        finished_seconds: i64,
         /// 选了的文件都有了
         finished: bool,
         /// 下载与上传的速度，字节每秒，只算内容
@@ -129,9 +130,7 @@ mod ffi {
     enum Removal {
         /// 不删
         Keep,
-        /// 只删存不要的文件的部分块的 `.parts` 文件（在保存目录里，名字为 `.<信息哈希>.parts`）
-        PartFile,
-        /// 删下了的文件、空了的目录与 `.parts` 文件
+        /// 删下了的文件、空了的目录与 `.parts` 文件（[`crate::Metadata::part_file`]）
         Files,
     }
 
@@ -158,6 +157,8 @@ mod ffi {
         files: Vec<FileEntry>,
         /// 续传数据里记的已有的块落在要下的文件里的字节数
         done: i64,
+        /// 存不要的文件落在要下的块里的部分的文件名（在保存目录里）
+        part_file: String,
     }
 
     /// 一个事件。
@@ -198,7 +199,7 @@ mod ffi {
         fn listen_port(self: &Session) -> u16;
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
-        fn create_torrent(path: &str, piece_size: i32) -> Result<Vec<u8>>;
+        fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
         fn describe(resume: &[u8]) -> Result<Described>;
         fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>>;
@@ -410,6 +411,9 @@ pub struct Metadata {
     pub files: Vec<FileEntry>,
     /// 续传数据里记的已有的块落在要下的文件里的字节数
     pub done: u64,
+    /// `.parts` 文件的名字（在保存目录里）：没选的文件与选了的共用的块里没选的那部分存在这里，做种时读得到它们才凑得出
+    /// 整块；只在有这样的块时才有这个文件
+    pub part_file: String,
 }
 
 /// 读出续传数据里的种子信息；没有种子信息（磁力链接还没取到）或读不出时报错。
@@ -421,6 +425,7 @@ pub fn describe(resume: &[u8]) -> Result<Metadata, Error> {
         private: described.private_torrent,
         files: described.files,
         done: u64::try_from(described.done).expect("字节数由各块落在文件里的长度相加，不为负"),
+        part_file: described.part_file,
     })
 }
 
@@ -431,9 +436,11 @@ pub fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>, Error
     Ok(ffi::place(resume, root, wanted)?)
 }
 
-/// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的内容。
-pub fn create_torrent(path: &str, piece_size: i32) -> Result<Vec<u8>, Error> {
-    Ok(ffi::create_torrent(path, piece_size)?)
+/// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的内容。默认
+/// 建 v1 与 v2 兼有的（各文件从新的一块开始，中间是对齐用的填充文件）；`v1_only` 时只有 v1，文件首尾相接，一块可以跨
+/// 两个文件（网上多数种子是这样）。
+pub fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>, Error> {
+    Ok(ffi::create_torrent(path, piece_size, v1_only)?)
 }
 
 impl fmt::Debug for Alert {

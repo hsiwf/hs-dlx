@@ -206,7 +206,14 @@ struct Shared {
     /// 做种的设置，随 [`Service::set_seeding`] 改；在做种的随时照它判停不停
     seeding: watch::Sender<Seeding>,
     /// 在做种的（含正在加入会话、还没开始的）：停止做种经它找到，登记与查询都在 `store` 锁内
-    seeders: Mutex<HashMap<TaskId, Running>>,
+    seeders: Mutex<HashMap<TaskId, SeedControl>>,
+}
+
+/// 一个在做种的任务的控制。
+struct SeedControl {
+    cancel: CancellationToken,
+    /// 用户停止了做种（[`Service::stop_seeding`]）：停下后不再做种，即使停的期间应用正在退出
+    by_user: Arc<AtomicBool>,
 }
 
 /// 任务服务。不能在 tokio 运行时里释放：释放时要在自己的运行时上等任务停下（见 [`Service::close`]）。
@@ -227,7 +234,7 @@ impl Service {
     ) -> Result<(Service, Events), Error> {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
-        let policy = store::settings(&tx)?.seeding;
+        let settings = store::settings(&tx)?;
         let seeding: Vec<TaskId> = store::list(&tx)?
             .into_iter()
             .filter(|task| task.seeding)
@@ -257,15 +264,16 @@ impl Service {
             unsaved: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             events,
-            bt: Bt::new(network),
-            seeding: watch::Sender::new(policy),
+            bt: Bt::new(network, settings.upload_limit),
+            seeding: watch::Sender::new(settings.seeding),
             seeders: Mutex::new(HashMap::new()),
         });
         let service = Service {
             shared,
             runtime: Some(runtime),
         };
-        // 上次退出时还在做种的接着做；开始不了的照常以做种停了报出
+        // 上次退出时还在做种的接着做；开始不了的以做种停了报出，存储里照旧记着，下次打开再试（开始不了多是一时的，如
+        // BT 会话建不出）
         {
             let _entered = service.runtime().enter();
             for id in seeding {
@@ -274,10 +282,7 @@ impl Service {
                     let _closed = service.shared.events.send(Event::SeedingEnded {
                         id,
                         end: SeedEnd::Failed(error.to_string()),
-                        unsaved: service
-                            .shared
-                            .write(|tx| store::set_seeding_task(tx, id, false))
-                            .err(),
+                        unsaved: None,
                     });
                 }
             }
@@ -321,7 +326,7 @@ impl Service {
             }
             // 停下做种；存储里照旧记着在做种，下次打开接着做
             for seeder in lock(&self.shared.seeders).values() {
-                seeder.control.cancel();
+                seeder.cancel.cancel();
             }
         }
         let tracker = &self.shared.tracker;
@@ -394,7 +399,8 @@ impl Service {
     /// 停止做种：存下进度、从 BT 会话里移除，记为不再做种；停下后发 [`Event::SeedingEnded`]。没在做种时什么也不做。
     pub fn stop_seeding(&self, id: TaskId) {
         if let Some(seeder) = lock(&self.shared.seeders).get(&id) {
-            seeder.control.cancel();
+            seeder.by_user.store(true, Ordering::Relaxed);
+            seeder.cancel.cancel();
         }
     }
 
@@ -574,8 +580,9 @@ impl Service {
         })
     }
 
-    /// 只从存储里删掉任务，不碰磁盘：用于已完成的（任务目录已在完成时删掉，输出归用户）与没有自己的任务目录的 HLS、
-    /// 文件任务。别的报 [`Error::NotFinished`]：它们的任务目录（BT 为下了的文件）要用 [`Service::discard`] 一起删。
+    /// 从存储里删掉任务，输出不动：用于已完成的（任务目录已在完成时删掉，输出归用户；BT 另删保存目录里它的 `.parts`
+    /// 文件）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们的任务目录（BT 为下了的文件）要用
+    /// [`Service::discard`] 一起删。在做种的报 [`Error::Seeding`]；`.parts` 删不掉时报 [`Error::Io`]，记录留着。
     pub fn forget(&self, id: TaskId) -> Result<(), Error> {
         self.shared.write(|tx| {
             if lock(&self.shared.discarding).contains(&id) {
@@ -588,6 +595,25 @@ impl Service {
             let unfinished = task.work_dir.is_some() || task.spec.torrent().is_some();
             if task.status != Status::Done && unfinished {
                 return Err(Error::NotFinished(id));
+            }
+            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户，随记录一起删；
+            // 删不掉时记录留着
+            if let Some(spec) = task.spec.torrent() {
+                let resume = store::torrent_resume(tx, id)?;
+                let info = TorrentInfo::of(&resume.data)
+                    .map_err(|error| Error::Corrupt(format!("{id}的续传数据：{error}")))?;
+                let part = torrent_folder(spec).join(&info.part_file);
+                match std::fs::remove_file(&part) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(cause) => {
+                        return Err(Error::Io {
+                            action: "删除",
+                            path: part,
+                            cause,
+                        });
+                    }
+                }
             }
             store::delete(tx, id)
         })
@@ -814,15 +840,12 @@ impl Shared {
 
     /// BT 引擎；还没有时照存储里上次关闭时的端口与 DHT 状态建会话（见 [`Bt::engine`]）。不持 `store` 锁调用。
     fn bt_engine(&self) -> Result<Arc<torrent::Engine>, Error> {
-        let (saved, limit) = {
+        let saved = {
             let mut store = lock(&self.store);
             let tx = store.transaction()?;
-            (
-                store::torrent_session(&tx)?,
-                store::settings(&tx)?.upload_limit,
-            )
+            store::torrent_session(&tx)?
         };
-        self.bt.engine(saved, limit)
+        self.bt.engine(saved)
     }
 
     /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；
@@ -847,10 +870,7 @@ impl Shared {
                     )));
                 }
             };
-            let engine = self.bt.engine(
-                store::torrent_session(&tx)?,
-                store::settings(&tx)?.upload_limit,
-            )?;
+            let engine = self.bt.engine(store::torrent_session(&tx)?)?;
             let resume = store::torrent_resume(&tx, id)?;
             store::set_seeding_task(&tx, id, true)?;
             self.commit(tx, applied)?;
@@ -867,22 +887,23 @@ impl Shared {
         Ok(())
     }
 
-    /// 登记任务 `id` 在做种，等 `started` 给出加进会话的种子后做种，直到停下；停下时存下进度，除了应用退出时停下的都记为
-    /// 不再做种，发出 [`Event::SeedingEnded`]。调用方须在运行时里。
+    /// 登记任务 `id` 在做种，等 `started` 给出加进会话的种子后做种（期间每 5 分钟存一次进度），直到停下；停下时存下进度，
+    /// 发出 [`Event::SeedingEnded`]。应用退出时停下的（用户没先停止做种，也不是到了条件或文件不全）记着在做种，下次打开
+    /// 接着做，别的记为不再做种。调用方须在运行时里。
     fn track_seeding(
         self: &Arc<Self>,
         id: TaskId,
         started: impl Future<Output = Result<Seeder, Error>> + Send + 'static,
     ) {
         let cancel = CancellationToken::new();
-        let (stopped_tx, stopped) = watch::channel(false);
+        let by_user = Arc::new(AtomicBool::new(false));
         {
             let _store = lock(&self.store);
             lock(&self.seeders).insert(
                 id,
-                Running {
-                    control: Control::Torrent(cancel.clone()),
-                    stopped,
+                SeedControl {
+                    cancel: cancel.clone(),
+                    by_user: by_user.clone(),
                 },
             );
             // 关闭之后才登记的（下完时正赶上退出）随即停下
@@ -898,13 +919,20 @@ impl Shared {
             let events = shared.events.clone();
             let seeded = match started.await {
                 Ok(seeder) => {
-                    torrent::seed(seeder, policy, cancel, |progress| {
-                        // 同上
-                        let _closed = events.send(Event::TorrentProgress {
-                            id,
-                            progress: Box::new(progress),
-                        });
-                    })
+                    let saving = shared.clone();
+                    torrent::seed(
+                        seeder,
+                        policy,
+                        cancel,
+                        |progress| {
+                            // 同上
+                            let _closed = events.send(Event::TorrentProgress {
+                                id,
+                                progress: Box::new(progress),
+                            });
+                        },
+                        |resume| saving.write(|tx| store::set_torrent_resume(tx, id, &resume)),
+                    )
                     .await
                 }
                 Err(error) => torrent::Seeded {
@@ -912,8 +940,10 @@ impl Shared {
                     resume: None,
                 },
             };
-            // 应用退出时停下的，下次打开接着做
-            let keep = seeded.end == SeedEnd::Stopped && shared.closed.load(Ordering::Relaxed);
+            // 应用退出时停下的（停下时出了错也算），下次打开接着做
+            let keep = shared.closed.load(Ordering::Relaxed)
+                && !by_user.load(Ordering::Relaxed)
+                && !matches!(seeded.end, SeedEnd::Reached | SeedEnd::Incomplete);
             let saved = shared.write(|tx| {
                 if let Some(resume) = &seeded.resume {
                     store::set_torrent_resume(tx, id, resume)?;
@@ -921,7 +951,6 @@ impl Shared {
                 store::set_seeding_task(tx, id, keep)
             });
             lock(&shared.seeders).remove(&id);
-            stopped_tx.send_replace(true);
             // 同上
             let _closed = shared.events.send(Event::SeedingEnded {
                 id,
@@ -1114,10 +1143,7 @@ impl Shared {
         id: TaskId,
         spec: &TorrentSpec,
     ) -> Result<TorrentRun, Error> {
-        let engine = self.bt.engine(
-            store::torrent_session(tx)?,
-            store::settings(tx)?.upload_limit,
-        )?;
+        let engine = self.bt.engine(store::torrent_session(tx)?)?;
         let resume = store::torrent_resume(tx, id)?;
         let data = resume.data.clone();
         let cancel = CancellationToken::new();

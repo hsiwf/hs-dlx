@@ -39,14 +39,15 @@ const B: u32 = 70_001;
 /// b.bin 占 5 块
 const PIECE: i32 = 16 << 10;
 
-/// 在 `dir` 下写 album/a.bin 与 album/b.bin，建种子；`without_b` 时建完再删掉 b.bin，做种的一方只有 a.bin 的块。
-/// 在只监听回环地址的新会话里校验已有的文件后上传，返回会话与种子的编号。
-fn seed(dir: &Path, without_b: bool) -> (Session, TorrentId) {
+/// 在 `dir` 下写 album/a.bin 与 album/b.bin，建种子（`v1_only` 时只有 v1：文件首尾相接，第 7 块跨 a.bin 与 b.bin）；
+/// `without_b` 时建完再删掉 b.bin，做种的一方只有 a.bin 的块。在只监听回环地址的新会话里校验已有的文件后上传，返回
+/// 会话与种子的编号。
+fn seed(dir: &Path, without_b: bool, v1_only: bool) -> (Session, TorrentId) {
     let album = dir.join("album");
     std::fs::create_dir_all(&album).unwrap();
     std::fs::write(album.join("a.bin"), content(A, 1)).unwrap();
     std::fs::write(album.join("b.bin"), content(B, 2)).unwrap();
-    let torrent = create_torrent(album.to_str().unwrap(), PIECE).unwrap();
+    let torrent = create_torrent(album.to_str().unwrap(), PIECE, v1_only).unwrap();
     if without_b {
         std::fs::remove_file(album.join("b.bin")).unwrap();
     }
@@ -173,7 +174,7 @@ fn index_of(info: &TorrentInfo, name: &str) -> i32 {
 #[test]
 fn a_magnet_link_downloads_the_chosen_file() {
     let dir = test_dir("download");
-    let (seeder, id) = seed(&dir.join("seed"), false);
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
     let folder = dir.join("downloads");
     std::fs::create_dir_all(folder.join("album")).unwrap();
     let store = dir.join("tasks.sqlite");
@@ -241,7 +242,7 @@ fn a_magnet_link_downloads_the_chosen_file() {
 #[test]
 fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     let dir = test_dir("partial");
-    let (seeder, id) = seed(&dir.join("seed"), true);
+    let (seeder, id) = seed(&dir.join("seed"), true, false);
     let folder = dir.join("downloads");
     let store = dir.join("tasks.sqlite");
     let rt = runtime();
@@ -336,7 +337,7 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
 #[test]
 fn torrent_drafts_are_checked() {
     let dir = test_dir("drafts");
-    let (seeder, id) = seed(&dir.join("seed"), false);
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
     let rt = runtime();
     let (service, _events) = service(&dir.join("tasks.sqlite"));
     let uri = magnet(&id, &seeder);
@@ -416,7 +417,7 @@ async fn seeding(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Tor
 #[test]
 fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     let dir = test_dir("seeding");
-    let (seeder, id) = seed(&dir.join("seed"), false);
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
     let folder = dir.join("downloads");
     let store = dir.join("tasks.sqlite");
     let rt = runtime();
@@ -483,7 +484,64 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     );
     assert!(!b.exists(), "做种时补下了");
     assert!(!service.task(task.id).unwrap().seeding);
+    // 文件放回去再做种：存着的进度没被不全的那次盖掉，照常做种
+    std::fs::copy(dir.join("seed").join("album").join("b.bin"), &b).unwrap();
+    service.seed(task.id).unwrap();
+    rt.block_on(seeding(&mut events, task.id));
+    service.stop_seeding(task.id);
+    assert_eq!(
+        rt.block_on(seeding_ended(&mut events, task.id)),
+        SeedEnd::Stopped
+    );
     service.forget(task.id).unwrap();
+    drop(service);
+    drop(seeder);
+}
+
+/// 只有 v1 的种子只选 a.bin：跨 a.bin 与 b.bin 的那块里 b.bin 的部分存在保存目录的 .parts 里。下完做种、退出再打开
+/// 接着做种、停止做种都留着它（再做种要读），从列表移除时一起删。
+#[test]
+fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
+    let dir = test_dir("part-file");
+    let (seeder, id) = seed(&dir.join("seed"), false, true);
+    let folder = dir.join("downloads");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let (service, mut events) = service(&store);
+
+    let uri = magnet(&id, &seeder);
+    let resume = fetch(&rt, &service, &uri);
+    let info = TorrentInfo::of(&resume).unwrap();
+    let task = rt
+        .block_on(service.create(
+            draft(&uri, &folder, resume, vec![index_of(&info, "a.bin")]),
+            1,
+        ))
+        .unwrap()
+        .unwrap();
+    let status = rt.block_on(until(&mut events, task.id, |_| false));
+    assert_eq!(status, Some(Status::Done));
+    rt.block_on(seeding(&mut events, task.id));
+    let part = folder.join(&info.part_file);
+    assert!(part.exists(), "{} 不在", part.display());
+
+    service.close().unwrap();
+    drop(service);
+    assert!(part.exists());
+    let (service, mut events) = self::service(&store);
+    rt.block_on(seeding(&mut events, task.id));
+    service.stop_seeding(task.id);
+    assert_eq!(
+        rt.block_on(seeding_ended(&mut events, task.id)),
+        SeedEnd::Stopped
+    );
+    assert!(part.exists());
+    service.forget(task.id).unwrap();
+    assert!(!part.exists(), "从列表移除时删掉 .parts");
+    assert!(
+        folder.join("album").join("a.bin").exists(),
+        "下的文件归用户"
+    );
     drop(service);
     drop(seeder);
 }
