@@ -78,7 +78,16 @@ pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl Int
                 .border_color(theme::hairline())
                 .child(
                     canvas(
-                        |bounds, _, cx| backdrop::report_disc(bounds.center(), cx),
+                        |bounds, _, cx| {
+                            backdrop::report_disc(
+                                backdrop::Disc {
+                                    center: bounds.center(),
+                                    radius: DISC_RADIUS,
+                                    strength: 1.,
+                                },
+                                cx,
+                            );
+                        },
                         |_, _, _, _| {},
                     )
                     .size_full(),

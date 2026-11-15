@@ -11,6 +11,7 @@ use hs_dlx_app::Failure;
 use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, duration_of};
+use crate::backdrop::{self, Disc};
 use crate::ring::{self, Ticks};
 use crate::{dial, format, theme, ui};
 
@@ -36,6 +37,8 @@ const LABEL_WIDTH: f32 = 184.;
 pub(super) const FIGURE_WIDTH: f32 = LABEL_X + LABEL_WIDTH;
 /// 同心环区域的高。
 pub(super) const FIGURE_HEIGHT: f32 = BOX_TOP + BOX + BOX_TOP;
+/// 同心环外面的日冕的强度（表盘的为 1）。
+const RINGS_GLOW: f32 = 0.2;
 /// 点在环宽之外多远以内仍算点中这一环。
 const HIT_SLOP: f32 = 8.;
 
@@ -197,6 +200,7 @@ impl NewTask {
             labels,
             center,
             note,
+            edge,
         } = self.ready_figure(probe);
         let bounds_cell = self.rings_bounds.clone();
         div()
@@ -236,9 +240,23 @@ impl NewTask {
                         }
                     }))
                     .child(
-                        canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {})
-                            .absolute()
-                            .size_full(),
+                        canvas(
+                            move |bounds, _, cx| {
+                                bounds_cell.set(bounds);
+                                // 日冕弱一档：环与右侧的标签是这一页的主角
+                                backdrop::report_disc(
+                                    Disc {
+                                        center: bounds.center(),
+                                        radius: edge,
+                                        strength: RINGS_GLOW,
+                                    },
+                                    cx,
+                                );
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
                     )
                     .children(rings)
                     .child(
@@ -300,6 +318,7 @@ impl NewTask {
                 labels: Vec::new(),
                 center,
                 note,
+                edge: SINGLE_RADIUS + SINGLE_WIDTH / 2.,
             };
         };
         let rings = rings(&master.variants);
@@ -377,11 +396,13 @@ impl NewTask {
             .filter(|_| !probe.live)
             .map(|bw| format::size_bound(bw, duration))
             .unwrap_or_default();
+        let outer = rings.first().expect("主播放列表至少有一档");
         Figure {
             rings: ring_divs,
             labels,
             center: format::variant(picked),
             note: size,
+            edge: outer.radius + outer.width / 2.,
         }
     }
 }
@@ -432,6 +453,8 @@ struct Figure {
     center: String,
     /// 圆心大字下面的小字
     note: String,
+    /// 最外一环的外沿离圆心多远：窗口背景的日冕从这里放出
+    edge: f32,
 }
 
 #[cfg(test)]
