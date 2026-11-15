@@ -1,8 +1,9 @@
 //! 编译 C++ 的这一层（src/shim.cpp）并链接静态的 libtorrent、OpenSSL。libtorrent 装在环境变量 `LIBTORRENT_DIR` 指的
 //! 目录（由 third_party/libtorrent/build.sh 生成，.cargo/config.toml 里设了默认位置）。
 //!
-//! libtorrent 的公开宏（ABI 版本、关掉的功能、用 OpenSSL）与要链接的系统库只从它装好的 CMake 配置里读，不在这里另写
-//! 一份：两边不一致时 C++ 的类型布局对不上，编译与链接都不报错，运行时才出错。
+//! libtorrent 的公开宏（ABI 版本、关掉的功能、用 OpenSSL）与它要链接的系统库只从它装好的 CMake 配置里读，不在这里另写
+//! 一份：两边不一致时 C++ 的类型布局对不上，编译与链接都不报错，运行时才出错。静态 OpenSSL 要的系统库不在那份配置里
+//! （那里只写了 OpenSSL::SSL），在下面按平台列出；漏了时链接报错。
 
 use std::path::{Path, PathBuf};
 
@@ -35,10 +36,14 @@ fn main() {
         build.flag("/utf-8");
     }
     for define in property(&cmake, "INTERFACE_COMPILE_DEFINITIONS") {
-        // 只在调试配置里定义的（`$<$<CONFIG:Debug>:…>`）不用：库按发布配置编译
-        if define.starts_with("$<") {
+        if debug_only(&define) {
             continue;
         }
+        // 按平台、编译器加的宏少了时类型布局对不上而不报错：认不出的生成表达式先报出来
+        assert!(
+            !define.starts_with("$<"),
+            "libtorrent 的 CMake 配置里有认不出的编译宏 {define}：在 build.rs 里加上它的处理"
+        );
         match define.split_once('=') {
             Some((name, value)) => build.define(name, value),
             None => build.define(&define, None),
@@ -84,6 +89,11 @@ fn property(cmake: &str, name: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("libtorrent 的 CMake 配置里没有 {name}"))
 }
 
+/// 只在调试配置里用的（`$<$<CONFIG:Debug>:…>`；由 `debug` 关键字生成时配置名为大写）：库按发布配置编译，不用。
+fn debug_only(item: &str) -> bool {
+    item.to_ascii_uppercase().starts_with("$<$<CONFIG:DEBUG>:")
+}
+
 /// 静态库 `name` 在 `lib` 里的链接名：MSVC 上 OpenSSL 装成 libssl.lib、libcrypto.lib，其余平台与 libtorrent 都是去掉
 /// `lib` 前缀与扩展名的名字。
 fn static_name(lib: &Path, name: &str) -> String {
@@ -96,14 +106,14 @@ fn static_name(lib: &Path, name: &str) -> String {
 
 /// 链接 CMake 导出的依赖里的系统库：`-framework X` 为 macOS 的框架，`$<LINK_ONLY:x>` 与普通的名字为系统库；
 /// `Threads::Threads` 由 Rust 的标准库带上，`OpenSSL::SSL` 与 `Boost::headers` 是上面单独处理的静态库与头文件；只在调试
-/// 配置里用的（`$<$<CONFIG:Debug>:…>`）不用，库按发布配置编译。认不出的生成表达式报错：当成库名链接会报一个看不懂的
+/// 配置里用的（[`debug_only`]）不用。认不出的生成表达式报错：当成库名链接会报一个看不懂的
 /// 「找不到库」。
 fn link_system_library(library: &str) {
     let library = library
         .strip_prefix("$<LINK_ONLY:")
         .and_then(|inner| inner.strip_suffix('>'))
         .unwrap_or(library);
-    if library.starts_with("$<$<CONFIG:Debug>:") {
+    if debug_only(library) {
         return;
     }
     assert!(

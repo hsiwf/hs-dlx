@@ -154,21 +154,24 @@ fn kept(row: &Row, paused: bool) -> Kept {
     }
 }
 
-/// 文件任务能不能续传：服务器支持范围请求、且给出了总大小（新建前认出的）。不能时已下的不沿用，继续时从头下。
+/// 文件任务能不能续传：新建前认出服务器支持范围请求（这时总大小必已知道）。不能时已下的不沿用，中断后从头下。
 fn resumable(row: &Row) -> bool {
     row.task
         .spec
         .file()
-        .is_some_and(|file| file.expected.accepts_ranges && file.expected.length.is_some())
+        .is_some_and(|file| file.expected.accepts_ranges)
 }
 
 /// 停着的文件任务的 [`Kept`]：按任务目录里已落盘的字节数。不能续传时（[`resumable`]）写明继续时从头下。
 fn kept_file(row: &Row, paused: bool) -> Kept {
-    let amount = FileAmount::of(row);
+    let resumable = resumable(row);
+    // 不能续传时已下的不算数，不按它显示比例
+    let amount = FileAmount::of(row).filter(|_| resumable);
     let fraction = amount.as_ref().and_then(FileAmount::fraction);
     let then = if paused { " · 继续时接着下" } else { "" };
     let line = match (&amount, &row.disk) {
-        _ if !resumable(row) => "服务器不支持续传：继续时从头下".to_owned(),
+        (_, Disk::Unreadable(reason)) => format!("读不出任务目录：{reason}"),
+        _ if !resumable => "服务器不支持续传：继续时从头下".to_owned(),
         (Some(a), _) if a.bytes > 0 => match a.total {
             Some(total) => format!(
                 "已下 {} / {}{then}",
@@ -177,7 +180,6 @@ fn kept_file(row: &Row, paused: bool) -> Kept {
             ),
             None => format!("已下 {}{then}", format::bytes(a.bytes)),
         },
-        (_, Disk::Unreadable(reason)) => format!("读不出任务目录：{reason}"),
         (_, Disk::Unread) => "正在读取任务目录".to_owned(),
         _ => "还没有下载内容".to_owned(),
     };
@@ -235,7 +237,7 @@ fn running_file(row: &Row) -> Look {
         None => (format::bytes(amount.bytes), "服务器没给出大小".to_owned()),
     };
     if !resumable(row) {
-        line.push_str(" · 暂停后要从头下");
+        line.push_str(" · 中断后要从头下");
     }
     Look {
         state: "下载中".to_owned(),

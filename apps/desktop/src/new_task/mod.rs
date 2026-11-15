@@ -243,9 +243,7 @@ impl NewTask {
                 Ok(Ok(Resource::Page { content_type })) => (
                     Probing::Failed(Failure {
                         kind: FailureKind::Malformed,
-                        message: format!(
-                            "地址回的是网页（{content_type}），不是视频流或文件：多为登录页或错误页"
-                        ),
+                        message: format!("地址回的是网页（{content_type}），不是视频流或文件"),
                     }),
                     true,
                 ),

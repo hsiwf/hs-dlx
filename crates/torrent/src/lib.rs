@@ -73,12 +73,14 @@ mod ffi {
         ResumeRejected,
         TorrentError,
         FileError,
-        /// 从会话里去掉了；要删文件时之后还有 [`AlertKind::Deleted`] 或 [`AlertKind::DeleteFailed`]
+        /// 从会话里去掉了；要删文件时另有 [`AlertKind::Deleted`] 或 [`AlertKind::DeleteFailed`]，与这条先后不定
+        /// （libtorrent 2.1 先发删的结果）
         Removed,
         Deleted,
         DeleteFailed,
-        /// 事件来得太快、队列满了丢了一些，哪些种子的哪种事件说不清（可能有续传数据、移除的结果）：会话里靠事件维持的
-        /// 状态不再可信，要重新要续传数据，并在之后重建会话（移除的结果丢了的种子，这个会话里再也加不进）
+        /// 事件来得太快、队列满了丢了一些：哪些种子的说不清（libtorrent 只给出丢了哪几类，这里没转出来），可能有续传
+        /// 数据、移除的结果。会话里靠事件维持的状态不再可信：要重新要续传数据，并在之后重建会话（移除的结果丢了的种子，
+        /// 这个会话里再也加不进）
         AlertsDropped,
         ListenSucceeded,
         ListenFailed,
@@ -287,7 +289,7 @@ impl Session {
         Ok(self.inner().resume(id.as_str())?)
     }
 
-    /// 从会话里去掉；`delete_files` 时连同下了的文件一起删（删完报 [`AlertKind::Removed`] 之后的文件事件）。
+    /// 从会话里去掉；`delete_files` 时连同下了的文件一起删。结果见 [`AlertKind::Removed`]。
     pub fn remove(&self, id: &TorrentId, delete_files: bool) -> Result<(), Error> {
         Ok(self.inner().remove(id.as_str(), delete_files)?)
     }

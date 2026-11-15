@@ -22,7 +22,8 @@ pub fn path_key(path: &str) -> String {
 /// 地址路径里不足以当名字、要取上一级目录名的末段（不分大小写，已去掉 `.m3u8`）。
 const GENERIC: [&str; 5] = ["index", "master", "playlist", "prog_index", "main"];
 
-/// 主名最多多少字节：常见文件系统的文件名上限是 255 字节，给编号（` 99999`）与最长的后缀（`.hsdl`、`.mp4`）留出余量。
+/// 主名最多多少字节：常见文件系统的文件名上限是 255 字节，给编号（` 99999`）与最长的后缀（文件任务的任务目录
+/// `.<扩展名，至多 16 字节>.hsdl`，22 字节）留出余量。
 const STEM_LIMIT: usize = 200;
 
 /// 列表与文件名用的标题：地址路径的最后一段（百分号解码、去掉 `.m3u8`）；是 index、master 之类的通用名时取上一级
@@ -158,7 +159,11 @@ pub fn file_output_for(
     };
     let stem = free_stem(folder, stem, taken, |stem| {
         let name = named(stem);
-        let work_dir = format!("{name}{WORK_DIR_SUFFIX}");
+        let work_dir = file_work_dir(&folder.join(&name))
+            .file_name()
+            .expect("任务目录以 <文件名>.hsdl 结尾")
+            .to_string_lossy()
+            .into_owned();
         vec![name, work_dir]
     })?;
     let name = named(&stem);

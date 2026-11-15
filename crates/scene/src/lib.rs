@@ -111,8 +111,7 @@ struct Target {
 
 impl Drop for Renderer {
     /// wgpu 释放队列时等 GPU 空闲，设备已坏（显存不足、驱动出错）时它 panic，与等画完时一样收住（见
-    /// [`panics_contained`]）。
-    /// 渲染器已不用了，这时的错误没有调用方可报，也不影响别的；画出错的原因之前已由 [`Renderer::render`] 报过。
+    /// [`panics_contained`]）。释放时设备出错不报：渲染器已不再用，没有可报的对象。
     fn drop(&mut self) {
         if let Some(gpu) = self.gpu.take() {
             let _released = contained(move || drop(gpu));

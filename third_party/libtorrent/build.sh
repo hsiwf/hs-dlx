@@ -145,8 +145,10 @@ libtorrent_flags=(
   -DBoost_NO_BOOST_CMAKE=ON
 )
 cmake -S "$WORK/libtorrent-rasterbar-$LIBTORRENT" -B "$WORK/libtorrent-cmake" "${libtorrent_flags[@]}"
-# 核对 CMake 找到的 Boost 与 OpenSSL 是这里下载、编译的那份
-cache="$WORK/libtorrent-cmake/CMakeCache.txt"
+# 核对 CMake 找到的 Boost 与 OpenSSL 是这里下载、编译的那份。Windows 上 CMake 按文本写缓存（行尾为 CRLF），去掉 \r
+# 再比
+cache="$WORK/libtorrent-cmake/CMakeCache.lf.txt"
+tr -d '\r' < "$WORK/libtorrent-cmake/CMakeCache.txt" > "$cache"
 # 路径在 CMake 里的写法：Windows 上为 `D:/a/b`（MSYS2 的 `/d/a/b` 转过去）
 cmake_path() {
   if [[ $PLATFORM == windows ]]; then cygpath -m "$1"; else printf '%s' "$1"; fi
@@ -159,11 +161,16 @@ expect_cache() {
     exit 1
   fi
 }
-if [[ $PLATFORM == windows ]]; then static=lib; else static=a; fi
 expect_cache Boost_INCLUDE_DIR:PATH "$WORK/boost-$BOOST"
 expect_cache OPENSSL_INCLUDE_DIR:PATH "$PREFIX/include"
-expect_cache OPENSSL_SSL_LIBRARY:FILEPATH "$PREFIX/lib/libssl.$static"
-expect_cache OPENSSL_CRYPTO_LIBRARY:FILEPATH "$PREFIX/lib/libcrypto.$static"
+# FindOpenSSL 用 MSVC 时把库记在 SSL_EAY_RELEASE、LIB_EAY_RELEASE，别处记在 OPENSSL_SSL_LIBRARY、OPENSSL_CRYPTO_LIBRARY
+if [[ $PLATFORM == windows ]]; then
+  expect_cache SSL_EAY_RELEASE:FILEPATH "$PREFIX/lib/libssl.lib"
+  expect_cache LIB_EAY_RELEASE:FILEPATH "$PREFIX/lib/libcrypto.lib"
+else
+  expect_cache OPENSSL_SSL_LIBRARY:FILEPATH "$PREFIX/lib/libssl.a"
+  expect_cache OPENSSL_CRYPTO_LIBRARY:FILEPATH "$PREFIX/lib/libcrypto.a"
+fi
 cmake --build "$WORK/libtorrent-cmake" --parallel "$jobs"
 cmake --install "$WORK/libtorrent-cmake"
 # libtorrent 的公开头文件包含 Boost 的头文件：一并装进安装目录，绑定只看这一个目录
