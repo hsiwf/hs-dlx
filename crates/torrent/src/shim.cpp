@@ -160,10 +160,23 @@ rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::S
 void Session::start(rust::Str id) const { handle(id).unset_flags(lt::torrent_flags::upload_mode); }
 
 void Session::flush(rust::Str id) const {
-	lt::torrent_handle h = handle(id);
+	// 与 remove 同一把锁：两者按调用的先后交给网络线程，先交的写盘在种子移除前做完、照样报来
+	std::lock_guard<std::mutex> lock(m_mutex);
+	std::string const key = string_of(id);
+	auto found = m_handles.find(key);
+	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
 	// 没有种子信息时还没有存储，libtorrent 不发写完的事件
-	if (!h.torrent_file()) throw std::invalid_argument("还没有种子信息，没有要写到磁盘的：" + string_of(id));
-	h.flush_cache();
+	if (!found->second.torrent_file()) throw std::invalid_argument("还没有种子信息，没有要写到磁盘的：" + key);
+	found->second.flush_cache();
+	++m_flush_requests[key];
+}
+
+bool Session::flush_requested(std::string const& id) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_flush_requests.find(id);
+	if (found == m_flush_requests.end()) return false;
+	if (--found->second == 0) m_flush_requests.erase(found);
+	return true;
 }
 
 rust::Vec<FileEntry> Session::files(rust::Str id) const {
@@ -309,7 +322,9 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeDataFailed, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::cache_flushed_alert>(a)) {
-			out.push_back(alert_of(AlertKind::CacheFlushed, *a, id_of(t->handle)));
+			// libtorrent 在种子下完时也自己释放文件、发这个事件：只转出 flush 要的
+			std::string const id = id_of(t->handle);
+			if (flush_requested(id)) out.push_back(alert_of(AlertKind::CacheFlushed, *a, id));
 		} else if (auto* t = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ResumeRejected, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_error_alert>(a)) {
