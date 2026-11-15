@@ -1,22 +1,23 @@
 //! 选中任务的舞台与检查面板：舞台中间是表盘（直播录制是钟面），检查面板是读数、信号与操作。
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, linear_color_stop,
+    linear_gradient, px,
 };
-use hs_dlx_app::{OutputSpec, Status};
+use hs_dlx_app::Status;
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, Row, resume_label};
+use crate::tasks::{Amount, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
-use crate::{dial, format, ring, theme};
+use crate::{dial, format, motion, ring, theme};
 
 /// 在系统的文件管理器里显示输出：各平台的叫法。
 const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -26,8 +27,10 @@ const REVEAL: &str = if cfg!(target_os = "macos") {
 } else {
     "在文件夹中显示"
 };
-/// 信号的时刻一栏的宽：放得下「11-14 10:20」。
-const SIGNAL_AT_WIDTH: f32 = 72.;
+/// 信号时间线：竖线离左边多远、最新几条不变淡、最新一条的节点呼吸一次多久。
+const SIGNAL_RAIL: f32 = 9.5;
+const SIGNAL_FRESH: usize = 3;
+const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 /// 任务页的最小宽：表盘与收到最窄的检查面板。
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
@@ -95,9 +98,9 @@ impl Shell {
                     div()
                         .id("probe-clipboard-hint")
                         .flex_none()
-                        .text_color(theme::cyan())
+                        .text_color(theme::accent())
                         .cursor_pointer()
-                        .hover(|s| s.text_color(theme::cyan_pale()))
+                        .hover(|s| s.text_color(theme::accent_pale()))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.probe_text(url.as_str(), window, cx)
                         }))
@@ -127,6 +130,26 @@ impl Shell {
         };
         if !cells.is_empty() {
             body.push(ui::reads(cells, None).into_any_element());
+        }
+        if !live && row.task.status == Status::Running {
+            body.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(ui::caption("速度 · 最近 60 秒"))
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(10.))
+                            .bg(theme::ground())
+                            .border_1()
+                            .border_color(theme::edge())
+                            .child(ui::speed_matrix(row.rate.history(now).to_vec())),
+                    )
+                    .into_any_element(),
+            );
         }
         if live {
             body.push(live_view::legend(row).into_any_element());
@@ -215,7 +238,7 @@ impl Shell {
         stopped_plan(failure, row.recording(), row.task.write_only, editing)
     }
 
-    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为橙色），其余在下面一行。
+    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
     fn stopped_foot(&self, row: &Row, discard: Stateful<Div>, cx: &Context<Self>) -> Foot {
         let id = row.task.id;
         let failed = matches!(row.task.status, Status::Failed(_));
@@ -250,7 +273,7 @@ impl Shell {
                 Action::OpenFolder => ("open-folder", "打开保存目录".to_owned(), None),
             };
             let act = *action;
-            let folder = folder_of(&row.task.spec.output);
+            let folder = folder_of(&row.task.spec);
             let on_click = cx.listener(move |this, _, window, cx| match act {
                 Action::EditHeaders => this.edit_headers(id, window, cx),
                 Action::WriteRecorded => this.write_recorded(id, cx),
@@ -293,8 +316,8 @@ impl Shell {
             if confirming {
                 button
                     .w_full()
-                    .border_color(theme::orange())
-                    .text_color(theme::orange())
+                    .border_color(theme::warn())
+                    .text_color(theme::warn())
             } else {
                 button
             }
@@ -389,23 +412,24 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         let Some(result) = row.task.result.as_ref() else {
             return Vec::new();
         };
-        let mut cells = vec![
-            cell(
+        let mut cells = Vec::new();
+        if row.task.spec.hls().is_some() {
+            cells.push(cell(
                 "时长",
                 result
                     .duration
                     .map_or_else(|| "—".to_owned(), format::clock),
-            ),
-            cell("大小", format::bytes(result.bytes)),
-        ];
+            ));
+        }
+        cells.push(cell("大小", format::bytes(result.bytes)));
         if let Some((width, height)) = result.resolution {
             cells.push(cell("画面", format!("{width}×{height}")));
         }
-        cells.push(cell(
-            "保存为",
-            output_kind(&row.task.spec.output).to_owned(),
-        ));
+        cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
         return cells;
+    }
+    if row.task.spec.hls().is_none() {
+        return file_reads(row, now);
     }
     let Some(amount) = Amount::of(row) else {
         return Vec::new();
@@ -444,67 +468,165 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     }
 }
 
-/// 输出的种类。
-fn output_kind(output: &OutputSpec) -> &'static str {
-    match output {
-        OutputSpec::Mp4(_) => "MP4",
-        OutputSpec::Hls(_) => "本地 HLS",
-        OutputSpec::Both { .. } => "MP4 与本地 HLS",
+/// 文件任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下与连接数，停着的为已下与总大小；还没有内容时为空。
+fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let Some(amount) = FileAmount::of(row) else {
+        return Vec::new();
+    };
+    let size = amount
+        .total
+        .map_or_else(|| "不知道".to_owned(), format::bytes);
+    match (&row.task.status, &row.file_progress) {
+        (Status::Running, Some(progress)) if progress.limit > 0 => {
+            let speed = row.rate.bytes_per_second(now);
+            // 按最近几秒的速度估：剩下的字节除以速度
+            let left = amount
+                .total
+                .map(|total| total.saturating_sub(amount.bytes))
+                .filter(|_| speed > 0.0)
+                .map_or_else(
+                    || "—".to_owned(),
+                    |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
+                );
+            vec![
+                cell("速度", format!("{}/s", format::bytes(speed as u64))),
+                cell("剩余", left),
+                cell("已下", format::bytes(amount.bytes)),
+                cell(
+                    "连接",
+                    format!("{} / {}", progress.connections, progress.limit),
+                ),
+            ]
+        }
+        (Status::Running, _) => Vec::new(),
+        _ if amount.bytes == 0 => Vec::new(),
+        _ => vec![
+            cell("已下", format::bytes(amount.bytes)),
+            cell("大小", size),
+        ],
     }
 }
 
 /// 输出所在的目录：占着输出路径的东西就在里面。
-fn folder_of(output: &OutputSpec) -> std::path::PathBuf {
-    let target = output.options().target;
-    target
-        .mp4()
-        .or(target.hls())
-        .and_then(|path| path.parent())
+fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
+    main_output(spec)
+        .parent()
         .expect("输出是以文件名结尾的绝对路径")
         .to_path_buf()
 }
 
-/// 信号：最新的在最上面，左边是时刻，字色是级别。
+/// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点。要留意与失败级别的各条整行带同色的淡底与描边，
+/// 节点是同色的空心圈；其余的节点是暗的空心圈，最新一条是一般级别时它的节点实心发光、缓缓呼吸。较早的（第
+/// [`SIGNAL_FRESH`] 条往后）变淡。每条下面一行是时刻与连续发生的次数。
 fn signals(signals: &[Signal]) -> Div {
+    let accent = theme::accent();
+    let last = signals.len().saturating_sub(1);
+    let rows = signals.iter().rev().enumerate().map(|(index, signal)| {
+        let level = match signal.level {
+            Level::Info => None,
+            Level::Warn => Some(theme::signal_warn()),
+            Level::Error => Some(theme::signal_error()),
+        };
+        let newest = index == 0;
+        let breath = motion::breathe(SIGNAL_BREATH);
+        let node = div()
+            .absolute()
+            .left(px(SIGNAL_RAIL - 4.5))
+            .top(px(11.))
+            .size(px(9.))
+            .rounded_full()
+            .border_2()
+            .map(|node| match (level, newest) {
+                (Some(color), _) => node.bg(theme::ground()).border_color(color),
+                (None, true) => node
+                    .bg(accent)
+                    .border_color(accent)
+                    .shadow(ui::glow(accent, 10., breath)),
+                (None, false) => node.bg(theme::ground()).border_color(theme::accent_dim()),
+            });
+        // 竖线：第一条从节点往下，最后一条到节点为止
+        let rail = div()
+            .absolute()
+            .left(px(SIGNAL_RAIL - 0.5))
+            .w(px(1.))
+            .bg(theme::edge())
+            .map(|rail| match (index == 0, index == last) {
+                (true, true) => rail.h(px(0.)),
+                (true, false) => rail.top(px(14.)).bottom_0(),
+                (false, true) => rail.top_0().h(px(14.)),
+                (false, false) => rail.top_0().bottom_0(),
+            });
+        let when = if signal.repeat > 1 {
+            format!("{} · ×{}", signal.at, signal.repeat)
+        } else {
+            signal.at.clone()
+        };
+        div()
+            .relative()
+            .pl(px(26.))
+            .pr(px(8.))
+            .py(px(7.))
+            .rounded(px(10.))
+            .when_some(level, |row, color| {
+                row.bg(theme::alpha(color, 0.07))
+                    .border_1()
+                    .border_color(theme::alpha(color, 0.22))
+            })
+            .when(index >= SIGNAL_FRESH, |row| row.opacity(0.55))
+            .child(rail)
+            .child(node)
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .line_height(px(18.))
+                    .text_color(match (level, newest) {
+                        (Some(color), _) => color,
+                        (None, true) => theme::text(),
+                        (None, false) => theme::soft(),
+                    })
+                    .child(SharedString::from(signal.text.clone())),
+            )
+            .child(ui::num(
+                div()
+                    .mt(px(2.))
+                    .text_size(px(11.))
+                    .text_color(theme::faint())
+                    .child(when),
+            ))
+    });
     div()
         .flex()
         .flex_col()
-        .child(div().pb(px(6.)).child(ui::caption("信号")))
-        .children(signals.iter().rev().map(|signal| {
-            let color = match signal.level {
-                Level::Info => theme::soft(),
-                Level::Warn => theme::signal_warn(),
-                Level::Error => theme::signal_error(),
-            };
+        .px(px(12.))
+        .pt(px(6.))
+        .pb(px(8.))
+        .rounded(px(14.))
+        .border_1()
+        .border_color(theme::edge())
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(theme::alpha(accent, 0.04), 0.),
+            linear_color_stop(theme::alpha(accent, 0.), 0.4),
+        ))
+        .child(
             div()
                 .flex()
-                .gap(px(10.))
-                .py(px(7.))
-                .border_b_1()
-                .border_color(theme::hairline())
-                .text_size(px(13.))
-                .line_height(px(19.))
+                .items_center()
+                .justify_between()
+                .px(px(2.))
+                .pt(px(6.))
+                .pb(px(8.))
+                .child(ui::caption("信号"))
                 .child(ui::num(
                     div()
-                        .w(px(SIGNAL_AT_WIDTH))
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(theme::faint())
-                        .child(signal.at.clone()),
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(color)
-                        .child(SharedString::from(signal.text.clone()))
-                        .when(signal.repeat > 1, |s| {
-                            s.child(ui::num(
-                                div()
-                                    .text_color(theme::faint())
-                                    .child(format!("×{}", signal.repeat)),
-                            ))
-                        }),
-                )
-        }))
+                        .px(px(7.))
+                        .rounded(px(8.))
+                        .bg(theme::alpha(gpui_kit::white(), 0.05))
+                        .text_size(px(11.))
+                        .text_color(theme::muted())
+                        .child(signals.len().to_string()),
+                )),
+        )
+        .children(rows)
 }

@@ -27,10 +27,12 @@ use gpui_kit::{
 use hs_dlx_app::TaskId;
 use hs_dlx_instance::Handoff;
 
+use crate::backdrop::{self, Backdrop};
 use crate::dial;
 use crate::dock::{Dock, DockEvent};
 use crate::headers::HeadersEditor;
 use crate::links;
+use crate::motion;
 use crate::new_task;
 use crate::new_task::NewTask;
 use crate::settings::{SettingsEvent, SettingsView};
@@ -84,6 +86,12 @@ pub struct Shell {
     clipboard: Option<hs_m3u8_core::Url>,
     /// 待机页逐帧重画的定时器：在待机页时有，离开即释放（见 [`Shell::sync_standby`]）
     standby_frames: Option<Task<()>>,
+    /// 窗口的动态背景
+    backdrop: Backdrop,
+    /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图，并让窗口重画（装饰动效的节拍，见
+    /// [`crate::motion`]）：窗口在前台、系统没要求减少动态效果时每次都重画，否则只在背景换了图时重画。
+    /// 简化：整窗每次都重画（任务栏每一项的小环都重新细分），任务很多、机器很弱时成为瓶颈再把任务栏拆成缓存的视图
+    _frames: Task<()>,
     /// 这次进入待机页的时刻：彗尾与背光按它走
     standby_since: Instant,
     /// 进入待机页时读到的代理设置（待机页写新任务经哪里走；在设置页改了之后回来会重读）；读不出时为原因
@@ -127,6 +135,32 @@ impl Shell {
             cx.notify();
         });
         let selected = tasks.read(cx).rows().last().map(|row| row.task.id);
+        let frames = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(backdrop::FRAME).await;
+                let ticked = this.update_in(cx, |this, window, cx| {
+                    let changed = if this.backdrop.stopped() {
+                        false
+                    } else {
+                        let speed = this.tasks.read(cx).activity(Instant::now()).speed;
+                        match this.backdrop.tick(speed, cx) {
+                            Ok(changed) => changed,
+                            Err(backdrop::Stopped(error)) => {
+                                this.tell(format!("动态背景没有启用，界面改用纯色底：{error}"), cx);
+                                true
+                            }
+                        }
+                    };
+                    if changed || (window.is_window_active() && !cx.reduce_motion()) {
+                        cx.notify();
+                    }
+                });
+                // 窗口关了
+                if ticked.is_err() {
+                    break;
+                }
+            }
+        });
         let mut shell = Shell {
             tasks,
             selected,
@@ -137,6 +171,8 @@ impl Shell {
             clipboard: None,
             standby_frames: None,
             standby_since: Instant::now(),
+            backdrop: Backdrop::new(cx),
+            _frames: frames,
             standby_proxy: Ok(hs_m3u8_core::Proxy::System),
             confirm_discard: None,
             editing_headers: None,
@@ -154,8 +190,7 @@ impl Shell {
     pub fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
         if let Handoff::Link(link) = handoff {
             if self.new_task().is_some() {
-                self.dock
-                    .update(cx, |dock, cx| dock.set_text(link, window, cx));
+                self.dock.update(cx, |dock, cx| dock.put(&link, window, cx));
                 self.tell(
                     "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
                         .to_owned(),
@@ -168,10 +203,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// 把 `text` 填进粘贴栏并探测。
+    /// 把 `text` 放进粘贴栏（见 [`Dock::put`]）并探测。
     pub(super) fn probe_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.dock
-            .update(cx, |dock, cx| dock.set_text(text.to_owned(), window, cx));
+        self.dock.update(cx, |dock, cx| dock.put(text, window, cx));
         self.probe(text, window, cx);
     }
 
@@ -328,6 +362,7 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
+        motion::set_still(cx.reduce_motion());
         let cx = &*cx;
         let tasks = self.tasks.read(cx);
         let mut body = div()
@@ -365,6 +400,7 @@ impl Render for Shell {
             .bg(theme::ground())
             .text_color(theme::text())
             .text_size(px(14.))
+            .child(backdrop::layer())
             .child(self.render_header(tasks, now, cx))
             .child(body)
             .child(self.render_notices(tasks, cx))

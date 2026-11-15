@@ -1,4 +1,4 @@
-.PHONY: check ffmpeg ffmpeg_present icons licenses package \
+.PHONY: check ffmpeg ffmpeg_present libtorrent libtorrent_present icons licenses package \
 	rs_check rs_fmt rs_lint rs_clippy rs_doc rs_test rs_cov py_env py_check py_test
 
 FFMPEG_DIST := third_party/ffmpeg/dist
@@ -57,14 +57,14 @@ package: ffmpeg_present
 	@cargo packager --version >/dev/null 2>&1 || { echo "缺少 cargo-packager，版本见 .github/workflows/desktop.yml"; exit 1; }
 	cd apps/desktop && cargo packager --release --formats $(PACKAGE_FORMATS)
 
-rs_clippy: ffmpeg_present
+rs_clippy: ffmpeg_present libtorrent_present
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # 文档注释里的链接须都能解析（含私有项）：改名、删除后留下的断链在这里失败
-rs_doc: ffmpeg_present
+rs_doc: ffmpeg_present libtorrent_present
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
-rs_test: ffmpeg_present
+rs_test: ffmpeg_present libtorrent_present
 	cargo test --workspace
 
 # 任务存储与生命周期（app）的行覆盖不低于 80%
@@ -87,6 +87,19 @@ ffmpeg_present: py_env
 
 ffmpeg: py_env
 	script=$$($(FFMPEG_SCRIPT)) && bash "$$script" $(FFMPEG_DIST) third_party/ffmpeg/build
+
+# BT 引擎（crates/torrent）静态链接的 libtorrent、OpenSSL 与 Boost 的头文件，由 third_party/libtorrent/build.sh 编译；
+# 装好的须是当前那份脚本装的（标记文件是脚本的副本）：改了脚本而本地没重新构建时在这里失败
+LIBTORRENT_DIST := third_party/libtorrent/dist
+LIBTORRENT_SCRIPT := third_party/libtorrent/build.sh
+
+libtorrent_present:
+	@test -d $(LIBTORRENT_DIST)/include || { echo "缺少 $(LIBTORRENT_DIST)，先运行 make libtorrent"; exit 1; }
+	@cmp -s $(LIBTORRENT_DIST)/.hs-dlx-libtorrent $(LIBTORRENT_SCRIPT) || \
+		{ echo "$(LIBTORRENT_DIST) 不是当前的 $(LIBTORRENT_SCRIPT) 装的，先运行 make libtorrent"; exit 1; }
+
+libtorrent:
+	bash $(LIBTORRENT_SCRIPT)
 
 py_env:
 	uv sync --locked

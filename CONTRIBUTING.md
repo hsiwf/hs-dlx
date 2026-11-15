@@ -6,13 +6,17 @@
 - [uv](https://docs.astral.sh/uv/)：版本见 `pyproject.toml` 的 `required-version`，运行仓库里的 Python 脚本（第三方声明、图标、
   找 FFmpeg 的构建脚本、发版）。
 - Linux：WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包，包名见 `.github/workflows/check.yml`。
-- Windows：带 VC 工具的 Visual Studio 与 MSYS2（`make`、编译 FFmpeg 用），做法见 `.github/actions/msvc-env` 与
-  `.github/workflows/check.yml`。
+- 编译 libtorrent 与 OpenSSL：CMake、Ninja、Perl。
+- Windows：带 VC 工具的 Visual Studio 与 MSYS2（`make`、编译 FFmpeg 与 libtorrent 用），OpenSSL 的配置要 Windows 原生的
+  Perl（Strawberry Perl），做法见 `.github/actions/msvc-env` 与 `.github/workflows/check.yml`。
 - `make check` 另要 cargo-deny 与 cargo-llvm-cov，`make package` 另要 cargo-packager；版本分别见 `check.yml` 与
   `desktop.yml`。
 
 FFmpeg 用 hs-m3u8（`Cargo.lock` 固定的提交）里的构建脚本编译成静态库，装到 `third_party/ffmpeg/dist`。第一次与升级
 hs-m3u8 之后运行 `make ffmpeg`；装的不是当前那份脚本编出来的时，构建前的检查会失败并提示。
+
+BT 引擎（`crates/torrent`）用的 libtorrent、OpenSSL 静态库与 Boost 的头文件由 `third_party/libtorrent/build.sh` 编译，装到
+`third_party/libtorrent/dist`（十几分钟）。第一次与改了这个脚本之后运行 `make libtorrent`，检查同样核对。
 
 ## 检查
 

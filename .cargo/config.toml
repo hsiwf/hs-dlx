@@ -1,3 +1,5 @@
 [env]
 # ffmpeg-sys-next 从这里找静态 FFmpeg；由 make ffmpeg 生成
 FFMPEG_DIR = { value = "third_party/ffmpeg/dist", relative = true }
+# hs-dlx-torrent 从这里找静态 libtorrent（连同 OpenSSL 与 Boost 的头文件）；由 third_party/libtorrent/build.sh 生成
+LIBTORRENT_DIR = { value = "third_party/libtorrent/dist", relative = true }

@@ -5,7 +5,7 @@ use hs_dlx_app::{Failure, Status};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
-use crate::tasks::{Amount, Disk, Output, Row, finished_text};
+use crate::tasks::{Amount, Disk, FileAmount, Output, Row, finished_text};
 use crate::{format, theme};
 
 /// 一个任务此刻的样子。
@@ -45,6 +45,7 @@ pub fn look(row: &Row) -> Look {
             "放弃没做完",
             "任务目录可能已删了一部分，再放弃一次即可",
         ),
+        Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
@@ -75,9 +76,8 @@ fn discarding(row: &Row, state: &str, line: &str) -> Look {
 /// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字与说明按种类（见 [`format::failure`]），完整的
 /// 错误在信号里。点了继续、还在读任务目录时状态写「正在继续」。
 fn stopped(row: &Row, why: Stopped<'_>) -> Look {
-    let amount = Amount::of(row);
-    let (done, total) = amount.as_ref().map_or((0, 0), |a| (a.done, a.total));
-    let known = total > 0;
+    let kept = kept(row, matches!(why, Stopped::Paused));
+    let (done, total, known, fraction) = (kept.done, kept.total, kept.known, kept.fraction);
     let recording = row.recording();
     let state = |state: &str| if row.resuming { "正在继续" } else { state }.to_owned();
     let ticks = |lit: Hsla| Ticks {
@@ -85,14 +85,13 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
         glow: false,
         ..Ticks::of(total, done, false)
     };
-    let fraction = amount.as_ref().map_or(0.0, Amount::fraction);
     match why {
         Stopped::Paused => {
-            let (big, line) = kept_text(row, amount.as_ref(), recording, true);
+            let (big, line) = (kept.big, kept.line);
             Look {
                 state: state("已暂停"),
                 color: theme::muted(),
-                ticks: ticks(theme::cyan_dim()),
+                ticks: ticks(theme::accent_dim()),
                 short: if known && !recording {
                     big.clone()
                 } else {
@@ -102,24 +101,154 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 line,
                 hint: None,
                 fraction,
-                orb: theme::cyan_dim(),
+                orb: theme::accent_dim(),
             }
         }
         Stopped::Failed(failure) => {
             let (big, hint) = format::failure(failure.kind);
-            let (_, line) = kept_text(row, amount.as_ref(), recording, false);
+            let line = kept.line;
             Look {
                 state: state("需要处理"),
-                color: theme::orange(),
+                color: theme::warn(),
                 ticks: ticks(theme::finished()),
                 big,
                 line,
                 hint: Some(hint),
                 fraction,
-                orb: theme::orange(),
+                orb: theme::warn(),
                 short: "!".to_owned(),
             }
         }
+    }
+}
+
+/// 停着的任务已有的内容：刻度点亮多少（`done` / `total`，单位为刻度对应的片数或字节份数）、是否知道合计、比例，与
+/// 圆盘里的大字与说明。
+struct Kept {
+    done: usize,
+    total: usize,
+    known: bool,
+    fraction: f32,
+    big: String,
+    line: String,
+}
+
+/// 文件任务的刻度把总大小分成这么多份。
+const FILE_TICKS: usize = 120;
+
+/// 停着的任务的 [`Kept`]；`paused` 时说明里写明继续时接着下。
+fn kept(row: &Row, paused: bool) -> Kept {
+    if row.task.spec.hls().is_none() {
+        return kept_file(row, paused);
+    }
+    let amount = Amount::of(row);
+    let (done, total) = amount.as_ref().map_or((0, 0), |a| (a.done, a.total));
+    let (big, line) = kept_text(row, amount.as_ref(), row.recording(), paused);
+    Kept {
+        done,
+        total,
+        known: total > 0,
+        fraction: amount.as_ref().map_or(0.0, Amount::fraction),
+        big,
+        line,
+    }
+}
+
+/// 文件任务能不能续传：新建前认出服务器支持范围请求（这时总大小必已知道）。不能时已下的不沿用，中断后从头下。
+fn resumable(row: &Row) -> bool {
+    row.task
+        .spec
+        .file()
+        .is_some_and(|file| file.expected.accepts_ranges)
+}
+
+/// 停着的文件任务的 [`Kept`]：按任务目录里已落盘的字节数。不能续传时（[`resumable`]）写明继续时从头下。
+fn kept_file(row: &Row, paused: bool) -> Kept {
+    let resumable = resumable(row);
+    // 不能续传时已下的不算数，不按它显示比例
+    let amount = FileAmount::of(row).filter(|_| resumable);
+    let fraction = amount.as_ref().and_then(FileAmount::fraction);
+    let then = if paused { " · 继续时接着下" } else { "" };
+    let line = match (&amount, &row.disk) {
+        (_, Disk::Unreadable(reason)) => format!("读不出任务目录：{reason}"),
+        _ if !resumable => "服务器不支持续传：继续时从头下".to_owned(),
+        (Some(a), _) if a.bytes > 0 => match a.total {
+            Some(total) => format!(
+                "已下 {} / {}{then}",
+                format::bytes(a.bytes),
+                format::bytes(total)
+            ),
+            None => format!("已下 {}{then}", format::bytes(a.bytes)),
+        },
+        (_, Disk::Unread) => "正在读取任务目录".to_owned(),
+        _ => "还没有下载内容".to_owned(),
+    };
+    let lit = fraction.map_or(0, |f| (f * FILE_TICKS as f32) as usize);
+    Kept {
+        done: lit,
+        total: FILE_TICKS,
+        known: fraction.is_some(),
+        fraction: fraction.unwrap_or(0.0),
+        big: fraction.map_or_else(|| "‖".to_owned(), percent),
+        line,
+    }
+}
+
+/// 在下的文件任务：刻度按已下的字节比例；不知道总大小时只写已下多少。
+fn running_file(row: &Row) -> Look {
+    let progress = row.file_progress.as_ref();
+    let stage = progress.map_or(Stage::Preparing, |p| p.stage);
+    let amount = FileAmount::of(row);
+    let fraction = amount.as_ref().and_then(FileAmount::fraction);
+    let lit = fraction.map_or(0, |f| (f * FILE_TICKS as f32) as usize);
+    if stage == Stage::Writing {
+        return Look {
+            state: "装上文件".to_owned(),
+            color: theme::accent(),
+            ticks: Ticks::of(FILE_TICKS, FILE_TICKS, false),
+            big: "100%".to_owned(),
+            line: "不联网".to_owned(),
+            hint: None,
+            fraction: 1.0,
+            orb: theme::accent_pale(),
+            short: "…".to_owned(),
+        };
+    }
+    let Some(amount) = amount.filter(|_| progress.is_some_and(|p| p.limit > 0)) else {
+        return Look {
+            state: "准备中".to_owned(),
+            color: theme::accent(),
+            ticks: Ticks::of(0, 0, true),
+            big: "—".to_owned(),
+            line: "连接服务器".to_owned(),
+            hint: None,
+            fraction: 0.0,
+            orb: theme::accent(),
+            short: "…".to_owned(),
+        };
+    };
+    let mut ticks = Ticks::of(FILE_TICKS, lit, true);
+    ticks.retrying = progress.is_some_and(|p| !p.retrying.is_empty());
+    let (big, mut line) = match amount.total {
+        Some(total) => (
+            percent(fraction.unwrap_or(0.0)),
+            format!("{} / {}", format::bytes(amount.bytes), format::bytes(total)),
+        ),
+        None => (format::bytes(amount.bytes), "服务器没给出大小".to_owned()),
+    };
+    if !resumable(row) {
+        line.push_str(" · 中断后要从头下");
+    }
+    Look {
+        state: "下载中".to_owned(),
+        color: theme::accent(),
+        ticks,
+        short: fraction.map_or_else(|| "…".to_owned(), percent),
+        big,
+        line,
+        hint: None,
+        fraction: fraction.unwrap_or(0.0),
+        orb: theme::accent(),
     }
 }
 
@@ -179,7 +308,7 @@ fn done_look(row: &Row) -> Look {
         big,
         line: result.map_or_else(
             || row.file_name.clone(),
-            |r| finished_text(&row.task.spec.output, r),
+            |r| finished_text(&row.task.spec, r),
         ),
         hint: None,
         fraction: 1.0,
@@ -203,7 +332,7 @@ fn running(row: &Row, amount: Amount) -> Look {
         let ticks = Ticks::of(amount.total, amount.done, false);
         return Look {
             state: kind.to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks {
                 lit: ticks.count,
                 written: (written * ticks.count as f32) as usize,
@@ -216,49 +345,49 @@ fn running(row: &Row, amount: Amount) -> Look {
             ),
             hint: None,
             fraction: written,
-            orb: theme::cyan_pale(),
+            orb: theme::accent_pale(),
             short: percent,
         };
     }
     if row.task.write_only {
         return Look {
             state: "准备写出".to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks::of(0, 0, true),
             big: format::clock(amount.duration.max(row.recorded_before_writing)),
             line: "不联网，只写出已录的".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::cyan(),
+            orb: theme::accent(),
             short: "…".to_owned(),
         };
     }
     if row.recording() {
         return Look {
             state: "● 录制中".to_owned(),
-            color: theme::red(),
+            color: theme::live(),
             ticks: Ticks {
-                color: theme::red(),
+                color: theme::live(),
                 ..Ticks::of(amount.total, amount.done, true)
             },
             big: format::clock(amount.duration),
             line: format!("{} 片 · {}", amount.done, format::bytes(amount.bytes)),
             hint: None,
             fraction: 1.0,
-            orb: theme::red(),
+            orb: theme::live(),
             short: "REC".to_owned(),
         };
     }
     if amount.total == 0 {
         return Look {
             state: "准备中".to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks::of(0, 0, true),
             big: "—".to_owned(),
             line: "拉取播放列表".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::cyan(),
+            orb: theme::accent(),
             short: "…".to_owned(),
         };
     }
@@ -269,13 +398,13 @@ fn running(row: &Row, amount: Amount) -> Look {
         .is_some_and(|p| !p.retrying.is_empty());
     Look {
         state: "下载中".to_owned(),
-        color: theme::cyan(),
+        color: theme::accent(),
         ticks,
         big: percent(amount.fraction()),
         line: format!("{} / {} 片", amount.done, amount.total),
         hint: None,
         fraction: amount.fraction(),
-        orb: theme::cyan(),
+        orb: theme::accent(),
         short: percent(amount.fraction()),
     }
 }

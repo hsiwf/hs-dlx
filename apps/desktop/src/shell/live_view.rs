@@ -58,7 +58,7 @@ pub(super) fn figure(row: &Row, look: &Look) -> Div {
     } else {
         look.line.clone()
     };
-    dial::face(theme::red())
+    dial::face(theme::live())
         .child(
             canvas(
                 |_, _, _| {},
@@ -147,7 +147,7 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
         .border_color(theme::warn_edge())
         .text_size(px(12.))
         .line_height(px(TEXT_LINE))
-        .text_color(theme::orange())
+        .text_color(theme::warn())
         .truncate()
         .child(ui::num(div().child(parts.join(" · "))));
     // 圆心右边的往右伸、左边的往左伸，都不出钟面区域
@@ -234,7 +234,7 @@ pub(super) fn legend(row: &Row) -> Div {
         .first()
         .map_or(Duration::MAX, |&(start, _)| start);
     if row.recorded() > Duration::ZERO && unknown_before > Duration::ZERO {
-        sessions_legend.push((theme::cyan_dim(), "这次打开以前录的".to_owned()));
+        sessions_legend.push((theme::accent_dim(), "这次打开以前录的".to_owned()));
     }
     let legend = |color: Hsla, half: f32, text: String| {
         div()
@@ -258,7 +258,7 @@ pub(super) fn legend(row: &Row) -> Div {
                 .map(|(color, text)| legend(color, live::HALF, text)),
         )
         .child(legend(
-            theme::orange(),
+            theme::warn(),
             live::MISS_HALF,
             "缺片（取不到或刷新前已滑出窗口）".to_owned(),
         ))

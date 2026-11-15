@@ -1,4 +1,5 @@
-//! 新建页舞台中间的图形：探测中与失败时是表盘，探测完成后是各档清晰度的同心环（几何、点击判定与画法）。
+//! 新建页舞台中间的图形：探测中与失败时是表盘，认出播放列表后是各档清晰度的同心环（几何、点击判定与画法），认出文件
+//! 后是写着大小的表盘。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -7,7 +8,7 @@ use gpui_kit::{
     canvas, div, px,
 };
 use hs_dlx_app::Failure;
-use hs_m3u8_core::{Probe, VariantInfo};
+use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, duration_of};
 use crate::ring::{self, Ticks};
@@ -119,12 +120,12 @@ fn ring_div(radius: f32, width: f32) -> Div {
     )
 }
 
-/// 选中的环：青色的环，外加两圈更宽更淡的同心环作光晕。阴影会透过透明的环心铺满整个圆，所以光晕用环画。
+/// 选中的环：主色的环，外加两圈更宽更淡的同心环作光晕。阴影会透过透明的环心铺满整个圆，所以光晕用环画。
 fn lit_ring(radius: f32, width: f32) -> Vec<Div> {
     vec![
-        ring_div(radius, width + 18.).border_color(theme::alpha(theme::cyan(), 0.06)),
-        ring_div(radius, width + 8.).border_color(theme::alpha(theme::cyan(), 0.14)),
-        ring_div(radius, width).border_color(theme::cyan()),
+        ring_div(radius, width + 18.).border_color(theme::alpha(theme::accent(), 0.06)),
+        ring_div(radius, width + 8.).border_color(theme::alpha(theme::accent(), 0.14)),
+        ring_div(radius, width).border_color(theme::accent()),
     ]
 }
 
@@ -143,11 +144,12 @@ impl NewTask {
         hit(&rings(&master.variants), (dx * dx + dy * dy).sqrt())
     }
 
-    /// 舞台中间的图形：探测中（与取到的不是播放列表、正在网页里看时）是转着彗尾的表盘，失败时是橙色的表盘，探测完成
-    /// 后是同心环。
+    /// 舞台中间的图形：探测中（与取到的不是播放列表、正在网页里看时）是转着彗尾的表盘，失败时是警告色的表盘，认出播放
+    /// 列表后是同心环，认出文件后是写着大小的表盘。
     pub(super) fn render_figure(&self, cx: &mut Context<Self>) -> AnyElement {
         match &self.probing {
             Probing::Ready(probe) => self.rings_figure(probe, cx).into_any_element(),
+            Probing::File(info) => file_dial(info).into_any_element(),
             Probing::Failed(failure) if self.page_check != PageCheck::Opening => {
                 failed_dial(failure).into_any_element()
             }
@@ -171,13 +173,13 @@ impl NewTask {
             "读取播放列表"
         };
         dial::dial(
-            theme::cyan(),
+            theme::accent(),
             dial::figure(move |bounds, window, _| {
-                ring::paint_comet(bounds, ring::RADIUS, head, theme::cyan(), window)
+                ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
             }),
             dial::readout(
                 "探测中",
-                theme::cyan(),
+                theme::accent(),
                 dial::Big::Figure(if animate {
                     format::clock(elapsed)
                 } else {
@@ -269,8 +271,10 @@ impl NewTask {
 
     /// 探测完成后舞台里同心环下面的一行：按键在界面上看不出来。
     pub(super) fn keys_hint(&self) -> Option<AnyElement> {
-        let Probing::Ready(probe) = &self.probing else {
-            return None;
+        let probe = match &self.probing {
+            Probing::Ready(probe) => probe,
+            Probing::File(_) => return Some(ui::caption("回车开始").into_any_element()),
+            Probing::Running | Probing::Failed(_) => return None,
         };
         let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
             "↑ ↓ 换一档 · 回车开始"
@@ -310,7 +314,7 @@ impl NewTask {
             let on = ring.index == self.variant;
             let hover = self.hovered == Some(ring.index);
             let color = if on {
-                theme::cyan()
+                theme::accent()
             } else if hover {
                 theme::hover_edge()
             } else {
@@ -339,7 +343,7 @@ impl NewTask {
                     .top(px(y))
                     .w(px(LABEL_X - 4. - x))
                     .h(px(1.))
-                    .bg(if on { theme::cyan() } else { theme::edge() }),
+                    .bg(if on { theme::accent() } else { theme::edge() }),
             );
             labels.push(
                 div()
@@ -382,20 +386,39 @@ impl NewTask {
     }
 }
 
-/// 探测失败的表盘：整圈暗橙色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
-fn failed_dial(failure: &Failure) -> Div {
-    let (mark, hint) = format::failure(failure.kind);
+/// 认出文件的表盘：整圈暗的主色，圆盘里写大小（服务器没给出时写「大小未知」）与类型。
+fn file_dial(info: &FileInfo) -> Div {
     let ticks = Ticks::full(
         ring::COMET_TICKS,
-        theme::alpha(theme::orange(), 0.45),
+        theme::alpha(theme::accent(), 0.45),
         false,
     );
+    let big = info
+        .length
+        .map_or_else(|| "大小未知".to_owned(), format::bytes);
+    let line = info
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "类型未知".to_owned());
     dial::dial(
-        theme::orange(),
+        theme::accent(),
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
-        dial::readout("探测失败", theme::orange(), dial::Big::Figure(mark), hint),
+        dial::readout("文件", theme::accent(), dial::Big::Phrase(big), line),
+    )
+}
+
+/// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
+fn failed_dial(failure: &Failure) -> Div {
+    let (mark, hint) = format::failure(failure.kind);
+    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45), false);
+    dial::dial(
+        theme::warn(),
+        dial::figure(move |bounds, window, _| {
+            ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
+        }),
+        dial::readout("探测失败", theme::warn(), dial::Big::Figure(mark), hint),
     )
 }
 

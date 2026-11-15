@@ -19,7 +19,7 @@ pub use self::operations::resume_label;
 pub use self::quit::{Asked, Departure, Quit};
 #[cfg(test)]
 pub use self::row::sample;
-pub use self::row::{Amount, Disk, Output, Row, finished_text};
+pub use self::row::{Amount, Disk, FileAmount, Output, Row, finished_text, main_output, saved_as};
 use crate::signals::Level;
 use crate::wait::within;
 
@@ -235,6 +235,18 @@ impl Tasks {
                     row.progress = Some(*progress);
                 }
             }
+            Event::FileProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    // 文件没有片数：剩余时间另按字节算
+                    row.rate.update(Instant::now(), progress.received, 0);
+                    for (level, text) in
+                        crate::signals::between_file(row.file_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.file_progress = Some(*progress);
+                }
+            }
             Event::Ended {
                 id,
                 status,
@@ -291,7 +303,7 @@ impl Tasks {
         if let Some(row) = self.row_mut(id) {
             // 放弃时任务先停下，这时的「暂停」不是用户要的，不写
             if !row.discarding {
-                let (level, text) = ended_signal(&status, &row.task.spec.output, result.as_ref());
+                let (level, text) = ended_signal(&status, &row.task.spec, result.as_ref());
                 row.signal(level, text);
             }
             row.task.status = status;
@@ -461,16 +473,17 @@ impl Tasks {
 /// 任务停下时的信号。
 fn ended_signal(
     status: &Status,
-    output: &hs_dlx_app::OutputSpec,
+    spec: &hs_dlx_app::TaskSpec,
     result: Option<&Finished>,
 ) -> (Level, String) {
     match status {
         Status::Done => (
             Level::Info,
-            result.map_or_else(
-                || "完成".to_owned(),
-                |r| format!("写出 {}", finished_text(output, r)),
-            ),
+            match (result, spec.hls()) {
+                (None, _) => "完成".to_owned(),
+                (Some(r), Some(_)) => format!("写出 {}", finished_text(spec, r)),
+                (Some(r), None) => format!("下载完成 · {}", crate::format::bytes(r.bytes)),
+            },
         ),
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),

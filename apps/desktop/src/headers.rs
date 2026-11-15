@@ -1,5 +1,7 @@
 //! 请求头的编辑：已有的一条一条列出、可以删，输入框里写「名称: 值」回车添加。添加时按核心的规则校验
-//! （[`check_option_header`]），同名的（不分大小写）替换原有的一条。
+//! （[`check_option_header`]），同名的（不分大小写）替换原有的一条。输入框里写好 curl 命令回车、或在空着（全选）的
+//! 输入框里粘贴 curl 命令时，加入命令转成的请求头（见 [`curl::parse`]），命令里没带上的列在输入框下面；粘贴的命令
+//! 不经单行的输入框（换行会被删掉）。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -7,26 +9,36 @@ use gpui_kit::{
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
     div, px,
 };
-use hs_m3u8_core::check_option_header;
+use hs_dlx_app::curl;
+use hs_m3u8_core::{Url, check_option_header};
 
 use crate::theme;
 use crate::ui::{self, TEXT_LINE};
 
 pub struct HeadersEditor {
+    /// 这些请求头用于哪个地址：加入的 curl 命令要与它同源（见 [`curl::Request::check_target`]）
+    target: Url,
     headers: Vec<(String, String)>,
     input: Entity<InputState>,
     /// 输入框里的内容加不进去的原因；改了内容时清掉
     error: Option<String>,
+    /// 最近一次添加的 curl 命令里没带上的请求头名，列在输入框下面；再添加（不论成败）时换掉
+    dropped: Vec<String>,
     _typed: Subscription,
 }
 
 impl HeadersEditor {
+    /// 编辑发往 `target` 的请求头 `headers`；`dropped` 为它们出自的 curl 命令里没带上的请求头名。
     pub fn new(
+        target: Url,
         headers: Vec<(String, String)>,
+        dropped: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("名称: 值，回车添加"));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("名称: 值，回车添加；可粘贴 curl 命令")
+        });
         let typed = cx.subscribe_in(
             &input,
             window,
@@ -46,9 +58,11 @@ impl HeadersEditor {
             },
         );
         HeadersEditor {
+            target,
             headers,
             input,
             error: None,
+            dropped,
             _typed: typed,
         }
     }
@@ -65,6 +79,8 @@ impl HeadersEditor {
         cx: &mut Context<Self>,
     ) -> Option<Vec<(String, String)>> {
         let pending = self.input.read(cx).value().to_string();
+        // 上一次没加进去的已不在输入框里，原因不再适用
+        self.error = None;
         if !pending.trim().is_empty() {
             if !self.add(&pending) {
                 cx.notify();
@@ -76,20 +92,35 @@ impl HeadersEditor {
         Some(self.headers.clone())
     }
 
-    /// 加一条「名称: 值」；加不进去时记下原因，返回 false。
+    /// 加一条「名称: 值」，或 curl 命令里的全部请求头；加不进去时记下原因，返回 false。
     fn add(&mut self, text: &str) -> bool {
-        match parse(text) {
-            Ok(header) => {
-                merge(&mut self.headers, header);
-                self.error = None;
-                true
-            }
-            Err(error) => {
-                self.error = Some(error);
-                false
-            }
-        }
+        self.dropped = Vec::new();
+        let added = if curl::is_command(text) {
+            self.add_command(text)
+        } else {
+            parse(text).map(|header| merge(&mut self.headers, header))
+        };
+        self.error = added.err();
+        self.error.is_none()
     }
+
+    /// 加入 curl 命令 `text` 里的请求头；命令认不出、或与 [`HeadersEditor::target`] 不同源时一条也不加。
+    fn add_command(&mut self, text: &str) -> Result<(), String> {
+        let request = curl::parse(text).map_err(|error| error.to_string())?;
+        request
+            .check_target(&self.target)
+            .map_err(|error| error.to_string())?;
+        for header in request.headers {
+            merge(&mut self.headers, header);
+        }
+        self.dropped = request.dropped;
+        Ok(())
+    }
+}
+
+/// 输入框下面对 curl 命令里没带上的请求头的说明；都带上了时为 None。
+fn dropped_note(dropped: &[String]) -> Option<String> {
+    (!dropped.is_empty()).then(|| format!("没带上命令里的 {}：由下载器决定", dropped.join("、")))
 }
 
 /// 把 `header` 加到 `headers` 末尾，同名的（不分大小写）先去掉。
@@ -170,8 +201,34 @@ impl Render for HeadersEditor {
             .flex_col()
             .gap(px(8.))
             .children(rows)
-            .child(ui::input_frame().child(Input::new(&self.input).appearance(false)))
+            .child(
+                ui::input_frame().child(Input::new(&self.input).appearance(false).on_paste({
+                    let editor = cx.entity().downgrade();
+                    let input = self.input.clone();
+                    move |item, window, cx| {
+                        let Some(text) = item
+                            .text()
+                            .filter(|text| curl::is_command(text) && ui::pastes_over(&input, cx))
+                        else {
+                            return false;
+                        };
+                        // 视图已释放时照常粘贴
+                        editor
+                            .update(cx, |editor, cx| {
+                                // 加进去了就清掉框里被这次粘贴选中替换的内容
+                                if editor.add(&text) {
+                                    editor
+                                        .input
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                                cx.notify();
+                            })
+                            .is_ok()
+                    }
+                })),
+            )
             .children(self.error.clone().map(ui::error_text))
+            .children(dropped_note(&self.dropped).map(ui::caption))
     }
 }
 

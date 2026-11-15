@@ -22,7 +22,7 @@ const LOGO_WIDTH: f32 = 2.4;
 const LOGO_MARGIN: f32 = 14.;
 const LOGO_GAP: f32 = 9.;
 const STATUS_MARGIN: f32 = 20.;
-/// 可用空间少于这么多时标成橙色：约 10 Mbps 的视频再下十几分钟就满。
+/// 可用空间少于这么多时标成警告色：约 10 Mbps 的视频再下十几分钟就满。
 const LOW_SPACE: u64 = 1 << 30;
 /// 设置按钮的边长。
 const SETTINGS: f32 = 34.;
@@ -36,7 +36,7 @@ impl Shell {
     ) -> impl IntoElement {
         let activity = tasks.activity(now);
         let activity = format::activity(activity.running, activity.speed);
-        // 可用空间：不足或读不出时标橙色，只标这一段
+        // 可用空间：不足或读不出时标警告色，只标这一段
         let space = tasks.free_space().map(|free| match free {
             Ok(bytes) => (
                 format!("可用 {}", format::bytes(*bytes)),
@@ -46,8 +46,9 @@ impl Shell {
         });
         TitleBar::new()
             .h(px(TITLE_HEIGHT))
-            .bg(theme::ground())
-            .border_color(theme::ground())
+            // 透明：窗口的背景铺到顶
+            .bg(gpui_kit::transparent_black())
+            .border_color(gpui_kit::transparent_black())
             .child(
                 div()
                     .flex()
@@ -62,7 +63,7 @@ impl Shell {
                                     bounds,
                                     LOGO_WIDTH,
                                     ring::LOGO_ARC,
-                                    theme::cyan(),
+                                    theme::accent(),
                                     theme::line(),
                                     window,
                                 );
@@ -92,7 +93,7 @@ impl Shell {
                             .children(activity)
                             .children(space.map(|(text, warn)| {
                                 div()
-                                    .when(warn, |s| s.text_color(theme::orange()))
+                                    .when(warn, |s| s.text_color(theme::warn()))
                                     .child(text)
                             })),
                     ))
@@ -117,7 +118,7 @@ impl Shell {
                     button
                         .border_color(theme::edge())
                         .bg(theme::selected())
-                        .text_color(theme::cyan())
+                        .text_color(theme::accent())
                 } else {
                     button
                         .border_color(gpui_kit::transparent_black())

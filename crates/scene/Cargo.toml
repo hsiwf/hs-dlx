@@ -1,0 +1,23 @@
+[package]
+name = "hs-dlx-scene"
+version.workspace = true
+description = "Animated window background for the hs-dlx desktop app: an eclipse corona and a lensed grid rendered off-screen with wgpu"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# 在不是异步的线程上等 wgpu 取适配器与建设备（原生平台上立即完成）
+pollster = "1.0.1"
+thiserror.workspace = true
+# 屏幕外渲染背景的着色器；接口每个大版本都改，精确到小版本
+wgpu = "30.0.2"
+
+[dev-dependencies]
+# 示例把渲染出的一帧存成 PNG；与 gpui-pre 用的同一版
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

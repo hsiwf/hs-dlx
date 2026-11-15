@@ -1,4 +1,4 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、外观、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
 use std::path::PathBuf;
@@ -13,7 +13,8 @@ use hs_m3u8_core::{Proxy, Url};
 
 use crate::route::Route;
 use crate::tasks::Tasks;
-use crate::theme;
+use crate::theme::{self, Theme};
+use crate::tray::Tray;
 use crate::ui::{self, Tone};
 use crate::web_route::WebRoute;
 
@@ -52,6 +53,8 @@ pub struct SettingsView {
     folder_error: Option<String>,
     /// 代理最近一次没存进去的原因
     proxy_error: Option<String>,
+    /// 外观最近一次没存进去的原因
+    theme_error: Option<String>,
     /// 第三方声明打不开的原因
     notices_error: Option<String>,
     _system: Task<()>,
@@ -105,6 +108,7 @@ impl SettingsView {
             system: None,
             folder_error: None,
             proxy_error: None,
+            theme_error: None,
             notices_error: None,
             _system: system,
             _typed: typed,
@@ -147,6 +151,48 @@ impl SettingsView {
                 self.proxy_error = Some(error.to_string());
             }
         }
+    }
+
+    /// 换外观：存进了才换，整个窗口随之重画。
+    fn pick_theme(&mut self, picked: Theme, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_theme(picked) {
+            Ok(()) => {
+                self.theme_error = None;
+                theme::set(picked);
+                Tray::theme_changed(&self.tasks, cx);
+                cx.refresh_windows();
+            }
+            Err(error) => self.theme_error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn render_theme(&self, cx: &mut Context<Self>) -> Div {
+        let chip = |id: &'static str, label: &'static str, value: Theme, cx: &mut Context<Self>| {
+            ui::chip(
+                id,
+                label,
+                theme::current() == value,
+                cx.listener(move |this, _, _, cx| this.pick_theme(value, cx)),
+            )
+        };
+        row(
+            "外观",
+            None,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(8.))
+                        .child(chip("theme-eclipse", "日蚀", Theme::Eclipse, cx))
+                        .child(chip("theme-blood-moon", "血月", Theme::BloodMoon, cx)),
+                )
+                .children(self.theme_error.clone().map(ui::error_text)),
+        )
     }
 
     /// 在访达（资源管理器、文件管理器）里打开随安装包附上的第三方声明目录；不是从安装包运行时写明原因。
@@ -373,6 +419,11 @@ impl Render for SettingsView {
                             .child(folder.border_b_1().border_color(theme::hairline()))
                             .child(
                                 self.render_proxy(cx)
+                                    .border_b_1()
+                                    .border_color(theme::hairline()),
+                            )
+                            .child(
+                                self.render_theme(cx)
                                     .border_b_1()
                                     .border_color(theme::hairline()),
                             )

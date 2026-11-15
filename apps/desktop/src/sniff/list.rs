@@ -122,11 +122,11 @@ impl SniffView {
     /// 网页加载到哪一步：状态点的颜色与说法。
     fn state(&self) -> (gpui_kit::Hsla, &'static str) {
         match (&self.webview, self.load.shown.is_some()) {
-            (Err(_), _) => (theme::orange(), "建不出网页"),
-            _ if self.failure.is_some() => (theme::orange(), "打不开"),
-            (Ok(_), false) => (theme::cyan(), "正在打开"),
-            (Ok(_), true) if self.load.finished => (theme::cyan(), "已加载"),
-            (Ok(_), true) => (theme::cyan(), "加载中"),
+            (Err(_), _) => (theme::warn(), "建不出网页"),
+            _ if self.failure.is_some() => (theme::warn(), "打不开"),
+            (Ok(_), false) => (theme::accent(), "正在打开"),
+            (Ok(_), true) if self.load.finished => (theme::accent(), "已加载"),
+            (Ok(_), true) => (theme::accent(), "加载中"),
         }
     }
 
@@ -286,7 +286,7 @@ impl SniffView {
                 div()
                     .text_size(px(15.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .when(self.failure.is_some(), |s| s.text_color(theme::orange()))
+                    .when(self.failure.is_some(), |s| s.text_color(theme::warn()))
                     .child(title),
             )
             .child(
@@ -317,7 +317,7 @@ impl SniffView {
                 gpui_kit::canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
-                        ring::paint_comet(bounds, SCAN_RADIUS, head, theme::cyan(), window)
+                        ring::paint_comet(bounds, SCAN_RADIUS, head, theme::accent(), window)
                     },
                 )
                 .absolute()
@@ -563,7 +563,7 @@ impl SniffView {
             .px(px(16.))
             .py(px(14.))
             .when(best, |row| {
-                row.border_color(theme::alpha(theme::cyan(), 0.45))
+                row.border_color(theme::alpha(theme::accent(), 0.45))
             })
             .child(ui::rings(RINGS, 3., 10.).when(!best, |rings| rings.opacity(0.6)))
             .child(
@@ -591,7 +591,7 @@ impl SniffView {
                         div()
                             .text_size(px(12.5))
                             .line_height(px(TEXT_LINE))
-                            .text_color(theme::orange())
+                            .text_color(theme::warn())
                             .line_clamp(2)
                             .child(reason)
                     }))

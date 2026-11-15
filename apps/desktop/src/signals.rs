@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hs_m3u8_core::{
-    FetchErrorKind, FetchFailure, HttpErrorKind, Progress, Purpose, Retrying, Stage,
+    FetchErrorKind, FetchFailure, FileProgress, HttpErrorKind, Progress, Purpose, Retrying, Stage,
 };
 
 use crate::format;
@@ -77,45 +77,7 @@ pub fn between(before: Option<&Progress>, now: &Progress) -> Vec<(Level, String)
             format!("{} 片来源标为空缺，不下载", now.segments.gap - gaps_before),
         ));
     }
-    // 新开始退避的：按多重集合比较，同一批里完全相同的几条各算一次。
-    // 简化：重试里没有是哪个请求，一条退避结束重试、另一条完全相同的同时开始时，后一条不报；要准确得让核心带上请求身份。
-    let mut unmatched: Vec<&Retrying> =
-        before.map_or_else(Vec::new, |b| b.retrying.iter().collect());
-    let mut fresh = Vec::new();
-    for retry in &now.retrying {
-        match unmatched.iter().position(|old| *old == retry) {
-            Some(at) => {
-                unmatched.swap_remove(at);
-            }
-            None => fresh.push(retry),
-        }
-    }
-    // 同一时刻常有一批请求因同一原因重试：按（请求的是什么、原因）合成一条
-    let mut groups: BTreeMap<(&'static str, String), Vec<&Retrying>> = BTreeMap::new();
-    for retry in fresh {
-        groups
-            .entry((purpose(retry.purpose), failure(&retry.failure)))
-            .or_default()
-            .push(retry);
-    }
-    for ((what, why), retries) in groups {
-        let delay = retries.iter().map(|r| r.delay).min().expect("每组至少一条");
-        let text = match retries.as_slice() {
-            [one] => format!(
-                "{}，{}后第 {} 次重试",
-                joined(what, &why),
-                seconds(delay),
-                one.retry
-            ),
-            many => format!(
-                "{} 个{}，{}后重试",
-                many.len(),
-                joined(what, &why),
-                seconds(delay)
-            ),
-        };
-        found.push((Level::Warn, text));
-    }
+    found.extend(retries(before.map_or(&[], |b| &b.retrying), &now.retrying));
     // 直播的缺片按本次运行计，新的运行（`before` 为 None）从 0 起；另起会话由钟面的时间线报（它也认得续录时的）
     let failed_before = before.map_or(0, |b| b.segments.failed);
     if now.segments.failed > failed_before {
@@ -143,12 +105,87 @@ pub fn between(before: Option<&Progress>, now: &Progress) -> Vec<(Level, String)
     found
 }
 
+/// 文件任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事。
+pub fn between_file(before: Option<&FileProgress>, now: &FileProgress) -> Vec<(Level, String)> {
+    let mut found = Vec::new();
+    if before.is_none_or(|b| b.limit == 0) && now.limit > 0 {
+        let text = if now.limit == 1 {
+            "开始下载 · 一个连接（服务器不支持分段或没给出大小）".to_owned()
+        } else {
+            format!("开始下载 · 最多 {} 个连接", now.limit)
+        };
+        found.push((Level::Info, text));
+    }
+    if let Some(throttled) = &now.throttled
+        && before.is_none_or(|b| b.throttled.as_ref() != Some(throttled))
+    {
+        found.push((
+            Level::Warn,
+            format!(
+                "服务器限制连接数（{}），降到 {} 个",
+                failure(&FetchFailure::Http(throttled.failure.clone())),
+                throttled.limit
+            ),
+        ));
+    }
+    found.extend(retries(before.map_or(&[], |b| &b.retrying), &now.retrying));
+    if now.stage == Stage::Writing && before.is_none_or(|b| b.stage != Stage::Writing) {
+        found.push((Level::Info, "下载完，装上文件".to_owned()));
+    }
+    found
+}
+
+/// `now` 里新开始退避的请求（`before` 为上一次进度里的）：按多重集合比较，同一批里完全相同的几条各算一次；同一时刻
+/// 因同一原因重试的一批按（请求的是什么、原因）合成一条。
+/// 简化：重试里没有是哪个请求，一条退避结束重试、另一条完全相同的同时开始时，后一条不报；要准确得让核心带上请求身份。
+fn retries(before: &[Retrying], now: &[Retrying]) -> Vec<(Level, String)> {
+    let mut unmatched: Vec<&Retrying> = before.iter().collect();
+    let mut fresh = Vec::new();
+    for retry in now {
+        match unmatched.iter().position(|old| *old == retry) {
+            Some(at) => {
+                unmatched.swap_remove(at);
+            }
+            None => fresh.push(retry),
+        }
+    }
+    let mut groups: BTreeMap<(&'static str, String), Vec<&Retrying>> = BTreeMap::new();
+    for retry in fresh {
+        groups
+            .entry((purpose(retry.purpose), failure(&retry.failure)))
+            .or_default()
+            .push(retry);
+    }
+    groups
+        .into_iter()
+        .map(|((what, why), retries)| {
+            let delay = retries.iter().map(|r| r.delay).min().expect("每组至少一条");
+            let text = match retries.as_slice() {
+                [one] => format!(
+                    "{}，{}后第 {} 次重试",
+                    joined(what, &why),
+                    seconds(delay),
+                    one.retry
+                ),
+                many => format!(
+                    "{} 个{}，{}后重试",
+                    many.len(),
+                    joined(what, &why),
+                    seconds(delay)
+                ),
+            };
+            (Level::Warn, text)
+        })
+        .collect()
+}
+
 fn purpose(purpose: Purpose) -> &'static str {
     match purpose {
         Purpose::Playlist => "播放列表",
         Purpose::Key => "密钥",
         Purpose::Init => "init 段",
         Purpose::Segment => "分片",
+        Purpose::File => "文件的一段",
     }
 }
 

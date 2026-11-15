@@ -14,8 +14,9 @@ use std::time::Duration;
 use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
-    CancellationToken, Engine, Job, JobControl, JobRequest, Leftover, LeftoverKind, Output,
-    OutputOptions, Probe, Progress, Proxy, Saved, Source, Stage, Unsettled, check_option_header,
+    CancellationToken, Engine, FileOutput, FileOutputOptions, FileProgress, FileRequest, Job,
+    JobControl, JobRequest, Leftover, LeftoverKind, Output, OutputOptions, Probe, Progress, Proxy,
+    Resource, Saved, Source, Stage, Unsettled, check_option_header,
 };
 use rusqlite::Transaction;
 use tokio::runtime::Runtime;
@@ -26,7 +27,8 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use crate::preference::StoredPreference;
 use crate::store::{self, Store};
 use crate::{
-    Draft, Error, Failure, Finished, OutputSpec, Settings, Status, Task, TaskId, TaskSpec, naming,
+    Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
+    Status, Task, TaskId, TaskSpec, Theme, naming,
 };
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
@@ -43,8 +45,13 @@ const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
 /// 交给界面的事件。
 #[derive(Debug)]
 pub enum Event {
-    /// 运行中任务的进度快照；同一任务两次之间至少隔 100 毫秒，进度没变时不发
+    /// 运行中的 HLS 任务的进度快照；同一任务两次之间至少隔 100 毫秒，进度没变时不发
     Progress { id: TaskId, progress: Box<Progress> },
+    /// 运行中的文件任务的进度快照，节流同上
+    FileProgress {
+        id: TaskId,
+        progress: Box<FileProgress>,
+    },
     /// 任务停下。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
     /// 没删掉的东西（被替换的旧输出、没删干净的任务目录等，输出不受影响）。`unsaved` 为 Some 时状态没能写进存储：服务
     /// 记着它，下一次写存储（任何操作或 [`Service::flush`]）时补写，[`Service::tasks`] 也按它返回；补写之前服务关闭
@@ -69,9 +76,48 @@ pub type Events = mpsc::UnboundedReceiver<Event>;
 
 /// 一个正在运行的任务。
 struct Running {
-    control: JobControl,
+    control: Control,
     /// 停下（状态已写进存储或记为待补写、已从运行表里去掉）时变为 true
     stopped: watch::Receiver<bool>,
+}
+
+/// 运行中任务的控制：两种任务的进度不同。
+#[derive(Clone)]
+enum Control {
+    Hls(JobControl),
+    File(JobControl<FileProgress>),
+}
+
+impl Control {
+    fn cancel(&self) {
+        match self {
+            Control::Hls(control) => control.cancel(),
+            Control::File(control) => control.cancel(),
+        }
+    }
+
+    /// 停止录制；文件任务没有录制，什么也不做。
+    fn stop(&self) {
+        match self {
+            Control::Hls(control) => control.stop(),
+            Control::File(_) => {}
+        }
+    }
+}
+
+/// 开始了的任务：两种任务的结果与进度不同。
+enum Launched {
+    Hls(Job),
+    File(Job<FileOutput, FileProgress>),
+}
+
+impl Launched {
+    fn cancel(&self) {
+        match self {
+            Launched::Hls(job) => job.control().cancel(),
+            Launched::File(job) => job.control().cancel(),
+        }
+    }
 }
 
 /// 任务停下时要写进存储的。
@@ -221,6 +267,15 @@ impl Service {
         Ok(())
     }
 
+    /// 记下外观主题。
+    pub fn set_theme(&self, theme: Theme) -> Result<(), Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_theme(&tx, theme)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 记下代理：之后的探测与开始的任务照它，已在运行的任务不变。指定的代理地址用不了（协议不是 http、https、socks4、
     /// socks4a、socks5、socks5h，或没有主机）时报 [`Error::InvalidInput`]。
     pub fn set_proxy(&self, proxy: &Proxy) -> Result<(), Error> {
@@ -248,9 +303,24 @@ impl Service {
         ))
     }
 
-    /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里，
-    /// 主名为任务的标题（见 [`crate::task_title`]），避开磁盘上已有的与存储里各任务占用的输出与任务目录（不分大小写与
-    /// Unicode 写法），被占用时加编号；任务的标题即这个主名，任务目录为核心的默认位置。`draft.folder` 不是绝对路径、
+    /// 认出地址是什么（播放列表、网页还是文件，见 [`Engine::identify`]），经设置里的代理；句柄与读不出设置时同
+    /// [`Service::probe`]。
+    pub fn identify(
+        &self,
+        mut source: Source,
+    ) -> Result<AbortOnDropHandle<Result<Resource, hs_m3u8_core::Error>>, Error> {
+        source.http.proxy = self.settings()?.proxy;
+        let engine = self.shared.engine.clone();
+        Ok(AbortOnDropHandle::new(
+            self.runtime()
+                .spawn(async move { engine.identify(&source).await }),
+        ))
+    }
+
+    /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里：
+    /// HLS 的主名为任务的标题（见 [`crate::task_title`]），文件的文件名为服务器给的或由地址得出（见
+    /// [`crate::file_name`]）；避开磁盘上已有的与存储里各任务占用的输出与任务目录（不分大小写与 Unicode 写法），被占用时
+    /// 主名后加编号；任务的标题即这个主名（文件为文件名），任务目录为核心的默认位置。`draft.folder` 不是绝对路径、
     /// 选轨偏好存不了时报 [`Error::InvalidInput`]。取名要查磁盘（网络盘上可能慢），在运行时的阻塞线程上、存储锁外做，
     /// 10 秒内查不完报 [`Error::TimedOut`]；返回的句柄在任何执行器上都可等待。存储写不进时什么也不留：已开始的任务
     /// 取消，它建出的任务目录删掉，磁盘上还留下东西时发 [`Event::Orphaned`]。
@@ -260,7 +330,8 @@ impl Service {
             .spawn(async move { shared.create(draft, created_at).await })
     }
 
-    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的分片不重下；之前选了只写出已录的，从此改回续录
+    /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的不重下（文件任务在服务器不支持范围请求或没给出
+    /// 大小时从头下）；之前选了只写出已录的，从此改回续录
     /// （[`Task::write_only`] 为否）。在运行、正在放弃、已完成、放弃没做完的报 [`Error::Running`]、[`Error::Discarding`]、
     /// [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有自己的任务目录的报 [`Error::NoWorkDir`]。返回开始后的
     /// 任务（运行中）。存储写不进时任务已开始，随即取消，停下后照常发 [`Event::Ended`]。
@@ -285,13 +356,16 @@ impl Service {
     pub fn switch_to_hls(&self, id: TaskId) -> Result<Task, Error> {
         self.shared.write(|tx| {
             let mut task = self.shared.stopped(tx, id)?;
-            let hls = match &task.spec.output {
+            let Kind::Hls(spec) = &mut task.spec.kind else {
+                return Err(Error::NotHls(id));
+            };
+            let hls = match &spec.output {
                 OutputSpec::Hls(_) => return Ok(task),
                 OutputSpec::Mp4(mp4) => mp4.with_extension(""),
                 OutputSpec::Both { hls, .. } => hls.clone(),
             };
-            task.spec.output = OutputSpec::Hls(hls);
-            store::set_output(tx, id, &task.spec.output)?;
+            spec.output = OutputSpec::Hls(hls);
+            store::set_output(tx, id, &spec.output)?;
             Ok(task)
         })
     }
@@ -361,7 +435,7 @@ impl Service {
         }
     }
 
-    /// 停止录制：把已列出的分片下完后写出（见 [`JobControl::stop`]）。没在运行时、或任务是点播时什么也不做。
+    /// 停止录制：把已列出的分片下完后写出（见 [`JobControl::stop`]）。没在运行时、或任务是点播或文件时什么也不做。
     pub fn stop(&self, id: TaskId) {
         if let Some(running) = lock(&self.shared.running).get(&id) {
             running.control.stop();
@@ -561,8 +635,14 @@ impl Shared {
             path: draft.folder.clone(),
             cause,
         })?;
-        let preference = StoredPreference::try_from(&draft.preference)?;
-        let title = naming::task_title(&draft.url, draft.title.as_deref());
+        let base = match &draft.kind {
+            DraftKind::Hls { title, .. } => naming::task_title(&draft.url, title.as_deref()),
+            DraftKind::File { name, .. } => naming::file_name(&draft.url, name.as_deref()),
+        };
+        let preference = match &draft.kind {
+            DraftKind::Hls { preference, .. } => Some(StoredPreference::try_from(preference)?),
+            DraftKind::File { .. } => None,
+        };
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
         loop {
@@ -572,25 +652,46 @@ impl Shared {
                 store::taken_paths(&tx)?
             };
             let seen = taken.clone();
-            let (folder, title, kind) = (folder.clone(), title.clone(), draft.output);
-            let naming = tokio::task::spawn_blocking(move || {
-                naming::output_for(&folder, &title, kind, &taken)
-            });
-            let (title, output) = tokio::time::timeout(NAMING_TIMEOUT, naming)
-                .await
-                .map_err(|_| Error::TimedOut {
-                    action: format!("检查保存目录 {}", draft.folder.display()),
-                    after: NAMING_TIMEOUT,
-                })?
-                .expect("取名不会 panic，运行时关闭时本任务也一起丢弃")?;
-            let work_dir = output.options().resolved_work_dir()?;
+            let (folder, base) = (folder.clone(), base.clone());
+            let (title, work_dir, kind) = match &draft.kind {
+                DraftKind::Hls { output, live, .. } => {
+                    let output_kind = *output;
+                    let (title, output) = named(&draft.folder, move || {
+                        naming::output_for(&folder, &base, output_kind, &taken)
+                    })
+                    .await?;
+                    let work_dir = output.options().resolved_work_dir()?;
+                    let preference = preference.clone().expect("HLS 的草稿上面已转好选轨偏好");
+                    let kind = Kind::Hls(HlsSpec {
+                        preference,
+                        output,
+                        live: *live,
+                    });
+                    (title, work_dir, kind)
+                }
+                DraftKind::File {
+                    expected,
+                    chunk_size,
+                    ..
+                } => {
+                    let (name, path) = named(&draft.folder, move || {
+                        naming::file_output_for(&folder, &base, &taken)
+                    })
+                    .await?;
+                    let work_dir = naming::file_work_dir(&path);
+                    let kind = Kind::File(FileSpec {
+                        path,
+                        expected: expected.clone(),
+                        chunk_size: *chunk_size,
+                    });
+                    (name, work_dir, kind)
+                }
+            };
             let spec = TaskSpec {
                 title,
                 url: draft.url.clone(),
-                preference: preference.clone(),
                 headers: draft.headers.clone(),
-                output,
-                live: draft.live,
+                kind,
             };
             match self.insert_and_start(&spec, work_dir, created_at) {
                 Err(Error::PathTaken(path))
@@ -616,7 +717,7 @@ impl Shared {
         let id = store::insert(&tx, spec, &work_dir, created_at)?;
         let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
         let proxy = store::settings(&tx)?.proxy;
-        let job = self.engine.start(request(&task, proxy)?)?;
+        let job = self.launch(&task, proxy)?;
         if let Err(error) = self.commit(tx, applied) {
             drop(store);
             self.abandon(job, work_dir);
@@ -624,6 +725,16 @@ impl Shared {
         }
         self.track(&task, job, Run::Resume);
         Ok(task)
+    }
+
+    /// 照任务 `task` 开始下载或录制，经代理 `proxy`；调用方须在运行时里。
+    fn launch(&self, task: &Task, proxy: Proxy) -> Result<Launched, Error> {
+        Ok(match &task.spec.kind {
+            Kind::Hls(_) => Launched::Hls(self.engine.start(request(task, proxy)?)?),
+            Kind::File(file) => {
+                Launched::File(self.engine.start_file(file_request(task, file, proxy)?)?)
+            }
+        })
     }
 
     /// 让停着的任务 `id` 再运行一次：`run` 为 [`Run::Resume`] 时照新建时的请求续传续录，为 [`Run::WriteRecorded`] 时
@@ -639,9 +750,11 @@ impl Shared {
         let job = match run {
             Run::Resume => {
                 let proxy = store::settings(&tx)?.proxy;
-                self.engine.start(request(&task, proxy)?)?
+                self.launch(&task, proxy)?
             }
-            Run::WriteRecorded => self.engine.merge_recorded(output_options(&task)?)?,
+            Run::WriteRecorded => {
+                Launched::Hls(self.engine.merge_recorded(output_options(&task)?)?)
+            }
         };
         task.status = Status::Running;
         task.write_only = run == Run::WriteRecorded;
@@ -650,7 +763,7 @@ impl Shared {
         let committed = self.commit(tx, applied);
         if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
-            job.control().cancel();
+            job.cancel();
         }
         self.track(&task, job, run);
         drop(store);
@@ -659,15 +772,16 @@ impl Shared {
 
     /// 新建时存储写不进而不要的任务：取消，等它停下，再删掉它建出的任务目录；磁盘上还留下东西时发
     /// [`Event::Orphaned`]。
-    fn abandon(self: &Arc<Self>, job: Job, work_dir: PathBuf) {
-        job.control().cancel();
+    fn abandon(self: &Arc<Self>, job: Launched, work_dir: PathBuf) {
+        job.cancel();
         let shared = self.clone();
         self.tracker.spawn(async move {
-            let (paths, reason) = match job.wait().await {
-                Ok(output) => (
-                    written(&output),
-                    "新建的任务没能记进存储，取消前已写出输出".to_owned(),
-                ),
+            let written = match job {
+                Launched::Hls(job) => job.wait().await.map(|output| written(&output)),
+                Launched::File(job) => job.wait().await.map(|output| vec![output.path]),
+            };
+            let (paths, reason) = match written {
+                Ok(paths) => (paths, "新建的任务没能记进存储，取消前已写出输出".to_owned()),
                 // 已取消，错误只能是取消或取消前就出的错，任务都已不要
                 Err(_) => match shared
                     .engine
@@ -691,28 +805,63 @@ impl Shared {
         });
     }
 
-    /// 登记运行中的任务 `task`，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。下载开始后的点播
-    /// 总片数与存储里记着的不同时记下。调用方须在运行时里。
-    fn track(self: &Arc<Self>, task: &Task, job: Job, run: Run) {
-        let (id, total, live) = (task.id, task.total, task.spec.live);
-        let control = job.control();
+    /// 登记运行中的任务 `task`，转发它的进度，等它停下后把状态写进存储并发出 [`Event::Ended`]。调用方须在运行时里。
+    fn track(self: &Arc<Self>, task: &Task, job: Launched, run: Run) {
+        match job {
+            Launched::Hls(job) => self.track_hls(task, job, run),
+            Launched::File(job) => self.track_file(task, job),
+        }
+    }
+
+    /// 登记运行中的任务 `id`：暂停与放弃经它找到任务，返回的登记释放时去掉。
+    fn register(self: &Arc<Self>, id: TaskId, control: Control) -> RunningGuard {
         let (stopped_tx, stopped) = watch::channel(false);
-        lock(&self.running).insert(
-            id,
-            Running {
-                control: control.clone(),
-                stopped,
-            },
-        );
-        let guard = RunningGuard {
+        lock(&self.running).insert(id, Running { control, stopped });
+        RunningGuard {
             id,
             shared: self.clone(),
             stopped: stopped_tx,
-        };
+        }
+    }
+
+    /// 任务 `id` 停下了：把 `ending` 写进存储（写不进时记为待补写），去掉运行登记 `guard`，发出 [`Event::Ended`]。
+    fn conclude(&self, id: TaskId, ending: Ending, leftovers: Vec<Leftover>, guard: RunningGuard) {
+        let saved = self.write(|tx| save_ending(tx, id, &ending));
+        if let Err(error) = &saved {
+            // 违反约束的结束状态永远写不进：留着待补写会让之后的每次写入都失败
+            assert!(
+                !error.violates_constraint(),
+                "{id}的结束状态与存储的表结构不一致：{error}"
+            );
+            lock(&self.unsaved).insert(id, ending.clone());
+        }
+        drop(guard);
+        let Ending {
+            status,
+            result,
+            total,
+        } = ending;
+        // 接收端随界面关闭而丢弃时没有谁要这个事件；状态已写进存储或留着待补写
+        let _closed = self.events.send(Event::Ended {
+            id,
+            status,
+            result,
+            total,
+            leftovers,
+            unsaved: saved.err(),
+        });
+    }
+
+    /// HLS 任务的 [`Shared::track`]：下载开始后的点播总片数与存储里记着的不同时记下。
+    fn track_hls(self: &Arc<Self>, task: &Task, job: Job, run: Run) {
+        let (id, total) = (task.id, task.total);
+        let live = task.spec.hls().is_some_and(|hls| hls.live);
+        let control = job.control();
+        let guard = self.register(id, Control::Hls(control.clone()));
         let shared = self.clone();
         self.tracker.spawn(async move {
             let done = CancellationToken::new();
-            let forwarding = tokio::spawn(forward(
+            let forwarding = tokio::spawn(forward_hls(
                 shared.clone(),
                 id,
                 control.clone(),
@@ -754,30 +903,53 @@ impl Shared {
                 result,
                 total,
             };
-            let saved = shared.write(|tx| save_ending(tx, id, &ending));
-            if let Err(error) = &saved {
-                // 违反约束的结束状态永远写不进：留着待补写会让之后的每次写入都失败
-                assert!(
-                    !error.violates_constraint(),
-                    "{id}的结束状态与存储的表结构不一致：{error}"
-                );
-                lock(&shared.unsaved).insert(id, ending.clone());
-            }
-            drop(guard);
-            let Ending {
+            shared.conclude(id, ending, leftovers, guard);
+        });
+    }
+
+    /// 文件任务的 [`Shared::track`]。
+    fn track_file(self: &Arc<Self>, task: &Task, job: Job<FileOutput, FileProgress>) {
+        let id = task.id;
+        let control = job.control();
+        let guard = self.register(id, Control::File(control.clone()));
+        let shared = self.clone();
+        self.tracker.spawn(async move {
+            let done = CancellationToken::new();
+            let events = shared.events.clone();
+            let forwarding = tokio::spawn(throttled(
+                control.progress(),
+                done.clone(),
+                move |progress| {
+                    // 接收端随界面关闭而丢弃时没有谁要
+                    let _closed = events.send(Event::FileProgress {
+                        id,
+                        progress: Box::new(progress),
+                    });
+                },
+            ));
+            let result = job.wait().await;
+            done.cancel();
+            forwarding
+                .await
+                .expect("转发进度的任务不会 panic，运行时关闭时本任务也一起丢弃");
+            let (status, result, leftovers) = match result {
+                Ok(output) => {
+                    let result = Finished {
+                        duration: None,
+                        bytes: output.bytes,
+                        resolution: None,
+                    };
+                    (Status::Done, Some(result), output.leftovers)
+                }
+                Err(hs_m3u8_core::Error::Cancelled) => (Status::Paused, None, Vec::new()),
+                Err(error) => (Status::Failed(Failure::of(&error)), None, Vec::new()),
+            };
+            let ending = Ending {
                 status,
                 result,
-                total,
-            } = ending;
-            // 接收端随界面关闭而丢弃时没有谁要这个事件；状态已写进存储或留着待补写
-            let _closed = shared.events.send(Event::Ended {
-                id,
-                status,
-                result,
-                total,
-                leftovers,
-                unsaved: saved.err(),
-            });
+                total: None,
+            };
+            shared.conclude(id, ending, leftovers, guard);
         });
     }
 }
@@ -790,8 +962,8 @@ struct Forwarded {
     recorded: bool,
 }
 
-/// 转发任务 `id` 的进度，同时记下点播的总片数，直到 `done` 取消或进度不再更新；`total` 为开始时知道的总片数。
-async fn forward(
+/// 转发 HLS 任务 `id` 的进度，同时记下点播的总片数，直到 `done` 取消或进度不再更新；`total` 为开始时知道的总片数。
+async fn forward_hls(
     shared: Arc<Shared>,
     id: TaskId,
     control: JobControl,
@@ -802,13 +974,7 @@ async fn forward(
         total,
         recorded: false,
     };
-    let mut progress = control.progress();
-    loop {
-        match done.run_until_cancelled(progress.changed()).await {
-            Some(Ok(())) => {}
-            None | Some(Err(_)) => return seen,
-        }
-        let snapshot = progress.borrow_and_update().clone();
+    throttled(control.progress(), done, |snapshot: Progress| {
         seen.recorded |= snapshot.stage == Stage::Recording;
         // 点播的总片数在下载开始时就定了；直播与准备阶段不记
         let count = snapshot.segments.total;
@@ -823,14 +989,46 @@ async fn forward(
             id,
             progress: Box::new(snapshot),
         });
+    })
+    .await;
+    seen
+}
+
+/// 进度每变一次把快照交给 `each`，两次之间至少隔 [`PROGRESS_INTERVAL`]，直到 `done` 取消或进度不再更新。
+async fn throttled<P: Clone>(
+    mut progress: watch::Receiver<P>,
+    done: CancellationToken,
+    mut each: impl FnMut(P),
+) {
+    loop {
+        match done.run_until_cancelled(progress.changed()).await {
+            Some(Ok(())) => {}
+            None | Some(Err(_)) => return,
+        }
+        each(progress.borrow_and_update().clone());
         if done
             .run_until_cancelled(tokio::time::sleep(PROGRESS_INTERVAL))
             .await
             .is_none()
         {
-            return seen;
+            return;
         }
     }
+}
+
+/// 在运行时的阻塞线程上取名（`choose` 要查保存目录 `folder` 里的名字，网络盘上可能慢），[`NAMING_TIMEOUT`] 内取不完
+/// 报 [`Error::TimedOut`]。
+async fn named<T: Send + 'static>(
+    folder: &Path,
+    choose: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
+    tokio::time::timeout(NAMING_TIMEOUT, tokio::task::spawn_blocking(choose))
+        .await
+        .map_err(|_| Error::TimedOut {
+            action: format!("检查保存目录 {}", folder.display()),
+            after: NAMING_TIMEOUT,
+        })?
+        .expect("取名不会 panic，运行时关闭时本任务也一起丢弃")
 }
 
 /// 输出写出的路径：MP4 与本地 HLS 目录。
@@ -876,24 +1074,40 @@ fn save_ending(tx: &Transaction<'_>, id: TaskId, ending: &Ending) -> Result<(), 
     Ok(())
 }
 
-/// 照任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是
-/// 直播时不开录制，来源是直播就报 [`hs_m3u8_core::Error::LiveNotEnabled`]。
+/// 照 HLS 任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；
+/// 不是直播时不开录制，来源是直播就报 [`hs_m3u8_core::Error::LiveNotEnabled`]。不是 HLS 任务时报 [`Error::NotHls`]。
 fn request(task: &Task, proxy: Proxy) -> Result<JobRequest, Error> {
-    let spec = &task.spec;
-    let mut source = Source::new(spec.url.clone());
-    source.preference = Preference::from(&spec.preference);
-    source.http.headers.clone_from(&spec.headers);
+    let hls = task.spec.hls().ok_or(Error::NotHls(task.id))?;
+    let mut source = Source::new(task.spec.url.clone());
+    source.preference = Preference::from(&hls.preference);
+    source.http.headers.clone_from(&task.spec.headers);
     source.http.proxy = proxy;
     let mut request = JobRequest::new(source, output_options(task)?);
-    if !spec.live {
+    if !hls.live {
         request.live = None;
     }
     Ok(request)
 }
 
-/// 任务的输出选项：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]。
+/// 照文件任务建请求，经代理 `proxy`（设置里的）：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；
+/// 第一次下载按新建前认出的核对（见 [`hs_m3u8_core::Expected`]）。
+fn file_request(task: &Task, file: &FileSpec, proxy: Proxy) -> Result<FileRequest, Error> {
+    let mut source = Source::new(task.spec.url.clone());
+    source.http.headers.clone_from(&task.spec.headers);
+    source.http.proxy = proxy;
+    let mut output = FileOutputOptions::new(file.path.clone());
+    output.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
+    let mut request = FileRequest::new(source, output);
+    request.chunk_size = file.chunk_size;
+    request.expected = Some((&file.expected).into());
+    Ok(request)
+}
+
+/// HLS 任务的输出选项：任务目录照 [`Task::work_dir`] 指定，没有时报 [`Error::NoWorkDir`]；不是 HLS 任务时报
+/// [`Error::NotHls`]。
 fn output_options(task: &Task) -> Result<OutputOptions, Error> {
-    let mut options = task.spec.output.options();
+    let hls = task.spec.hls().ok_or(Error::NotHls(task.id))?;
+    let mut options = hls.output.options();
     options.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
     Ok(options)
 }

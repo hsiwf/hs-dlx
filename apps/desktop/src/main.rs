@@ -2,6 +2,7 @@
 //! 转交给它后退出（见 hs-dlx-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
 //! main_window）。
 
+mod backdrop;
 mod dial;
 mod dock;
 mod format;
@@ -9,6 +10,7 @@ mod headers;
 mod links;
 mod live;
 mod main_window;
+mod motion;
 mod new_task;
 mod rate;
 mod ring;
@@ -73,12 +75,15 @@ fn application() -> gpui_kit::Application {
 }
 
 fn main() {
-    // 任何线程上的 panic 都是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务
-    // 悄悄消失；存储里还标着运行中的任务下次打开时按暂停处理
+    // panic 是不变量被破坏：照常打印后中止进程，不让界面带着坏掉的状态继续，也不让任务服务里的任务悄悄消失；存储里
+    // 还标着运行中的任务下次打开时按暂停处理。背景渲染器等 GPU 画完与释放的那一刻除外：wgpu 把设备丢失等外部故障当 panic
+    // 报，渲染器收住后只停掉背景（见 hs_dlx_scene::panics_contained）
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         report(info);
-        std::process::abort();
+        if !hs_dlx_scene::panics_contained() {
+            std::process::abort();
+        }
     }));
     // 程序坞、注销、关机时先问：在 GPUI 设好应用代理之前给它加上询问的方法（回调见 main_window）
     #[cfg(target_os = "macos")]
@@ -134,9 +139,11 @@ fn main() {
                     let handoffs = hs_dlx_instance::listen(&path);
                     let (service, events) = Service::new(store, MAX_REQUESTS)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
-                    let folder = service
+                    let settings = service
                         .settings()
-                        .map_err(|error| Failure::new("启动失败", error.to_string()))?
+                        .map_err(|error| Failure::new("启动失败", error.to_string()))?;
+                    theme::set(settings.theme);
+                    let folder = settings
                         .folder
                         .or_else(default_folder)
                         .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
@@ -233,7 +240,7 @@ impl Render for Failure {
                         div()
                             .text_size(px(20.))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(theme::orange())
+                            .text_color(theme::warn())
                             .child(self.title.clone()),
                     )
                     .child(

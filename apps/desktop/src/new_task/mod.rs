@@ -1,7 +1,8 @@
-//! 新建任务：带着请求头探测地址（或用嗅探页已探测好的结果），舞台上每档清晰度画成一个同心环（越粗码率越高，引线
-//! 连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头。探测被拒时可改请求头重新
-//! 探测；取到的不是播放列表时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理
-//! 写在检查面板里。舞台底部是外面给的粘贴栏。
+//! 新建任务：带着请求头认出地址是什么（或用嗅探页已探测好的结果）。是播放列表时，舞台上每档清晰度画成一个同心环
+//! （越粗码率越高，引线连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头；是文件时
+//! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。探测被拒时可改请求头重新探测；取到的是网页或不是播放列表时
+//! 外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是
+//! 外面给的粘贴栏。
 
 mod figure;
 mod inspector;
@@ -18,9 +19,12 @@ use gpui_kit::{
     IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Pixels, Render, Styled as _,
     Task, Window, div, px,
 };
-use hs_dlx_app::{Draft, Failure, FailureKind, OutputKind, Service, not_a_playlist, task_title};
+use hs_dlx_app::{
+    Draft, DraftKind, Expected, Failure, FailureKind, OutputKind, Service, file_name,
+    not_a_playlist, task_title,
+};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
-use hs_m3u8_core::{Probe, Source, Url};
+use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
 
 use crate::dial;
 use crate::dock::Dock;
@@ -42,6 +46,8 @@ pub struct Link {
     pub title: Option<String>,
     /// 探测与下载时带的请求头
     pub headers: Vec<(String, String)>,
+    /// `headers` 出自的 curl 命令里没带上的请求头名，列在请求头编辑框下面
+    pub dropped: Vec<String>,
     /// 已带着这些请求头探测好的结果（嗅探页后台探测的）：新建页不再探测；None 时新建页自己探测
     pub probe: Option<Box<Probe>>,
 }
@@ -55,7 +61,7 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 第一次探测（不是改了请求头重新探测）取到的不是播放列表：由外面决定要不要看它是不是网页
+    /// 第一次探测（不是改了请求头重新探测）取到的是网页或不是播放列表：由外面决定要不要看它是不是网页
     NotAPlaylist,
     /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
@@ -95,6 +101,8 @@ enum Probing {
     Running,
     Failed(Failure),
     Ready(Box<Probe>),
+    /// 地址上是文件
+    File(Box<FileInfo>),
 }
 
 pub struct NewTask {
@@ -156,9 +164,11 @@ impl NewTask {
             url,
             title: page_title,
             headers,
+            dropped,
             probe,
         } = link;
-        let editor = cx.new(|cx| HeadersEditor::new(headers.clone(), window, cx));
+        let editor =
+            cx.new(|cx| HeadersEditor::new(url.clone(), headers.clone(), dropped, window, cx));
         // 读系统代理要调操作系统的接口，在后台读
         let target = url.clone();
         let proxy = service.settings().map(|settings| settings.proxy);
@@ -211,7 +221,7 @@ impl NewTask {
         let mut source = Source::new(self.url.clone());
         source.http.headers = headers;
         self.page_check = PageCheck::Idle;
-        let handle = match self.service.probe(source) {
+        let handle = match self.service.identify(source) {
             Ok(handle) => handle,
             Err(error) => {
                 self.probing = Probing::Failed(Failure {
@@ -227,7 +237,16 @@ impl NewTask {
         self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
             let (probing, not_page) = match handle.await {
-                Ok(Ok(probe)) => (Probing::Ready(Box::new(probe)), false),
+                Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
+                Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
+                // 与 HLS 取到网页时同类：多为登录页或错误页，补上 Cookie 等请求头可能就对了；也可能是有视频的网页
+                Ok(Ok(Resource::Page { content_type })) => (
+                    Probing::Failed(Failure {
+                        kind: FailureKind::Malformed,
+                        message: format!("地址回的是网页（{content_type}），不是视频流或文件"),
+                    }),
+                    true,
+                ),
                 Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), not_a_playlist(&error)),
                 Err(join) => (
                     Probing::Failed(Failure {
@@ -239,7 +258,7 @@ impl NewTask {
             };
             // 视图在探测期间被关掉时不再需要结果
             let _closed = this.update(cx, |this, cx| {
-                let ready = matches!(probing, Probing::Ready(_));
+                let ready = matches!(probing, Probing::Ready(_) | Probing::File(_));
                 this.probed(probing);
                 if ready {
                     cx.emit(NewTaskEvent::Ready);
@@ -252,8 +271,12 @@ impl NewTask {
         cx.notify();
     }
 
-    /// 探测有了结果：成了的选中来源默认的变体与音频。
+    /// 探测有了结果：播放列表选中来源默认的变体与音频，文件的标题换成文件名（服务器给的，或由地址得出）。
     fn probed(&mut self, probing: Probing) {
+        if let Probing::File(info) = &probing {
+            // 地址经过重定向时，最后的地址里才有真正的文件名（`/download?id=1` 跳到 `/real.zip`）
+            self.title = file_name(&info.url, info.file_name.as_deref());
+        }
         if let Probing::Ready(probe) = &probing
             && let Some(master) = &probe.master
         {
@@ -323,7 +346,7 @@ impl NewTask {
             Probing::Running => Phase::Probing,
             Probing::Failed(_) if self.page_check == PageCheck::Opening => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
-            Probing::Ready(_) => Phase::Ready,
+            Probing::Ready(_) | Probing::File(_) => Phase::Ready,
         }
     }
 
@@ -410,40 +433,52 @@ impl NewTask {
         .detach();
     }
 
-    /// 交出选择，由主窗口新建任务；请求头输入框里还没按回车的一条加不进去时不交，原因显示在输入框下面。
+    /// 交出选择，由主窗口新建任务；请求头输入框里还没按回车的一条加不进去时不交，原因显示在输入框下面。还没探测完或
+    /// 探测失败时什么也不做。
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Probing::Ready(probe) = &self.probing else {
-            return;
-        };
         if self.creating {
             return;
         }
+        let kind = match &self.probing {
+            Probing::Ready(probe) => {
+                let preference = match &probe.master {
+                    Some(master) => Preference {
+                        variant: master.variants[self.variant].choice(),
+                        audio: self
+                            .audio
+                            .map_or(AudioChoice::Default, |index| master.audio[index].choice()),
+                    },
+                    None => Preference {
+                        variant: VariantChoice::Best,
+                        audio: AudioChoice::Default,
+                    },
+                };
+                DraftKind::Hls {
+                    title: self.page_title.clone(),
+                    preference,
+                    output: self.output,
+                    live: probe.live,
+                }
+            }
+            Probing::File(info) => DraftKind::File {
+                name: Some(self.title.clone()),
+                expected: Expected::from(&**info),
+                chunk_size: None,
+            },
+            Probing::Running | Probing::Failed(_) => return,
+        };
         let Some(headers) = self
             .headers
             .update(cx, |editor, cx| editor.confirm(window, cx))
         else {
             return;
         };
-        let preference = match &probe.master {
-            Some(master) => Preference {
-                variant: master.variants[self.variant].choice(),
-                audio: self
-                    .audio
-                    .map_or(AudioChoice::Default, |index| master.audio[index].choice()),
-            },
-            None => Preference {
-                variant: VariantChoice::Best,
-                audio: AudioChoice::Default,
-            },
-        };
+        // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随
         let draft = Draft {
             url: self.url.clone(),
-            title: self.page_title.clone(),
-            preference,
             headers,
-            output: self.output,
             folder: self.folder.clone(),
-            live: probe.live,
+            kind,
         };
         self.error = None;
         cx.emit(NewTaskEvent::Create(Box::new(draft)));

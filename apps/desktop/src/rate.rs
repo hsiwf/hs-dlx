@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 const WINDOW: Duration = Duration::from_secs(3);
 /// 开始不到这么久时不估剩余时间：分片常成批完成，刚开始的速度不可用。
 const SETTLE: Duration = Duration::from_secs(2);
+/// 速度表（[`Rate::history`]）一格管多久、一共几格：最近 60 秒。
+pub const BAR: Duration = Duration::from_millis(1500);
+pub const BARS: usize = 40;
 
 pub struct Rate {
     /// 本次运行开始的时刻
@@ -17,6 +20,11 @@ pub struct Rate {
     samples: VecDeque<(Instant, u64)>,
     /// 最近一次进度里已完成的分片数
     done: usize,
+    /// 最近一次进度里本次运行读到的字节数
+    received: u64,
+    /// 速度表的格：(从开始算第几格, 这一格里读到的字节数)，按先后，只留最近的 [`BARS`] 格与正在走的一格；没读到字节的
+    /// 格不记
+    bars: VecDeque<(u64, u64)>,
 }
 
 impl Rate {
@@ -27,6 +35,8 @@ impl Rate {
             baseline,
             samples: VecDeque::new(),
             done: 0,
+            received: 0,
+            bars: VecDeque::new(),
         }
     }
 
@@ -39,6 +49,43 @@ impl Rate {
             }
         }
         self.done = done;
+        let gained = received.saturating_sub(self.received);
+        self.received = received;
+        if gained > 0 {
+            let bar = self.bar_of(now);
+            match self.bars.back_mut() {
+                Some((last, bytes)) if *last == bar => *bytes += gained,
+                _ => self.bars.push_back((bar, gained)),
+            }
+            while self
+                .bars
+                .front()
+                .is_some_and(|(first, _)| first + (BARS as u64) < bar)
+            {
+                self.bars.pop_front();
+            }
+        }
+    }
+
+    /// `now` 落在从开始算的第几格。
+    fn bar_of(&self, now: Instant) -> u64 {
+        (now.saturating_duration_since(self.started).as_millis() / BAR.as_millis()) as u64
+    }
+
+    /// `now` 之前已走完的最近 [`BARS`] 格（`now` 所在的那格还没走完，不算）的平均速度，字节每秒，旧的在前；开始之前
+    /// 的格为 0。
+    pub fn history(&self, now: Instant) -> [f64; BARS] {
+        let current = self.bar_of(now);
+        let mut history = [0.; BARS];
+        for (slot, value) in history.iter_mut().enumerate() {
+            let Some(bar) = (current + slot as u64).checked_sub(BARS as u64) else {
+                continue;
+            };
+            if let Some((_, bytes)) = self.bars.iter().find(|(at, _)| *at == bar) {
+                *value = *bytes as f64 / BAR.as_secs_f64();
+            }
+        }
+        history
     }
 
     /// `now` 时的速度，字节每秒：时间窗起点（不晚于 `now` 前 [`WINDOW`] 的最后一次进度，没有时为第一次）到现在读到的
@@ -97,6 +144,32 @@ mod tests {
         let mut unknown = Rate::new(t0, None);
         unknown.update(at(3000), 0, 10);
         assert_eq!(unknown.remaining(at(3000), 10), None);
+    }
+
+    #[test]
+    fn history_averages_finished_bars() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut rate = Rate::new(t0, Some(0));
+        // 第 0 格读到 3 MB，第 1 格读到 1.5 MB，第 2 格没读到
+        rate.update(at(500), 1_500_000, 1);
+        rate.update(at(1000), 3_000_000, 2);
+        rate.update(at(2000), 4_500_000, 3);
+        let history = rate.history(at(4600));
+        assert_eq!(history[BARS - 3], 2_000_000.0);
+        assert_eq!(history[BARS - 2], 1_000_000.0);
+        assert_eq!(history[BARS - 1], 0.0);
+        assert!(history[..BARS - 3].iter().all(|&v| v == 0.0));
+        // 还在第 0 格里时一格也没走完
+        assert!(rate.history(at(1400)).iter().all(|&v| v == 0.0));
+        // 第 40 格里读到 1.5 MB：速度表里最旧的仍是第 0 格
+        rate.update(at(60_100), 6_000_000, 4);
+        assert_eq!(rate.history(at(60_500))[0], 2_000_000.0);
+        // 第 41 格时最旧的是第 1 格，第 0 格已移出速度表
+        let later = rate.history(at(61_600));
+        assert_eq!(later[0], 1_000_000.0);
+        assert_eq!(later[BARS - 1], 1_000_000.0);
+        assert_eq!(later.iter().filter(|&&v| v > 0.0).count(), 2);
     }
 
     #[test]

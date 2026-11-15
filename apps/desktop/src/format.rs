@@ -102,7 +102,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
             "连不上服务器或传输中断，检查网络或代理后重试",
         ),
         FailureKind::Certificate => ("证书".into(), "服务器的证书不受信任"),
-        FailureKind::Disk => ("磁盘".into(), "读写本机的文件出错，或读不到所在的盘"),
+        FailureKind::Disk => (
+            "磁盘".into(),
+            "读写本机的文件出错、空间不够，或读不到所在的盘",
+        ),
         FailureKind::OutputTaken => ("已存在".into(), "保存位置上已有同名的文件或目录"),
         FailureKind::SourceChanged => (
             "不符".into(),
@@ -116,6 +119,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         FailureKind::Mp4Unsupported => (
             "不兼容".into(),
             "内容放不进 MP4：改存本地 HLS，已下的照样用",
+        ),
+        FailureKind::NotExpected => (
+            "已变".into(),
+            "地址回的已不是之前看到的文件，多为链接过期或登录失效：换一个新链接，或更新 Cookie 等请求头",
         ),
         FailureKind::NothingToWrite => {
             ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")

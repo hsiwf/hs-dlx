@@ -550,6 +550,7 @@ impl SniffView {
             url,
             title,
             headers,
+            dropped: Vec::new(),
             probe,
         }));
     }

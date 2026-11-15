@@ -1,0 +1,42 @@
+name: libtorrent
+description: 恢复缓存的 libtorrent、OpenSSL 静态库与 Boost 头文件，没有时用 third_party/libtorrent/build.sh 编译到 third_party/libtorrent/dist。Windows 上要先有 MSVC 环境与 MSYS2，OpenSSL 的配置用运行机自带的 Strawberry Perl
+
+inputs:
+  cache-key:
+    description: 缓存键里区分构建环境的部分（运行机、容器镜像）；为空时不用缓存，从核对过 SHA-256 的源码包现编
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 缓存 libtorrent
+      id: cache
+      if: inputs.cache-key != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: third_party/libtorrent/dist
+        key: libtorrent-${{ inputs.cache-key }}-${{ hashFiles('third_party/libtorrent/build.sh') }}
+
+    # CMake 按 Ninja 生成
+    - name: Ninja（Linux）
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+
+    - name: Ninja（macOS）
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+      shell: bash
+      run: command -v ninja >/dev/null || brew install ninja
+
+    - name: 编译 libtorrent（Windows）
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: msys2 {0}
+      run: |
+        # MSYS2 coreutils 的 link.exe 会遮住 MSVC 的链接器
+        if [ -f /usr/bin/link.exe ]; then mv /usr/bin/link.exe /usr/bin/link.exe.msys; fi
+        bash third_party/libtorrent/build.sh third_party/libtorrent/dist third_party/libtorrent/build
+
+    - name: 编译 libtorrent
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      run: bash third_party/libtorrent/build.sh third_party/libtorrent/dist third_party/libtorrent/build

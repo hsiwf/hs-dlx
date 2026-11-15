@@ -1,0 +1,357 @@
+#include "hs-dlx-torrent/src/shim.h"
+#include "hs-dlx-torrent/src/lib.rs.h"
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <stdexcept>
+
+#include <libtorrent/add_torrent_params.hpp>
+#include <libtorrent/alert_types.hpp>
+#include <libtorrent/create_torrent.hpp>
+#include <libtorrent/fingerprint.hpp>
+#include <libtorrent/hex.hpp>
+#include <libtorrent/load_torrent.hpp>
+#include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/read_resume_data.hpp>
+#include <libtorrent/session_params.hpp>
+#include <libtorrent/settings_pack.hpp>
+#include <libtorrent/torrent_status.hpp>
+#include <libtorrent/write_resume_data.hpp>
+
+namespace hsdlx {
+
+namespace {
+
+std::string string_of(rust::Str text) { return std::string(text.data(), text.size()); }
+
+// libtorrent 给的文字（种子名、文件路径、说明）不保证是 UTF-8（磁力链接的 dn、种子里的路径都是对方写的）：不是 UTF-8 的
+// 字节换成替换字符
+rust::String text_of(std::string const& text) { return rust::String::lossy(text); }
+
+// 加入时定下的编号：有 v1 信息哈希时为它，否则为截到 20 字节的 v2 的，都写成十六进制
+std::string canonical(lt::info_hash_t const& hashes) {
+	return lt::aux::to_hex(hashes.has_v1() ? hashes.v1 : hashes.get(lt::protocol_version::V2));
+}
+
+// `id` 是 `hashes` 里 v1 或（截短的）v2 信息哈希的十六进制串
+bool names(lt::info_hash_t const& hashes, std::string const& id) {
+	return (hashes.has_v1() && lt::aux::to_hex(hashes.v1) == id)
+		|| (hashes.has_v2() && lt::aux::to_hex(hashes.get(lt::protocol_version::V2)) == id);
+}
+
+lt::settings_pack settings_of(SessionConfig const& config) {
+	lt::settings_pack pack;
+	pack.set_str(lt::settings_pack::listen_interfaces, string_of(config.listen_interfaces));
+	pack.set_bool(lt::settings_pack::enable_dht, config.dht);
+	pack.set_bool(lt::settings_pack::enable_upnp, config.upnp);
+	pack.set_bool(lt::settings_pack::enable_natpmp, config.natpmp);
+	pack.set_bool(lt::settings_pack::enable_lsd, config.lsd);
+	pack.set_str(lt::settings_pack::user_agent, string_of(config.user_agent));
+	pack.set_str(lt::settings_pack::peer_fingerprint, string_of(config.peer_fingerprint));
+	// 协议加密：两个方向都允许，优先加密，对方只会明文时照样连
+	pack.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
+	pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
+	pack.set_int(lt::settings_pack::allowed_enc_level, lt::settings_pack::pe_both);
+	pack.set_bool(lt::settings_pack::prefer_rc4, true);
+	// 关会话时向 tracker 报告停止最多等这么久（秒）：释放会话要等它，默认 5 秒，退出应用时界面一直等着
+	pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
+	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大，诊断时另开
+	pack.set_int(lt::settings_pack::alert_mask,
+		static_cast<int>(static_cast<std::uint32_t>(lt::alert_category::error
+			| lt::alert_category::status
+			| lt::alert_category::storage
+			| lt::alert_category::port_mapping)));
+	return pack;
+}
+
+Alert alert_of(AlertKind kind, lt::alert const& alert, std::string const& torrent) {
+	Alert out;
+	out.kind = kind;
+	out.torrent = rust::String(torrent);
+	out.message = text_of(alert.message());
+	return out;
+}
+
+} // namespace
+
+namespace {
+
+// 会话的参数：`config.state` 为上次 session_state() 写出的（只取 DHT 的状态），空时从头开始；设置一律取 `config`
+lt::session_params params_of(SessionConfig const& config) {
+	lt::session_params params;
+	if (!config.state.empty()) {
+		params = lt::read_session_params(
+			lt::span<char const>(reinterpret_cast<char const*>(config.state.data()), static_cast<std::ptrdiff_t>(config.state.size())),
+			lt::session::save_dht_state);
+	}
+	params.settings = settings_of(config);
+	return params;
+}
+
+lt::span<char const> bytes_of(rust::Slice<std::uint8_t const> data) {
+	return lt::span<char const>(reinterpret_cast<char const*>(data.data()), static_cast<std::ptrdiff_t>(data.size()));
+}
+
+} // namespace
+
+Session::Session(SessionConfig const& config)
+	: m_session(params_of(config))
+{}
+
+std::unique_ptr<Session> new_session(SessionConfig const& config) {
+	return std::make_unique<Session>(config);
+}
+
+rust::String Session::add(lt::add_torrent_params params, std::string const& id, rust::Str save_path) const {
+	params.save_path = string_of(save_path);
+	// 排队、开停由应用决定，libtorrent 不自动开停（默认的标志是「暂停 + 自动管理」，由它来开）；已在会话里的报错，不返回
+	// 原有的那个
+	params.flags &= ~lt::torrent_flags::auto_managed;
+	params.flags |= lt::torrent_flags::duplicate_is_error;
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_removing.count(id)) throw std::invalid_argument("这个种子还在移除中，移除完才能再加：" + id);
+	lt::torrent_handle h = m_session.add_torrent(std::move(params));
+	m_handles[id] = h;
+	m_ids[h] = id;
+	return rust::String(id);
+}
+
+lt::torrent_handle Session::handle(rust::Str id) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_handles.find(string_of(id));
+	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + string_of(id));
+	return found->second;
+}
+
+std::string Session::id_of(lt::torrent_handle const& handle) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_ids.find(handle);
+	if (found == m_ids.end()) throw std::logic_error("事件里的种子不是经这个会话加入的");
+	return found->second;
+}
+
+rust::String Session::add_magnet(rust::Str uri, rust::Str save_path) const {
+	lt::add_torrent_params params = lt::parse_magnet_uri(string_of(uri));
+	// 不暂停（连节点、取种子信息），但只上传不下载：选好文件后 start 才开始下
+	params.flags &= ~lt::torrent_flags::paused;
+	params.flags |= lt::torrent_flags::upload_mode;
+	std::string const id = canonical(params.info_hashes);
+	return add(std::move(params), id, save_path);
+}
+
+rust::String Session::add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const {
+	lt::add_torrent_params params = lt::load_torrent_buffer(bytes_of(torrent));
+	params.flags &= ~lt::torrent_flags::paused;
+	params.flags |= lt::torrent_flags::upload_mode;
+	std::string const id = canonical(params.ti->info_hashes());
+	return add(std::move(params), id, save_path);
+}
+
+rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const {
+	lt::add_torrent_params params = lt::read_resume_data(bytes_of(resume));
+	lt::info_hash_t const hashes = params.ti ? params.ti->info_hashes() : params.info_hashes;
+	std::string const expected = string_of(id);
+	if (!names(hashes, expected)) throw std::invalid_argument("续传数据不是这个种子的：" + expected);
+	// 暂停与否、是否只上传照续传数据里记的
+	return add(std::move(params), expected, save_path);
+}
+
+void Session::start(rust::Str id) const { handle(id).unset_flags(lt::torrent_flags::upload_mode); }
+
+void Session::flush(rust::Str id) const {
+	lt::torrent_handle h = handle(id);
+	// 没有种子信息时还没有存储，libtorrent 不发写完的事件
+	if (!h.torrent_file()) throw std::invalid_argument("还没有种子信息，没有要写到磁盘的：" + string_of(id));
+	h.flush_cache();
+}
+
+rust::Vec<FileEntry> Session::files(rust::Str id) const {
+	std::shared_ptr<lt::torrent_info const> info = handle(id).torrent_file();
+	if (!info) throw std::runtime_error("还没有种子信息：" + string_of(id));
+	lt::file_storage const& layout = info->layout();
+	rust::Vec<FileEntry> out;
+	for (lt::file_index_t const i : layout.file_range()) {
+		// 对齐用的填充文件不是内容，不下载、不列出
+		if (layout.pad_file_at(i)) continue;
+		FileEntry entry;
+		entry.index = static_cast<std::int32_t>(i);
+		entry.path = text_of(layout.file_path(i));
+		entry.size = layout.file_size(i);
+		out.push_back(std::move(entry));
+	}
+	return out;
+}
+
+void Session::select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const {
+	lt::torrent_handle h = handle(id);
+	std::shared_ptr<lt::torrent_info const> info = h.torrent_file();
+	if (!info) throw std::runtime_error("还没有种子信息：" + string_of(id));
+	lt::file_storage const& layout = info->layout();
+	std::vector<lt::download_priority_t> list(std::size_t(layout.num_files()), lt::dont_download);
+	for (std::int32_t index : wanted) {
+		if (index < 0 || index >= layout.num_files() || layout.pad_file_at(lt::file_index_t(index)))
+			throw std::invalid_argument("没有这个文件：" + std::to_string(index));
+		list[std::size_t(index)] = lt::default_priority;
+	}
+	h.prioritize_files(list);
+}
+
+rust::Vec<std::uint8_t> Session::session_state() const {
+	std::vector<char> buffer = lt::write_session_params_buf(m_session.session_state(lt::session::save_dht_state));
+	rust::Vec<std::uint8_t> out;
+	out.reserve(buffer.size());
+	for (char c : buffer) out.push_back(static_cast<std::uint8_t>(c));
+	return out;
+}
+
+Status Session::status(rust::Str id) const {
+	lt::torrent_handle h = handle(id);
+	lt::torrent_status s = h.status(lt::torrent_handle::query_pieces | lt::torrent_handle::query_name);
+	Status out;
+	out.state = static_cast<std::uint8_t>(s.state);
+	out.has_metadata = s.has_metadata;
+	out.paused = static_cast<bool>(s.flags & lt::torrent_flags::paused);
+	out.held = static_cast<bool>(s.flags & lt::torrent_flags::upload_mode);
+	out.name = text_of(s.name);
+	out.total_wanted = s.total_wanted;
+	out.total_wanted_done = s.total_wanted_done;
+	out.download_rate = s.download_payload_rate;
+	out.upload_rate = s.upload_payload_rate;
+	out.peers = s.num_peers;
+	out.seeds = s.num_seeds;
+	out.error = text_of(s.errc ? s.errc.message() : std::string());
+	// 要下的块（选了的文件所在的块），其中能凑齐的：自己已有的，或在线的节点里至少有一个有的
+	std::vector<int> availability;
+	std::vector<lt::download_priority_t> priorities;
+	if (s.has_metadata) {
+		h.piece_availability(availability);
+		priorities = h.get_piece_priorities();
+	}
+	std::int32_t wanted = 0;
+	std::int32_t reachable = 0;
+	for (std::size_t i = 0; i < priorities.size() && i < std::size_t(s.pieces.size()); ++i) {
+		if (priorities[i] == lt::dont_download) continue;
+		++wanted;
+		bool const available = i < availability.size() && availability[i] > 0;
+		if (s.pieces.get_bit(lt::piece_index_t(static_cast<int>(i))) || available) ++reachable;
+	}
+	out.pieces = wanted;
+	out.reachable_pieces = reachable;
+	return out;
+}
+
+void Session::connect_peer(rust::Str id, rust::Str ip, std::uint16_t port) const {
+	boost::system::error_code ec;
+	auto address = boost::asio::ip::make_address(string_of(ip), ec);
+	if (ec) throw std::invalid_argument("不是 IP 地址：" + string_of(ip));
+	handle(id).connect_peer(lt::tcp::endpoint(address, port));
+}
+
+void Session::pause(rust::Str id) const { handle(id).pause(lt::torrent_handle::graceful_pause); }
+
+void Session::resume(rust::Str id) const { handle(id).resume(); }
+
+void Session::remove(rust::Str id, bool delete_files) const {
+	// 整个过程持有锁：别的线程不能在这期间加入同一个种子
+	std::lock_guard<std::mutex> lock(m_mutex);
+	std::string const key = string_of(id);
+	auto found = m_handles.find(key);
+	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
+	m_session.remove_torrent(found->second, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+	m_handles.erase(found);
+	m_removing[key] = Removing{delete_files, false, false};
+}
+
+void Session::removed(std::string const& id, bool files_settled) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_removing.find(id);
+	if (found == m_removing.end()) return;
+	Removing& removing = found->second;
+	if (files_settled) {
+		removing.files_settled = true;
+	} else {
+		removing.removed = true;
+	}
+	// 移除的事件与（要删文件时）删的结果都来了才算移除完，两者先后不定
+	if (removing.removed && (!removing.deleting || removing.files_settled)) m_removing.erase(found);
+}
+
+void Session::save_resume_data(rust::Str id) const {
+	handle(id).save_resume_data(lt::torrent_handle::save_info_dict);
+}
+
+std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
+
+rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
+	rust::Vec<Alert> out;
+	std::lock_guard<std::mutex> lock(m_alerts_mutex);
+	m_session.wait_for_alert(std::chrono::milliseconds(wait_ms));
+	std::vector<lt::alert*> alerts;
+	m_session.pop_alerts(&alerts);
+	for (lt::alert* a : alerts) {
+		if (auto* added = lt::alert_cast<lt::add_torrent_alert>(a)) {
+			if (added->error) {
+				out.push_back(alert_of(AlertKind::AddFailed, *a, std::string()));
+			} else {
+				out.push_back(alert_of(AlertKind::Added, *a, id_of(added->handle)));
+			}
+		} else if (auto* t = lt::alert_cast<lt::metadata_received_alert>(a)) {
+			out.push_back(alert_of(AlertKind::Metadata, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::torrent_finished_alert>(a)) {
+			out.push_back(alert_of(AlertKind::Finished, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::save_resume_data_alert>(a)) {
+			Alert alert = alert_of(AlertKind::ResumeData, *a, id_of(t->handle));
+			std::vector<char> data = lt::write_resume_data_buf(t->params);
+			alert.data.reserve(data.size());
+			for (char c : data) alert.data.push_back(static_cast<std::uint8_t>(c));
+			out.push_back(std::move(alert));
+		} else if (auto* t = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+			out.push_back(alert_of(AlertKind::ResumeDataFailed, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::cache_flushed_alert>(a)) {
+			out.push_back(alert_of(AlertKind::CacheFlushed, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
+			out.push_back(alert_of(AlertKind::ResumeRejected, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::torrent_error_alert>(a)) {
+			out.push_back(alert_of(AlertKind::TorrentError, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::file_error_alert>(a)) {
+			out.push_back(alert_of(AlertKind::FileError, *a, id_of(t->handle)));
+		} else if (auto* t = lt::alert_cast<lt::torrent_removed_alert>(a)) {
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::Removed, *a, id));
+			removed(id, false);
+		} else if (auto* t = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::Deleted, *a, id));
+			removed(id, true);
+		} else if (auto* t = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
+			removed(id, true);
+		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
+			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
+		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
+			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
+		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
+			out.push_back(alert_of(AlertKind::ListenFailed, *a, std::string()));
+		} else if (lt::alert_cast<lt::portmap_alert>(a)) {
+			out.push_back(alert_of(AlertKind::PortMapped, *a, std::string()));
+		} else if (lt::alert_cast<lt::portmap_error_alert>(a)) {
+			out.push_back(alert_of(AlertKind::PortMapFailed, *a, std::string()));
+		}
+	}
+	return out;
+}
+
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size) {
+	std::filesystem::path const full = std::filesystem::absolute(string_of(path));
+	lt::create_torrent torrent(lt::list_files(full.string()), piece_size);
+	lt::set_piece_hashes(torrent, full.parent_path().string());
+	std::vector<char> buffer = torrent.generate_buf();
+	rust::Vec<std::uint8_t> out;
+	out.reserve(buffer.size());
+	for (char c : buffer) out.push_back(static_cast<std::uint8_t>(c));
+	return out;
+}
+
+} // namespace hsdlx
