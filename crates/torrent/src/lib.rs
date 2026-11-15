@@ -1,8 +1,10 @@
 //! BT 引擎：静态链接的 libtorrent-rasterbar（2.1）上的一层很薄的绑定，只公开桌面应用要用的会话操作。C++ 的那一层在
 //! src/shim.cpp，库由 third_party/libtorrent/build.sh 编出。
 //!
-//! 种子用加入时定下的编号（[`TorrentId`]）指认。加入的种子先只取种子信息、不下内容，选好文件后 [`Session::start`]
-//! 才开始下；排队与开停由应用决定，libtorrent 不自动开停。会话的操作都交给 libtorrent 的网络线程去做，可以在任意线程
+//! 种子用加入时定下的编号（[`TorrentId`]）指认。一个种子的全部内容（种子信息、tracker、文件改名、选了哪些文件、已有
+//! 哪些块）都在它的续传数据里：种子文件先转成续传数据（[`resume_from_torrent_file`]），磁力链接先加进会话取到种子
+//! 信息、再要它的续传数据；之后定下内容放哪、下哪些（[`place`]），由 [`Session::add_resume`] 加入。排队与开停由应用
+//! 决定，libtorrent 不自动开停。会话的操作都交给 libtorrent 的网络线程去做，可以在任意线程
 //! 上调用；事件（[`Alert`]）由 [`Session::pop_alerts`] 取出，取出时已转成自有的数据。libtorrent 给的文字（种子名、
 //! 文件路径、说明）不是 UTF-8 的字节换成了替换字符。
 
@@ -93,14 +95,36 @@ mod ffi {
     }
 
     /// 种子里的一个文件（不含对齐用的填充文件）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct FileEntry {
         /// 在种子里的序号，选文件时用它
         index: i32,
-        /// 在种子里的相对路径（多文件的种子以种子名的目录开头）；不是 UTF-8 的字节换成了替换字符，只用于显示，选文件
-        /// 用 `index`
+        /// 相对保存目录的路径（多文件的种子以根名的目录开头），用本平台的分隔符；不是 UTF-8 的字节换成了替换字符，
+        /// 只用于显示，选文件用 `index`
         path: String,
         /// 字节数
         size: i64,
+    }
+
+    /// 由续传数据加入种子时的选择。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct AddOptions {
+        /// 信续传数据里记的已有的块。否时去掉这些记录：磁盘上有这个种子的文件时 libtorrent 按块整体校验，用于续传数据
+        /// 可能比磁盘上的多的时候（上次没正常停下）
+        trust_pieces: bool,
+        /// 加入后暂停：不连节点、不下载
+        paused: bool,
+    }
+
+    /// 续传数据里的种子信息。
+    struct Described {
+        /// [`crate::TorrentId`] 的写法
+        id: String,
+        /// 种子名：单文件的为文件名，多文件的为顶层目录名；不是 UTF-8 的字节换成了替换字符
+        name: String,
+        /// 私有种子：只经种子里的 tracker 找节点，libtorrent 不用 DHT、节点交换与本地发现
+        private_torrent: bool,
+        files: Vec<FileEntry>,
     }
 
     /// 一个事件。
@@ -121,12 +145,16 @@ mod ffi {
 
         fn new_session(config: &SessionConfig) -> Result<UniquePtr<Session>>;
         fn add_magnet(self: &Session, uri: &str, save_path: &str) -> Result<String>;
-        fn add_torrent(self: &Session, torrent: &[u8], save_path: &str) -> Result<String>;
-        fn add_resume(self: &Session, resume: &[u8], id: &str, save_path: &str) -> Result<String>;
+        fn add_resume(
+            self: &Session,
+            resume: &[u8],
+            id: &str,
+            save_path: &str,
+            options: &AddOptions,
+        ) -> Result<String>;
+        fn removing(self: &Session, id: &str) -> bool;
         fn start(self: &Session, id: &str) -> Result<()>;
         fn flush(self: &Session, id: &str) -> Result<()>;
-        fn files(self: &Session, id: &str) -> Result<Vec<FileEntry>>;
-        fn select_files(self: &Session, id: &str, wanted: &[i32]) -> Result<()>;
         fn session_state(self: &Session) -> Result<Vec<u8>>;
         fn status(self: &Session, id: &str) -> Result<Status>;
         fn connect_peer(self: &Session, id: &str, ip: &str, port: u16) -> Result<()>;
@@ -137,10 +165,13 @@ mod ffi {
         fn listen_port(self: &Session) -> u16;
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, piece_size: i32) -> Result<Vec<u8>>;
+        fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
+        fn describe(resume: &[u8]) -> Result<Described>;
+        fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>>;
     }
 }
 
-pub use ffi::{Alert, AlertKind, FileEntry, SessionConfig, Status};
+pub use ffi::{AddOptions, Alert, AlertKind, FileEntry, SessionConfig, Status};
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
 // messages to the network thread」）；C++ 那一层自己的状态（种子表、取事件）各有一把锁。
@@ -235,28 +266,36 @@ impl Session {
         self.0.as_ref().expect("new_session 成功时返回的指针不为空")
     }
 
-    /// 加磁力链接，下到 `save_path` 下（种子里的文件与目录建在它里面）：只取种子信息，[`Session::start`] 之后才下内容。
-    /// 已在会话里、或还在移除中（[`Session::remove`] 之后、它移除完的事件之前）时报错。
+    /// 加磁力链接，只取种子信息、不下内容（只上传，与做种的一方之后互相断开）：取到后（[`AlertKind::Metadata`]）要它的
+    /// 续传数据、把它移除，再照新建任务的选择由 [`Session::add_resume`] 加入。`save_path` 为续传数据里记的保存目录，
+    /// 加入时另给。已在会话里、或还在移除中（[`Session::remove`] 之后、它移除完的事件之前，见 [`Session::removing`]）
+    /// 时报错。
     pub fn add_magnet(&self, uri: &str, save_path: &str) -> Result<TorrentId, Error> {
         Ok(TorrentId(self.inner().add_magnet(uri, save_path)?))
-    }
-
-    /// 加种子文件（bencode 写的内容），下到 `save_path` 下：[`Session::start`] 之后才下内容。已在会话里、或还在移除中
-    /// 时报错。
-    pub fn add_torrent(&self, torrent: &[u8], save_path: &str) -> Result<TorrentId, Error> {
-        Ok(TorrentId(self.inner().add_torrent(torrent, save_path)?))
     }
 
     pub fn status(&self, id: &TorrentId) -> Result<Status, Error> {
         Ok(self.inner().status(id.as_str())?)
     }
 
-    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复编号为 `id` 的种子，下到 `save_path` 下：已下完的块不重下（与
-    /// 磁盘上的文件对不上时报 [`AlertKind::ResumeRejected`]，改为从头校验）；暂停与否、是否只上传（[`Status::held`]）照写续传数据时的。续传数据不是这个种子的、已在会话里、或它
-    /// 还在移除中时报错。
-    pub fn add_resume(&self, resume: &[u8], id: &TorrentId, save_path: &str) -> Result<(), Error> {
-        self.inner().add_resume(resume, id.as_str(), save_path)?;
+    /// 由续传数据加入编号为 `id` 的种子，下到 `save_path` 下（种子的文件与目录建在它里面）。`options.trust_pieces` 时已
+    /// 有的块不重下（与磁盘上的文件对不上时报 [`AlertKind::ResumeRejected`]，改为整体校验）；写盘出错时记下的只上传
+    /// 去掉。续传数据不是这个种子的、没有种子信息也不是磁力链接的、已在会话里、或它还在移除中时报错。
+    pub fn add_resume(
+        &self,
+        resume: &[u8],
+        id: &TorrentId,
+        save_path: &str,
+        options: AddOptions,
+    ) -> Result<(), Error> {
+        self.inner()
+            .add_resume(resume, id.as_str(), save_path, &options)?;
         Ok(())
+    }
+
+    /// 种子 `id` 移除了、还没移除完（移除的事件，要删文件时还有删的结果，都转出了才算完）：其间再加入它报错。
+    pub fn removing(&self, id: &TorrentId) -> bool {
+        self.inner().removing(id.as_str())
     }
 
     /// 把缓存里的数据写到磁盘并关上文件，结果以 [`AlertKind::CacheFlushed`] 报来：那时调用这一刻已下的数据都已写过（其间
@@ -266,20 +305,9 @@ impl Session {
         Ok(self.inner().flush(id.as_str())?)
     }
 
-    /// 开始下内容（选好文件之后），或写文件出错改成只上传后继续下。
+    /// 写文件出错（[`AlertKind::FileError`]）改成只上传后，处理好了继续下。
     pub fn start(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().start(id.as_str())?)
-    }
-
-    /// 种子里的文件；还没有种子信息时报错。
-    pub fn files(&self, id: &TorrentId) -> Result<Vec<FileEntry>, Error> {
-        Ok(self.inner().files(id.as_str())?)
-    }
-
-    /// 只下载序号在 `wanted` 里的文件（[`FileEntry::index`]），其余不下载；还没有种子信息、或序号不是种子里的文件时
-    /// 报错。
-    pub fn select_files(&self, id: &TorrentId, wanted: &[i32]) -> Result<(), Error> {
-        Ok(self.inner().select_files(id.as_str(), wanted)?)
     }
 
     /// DHT 的状态（路由表里的节点），存起来下次建会话时放进 [`SessionConfig::state`]。
@@ -323,6 +351,41 @@ impl Session {
     pub fn pop_alerts(&self, wait_ms: u32) -> Result<Vec<Alert>, Error> {
         Ok(self.inner().pop_alerts(wait_ms)?)
     }
+}
+
+/// 种子文件（bencode 写的内容）转成续传数据：什么也没下过，保存目录为空。
+pub fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(ffi::resume_from_torrent_file(torrent)?)
+}
+
+/// 续传数据里的种子信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metadata {
+    pub id: TorrentId,
+    /// 种子名：单文件的为文件名，多文件的为顶层目录名；不是 UTF-8 的字节换成了替换字符
+    pub name: String,
+    /// 私有种子：只经种子里的 tracker 找节点，libtorrent 不用 DHT、节点交换与本地发现
+    pub private: bool,
+    /// 各文件，路径照续传数据里的改名
+    pub files: Vec<FileEntry>,
+}
+
+/// 读出续传数据里的种子信息；没有种子信息（磁力链接还没取到）或读不出时报错。
+pub fn describe(resume: &[u8]) -> Result<Metadata, Error> {
+    let described = ffi::describe(resume)?;
+    Ok(Metadata {
+        id: TorrentId(described.id),
+        name: described.name,
+        private: described.private_torrent,
+        files: described.files,
+    })
+}
+
+/// 新建任务前定下内容放哪、下哪些：根名（单文件的文件名、多文件的顶层目录名）改成 `root`（一个路径段），只下序号在
+/// `wanted` 里的文件（[`FileEntry::index`]），去掉只上传、暂停与做种模式；返回改后的续传数据。`root` 不是一个路径段、
+/// 序号不是种子里的文件、或续传数据里没有种子信息时报错。
+pub fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>, Error> {
+    Ok(ffi::place(resume, root, wanted)?)
 }
 
 /// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的内容。

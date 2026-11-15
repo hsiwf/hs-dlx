@@ -20,18 +20,19 @@ struct SessionConfig;
 struct Status;
 struct Alert;
 struct FileEntry;
+struct AddOptions;
+struct Described;
 
 class Session {
 public:
 	explicit Session(SessionConfig const& config);
 
 	rust::String add_magnet(rust::Str uri, rust::Str save_path) const;
-	rust::String add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const;
-	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const;
+	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path,
+		AddOptions const& options) const;
+	bool removing(rust::Str id) const;
 	void start(rust::Str id) const;
 	void flush(rust::Str id) const;
-	rust::Vec<FileEntry> files(rust::Str id) const;
-	void select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const;
 	rust::Vec<std::uint8_t> session_state() const;
 	Status status(rust::Str id) const;
 	void connect_peer(rust::Str id, rust::Str ip, std::uint16_t port) const;
@@ -80,6 +81,14 @@ private:
 };
 
 std::unique_ptr<Session> new_session(SessionConfig const& config);
+
+// 种子文件（bencode 写的）转成续传数据（还没下过的）。
+rust::Vec<std::uint8_t> resume_from_torrent_file(rust::Slice<std::uint8_t const> torrent);
+// 续传数据里的种子信息；没有种子信息时抛出。
+Described describe(rust::Slice<std::uint8_t const> resume);
+// 新建任务前定下内容放哪、下哪些：把续传数据里的种子根名（单文件的文件名、多文件的顶层目录名）改成 `root`，只下序号在
+// `wanted` 里的文件，去掉只上传、暂停、做种模式的标志；返回改后的续传数据。
+rust::Vec<std::uint8_t> place(rust::Slice<std::uint8_t const> resume, rust::Str root, rust::Slice<std::int32_t const> wanted);
 
 // 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的种子文件。
 rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size);
