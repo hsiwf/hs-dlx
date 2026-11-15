@@ -41,7 +41,8 @@ mod ffi {
         name: String,
         /// 要下载的字节数（没选的文件不算）；没有种子信息时为 0
         total_wanted: i64,
-        /// 其中已下完并校验过的
+        /// 其中已下完并校验过的；可能还在内存里没写到磁盘（libtorrent 先校验、再异步写盘），要确认已落盘用
+        /// [`Session::save_resume_data`]
         total_wanted_done: i64,
         /// 下载与上传的速度，字节每秒，只算内容
         download_rate: i32,
@@ -294,7 +295,8 @@ impl Session {
         Ok(self.inner().remove(id.as_str(), delete_files)?)
     }
 
-    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。
+    /// 要求写出续传数据，结果以 [`AlertKind::ResumeData`] 或 [`AlertKind::ResumeDataFailed`] 报来。先把缓存里的数据写到
+    /// 磁盘：收到 [`AlertKind::ResumeData`] 时，续传数据里记为已有的块都已在磁盘上。
     pub fn save_resume_data(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().save_resume_data(id.as_str())?)
     }

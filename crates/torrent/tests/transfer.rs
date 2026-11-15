@@ -114,25 +114,12 @@ fn selected_files_download_and_resume_without_peers() {
         .unwrap();
     wait_until(&fetcher, Duration::from_secs(60), |s| done(s, &id));
     assert_eq!(fetcher.status(&id).unwrap().total_wanted, 100_000 + 250_000);
+    // 写出续传数据（数据随之落盘），再看磁盘上的文件；之后换一个不连任何节点的会话恢复
+    let resume = flushed(&fetcher, &id);
     for (path, data) in [&files[0], &files[2]] {
         assert_file(&fetch_dir, path, data);
     }
     assert!(!fetch_dir.join("album/b.bin").exists());
-
-    // 写出续传数据，换一个不连任何节点的会话恢复
-    fetcher.save_resume_data(&id).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let resume = loop {
-        assert!(Instant::now() < deadline, "没等到续传数据");
-        if let Some(alert) = fetcher
-            .pop_alerts(100)
-            .unwrap()
-            .into_iter()
-            .find(|a| a.kind == AlertKind::ResumeData)
-        {
-            break alert.data;
-        }
-    };
     drop(fetcher);
     drop(seeder);
     let restored = local_session();
@@ -241,6 +228,24 @@ fn wait_until(session: &Session, limit: Duration, mut done: impl FnMut(&Session)
     }
 }
 
+/// 写出 `id` 的续传数据并等它报来，返回续传数据：报来时下完的块都已写到磁盘（libtorrent 先校验、再异步写盘，下完并
+/// 校验过时数据可能还在内存里）。
+fn flushed(session: &Session, id: &TorrentId) -> Vec<u8> {
+    session.save_resume_data(id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "没等到续传数据");
+        if let Some(alert) = session
+            .pop_alerts(100)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.kind == AlertKind::ResumeData)
+        {
+            return alert.data;
+        }
+    }
+}
+
 /// `dir` 下的 `relative`（`/` 分隔）是 `expected`：不在时列出 `dir` 下实际有的，不同时报两边的长度与第一个不同的位置
 /// （整个内容打出来太长，CI 的日志里看不到）。
 fn assert_file(dir: &Path, relative: &str, expected: &[u8]) {
@@ -339,6 +344,7 @@ fn a_magnet_link_downloads_from_a_local_seed() {
         status.has_metadata && status.pieces > 0 && status.total_wanted_done == status.total_wanted
     });
 
+    flushed(&fetcher, &fetching);
     let status = fetcher.status(&fetching).unwrap();
     assert_eq!(status.name, "sample.bin");
     assert_eq!(status.total_wanted, i64::try_from(content.len()).unwrap());

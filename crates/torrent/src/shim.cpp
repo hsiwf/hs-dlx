@@ -271,7 +271,8 @@ void Session::removed(std::string const& id, bool files_settled) const {
 }
 
 void Session::save_resume_data(rust::Str id) const {
-	handle(id).save_resume_data(lt::torrent_handle::save_info_dict);
+	// 先把缓存里的数据写到磁盘：续传数据记的块要都在磁盘上，崩溃后恢复时才对得上
+	handle(id).save_resume_data(lt::torrent_handle::flush_disk_cache | lt::torrent_handle::save_info_dict);
 }
 
 std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
