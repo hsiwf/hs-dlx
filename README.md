@@ -34,8 +34,8 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 
 <table>
   <tr>
-    <td width="50%"><img src=".github/screenshots/downloading.jpg" alt="下载中（日蚀外观）：进度、速度、剩余时间、最近 60 秒的速度与信号"></td>
-    <td width="50%"><img src=".github/screenshots/finished.jpg" alt="下载完成（血月外观）：时长、大小、画面与信号"></td>
+    <td width="50%"><img src=".github/screenshots/downloading.jpg" alt="下载中：进度、速度、剩余时间、最近 60 秒的速度与信号"></td>
+    <td width="50%"><img src=".github/screenshots/finished.jpg" alt="下载完成：时长、大小、画面与信号"></td>
   </tr>
   <tr>
     <td align="center">下载中</td>
@@ -98,6 +98,10 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 **外观**
 
 - 日蚀与血月两套外观；窗口背景是动态的日冕与网格，下载时随速度流动。系统要求减少动态效果时动画都停下。
+
+<p align="center">
+  <img src=".github/screenshots/blood-moon.jpg" width="80%" alt="血月外观：下载完成的任务">
+</p>
 
 **桌面集成**
 

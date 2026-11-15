@@ -1,8 +1,8 @@
 //! 窗口的动态背景：日冕、绕圆盘弯曲并向外流的网格，延伸进两侧面板（着色器与渲染见 hs-dlx-scene）。
 //!
 //! 一个后台线程持有 GPU 渲染器，按界面送来的最新参数画一帧、读回成图；界面每隔 [`FRAME`] 送一次参数、取走画好的
-//! 图，铺在窗口最底层（[`layer`]）。圆盘的中心与面板的位置不另写一份坐标：表盘与面板在布局时报上来
-//! （[`report_disc`]、[`panel_floor`]），下一次送参数时用。面板自己不涂底色：铺着的图是按它现在的位置画的时，面板
+//! 图，铺在窗口最底层（[`layer`]）。日冕的圆与面板的位置不另写一份坐标：表盘（新建页为同心环）与面板在布局时报上
+//! 来（[`report_disc`]、[`panel_floor`]），下一次送参数时用。面板自己不涂底色：铺着的图是按它现在的位置画的时，面板
 //! 的底已在图里（光从朝圆盘的那条边漫进去）；不是时（刚换页、刚改大小、没有 GPU）面板自己涂纯色底。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,10 +59,11 @@ pub struct Backdrop {
     phase: f32,
     /// 网格向外流过的距离（逻辑点，0 到一个格距）
     flow: f32,
-    /// 日冕的强度（0 到 1）：页面上有圆盘时向 1 走，没有时向 0 走
+    /// 日冕此刻的强度（0 到 1）：向报上来的圆盘的强度走，页面上没有圆盘时向 0 走
     strength: f32,
-    /// 最近一次报上来的圆盘中心；页面上没有圆盘时日冕留在原处熄灭。一次也没报过时为 None
-    disc: Option<Point<Pixels>>,
+    /// 日冕此刻的圆心与半径（逻辑点）：向报上来的走，换页时滑过去而不是跳过去；页面上没有圆盘时留在原处熄灭。一次也
+    /// 没报过时为 None
+    disc: Option<(Point<Pixels>, f32)>,
     /// 最近送出去的参数：没变就不再送，静止时不重画
     sent: Option<Params>,
     /// 已停：不再送参数、不再取图
@@ -105,8 +106,16 @@ struct Painted {
 /// 布局时量到的（逻辑点，窗口坐标）。
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Measured {
-    disc: Option<Point<Pixels>>,
+    disc: Option<Disc>,
     panels: Vec<Bounds<Pixels>>,
+}
+
+/// 日冕从哪个圆放出：圆心（窗口坐标）、半径（逻辑点，日冕的亮边贴着它）与强度（0 到 1）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Disc {
+    pub center: Point<Pixels>,
+    pub radius: f32,
+    pub strength: f32,
 }
 
 /// 窗口这一帧的大小、每点几个像素、是不是在前台。
@@ -234,7 +243,7 @@ impl Backdrop {
             self.phase = (self.phase + step / LOOP.as_secs_f32()).rem_euclid(1.);
             self.flow = (self.flow + step * flow_rate(speed)).rem_euclid(GRID_STEP);
         }
-        let target = if measured.disc.is_some() { 1. } else { 0. };
+        let target = measured.disc.map_or(0., |disc| disc.strength);
         self.strength = if animate {
             let reach = step / FADE.as_secs_f32();
             self.strength + (target - self.strength).clamp(-reach, reach)
@@ -242,12 +251,23 @@ impl Backdrop {
             target
         };
         if let Some(disc) = measured.disc {
-            self.disc = Some(disc);
+            // 每一步走剩下的一部分：约 FADE 内走完大半，换页时圆心与半径滑过去
+            let share = if animate {
+                (step / FADE.as_secs_f32()).min(1.)
+            } else {
+                1.
+            };
+            let (center, radius) = self.disc.unwrap_or((disc.center, disc.radius));
+            self.disc = Some((
+                center + (disc.center - center) * share,
+                radius + (disc.radius - radius) * share,
+            ));
         }
-        let center = self
-            .disc
-            .unwrap_or_else(|| Point::new(viewport.size.width / 2., viewport.size.height / 2.));
-        let params = self.params(viewport, center, &measured.panels);
+        let (center, radius) = self.disc.unwrap_or_else(|| {
+            let middle = Point::new(viewport.size.width / 2., viewport.size.height / 2.);
+            (middle, dial::DISC_RADIUS)
+        });
+        let params = self.params(viewport, center, radius, &measured.panels);
         if self.sent != Some(params) {
             self.sent = Some(params);
             self.waiting.get_or_insert(Duration::ZERO);
@@ -266,6 +286,7 @@ impl Backdrop {
         &self,
         viewport: Viewport,
         center: Point<Pixels>,
+        radius: f32,
         panels: &[Bounds<Pixels>],
     ) -> Params {
         let scale = DETAIL.min(viewport.scale);
@@ -290,7 +311,7 @@ impl Backdrop {
             scale,
             phase: self.phase,
             center: [pixels(center.x), pixels(center.y)],
-            radius: dial::DISC_RADIUS * scale,
+            radius: radius * scale,
             strength: self.strength,
             flow: self.flow,
             palette: palette(),
@@ -448,9 +469,9 @@ pub fn layer() -> impl IntoElement {
     .size_full()
 }
 
-/// 表盘在布局时报上圆盘的中心（窗口坐标）：日冕从这里放出。
-pub fn report_disc(center: Point<Pixels>, cx: &mut App) {
-    cx.global_mut::<Board>().measuring.disc = Some(center);
+/// 表盘、新建页的同心环在布局时报上日冕从哪个圆放出。
+pub fn report_disc(disc: Disc, cx: &mut App) {
+    cx.global_mut::<Board>().measuring.disc = Some(disc);
 }
 
 /// 面板的底：铺满面板（描边以内），布局时报上自己的位置；铺着的图是按这个位置画的时什么也不涂（底已在图里），否则
