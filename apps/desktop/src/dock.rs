@@ -1,7 +1,7 @@
-//! 粘贴栏：舞台底部的链接输入。回车或点「探测」发出 [`DockEvent::Probe`]；粘贴的是 curl 命令时不放进框里（单行的框
-//! 会删掉换行，续行就断了），原样立即发出。外面告诉它正在探测的链接（[`Dock::set_probing`]），框里正是它时右边写
-//! 探测到哪一步；外面拒绝了输入（不是链接、命令认不出）时右边写原因，改了内容即清掉。任务页、待机页与新建页的舞台
-//! 里放的是同一个视图。
+//! 粘贴栏：舞台底部的链接或 curl 命令的输入。回车或点「探测」发出 [`DockEvent::Probe`]。框里空着或全选时粘贴的 curl
+//! 命令不经输入框（单行的框会删掉换行，续行就断了），交给 [`Dock::put`] 并立即发出。外面告诉它正在探测的链接
+//! （[`Dock::set_probing`]），框里正是它时右边写探测到哪一步；外面拒绝了输入时右边写原因，改了内容即清掉。任务页、
+//! 待机页与新建页的舞台里放的是同一个视图。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -20,7 +20,7 @@ use crate::ui::{self, DOCK_HEIGHT, Tone};
 const MAX_WIDTH: f32 = 760.;
 
 pub enum DockEvent {
-    /// 探测框里的这段文字，或粘贴的 curl 命令（原样，含换行）
+    /// 框里的链接或命令；框里是记下的 curl 命令的地址时为整条命令（原样，含换行）
     Probe(String),
 }
 
@@ -30,6 +30,8 @@ pub struct Dock {
     refused: Option<String>,
     /// 显示着的新建页：探测的正是框里的链接时，右边写它探测到哪一步
     probing: Option<(Url, &'static str)>,
+    /// 放进来的 curl 命令：框里显示的它的地址与整条命令；改了框里的内容即清掉
+    command: Option<(SharedString, String)>,
     _typed: Subscription,
 }
 
@@ -42,12 +44,11 @@ impl Dock {
         let typed = cx.subscribe_in(
             &input,
             window,
-            |this: &mut Self, input, event: &InputEvent, _, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    cx.emit(DockEvent::Probe(input.read(cx).value().to_string()))
-                }
+            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { .. } => cx.emit(DockEvent::Probe(this.submission(cx))),
                 InputEvent::Change => {
                     this.refused = None;
+                    this.command = None;
                     cx.notify();
                 }
                 InputEvent::Focus | InputEvent::Blur => cx.notify(),
@@ -57,7 +58,37 @@ impl Dock {
             input,
             refused: None,
             probing: None,
+            command: None,
             _typed: typed,
+        }
+    }
+
+    /// 回车或点「探测」时发出的：框里是记下的 curl 命令的地址时为整条命令，否则为框里的内容。
+    fn submission(&self, cx: &gpui_kit::App) -> String {
+        let value = self.text(cx);
+        match &self.command {
+            Some((shown, command)) if *shown == value => command.clone(),
+            _ => value.to_string(),
+        }
+    }
+
+    /// 把 `text` 放进框里。curl 命令换成它的地址（命令里的凭据不明文显示）并记下整条命令；认不出的命令不放，框里清空、
+    /// 右边写原因。别的照原样放。
+    pub fn put(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !curl::is_command(text) {
+            self.set_text(text.to_owned(), window, cx);
+            return;
+        }
+        match curl::parse(text) {
+            Ok(request) => {
+                let shown = SharedString::from(request.url.to_string());
+                self.set_text(shown.to_string(), window, cx);
+                self.command = Some((shown, text.to_owned()));
+            }
+            Err(error) => {
+                self.set_text(String::new(), window, cx);
+                self.refuse(error.to_string(), cx);
+            }
         }
     }
 
@@ -66,6 +97,7 @@ impl Dock {
     }
 
     pub fn set_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.command = None;
         self.input
             .update(cx, |input, cx| input.set_value(text, window, cx));
     }
@@ -131,7 +163,7 @@ impl Render for Dock {
                     Tone::Glow
                 },
                 cx.listener(|this, _, _, cx| {
-                    let text = this.input.read(cx).value().to_string();
+                    let text = this.submission(cx);
                     cx.emit(DockEvent::Probe(text));
                 }),
             )
@@ -180,13 +212,22 @@ impl Render for Dock {
             .child(div().flex_1().min_w_0().text_size(px(14.)).child(
                 Input::new(&self.input).appearance(false).on_paste({
                     let dock = cx.entity().downgrade();
-                    move |item, _, cx| {
-                        let Some(text) = item.text().filter(|text| curl::is_command(text)) else {
+                    let input = self.input.clone();
+                    move |item, window, cx| {
+                        let Some(text) = item
+                            .text()
+                            .filter(|text| curl::is_command(text) && ui::pastes_over(&input, cx))
+                        else {
                             return false;
                         };
                         // 视图已释放时照常粘贴
-                        dock.update(cx, |_, cx| cx.emit(DockEvent::Probe(text)))
-                            .is_ok()
+                        dock.update(cx, |dock, cx| {
+                            dock.put(&text, window, cx);
+                            if dock.refused.is_none() {
+                                cx.emit(DockEvent::Probe(text));
+                            }
+                        })
+                        .is_ok()
                     }
                 }),
             ))

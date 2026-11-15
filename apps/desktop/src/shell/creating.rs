@@ -1,7 +1,7 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::{Draft, curl};
+use hs_dlx_app::Draft;
 use hs_m3u8_core::Url;
 
 use super::{Page, Shell};
@@ -10,7 +10,7 @@ use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
 use crate::sniff::{SniffEvent, SniffView, Verdict};
 
 impl Shell {
-    /// 探测 `text`：链接，或 curl 命令（地址与请求头一起交给新建页，粘贴栏里换成地址）；都不是时在粘贴栏里写原因。
+    /// 探测 `text`：链接，或 curl 命令（地址与请求头一起交给新建页）；都不是时在粘贴栏里写原因。
     pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let request = match links::request(text) {
             Ok(request) => request,
@@ -24,12 +24,7 @@ impl Shell {
             }
         };
         let url = request.url;
-        self.dock.update(cx, |dock, cx| {
-            if curl::is_command(text) {
-                dock.set_text(url.to_string(), window, cx);
-            }
-            dock.accepted(cx)
-        });
+        self.dock.update(cx, |dock, cx| dock.accepted(cx));
         self.confirm_discard = None;
         if self.clipboard.as_ref() == Some(&url) {
             self.clipboard = None;

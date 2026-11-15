@@ -6,8 +6,9 @@
 //! - Windows cmd（「复制为 cURL (cmd)」）：命令里有 `^"` 或以 `^` 结尾的行时按它拆。先按 cmd.exe 处理 `^` 转义、`^` 续行
 //!   与命令分隔，再按 MS C 运行库拆参数（`""` 与 `\"` 为引号本身）。`%名称%` 不展开。
 //!
-//! 只认不带请求体的 GET 请求。命令里的 `-H`、`-b 名=值`、`-A`、`-e`、`-u` 转成请求头，同 curl：`-H` 给了同名的
-//! （含 Cookie、Authorization）就不用后几种转成的，多个 `-b` 合成一条 Cookie。由连接或下载器决定的请求头去掉并列出
+//! 只认不带请求体的 GET 请求、一个地址（地址里有 curl 会展开的 `[ ]`、`{ }` 时报错，加 `-g` 即按字面）。命令里的
+//! `-H`、`-b 名=值`、`-A`、`-e`、`-u` 转成请求头，同 curl：`-H` 给了同名的（含 Cookie、Authorization）、或写成
+//! `-H '名称:'` 去掉了它，就不用后几种转成的；多个 `-b` 合成一条 Cookie。由连接或下载器决定的请求头去掉并列出
 //! （[`Request::dropped`]）。
 
 use base64::Engine as _;
@@ -25,13 +26,10 @@ pub struct Request {
 }
 
 impl Request {
-    /// 这些请求头能否用于地址为 `target` 的任务：带 Cookie 或 Authorization 而命令的地址与 `target` 不同源时不能——
-    /// 核心把它们只发往任务的来源，换了来源即把凭据交给了命令以外的服务器。
+    /// 这些请求头能否用于地址为 `target` 的任务：命令的地址与 `target` 不同源时不能。命令里的请求头是发给它自己的地址
+    /// 的，其中哪些是凭据看不出来（自定义的令牌头没有固定的名字），用在别的来源上就交给了命令以外的服务器。
     pub fn check_target(&self, target: &Url) -> Result<(), CurlError> {
-        let credentials = self.headers.iter().any(|(name, _)| {
-            name.eq_ignore_ascii_case("cookie") || name.eq_ignore_ascii_case("authorization")
-        });
-        if credentials && self.url.origin() != target.origin() {
+        if self.url.origin() != target.origin() {
             return Err(CurlError::CrossOrigin {
                 command: self.url.origin().ascii_serialization(),
                 target: target.origin().ascii_serialization(),
@@ -46,17 +44,21 @@ impl Request {
 pub enum CurlError {
     #[error("不是 curl 命令")]
     NotCurl,
-    #[error("引号没有闭合，命令可能没复制全")]
+    /// 引号没有闭合，或以续行符结尾
+    #[error("命令没有结束（引号没有闭合或以续行符结尾），可能没复制全")]
     Unclosed,
     /// 值为 shell 的哪种写法
     #[error("命令里有 {0}，这里不执行 shell，只认 curl 的参数")]
     Shell(&'static str),
-    #[error("粘贴了多条命令，一次只认一条 curl 命令")]
+    #[error("这是多条命令，一次只认一条 curl 命令")]
     MultipleCommands,
     #[error("命令里没有地址")]
     NoUrl,
     #[error("命令里有多个地址，一次只能下载一个")]
     MultipleUrls,
+    /// curl 会把地址里的 `[ ]`、`{ }` 展开成多个地址
+    #[error("地址里的 [ ] 或 {{ }} 会被 curl 展开成多个地址；要按字面下载就加 -g")]
+    Glob,
     #[error("地址要是 http 或 https 链接：{0}")]
     BadUrl(String),
     /// 值为选项（照命令里的写法）
@@ -77,20 +79,18 @@ pub enum CurlError {
     #[error("-u 只写了用户名，要写成 用户名:口令")]
     NoPassword,
     /// 值为选项
-    #[error("不认识的参数 {0}，删掉后再粘贴")]
+    #[error("不认识的参数 {0}，删掉后再试")]
     UnknownOption(String),
     /// 值为原因
     #[error("{0}")]
     Header(String),
     /// 值为请求头名：curl 会两条都发，核心与请求头编辑都是一个名字一条
-    #[error("命令里有两条 {0}，只留要用的一条后再粘贴")]
+    #[error("命令里有两条 {0}，只留要用的一条后再试")]
     DuplicateHeader(String),
     #[error("命令里有不是 UTF-8 的字节")]
     NotUtf8,
-    /// 带凭据的命令的来源与任务的不同（见 [`Request::check_target`]）
-    #[error(
-        "命令的地址（{command}）与任务的（{target}）不同源，其中的 Cookie 或 Authorization 不能用于这个任务"
-    )]
+    /// 命令的来源与任务的不同（见 [`Request::check_target`]）
+    #[error("命令的地址（{command}）与任务的（{target}）不同源，其中的请求头是给那边的")]
     CrossOrigin { command: String, target: String },
 }
 
@@ -136,9 +136,12 @@ pub fn parse(text: &str) -> Result<Request, CurlError> {
     Options::read(words)?.into_request()
 }
 
-/// 按 Windows cmd 的写法拆：Chrome 与 Firefox 生成的 cmd 命令值都包在 `^"…^"` 里、续行为行末的 ` ^`。
+/// 按 Windows cmd 的写法拆：Chrome 与 Firefox 生成的 cmd 命令值都包在 `^"…^"` 里（命令里第一个引号是 `^"`）、续行为
+/// 行末的 ` ^`。bash 写法的第一个引号是 `'` 或不带 `^` 的 `"`，值里出现 `^"` 也不影响。
 fn is_cmd(text: &str) -> bool {
-    text.contains("^\"") || text.lines().any(|line| line.trim_end().ends_with('^'))
+    let first_quote = text.find(['\'', '"']);
+    first_quote.is_some_and(|at| text[..at].ends_with('^') && text[at..].starts_with('"'))
+        || text.lines().any(|line| line.trim_end().ends_with('^'))
 }
 
 /// 按 bash 的规则把命令拆成词。
@@ -157,7 +160,7 @@ fn split_bash(text: &str) -> Result<Vec<String>, CurlError> {
                 // 续行
                 Some('\n') => {}
                 Some(c) => push(&mut word, c),
-                None => push(&mut word, '\\'),
+                None => return Err(CurlError::Unclosed),
             },
             '\'' => {
                 let word = word.get_or_insert_default();
@@ -500,6 +503,8 @@ struct Options {
     derived: Vec<(String, String)>,
     /// `-b` 给的，合成一条 Cookie；`-H` 给了 Cookie 时不用
     cookies: Vec<String>,
+    /// `-H '名称:'` 去掉的请求头名与 `-A ''`：转成的同名头不用
+    removed: Vec<String>,
     dropped: Vec<String>,
 }
 
@@ -566,6 +571,8 @@ impl Options {
             // 没有等号的是 Cookie 文件名
             Known::Cookie if value.contains('=') => self.cookies.push(value),
             Known::Cookie => return Err(CurlError::CookieFile(value)),
+            // 值为空时 curl 不发 User-Agent
+            Known::UserAgent if value.is_empty() => self.removed.push("User-Agent".to_owned()),
             Known::UserAgent => self.derive("User-Agent", value),
             // `;auto`：跟随重定向时换成上一个地址，下载不跟它
             Known::Referer => {
@@ -592,16 +599,19 @@ impl Options {
         Ok(())
     }
 
-    /// `-H` 的一条（`written` 为命令里的写法）。`名称:` 没有值的是让 curl 不发它自己会加的这个请求头，没有要带上的；
-    /// `名称;` 是值为空的请求头。
+    /// `-H` 的一条（`written` 为命令里的写法）。`名称:` 没有值的是让 curl 不发这个请求头（含它自己会加的与 `-A`
+    /// 等转成的）；`名称;`（分号在最后）是值为空的请求头。
     fn header(&mut self, line: &str, written: &str) -> Result<(), CurlError> {
         if line.starts_with('@') {
             return Err(CurlError::FromFile(written.to_owned()));
         }
         let (name, value) = match line.split_once(':') {
-            Some((_, value)) if value.trim().is_empty() => return Ok(()),
+            Some((name, value)) if value.trim().is_empty() => {
+                self.removed.push(name.trim().to_owned());
+                return Ok(());
+            }
             Some((name, value)) => (name.trim(), value.trim()),
-            None => match line.trim().strip_suffix(';') {
+            None => match line.trim_start().strip_suffix(';') {
                 Some(name) => (name.trim(), ""),
                 None => {
                     return Err(CurlError::Header(format!(
@@ -644,7 +654,7 @@ impl Options {
         if urls.next().is_some() {
             return Err(CurlError::MultipleUrls);
         }
-        let url = if self.globoff { url } else { unglob(&url) };
+        let url = if self.globoff { url } else { unglob(&url)? };
         let url = Url::parse(&url)
             .ok()
             .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
@@ -662,11 +672,10 @@ impl Options {
             derived.push(("Cookie".to_owned(), cookie));
         }
         let mut headers = self.headers;
+        let removed = self.removed;
         for (name, value) in derived {
-            if !headers
-                .iter()
-                .any(|(old, _)| old.eq_ignore_ascii_case(&name))
-            {
+            let given = |old: &String| old.eq_ignore_ascii_case(&name);
+            if !headers.iter().any(|(old, _)| given(old)) && !removed.iter().any(given) {
                 check_option_header(&name, &value).map_err(CurlError::Header)?;
                 headers.push((name, value));
             }
@@ -679,17 +688,22 @@ impl Options {
     }
 }
 
-/// 还原地址里为避开 curl 的通配而转义的 `\[ \] \{ \}`（Chrome 与 Safari 这样写，Firefox 改加 `--globoff`）。
-fn unglob(url: &str) -> String {
+/// 还原地址里为避开 curl 的通配而转义的 `\[ \] \{ \}`（Chrome 与 Safari 这样写，Firefox 改加 `--globoff`）；没转义的
+/// `[`、`{` 会被 curl 展开成多个地址，报 [`CurlError::Glob`]（紧跟在 `://` 后面的 `[` 是 IPv6 地址，curl 不展开）。
+fn unglob(url: &str) -> Result<String, CurlError> {
     let mut plain = String::with_capacity(url.len());
     let mut chars = url.chars().peekable();
     while let Some(c) = chars.next() {
-        match chars.next_if(|next| c == '\\' && "[]{}".contains(*next)) {
-            Some(bracket) => plain.push(bracket),
-            None => plain.push(c),
+        if let Some(bracket) = chars.next_if(|next| c == '\\' && "[]{}".contains(*next)) {
+            plain.push(bracket);
+            continue;
         }
+        if c == '{' || (c == '[' && !plain.ends_with("://")) {
+            return Err(CurlError::Glob);
+        }
+        plain.push(c);
     }
-    plain
+    Ok(plain)
 }
 
 #[cfg(test)]
@@ -1042,7 +1056,66 @@ mod tests {
                 target: "https://a.example".into(),
             })
         );
-        let plain = parse("curl https://cdn.example/seg/1.ts -e https://a.example/").unwrap();
-        assert_eq!(plain.check_target(&target), Ok(()));
+        // 看不出哪些是凭据（自定义的令牌头），不同源的一律不用
+        let token = parse("curl https://cdn.example/seg/1.ts -H 'X-Auth-Token: s'").unwrap();
+        assert!(token.check_target(&target).is_err());
+        let port = parse("curl https://a.example:8443/live/index.m3u8").unwrap();
+        assert!(port.check_target(&target).is_err());
+    }
+
+    /// 同 curl：`-H '名称:'` 与 `-A ''` 让同名的转成的头不发；`名称;` 分号后面再有空白的不是空值的写法。
+    #[test]
+    fn removed_headers_stay_removed() {
+        let request = parse(
+            "curl https://a.example/ -b a=1 -H 'Cookie:' -u u:p -H 'authorization:' -e r              -H 'Referer:' -A x -A ''",
+        )
+        .unwrap();
+        assert_eq!(request.headers, Vec::new());
+        assert_eq!(
+            parse("curl https://a.example/ -H 'X;  '"),
+            Err(CurlError::Header("-H 后面要写成「名称: 值」".into()))
+        );
+    }
+
+    /// 没转义的 `[ ]`、`{ }` 会被 curl 展开；加 -g 按字面；主机处的 `[` 是 IPv6 地址。
+    #[test]
+    fn globs_are_refused_unless_globoff() {
+        assert_eq!(
+            parse("curl 'https://a.example/seg[1-3].ts'"),
+            Err(CurlError::Glob)
+        );
+        assert_eq!(
+            parse("curl https://a.example/{a,b}.m3u8"),
+            Err(CurlError::Glob)
+        );
+        assert_eq!(
+            parse("curl -g 'https://a.example/seg[1-3].ts'")
+                .unwrap()
+                .url
+                .path(),
+            "/seg[1-3].ts"
+        );
+        assert_eq!(
+            parse("curl 'http://[::1]:8080/v.m3u8'")
+                .unwrap()
+                .url
+                .host_str(),
+            Some("[::1]")
+        );
+    }
+
+    /// bash 写法的值里有 `^"` 不当作 cmd；命令以续行符结尾即没复制全。
+    #[test]
+    fn bash_is_not_taken_for_cmd() {
+        assert_eq!(
+            parse("curl 'https://a.example/' -H 'X-Q: a^\"b'")
+                .unwrap()
+                .headers,
+            pairs(&[("X-Q", "a^\"b")])
+        );
+        assert_eq!(
+            parse("curl 'https://a.example/' \\"),
+            Err(CurlError::Unclosed)
+        );
     }
 }

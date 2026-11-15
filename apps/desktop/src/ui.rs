@@ -440,6 +440,15 @@ pub fn steps(items: impl IntoIterator<Item = (SharedString, Step)>) -> Div {
         }))
 }
 
+/// 粘贴会换掉 `input` 里的全部内容（空着或全选了）：只在这时把粘贴的 curl 命令当作整条命令接走，否则照常插入。
+pub fn pastes_over(
+    input: &gpui_kit::Entity<gpui_kit::component::input::InputState>,
+    cx: &gpui_kit::App,
+) -> bool {
+    let input = input.read(cx);
+    input.selected_text().len() == input.value().len()
+}
+
 /// 输入框的外框（里面放 `Input`，或只读的字，见 [`field`]）：比面板暗一层的底、细边。
 pub fn input_frame() -> Div {
     div()

@@ -1,6 +1,7 @@
 //! 请求头的编辑：已有的一条一条列出、可以删，输入框里写「名称: 值」回车添加。添加时按核心的规则校验
-//! （[`check_option_header`]），同名的（不分大小写）替换原有的一条。输入框里粘贴（或写好回车）curl 命令时加入命令里的
-//! 全部请求头（见 [`curl::parse`]），命令里没带上的列在输入框下面；粘贴的命令不放进单行的输入框（换行会被删掉）。
+//! （[`check_option_header`]），同名的（不分大小写）替换原有的一条。输入框里写好 curl 命令回车、或在空着（全选）的
+//! 输入框里粘贴 curl 命令时，加入命令转成的请求头（见 [`curl::parse`]），命令里没带上的列在输入框下面；粘贴的命令
+//! 不经单行的输入框（换行会被删掉）。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -15,13 +16,13 @@ use crate::theme;
 use crate::ui::{self, TEXT_LINE};
 
 pub struct HeadersEditor {
-    /// 这些请求头用于哪个地址：加入的 curl 命令带凭据时要与它同源（见 [`curl::Request::check_target`]）
+    /// 这些请求头用于哪个地址：加入的 curl 命令要与它同源（见 [`curl::Request::check_target`]）
     target: Url,
     headers: Vec<(String, String)>,
     input: Entity<InputState>,
     /// 输入框里的内容加不进去的原因；改了内容时清掉
     error: Option<String>,
-    /// 最近加入的 curl 命令里没带上的请求头名，列在输入框下面
+    /// 最近一次添加的 curl 命令里没带上的请求头名，列在输入框下面；再添加（不论成败）时换掉
     dropped: Vec<String>,
     _typed: Subscription,
 }
@@ -78,6 +79,8 @@ impl HeadersEditor {
         cx: &mut Context<Self>,
     ) -> Option<Vec<(String, String)>> {
         let pending = self.input.read(cx).value().to_string();
+        // 上一次没加进去的已不在输入框里，原因不再适用
+        self.error = None;
         if !pending.trim().is_empty() {
             if !self.add(&pending) {
                 cx.notify();
@@ -91,6 +94,7 @@ impl HeadersEditor {
 
     /// 加一条「名称: 值」，或 curl 命令里的全部请求头；加不进去时记下原因，返回 false。
     fn add(&mut self, text: &str) -> bool {
+        self.dropped = Vec::new();
         let added = if curl::is_command(text) {
             self.add_command(text)
         } else {
@@ -100,7 +104,7 @@ impl HeadersEditor {
         self.error.is_none()
     }
 
-    /// 加入 curl 命令 `text` 里的请求头；命令认不出、或带凭据而与 [`HeadersEditor::target`] 不同源时一条也不加。
+    /// 加入 curl 命令 `text` 里的请求头；命令认不出、或与 [`HeadersEditor::target`] 不同源时一条也不加。
     fn add_command(&mut self, text: &str) -> Result<(), String> {
         let request = curl::parse(text).map_err(|error| error.to_string())?;
         request
@@ -200,14 +204,23 @@ impl Render for HeadersEditor {
             .child(
                 ui::input_frame().child(Input::new(&self.input).appearance(false).on_paste({
                     let editor = cx.entity().downgrade();
-                    move |item, _, cx| {
-                        let Some(text) = item.text().filter(|text| curl::is_command(text)) else {
+                    let input = self.input.clone();
+                    move |item, window, cx| {
+                        let Some(text) = item
+                            .text()
+                            .filter(|text| curl::is_command(text) && ui::pastes_over(&input, cx))
+                        else {
                             return false;
                         };
                         // 视图已释放时照常粘贴
                         editor
                             .update(cx, |editor, cx| {
-                                editor.add(&text);
+                                // 加进去了就清掉框里被这次粘贴选中替换的内容
+                                if editor.add(&text) {
+                                    editor
+                                        .input
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                }
                                 cx.notify();
                             })
                             .is_ok()

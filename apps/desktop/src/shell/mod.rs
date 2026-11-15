@@ -154,8 +154,7 @@ impl Shell {
     pub fn handed_over(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
         if let Handoff::Link(link) = handoff {
             if self.new_task().is_some() {
-                self.dock
-                    .update(cx, |dock, cx| dock.set_text(link, window, cx));
+                self.dock.update(cx, |dock, cx| dock.put(&link, window, cx));
                 self.tell(
                     "再次打开应用时转交的链接已填进粘贴栏：新建页还开着，回车即换成探测它"
                         .to_owned(),
@@ -168,10 +167,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// 把 `text` 填进粘贴栏并探测。
+    /// 把 `text` 放进粘贴栏（见 [`Dock::put`]）并探测。
     pub(super) fn probe_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.dock
-            .update(cx, |dock, cx| dock.set_text(text.to_owned(), window, cx));
+        self.dock.update(cx, |dock, cx| dock.put(text, window, cx));
         self.probe(text, window, cx);
     }
 
