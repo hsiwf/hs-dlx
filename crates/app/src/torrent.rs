@@ -2,8 +2,8 @@
 //! 运行中的 BT 任务与正在取种子信息的磁力链接，每个种子归一个异步任务管：一条线程取会话的事件，按种子的编号转给
 //! 管它的那个（[`Owner`]）。
 //!
-//! 种子的一切（种子信息、tracker、根名、选了的文件、已有的块）都在它的续传数据里，存进任务存储；停下时先要续传数据、
-//! 紧接着把缓存写到磁盘，两者都回来、其间没有写盘出错，存下的已有块才不多于磁盘上的（标为可信）。
+//! 种子的一切（种子信息、tracker、根名、选了的文件、已有的块）都在它的续传数据里，存进任务存储；停下时先把缓存写到
+//! 磁盘、再要续传数据（libtorrent 只记写完的块），存下的已有块不多于磁盘上的（标为可信）。
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -1017,86 +1017,75 @@ async fn stop(owner: &mut Owner, removal: Removal) -> (Option<Resume>, Result<()
     (resume, problem.map_or(Ok(()), Err))
 }
 
-/// 存下进度：要续传数据、紧接着把缓存写到磁盘，等两者都回来。还没校验完已有的文件的（libtorrent 这时写出的续传数据里
-/// 一块也没有，torrent.cpp 的 write_resume_data 按已校验到哪写），不要续传数据，存储里的照旧；这时也还没开始下，没有
-/// 要写盘的。返回要存的续传数据（不要或没要到时为 None），与出的问题：写盘出错（[`FailureKind::Disk`]），或要不到、
-/// 等不到结果。
+/// 存下进度：先把缓存写到磁盘、等写完，再要续传数据。libtorrent 的续传数据只记交给磁盘写完的块（torrent.cpp 的
+/// write_resume_data 按 is_piece_flushed；写失败的块撤回、不算已有），所以先写完才记得全，记的也不会多于磁盘上的。还没
+/// 校验完已有的文件的（这时写出的续传数据里一块也没有，write_resume_data 按已校验到哪写），不要续传数据，存储里的照旧；
+/// 这时也还没开始下，没有要写盘的。返回要存的续传数据（不要或没要到时为 None），与出的问题：写盘出错
+/// （[`FailureKind::Disk`]，写失败的块没记进续传数据），或要不到、等不到结果。
 async fn snapshot(owner: &mut Owner) -> (Option<Resume>, Option<Failure>) {
     let other = |error: Error| Failure {
         kind: FailureKind::Other,
         message: format!("BT 任务停下时出错：{error}"),
     };
-    let mut problem = None;
-    let mut resume = None;
-    let checked = owner
-        .session()
-        .status(&owner.id)
-        .map(|status| {
-            matches!(
-                status.state(),
-                Some(State::Downloading | State::Finished | State::Seeding)
-            )
-        })
-        .map_err(owner.libtorrent("查状态"));
-    let requested = match checked {
-        Ok(true) => owner
-            .session()
-            .save_resume_data(&owner.id)
-            .and_then(|()| owner.session().flush(&owner.id))
-            .map(|()| true)
-            .map_err(owner.libtorrent("要续传数据")),
-        Ok(false) => Ok(false),
-        Err(error) => Err(error),
+    let checked = match owner.session().status(&owner.id) {
+        Ok(status) => matches!(
+            status.state(),
+            Some(State::Downloading | State::Finished | State::Seeding)
+        ),
+        Err(error) => return (None, Some(other(owner.libtorrent("查状态")(error)))),
     };
-    match requested {
-        Err(error) => problem = Some(other(error)),
-        Ok(false) => {}
-        Ok(true) => {
-            // 续传数据在写盘之前取样：写完的事件来了，取样时已有的块都已在磁盘上
-            let mut data = None::<Option<Vec<u8>>>;
-            let mut flushed = false;
-            let mut write_error = None;
-            while data.is_none() || !flushed {
-                let step = owner
-                    .step(
-                        "续传数据与写完缓存",
-                        |alert| {
-                            matches!(
-                                alert.kind,
-                                AlertKind::ResumeData
-                                    | AlertKind::ResumeDataFailed
-                                    | AlertKind::CacheFlushed
-                            )
-                        },
-                        |alert| {
-                            if alert.kind == AlertKind::FileError {
-                                write_error.get_or_insert_with(|| alert.message.clone());
-                            }
-                        },
-                    )
-                    .await;
-                match step {
-                    Ok(alert) => match alert.kind {
-                        AlertKind::ResumeData => data = Some(Some(alert.data)),
-                        AlertKind::ResumeDataFailed => data = Some(None),
-                        _ => flushed = true,
-                    },
-                    Err(error) => {
-                        problem = Some(other(error));
-                        break;
-                    }
-                }
-            }
-            let trusted = flushed && write_error.is_none();
-            if let Some(message) = write_error {
-                problem.get_or_insert(Failure {
-                    kind: FailureKind::Disk,
-                    message: format!("BT 下载写文件出错：{message}"),
-                });
-            }
-            resume = data.flatten().map(|data| Resume { data, trusted });
-        }
+    if !checked {
+        return (None, None);
     }
+    let mut write_error = None;
+    let mut note = |alert: &Alert| {
+        if alert.kind == AlertKind::FileError {
+            write_error.get_or_insert_with(|| alert.message.clone());
+        }
+    };
+    if let Err(error) = owner.session().flush(&owner.id) {
+        return (None, Some(other(owner.libtorrent("写盘")(error))));
+    }
+    if let Err(error) = owner
+        .step(
+            "写完缓存",
+            |alert| alert.kind == AlertKind::CacheFlushed,
+            &mut note,
+        )
+        .await
+    {
+        return (None, Some(other(error)));
+    }
+    if let Err(error) = owner.session().save_resume_data(&owner.id) {
+        return (None, Some(other(owner.libtorrent("要续传数据")(error))));
+    }
+    let alert = owner
+        .step(
+            "续传数据",
+            |alert| {
+                matches!(
+                    alert.kind,
+                    AlertKind::ResumeData | AlertKind::ResumeDataFailed
+                )
+            },
+            &mut note,
+        )
+        .await;
+    let mut problem = write_error.map(|message| Failure {
+        kind: FailureKind::Disk,
+        message: format!("BT 下载写文件出错：{message}"),
+    });
+    let resume = match alert {
+        Ok(alert) if alert.kind == AlertKind::ResumeData => Some(Resume {
+            data: alert.data,
+            trusted: true,
+        }),
+        Ok(_) => None,
+        Err(error) => {
+            problem.get_or_insert(other(error));
+            None
+        }
+    };
     (resume, problem)
 }
 
