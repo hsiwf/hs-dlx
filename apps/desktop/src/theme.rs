@@ -139,11 +139,6 @@ pub fn accent_dim() -> Hsla {
     pick(0x2C7F88, 0x8A2E18)
 }
 
-/// 警告色实心上的文字
-pub fn on_warn() -> Hsla {
-    rgb(0x1F1204).into()
-}
-
 /// 要处理的说明的底色
 pub fn warn_ground() -> Hsla {
     rgb(0x140F08).into()

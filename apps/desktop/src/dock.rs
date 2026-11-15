@@ -1,23 +1,29 @@
 //! 粘贴栏：舞台底部的链接或 curl 命令的输入。回车或点「探测」发出 [`DockEvent::Probe`]。框里空着或全选时粘贴的 curl
 //! 命令不经输入框（单行的框会删掉换行，续行就断了），交给 [`Dock::put`] 并立即发出。外面告诉它正在探测的链接
 //! （[`Dock::set_probing`]），框里正是它时右边写探测到哪一步；外面拒绝了输入时右边写原因，改了内容即清掉。任务页、
-//! 待机页与新建页的舞台里放的是同一个视图。
+//! 待机页与新建页的舞台里放的是同一个视图。描边上有一段主色的流光绕着走（[`paint_sweep`]）。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use std::f32::consts::PI;
+use std::time::Duration;
+
 use gpui_kit::{
-    AppContext as _, Context, EventEmitter, Focusable as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, px,
+    AppContext as _, Bounds, Context, EventEmitter, Focusable as _, IntoElement,
+    ParentElement as _, PathBuilder, Pixels, Point, Render, SharedString, Styled as _,
+    Subscription, Window, canvas, div, point, px,
 };
 
 use hs_dlx_app::curl;
 use hs_m3u8_core::Url;
 
 use crate::links;
-use crate::theme;
 use crate::ui::{self, DOCK_HEIGHT, Tone};
+use crate::{motion, theme};
 
 /// 胶囊的最大宽。
 const MAX_WIDTH: f32 = 760.;
+/// 流光绕一圈要多久。
+const SWEEP: Duration = Duration::from_secs(6);
 
 pub enum DockEvent {
     /// 框里的链接或命令；框里是记下的 curl 命令的地址时为整条命令（原样，含换行）
@@ -172,6 +178,7 @@ impl Render for Dock {
             .into_any_element()
         };
         div()
+            .relative()
             .w_full()
             .max_w(px(MAX_WIDTH))
             .h(px(DOCK_HEIGHT))
@@ -232,5 +239,87 @@ impl Render for Dock {
                 }),
             ))
             .child(trailing)
+            .children(motion::turn(SWEEP).map(|head| {
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, _| {
+                        paint_sweep(bounds, head, window);
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+            }))
+    }
+}
+
+/// 胶囊形（`bounds` 里两端为半圆）的描边上，沿边走到 `head`（一圈为 1，从上边左端起顺时针）处的一段流光：前后各约
+/// 一成周长由暗到亮再到暗，最亮处在 `head` 稍后。
+fn paint_sweep(bounds: Bounds<Pixels>, head: f32, window: &mut Window) {
+    /// 流光在 `head` 前后各占周长的多少，与分几段画。
+    const BEFORE: f32 = 0.13;
+    const AFTER: f32 = 0.12;
+    const STEPS: usize = 48;
+    let edge = Stadium::inside(bounds);
+    let accent = theme::accent();
+    for step in 0..STEPS {
+        let from = step as f32 / STEPS as f32;
+        let to = (step + 1) as f32 / STEPS as f32;
+        let middle = (from + to) / 2.;
+        // 0 在流光尾端，BEFORE / (BEFORE + AFTER) 处最亮，1 在前端
+        let peak = BEFORE / (BEFORE + AFTER);
+        let strength = if middle < peak {
+            middle / peak
+        } else {
+            (1. - middle) / (1. - peak)
+        };
+        let at = |t: f32| edge.at(head - BEFORE + t * (BEFORE + AFTER));
+        for (width, alpha) in [(4., 0.25), (1.5, 0.9)] {
+            let mut path = PathBuilder::stroke(px(width));
+            path.move_to(at(from));
+            path.line_to(at(to));
+            let path = path.build().expect("两点的描边，顶点远低于曲面细分的上限");
+            window.paint_path(path, theme::alpha(accent, alpha * strength * strength));
+        }
+    }
+}
+
+/// 胶囊形描边的中线：上下两条直边与左右两个半圆。
+struct Stadium {
+    origin: Point<Pixels>,
+    width: f32,
+    radius: f32,
+}
+
+impl Stadium {
+    /// `bounds` 里 1 点宽的描边的中线。
+    fn inside(bounds: Bounds<Pixels>) -> Stadium {
+        Stadium {
+            origin: point(bounds.origin.x + px(0.5), bounds.origin.y + px(0.5)),
+            width: f32::from(bounds.size.width) - 1.,
+            radius: (f32::from(bounds.size.height) - 1.) / 2.,
+        }
+    }
+
+    /// 中线上 `turn`（一圈为 1，从上边左端起顺时针，可以超出 0 到 1）处的点。
+    fn at(&self, turn: f32) -> Point<Pixels> {
+        let r = self.radius;
+        let straight = (self.width - 2. * r).max(0.);
+        let perimeter = 2. * straight + 2. * PI * r;
+        let arc = PI * r;
+        let s = turn.rem_euclid(1.) * perimeter;
+        let (x, y) = if s < straight {
+            (r + s, 0.)
+        } else if s < straight + arc {
+            let a = -PI / 2. + (s - straight) / r;
+            (r + straight + r * a.cos(), r + r * a.sin())
+        } else if s < 2. * straight + arc {
+            (r + straight - (s - straight - arc), 2. * r)
+        } else {
+            let a = PI / 2. + (s - 2. * straight - arc) / r;
+            (r + r * a.cos(), r + r * a.sin())
+        };
+        point(self.origin.x + px(x), self.origin.y + px(y))
     }
 }

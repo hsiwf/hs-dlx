@@ -5,7 +5,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use gpui_kit::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
 
-use crate::theme;
+use crate::{motion, theme};
 
 /// 中央刻度环的绘制区域边长与刻度环的半径。
 pub const AREA: f32 = 460.;
@@ -102,7 +102,8 @@ impl Stroke {
     }
 }
 
-/// 在 `bounds` 中心画半径 `radius` 的刻度环。发光是同一组刻度先画两层更粗、更淡的描边。
+/// 在 `bounds` 中心画半径 `radius` 的刻度环。发光是同一组刻度先画两层更粗、更淡的描边；下载中的那一格是闪烁的亮白
+/// （[`motion::blink`]），带已完成刻度颜色的光晕。
 pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &mut Window) {
     let center = bounds.center();
     let mut idle = Stroke::new(2., theme::line(), HALF);
@@ -111,7 +112,9 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
     let mut lit = Stroke::new(2., ticks.color, HALF);
     let mut written_halo = Stroke::new(5., theme::alpha(theme::written(), 0.16), HALF + 1.);
     let mut written = Stroke::new(2., theme::written(), HALF);
-    let mut active = Stroke::new(2., theme::accent_dim(), HALF);
+    let blink = motion::blink();
+    let mut active_halo = Stroke::new(8., theme::alpha(ticks.color, 0.35 * blink), HALF + 2.);
+    let mut active = Stroke::new(2.2, theme::alpha(gpui_kit::white(), blink), HALF);
     let mut retry_halo = Stroke::new(10., theme::alpha(theme::warn(), 0.3), RETRY_HALF + 2.);
     let mut retry = Stroke::new(3., theme::warn(), RETRY_HALF);
     for i in 0..ticks.count {
@@ -129,6 +132,7 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
             retry_halo.tick(center, radius, rad);
             retry.tick(center, radius, rad);
         } else if i < ticks.lit + ticks.active {
+            active_halo.tick(center, radius, rad);
             active.tick(center, radius, rad);
         } else {
             idle.tick(center, radius, rad);
@@ -141,6 +145,7 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
         lit,
         written_halo,
         written,
+        active_halo,
         active,
         retry_halo,
         retry,
@@ -220,6 +225,36 @@ pub fn paint_arc(
         if span > 0.0 {
             window.paint_path(arc(center, radius, width, 0.0, span), paint);
         }
+    }
+}
+
+/// [`paint_arc`] 画的环上，`turn`（整圈为 1，从 12 点顺时针）处一颗白色光点，带 `color` 的光晕：在下的任务的小环上
+/// 绕行。
+pub fn paint_orbit(
+    bounds: Bounds<Pixels>,
+    width: f32,
+    turn: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let side = f32::from(bounds.size.width.min(bounds.size.height));
+    let at = on_circle(bounds.center(), side / 2. - width / 2., angle(turn));
+    for (diameter, paint) in [
+        (11., theme::alpha(color, 0.35)),
+        (7., theme::alpha(color, 0.7)),
+        (4.4, gpui_kit::white()),
+    ] {
+        let half = px(diameter / 2.);
+        window.paint_quad(
+            gpui_kit::fill(
+                Bounds::new(
+                    point(at.x - half, at.y - half),
+                    gpui_kit::size(half * 2., half * 2.),
+                ),
+                paint,
+            )
+            .corner_radii(half),
+        );
     }
 }
 

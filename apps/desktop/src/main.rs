@@ -10,6 +10,7 @@ mod headers;
 mod links;
 mod live;
 mod main_window;
+mod motion;
 mod new_task;
 mod rate;
 mod ring;

@@ -1,6 +1,8 @@
 //! 左边的任务栏面板：标题栏写有几个任务，下面每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，在网页里
 //! 找视频流时有网页那一项。
 
+use std::time::Duration;
+
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
@@ -11,7 +13,8 @@ use super::look::look;
 use super::{Page, Shell};
 use crate::new_task::Phase;
 use crate::tasks::{Row, Tasks};
-use crate::{ring, theme, ui};
+use crate::{motion, ring, theme, ui};
+use hs_dlx_app::Status;
 
 /// 任务栏的宽度。
 const WIDTH: f32 = 288.;
@@ -21,6 +24,8 @@ pub(super) const MIN_WIDTH: f32 = 240.;
 /// 小环的边长与环宽。
 const ORB: f32 = 46.;
 const ORB_WIDTH: f32 = 5.;
+/// 小环上的光点绕一圈要多久。
+const ORBIT: Duration = Duration::from_millis(2800);
 
 impl Shell {
     pub(super) fn render_list(&self, tasks: &Tasks, cx: &Context<Self>) -> impl IntoElement {
@@ -87,6 +92,10 @@ impl Shell {
         let look = look(row);
         let on = selected == Some(id) && matches!(self.page, Page::Task);
         let (fraction, color) = (look.fraction, look.orb);
+        // 在下的任务：一颗光点沿小环绕行
+        let orbit = (row.task.status == Status::Running)
+            .then(|| motion::turn(ORBIT))
+            .flatten();
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.5))
             .cursor_pointer()
@@ -108,6 +117,9 @@ impl Shell {
                                     theme::line(),
                                     window,
                                 );
+                                if let Some(turn) = orbit {
+                                    ring::paint_orbit(bounds, ORB_WIDTH, turn, color, window);
+                                }
                             },
                         )
                         .absolute()

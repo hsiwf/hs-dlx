@@ -32,6 +32,7 @@ use crate::dial;
 use crate::dock::{Dock, DockEvent};
 use crate::headers::HeadersEditor;
 use crate::links;
+use crate::motion;
 use crate::new_task;
 use crate::new_task::NewTask;
 use crate::settings::{SettingsEvent, SettingsView};
@@ -87,8 +88,9 @@ pub struct Shell {
     standby_frames: Option<Task<()>>,
     /// 窗口的动态背景
     backdrop: Backdrop,
-    /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图；背景停了即结束
-    _backdrop_frames: Task<()>,
+    /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图，并让窗口重画（装饰动效的节拍，见
+    /// [`crate::motion`]）：窗口在前台、系统没要求减少动态效果时每次都重画，否则只在背景换了图时重画
+    _frames: Task<()>,
     /// 这次进入待机页的时刻：彗尾与背光按它走
     standby_since: Instant,
     /// 进入待机页时读到的代理设置（待机页写新任务经哪里走；在设置页改了之后回来会重读）；读不出时为原因
@@ -132,27 +134,26 @@ impl Shell {
             cx.notify();
         });
         let selected = tasks.read(cx).rows().last().map(|row| row.task.id);
-        let backdrop_frames = cx.spawn(async move |this, cx| {
+        let frames = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(backdrop::FRAME).await;
-                let ticked = this.update(cx, |this, cx| {
+                let ticked = this.update_in(cx, |this, window, cx| {
+                    let still = cx.reduce_motion();
+                    motion::set_still(still);
                     let speed = this.tasks.read(cx).activity(Instant::now()).speed;
-                    match this.backdrop.tick(speed, cx) {
-                        Ok(changed) => {
-                            if changed {
-                                cx.notify();
-                            }
-                            true
-                        }
+                    let changed = match this.backdrop.tick(speed, cx) {
+                        Ok(changed) => changed,
                         Err(backdrop::Stopped(error)) => {
                             this.tell(format!("动态背景没有启用，界面改用纯色底：{error}"), cx);
-                            cx.notify();
-                            false
+                            true
                         }
+                    };
+                    if changed || (window.is_window_active() && !still) {
+                        cx.notify();
                     }
                 });
-                // 窗口关了，或背景停了
-                if !matches!(ticked, Ok(true)) {
+                // 窗口关了
+                if ticked.is_err() {
                     break;
                 }
             }
@@ -168,7 +169,7 @@ impl Shell {
             standby_frames: None,
             standby_since: Instant::now(),
             backdrop: Backdrop::new(cx),
-            _backdrop_frames: backdrop_frames,
+            _frames: frames,
             standby_proxy: Ok(hs_m3u8_core::Proxy::System),
             confirm_discard: None,
             editing_headers: None,

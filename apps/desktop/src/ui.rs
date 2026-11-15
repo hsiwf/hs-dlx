@@ -4,15 +4,17 @@
 //! 整页面板的操作在它标题栏（[`page_head`]）的右侧。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, BoxShadow, ClickEvent, Div, ElementId, FontFallbacks, FontFeatures,
+    AnyElement, App, Bounds, BoxShadow, ClickEvent, Div, ElementId, FontFallbacks, FontFeatures,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled, Window, div, point, px,
+    Stateful, StatefulInteractiveElement as _, Styled, Window, canvas, div, fill,
+    linear_color_stop, linear_gradient, point, px, relative,
 };
 
-use crate::{backdrop, theme};
+use crate::{backdrop, motion, theme};
 
 /// 顶栏高度；macOS 的红绿灯按它垂直居中，右上角的提示从它下面开始。
 pub const TITLE_HEIGHT: f32 = 52.;
@@ -60,7 +62,7 @@ pub enum Tone {
     Ghost,
 }
 
-/// 实心的样子：按钮的三种实心，也是主操作（[`primary`]）能用的全部样子。
+/// 主操作（[`primary`]）的颜色。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Solid {
     /// 主色：每屏最该按的那一个
@@ -72,23 +74,17 @@ pub enum Solid {
 }
 
 impl Solid {
-    /// 底色、悬停时的底色与上面的字色。
-    fn colors(self) -> (Hsla, Hsla, Hsla) {
+    fn color(self) -> Hsla {
         match self {
-            Solid::Glow => (theme::accent(), theme::accent_pale(), theme::on_accent()),
-            Solid::Rec => (
-                theme::live(),
-                theme::alpha(theme::live(), 0.85),
-                gpui_kit::white(),
-            ),
-            Solid::Amber => (
-                theme::warn(),
-                theme::alpha(theme::warn(), 0.85),
-                theme::on_warn(),
-            ),
+            Solid::Glow => theme::accent(),
+            Solid::Amber => theme::warn(),
+            Solid::Rec => theme::live(),
         }
     }
 }
+
+/// 主操作底部那团内光呼吸一次的时长。
+const PRIMARY_BREATH: Duration = Duration::from_millis(3200);
 
 /// 按钮。
 pub fn button(
@@ -111,13 +107,12 @@ pub fn button(
         .on_click(on_click)
         .child(label.into());
     if tone == Tone::Glow {
-        let (bg, hover, text) = Solid::Glow.colors();
         return base
-            .bg(bg)
-            .text_color(text)
+            .bg(theme::accent())
+            .text_color(theme::on_accent())
             .font_weight(FontWeight::BOLD)
-            .shadow(glow(bg, 18., 0.3))
-            .hover(move |s| s.bg(hover));
+            .shadow(glow(theme::accent(), 18., 0.3))
+            .hover(|s| s.bg(theme::accent_pale()));
     }
     match tone {
         Tone::Ghost => base
@@ -133,7 +128,8 @@ pub fn button(
 }
 
 /// 当前对象的主操作：整宽、两行（做什么与它的后果，如「开始下载 · 1080p」「约 1.9 GB · MP4」），放在检查面板底栏的
-/// 最前面。`enabled` 为 false 时变淡、不可点。
+/// 最前面。深色底、`solid` 色的描边与外光，底部一团同色的内光缓缓呼吸（[`motion::breathe`]）。`enabled` 为 false
+/// 时变淡、不可点。
 pub fn primary(
     id: impl Into<ElementId>,
     title: impl Into<SharedString>,
@@ -142,37 +138,52 @@ pub fn primary(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    let (bg, hover, text) = solid.colors();
+    let color = solid.color();
+    let breath = motion::breathe(PRIMARY_BREATH);
+    // 内光：底边中间一团，大部分在按钮下面、被按钮裁掉，只露出往上漫的一截
+    let inner = div()
+        .absolute()
+        .left(relative(0.1))
+        .top(relative(0.3))
+        .w(relative(0.8))
+        .h(relative(1.1))
+        .rounded_full()
+        .shadow(glow(color, 34., 0.7 * breath));
     let base = div()
         .id(id)
+        .relative()
+        .overflow_hidden()
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(1.))
-        .px(px(16.))
+        .gap(px(2.))
+        .px(px(18.))
         .py(px(11.))
-        .rounded(px(14.))
-        .bg(bg)
-        .text_color(text)
-        // 光往下投，不漫进上面的正文
-        .shadow(vec![BoxShadow {
-            color: theme::alpha(bg, 0.22),
-            offset: point(px(0.), px(10.)),
-            blur_radius: px(26.),
-            spread_radius: px(-6.),
-            inset: false,
-        }])
+        .rounded(px(16.))
+        .bg(theme::deck())
+        .border_1()
+        .border_color(theme::alpha(color, 0.45))
+        .text_color(gpui_kit::white())
+        .shadow(glow(color, 30., 0.25))
+        .child(inner)
         .child(
             div()
+                .relative()
                 .text_size(px(15.))
                 .font_weight(FontWeight::BOLD)
                 .child(title.into()),
         )
-        .children(detail.map(|detail| num(div().text_size(px(12.)).opacity(0.75).child(detail))));
+        .children(detail.map(|detail| {
+            num(div()
+                .relative()
+                .text_size(px(12.))
+                .opacity(0.7)
+                .child(detail))
+        }));
     if enabled {
         base.cursor_pointer()
             .on_click(on_click)
-            .hover(move |s| s.bg(hover))
+            .hover(move |s| s.border_color(theme::alpha(color, 0.8)))
     } else {
         base.opacity(0.55)
     }
@@ -540,6 +551,67 @@ pub fn glow(color: Hsla, blur: f32, strength: f32) -> Vec<BoxShadow> {
     }]
 }
 
+/// 点阵速度表的高与每列几个点。
+const MATRIX_HEIGHT: f32 = 78.;
+const MATRIX_ROWS: usize = 9;
+
+/// 点阵速度表：每列一格速度（`speeds`，旧的在左），按其中最大的一格归一，从下往上点亮；每列最上面亮的那个点最亮、
+/// 带光晕。全为 0 时一个也不亮。
+pub fn speed_matrix(speeds: Vec<f64>) -> impl IntoElement {
+    let peak = speeds.iter().copied().fold(0., f64::max);
+    let accent = theme::accent();
+    let off = theme::alpha(theme::muted(), 0.1);
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let columns = speeds.len();
+            if columns == 0 {
+                return;
+            }
+            let cell_w = f32::from(bounds.size.width) / columns as f32;
+            let cell_h = f32::from(bounds.size.height) / MATRIX_ROWS as f32;
+            let diameter = cell_w.min(cell_h) * 0.64;
+            for (column, speed) in speeds.iter().enumerate() {
+                let lit = if peak > 0. && *speed > 0. {
+                    ((speed / peak * MATRIX_ROWS as f64).round() as usize).clamp(1, MATRIX_ROWS)
+                } else {
+                    0
+                };
+                for row in 0..MATRIX_ROWS {
+                    let from_bottom = MATRIX_ROWS - row;
+                    let center = point(
+                        bounds.origin.x + px((column as f32 + 0.5) * cell_w),
+                        bounds.origin.y + px((row as f32 + 0.5) * cell_h),
+                    );
+                    let mut paint = |size: f32, color: Hsla| {
+                        let half = px(size / 2.);
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(
+                                    point(center.x - half, center.y - half),
+                                    gpui_kit::size(half * 2., half * 2.),
+                                ),
+                                color,
+                            )
+                            .corner_radii(half),
+                        );
+                    };
+                    if from_bottom > lit {
+                        paint(diameter, off);
+                    } else if from_bottom == lit {
+                        paint(diameter * 2.2, theme::alpha(accent, 0.22));
+                        paint(diameter, accent);
+                    } else {
+                        paint(diameter, theme::alpha(accent, 0.55));
+                    }
+                }
+            }
+        },
+    )
+    .w_full()
+    .h(px(MATRIX_HEIGHT))
+}
+
 /// 发光的小圆点，`size` 为直径。
 pub fn dot(color: Hsla, size: f32) -> Div {
     div()
@@ -615,7 +687,7 @@ pub const fn stage_height(figure_height: f32, below_height: f32) -> f32 {
     figure_height + below + DOCK_GAP + DOCK_HEIGHT + DOCK_BOTTOM
 }
 
-/// 任务栏的一项：横排；选中时有底色与描边，否则悬停时有底色。
+/// 任务栏的一项：横排；选中时有自上而下变淡的主色底、主色描边与一圈淡光，否则悬停时有底色。
 pub fn list_item(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
     let base = div()
         .id(id)
@@ -626,7 +698,14 @@ pub fn list_item(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
         .rounded(px(14.))
         .border_1();
     if selected {
-        base.border_color(theme::edge()).bg(theme::selected())
+        let accent = theme::accent();
+        base.border_color(theme::alpha(accent, 0.28))
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(theme::alpha(accent, 0.10), 0.),
+                linear_color_stop(theme::alpha(accent, 0.03), 1.),
+            ))
+            .shadow(glow(accent, 24., 0.10))
     } else {
         base.border_color(gpui_kit::transparent_black())
             .hover(|s| s.bg(theme::raised()))

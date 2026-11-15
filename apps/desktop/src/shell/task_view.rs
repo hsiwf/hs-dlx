@@ -1,11 +1,12 @@
 //! 选中任务的舞台与检查面板：舞台中间是表盘（直播录制是钟面），检查面板是读数、信号与操作。
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, linear_color_stop,
+    linear_gradient, px,
 };
 use hs_dlx_app::Status;
 use hs_m3u8_core::bare_url;
@@ -16,7 +17,7 @@ use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
-use crate::{dial, format, ring, theme};
+use crate::{dial, format, motion, ring, theme};
 
 /// 在系统的文件管理器里显示输出：各平台的叫法。
 const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -26,8 +27,10 @@ const REVEAL: &str = if cfg!(target_os = "macos") {
 } else {
     "在文件夹中显示"
 };
-/// 信号的时刻一栏的宽：放得下「11-14 10:20」。
-const SIGNAL_AT_WIDTH: f32 = 72.;
+/// 信号时间线：竖线离左边多远、最新几条不变淡、最新一条的节点呼吸一次多久。
+const SIGNAL_RAIL: f32 = 9.5;
+const SIGNAL_FRESH: usize = 3;
+const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 /// 任务页的最小宽：表盘与收到最窄的检查面板。
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
@@ -127,6 +130,26 @@ impl Shell {
         };
         if !cells.is_empty() {
             body.push(ui::reads(cells, None).into_any_element());
+        }
+        if !live && row.task.status == Status::Running {
+            body.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(ui::caption("速度 · 最近 60 秒"))
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(10.))
+                            .bg(theme::ground())
+                            .border_1()
+                            .border_color(theme::edge())
+                            .child(ui::speed_matrix(row.rate.history(now).to_vec())),
+                    )
+                    .into_any_element(),
+            );
         }
         if live {
             body.push(live_view::legend(row).into_any_element());
@@ -449,47 +472,116 @@ fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// 信号：最新的在最上面，左边是时刻，字色是级别。
+/// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点：最新一条的节点实心发光、缓缓呼吸，要留意与失败
+/// 级别的那一条整行带同色的淡底与描边，较早的（第 [`SIGNAL_FRESH`] 条往后）变淡。每条下面一行是时刻与连续发生的次数。
 fn signals(signals: &[Signal]) -> Div {
+    let accent = theme::accent();
+    let last = signals.len().saturating_sub(1);
+    let rows = signals.iter().rev().enumerate().map(|(index, signal)| {
+        let level = match signal.level {
+            Level::Info => None,
+            Level::Warn => Some(theme::signal_warn()),
+            Level::Error => Some(theme::signal_error()),
+        };
+        let newest = index == 0;
+        let breath = motion::breathe(SIGNAL_BREATH);
+        let node = div()
+            .absolute()
+            .left(px(SIGNAL_RAIL - 4.5))
+            .top(px(11.))
+            .size(px(9.))
+            .rounded_full()
+            .border_2()
+            .map(|node| match (level, newest) {
+                (Some(color), _) => node.bg(theme::ground()).border_color(color),
+                (None, true) => node
+                    .bg(accent)
+                    .border_color(accent)
+                    .shadow(ui::glow(accent, 10., breath)),
+                (None, false) => node.bg(theme::ground()).border_color(theme::accent_dim()),
+            });
+        // 竖线：第一条从节点往下，最后一条到节点为止
+        let rail = div()
+            .absolute()
+            .left(px(SIGNAL_RAIL - 0.5))
+            .w(px(1.))
+            .bg(theme::edge())
+            .map(|rail| match (index == 0, index == last) {
+                (true, true) => rail.h(px(0.)),
+                (true, false) => rail.top(px(14.)).bottom_0(),
+                (false, true) => rail.top_0().h(px(14.)),
+                (false, false) => rail.top_0().bottom_0(),
+            });
+        let when = if signal.repeat > 1 {
+            format!("{} · ×{}", signal.at, signal.repeat)
+        } else {
+            signal.at.clone()
+        };
+        div()
+            .relative()
+            .pl(px(26.))
+            .pr(px(8.))
+            .py(px(7.))
+            .rounded(px(10.))
+            .when_some(level, |row, color| {
+                row.bg(theme::alpha(color, 0.07))
+                    .border_1()
+                    .border_color(theme::alpha(color, 0.22))
+            })
+            .when(index >= SIGNAL_FRESH, |row| row.opacity(0.55))
+            .child(rail)
+            .child(node)
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .line_height(px(18.))
+                    .text_color(match (level, newest) {
+                        (Some(color), _) => color,
+                        (None, true) => theme::text(),
+                        (None, false) => theme::soft(),
+                    })
+                    .child(SharedString::from(signal.text.clone())),
+            )
+            .child(ui::num(
+                div()
+                    .mt(px(2.))
+                    .text_size(px(11.))
+                    .text_color(theme::faint())
+                    .child(when),
+            ))
+    });
     div()
         .flex()
         .flex_col()
-        .child(div().pb(px(6.)).child(ui::caption("信号")))
-        .children(signals.iter().rev().map(|signal| {
-            let color = match signal.level {
-                Level::Info => theme::soft(),
-                Level::Warn => theme::signal_warn(),
-                Level::Error => theme::signal_error(),
-            };
+        .px(px(12.))
+        .pt(px(6.))
+        .pb(px(8.))
+        .rounded(px(14.))
+        .border_1()
+        .border_color(theme::edge())
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(theme::alpha(accent, 0.04), 0.),
+            linear_color_stop(theme::alpha(accent, 0.), 0.4),
+        ))
+        .child(
             div()
                 .flex()
-                .gap(px(10.))
-                .py(px(7.))
-                .border_b_1()
-                .border_color(theme::hairline())
-                .text_size(px(13.))
-                .line_height(px(19.))
+                .items_center()
+                .justify_between()
+                .px(px(2.))
+                .pt(px(6.))
+                .pb(px(8.))
+                .child(ui::caption("信号"))
                 .child(ui::num(
                     div()
-                        .w(px(SIGNAL_AT_WIDTH))
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(theme::faint())
-                        .child(signal.at.clone()),
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(color)
-                        .child(SharedString::from(signal.text.clone()))
-                        .when(signal.repeat > 1, |s| {
-                            s.child(ui::num(
-                                div()
-                                    .text_color(theme::faint())
-                                    .child(format!("×{}", signal.repeat)),
-                            ))
-                        }),
-                )
-        }))
+                        .px(px(7.))
+                        .rounded(px(8.))
+                        .bg(theme::alpha(gpui_kit::white(), 0.05))
+                        .text_size(px(11.))
+                        .text_color(theme::muted())
+                        .child(signals.len().to_string()),
+                )),
+        )
+        .children(rows)
 }
