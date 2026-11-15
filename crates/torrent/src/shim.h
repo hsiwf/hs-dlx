@@ -45,6 +45,8 @@ private:
 	// 加入一个种子并登记，编号为 `id`
 	rust::String add(lt::add_torrent_params params, std::string const& id, rust::Str save_path) const;
 	lt::torrent_handle handle(rust::Str id) const;
+	// 种子 `id` 的移除有了结果：`files_settled` 为删文件的结果（删完或删失败）
+	void removed(std::string const& id, bool files_settled) const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
 
@@ -52,8 +54,13 @@ private:
 	// 编号到句柄：移除即去掉，之后对这个编号的操作报「没有这个种子」
 	mutable std::map<std::string, lt::torrent_handle> m_handles;
 	// 句柄到编号：句柄按 libtorrent 的 owner_before 比较，种子移除、句柄失效后照样查得到。移除了的也不去掉：移除之后
-	// 还会有它的事件（移除、删文件的结果，移除前要的续传数据的结果），每个种子一项，会话活多久留多久
+	// 还会有它的事件（移除、删文件的结果，移除前要的续传数据的结果）。简化：句柄里的弱引用让 libtorrent 的整个种子
+	// 对象（约 1.7 KB）留到会话结束，每加入并移除一个种子多占这么多；一个会话里加删上万个时改为在最后一个事件之后去掉
 	mutable std::map<lt::torrent_handle, std::string> m_ids;
+	// 调了 remove、还没移除完的种子的编号，与是否连文件一起删：移除完（移除的事件；删文件时为删完或删失败的事件）之前
+	// 不许再加同一个种子，否则旧的那个还没发出的事件会带着同一个编号。事件队列满了丢了这几个事件时，这个会话里再也
+	// 加不进它
+	mutable std::map<std::string, bool> m_removing;
 	// 守着上面两张表；加入时整个过程持有，取事件时查编号不会早于登记
 	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取

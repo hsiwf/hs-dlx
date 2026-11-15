@@ -34,6 +34,10 @@ mod ffi {
         /// 已取得种子信息（磁力链接要先从节点那里取）
         has_metadata: bool,
         paused: bool,
+        /// 只上传、不下载（开始之前对方是做种的会断开，`peers` 与 `reachable_pieces` 因此偏少）：加入后还没 [`Session::start`]，或写文件出错（磁盘满、没权限、只读、文件太大）时 libtorrent
+        /// 改成了这样（同时报 [`AlertKind::FileError`]）；处理好后 [`Session::start`] 继续下
+        held: bool,
+        /// 种子名；不是 UTF-8 的字节换成了替换字符，只用于显示
         name: String,
         /// 要下载的字节数（没选的文件不算）；没有种子信息时为 0
         total_wanted: i64,
@@ -56,6 +60,7 @@ mod ffi {
     /// 事件的种类。
     enum AlertKind {
         Added,
+        /// 加入失败：同步的加入已经报了错，这条只是 libtorrent 也发了一次，`torrent` 为空，可以不理
         AddFailed,
         /// 磁力链接取到了种子信息
         Metadata,
@@ -72,7 +77,8 @@ mod ffi {
         Removed,
         Deleted,
         DeleteFailed,
-        /// 事件来得太快、队列满了丢了一些：靠事件维持的状态要重新查一遍
+        /// 事件来得太快、队列满了丢了一些，哪些种子的哪种事件说不清：在等续传数据的种子要重新要，在移除的种子要查它是否
+        /// 还在（移除完的事件丢了时这个会话里再也加不进它）
         AlertsDropped,
         ListenSucceeded,
         ListenFailed,
@@ -222,12 +228,13 @@ impl Session {
     }
 
     /// 加磁力链接，下到 `save_path` 下（种子里的文件与目录建在它里面）：只取种子信息，[`Session::start`] 之后才下内容。
-    /// 已在会话里的报错。
+    /// 已在会话里、或还在移除中（[`Session::remove`] 之后、它移除完的事件之前）时报错。
     pub fn add_magnet(&self, uri: &str, save_path: &str) -> Result<TorrentId, Error> {
         Ok(TorrentId(self.inner().add_magnet(uri, save_path)?))
     }
 
-    /// 加种子文件（bencode 写的内容），下到 `save_path` 下：[`Session::start`] 之后才下内容。已在会话里的报错。
+    /// 加种子文件（bencode 写的内容），下到 `save_path` 下：[`Session::start`] 之后才下内容。已在会话里、或还在移除中
+    /// 时报错。
     pub fn add_torrent(&self, torrent: &[u8], save_path: &str) -> Result<TorrentId, Error> {
         Ok(TorrentId(self.inner().add_torrent(torrent, save_path)?))
     }
@@ -236,14 +243,15 @@ impl Session {
         Ok(self.inner().status(id.as_str())?)
     }
 
-    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复编号为 `id` 的种子，下到 `save_path` 下：已下完的块不再校验、
-    /// 不重下；写续传数据时在下的照样下（不用再 [`Session::start`]）。续传数据不是这个种子的、或已在会话里时报错。
+    /// 从续传数据（[`AlertKind::ResumeData`] 带的）恢复编号为 `id` 的种子，下到 `save_path` 下：已下完的块不重下（与
+    /// 磁盘上的文件对不上时报 [`AlertKind::ResumeRejected`]，改为从头校验）；暂停与否、是否只上传（[`Status::held`]）照写续传数据时的。续传数据不是这个种子的、已在会话里、或它
+    /// 还在移除中时报错。
     pub fn add_resume(&self, resume: &[u8], id: &TorrentId, save_path: &str) -> Result<(), Error> {
         self.inner().add_resume(resume, id.as_str(), save_path)?;
         Ok(())
     }
 
-    /// 开始下内容（选好文件之后）。
+    /// 开始下内容（选好文件之后），或写文件出错改成只上传后继续下。
     pub fn start(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().start(id.as_str())?)
     }
@@ -293,7 +301,8 @@ impl Session {
         self.inner().listen_port()
     }
 
-    /// 取出积攒的事件；没有时最多等 `wait_ms` 毫秒。转换出错时这一批事件丢了，报错（之后照常取）。
+    /// 取出积攒的事件；没有时最多等 `wait_ms` 毫秒。报错只在内存不够、或事件里的种子不在登记里（本库的不变量被破坏）
+    /// 时：这一批事件已从 libtorrent 取走、丢了，会话里的状态不可信，要重建会话。
     pub fn pop_alerts(&self, wait_ms: u32) -> Result<Vec<Alert>, Error> {
         Ok(self.inner().pop_alerts(wait_ms)?)
     }

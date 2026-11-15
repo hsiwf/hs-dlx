@@ -108,6 +108,7 @@ rust::String Session::add(lt::add_torrent_params params, std::string const& id, 
 	params.flags &= ~lt::torrent_flags::auto_managed;
 	params.flags |= lt::torrent_flags::duplicate_is_error;
 	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_removing.count(id)) throw std::invalid_argument("这个种子还在移除中，移除完才能再加：" + id);
 	lt::torrent_handle h = m_session.add_torrent(std::move(params));
 	m_handles[id] = h;
 	m_ids[h] = id;
@@ -202,6 +203,7 @@ Status Session::status(rust::Str id) const {
 	out.state = static_cast<std::uint8_t>(s.state);
 	out.has_metadata = s.has_metadata;
 	out.paused = static_cast<bool>(s.flags & lt::torrent_flags::paused);
+	out.held = static_cast<bool>(s.flags & lt::torrent_flags::upload_mode);
 	out.name = text_of(s.name);
 	out.total_wanted = s.total_wanted;
 	out.total_wanted_done = s.total_wanted_done;
@@ -242,10 +244,21 @@ void Session::pause(rust::Str id) const { handle(id).pause(lt::torrent_handle::g
 void Session::resume(rust::Str id) const { handle(id).resume(); }
 
 void Session::remove(rust::Str id, bool delete_files) const {
-	lt::torrent_handle h = handle(id);
-	m_session.remove_torrent(h, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+	// 整个过程持有锁：别的线程不能在这期间加入同一个种子
 	std::lock_guard<std::mutex> lock(m_mutex);
-	m_handles.erase(string_of(id));
+	std::string const key = string_of(id);
+	auto found = m_handles.find(key);
+	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
+	m_session.remove_torrent(found->second, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
+	m_handles.erase(found);
+	m_removing[key] = delete_files;
+}
+
+void Session::removed(std::string const& id, bool files_settled) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_removing.find(id);
+	// 不删文件的在移除的事件时就移除完了；删文件的要等删的结果
+	if (found != m_removing.end() && (files_settled || !found->second)) m_removing.erase(found);
 }
 
 void Session::save_resume_data(rust::Str id) const {
@@ -286,11 +299,17 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::file_error_alert>(a)) {
 			out.push_back(alert_of(AlertKind::FileError, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::torrent_removed_alert>(a)) {
-			out.push_back(alert_of(AlertKind::Removed, *a, id_of(t->handle)));
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::Removed, *a, id));
+			removed(id, false);
 		} else if (auto* t = lt::alert_cast<lt::torrent_deleted_alert>(a)) {
-			out.push_back(alert_of(AlertKind::Deleted, *a, id_of(t->handle)));
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::Deleted, *a, id));
+			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::torrent_delete_failed_alert>(a)) {
-			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id_of(t->handle)));
+			std::string const id = id_of(t->handle);
+			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
+			removed(id, true);
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {

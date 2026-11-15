@@ -151,6 +151,26 @@ fn selected_files_download_and_resume_without_peers() {
         .unwrap();
     wait_until(&restored, Duration::from_secs(20), |s| done(s, &id));
     assert_eq!(restored.status(&id).unwrap().peers, 0);
+    // 移除完（移除的事件）之前不许再加同一个种子，之后可以
+    restored.remove(&id, false).unwrap();
+    assert!(restored.status(&id).is_err());
+    assert!(
+        restored
+            .add_resume(&resume, &id, path_str(&fetch_dir))
+            .is_err()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !restored
+        .pop_alerts(100)
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::Removed && a.torrent == id.as_str())
+    {
+        assert!(Instant::now() < deadline, "没等到移除的事件");
+    }
+    restored
+        .add_resume(&resume, &id, path_str(&fetch_dir))
+        .unwrap();
     assert!(
         local_session()
             .add_resume(b"not bencode", &id, path_str(&fetch_dir))
@@ -235,8 +255,11 @@ fn a_magnet_link_downloads_from_a_local_seed() {
         let status = s.status(&fetching).unwrap();
         status.has_metadata && status.state() == Some(State::Downloading)
     });
-    assert_eq!(fetcher.status(&fetching).unwrap().total_wanted_done, 0);
+    let held = fetcher.status(&fetching).unwrap();
+    assert!(held.held);
+    assert_eq!(held.total_wanted_done, 0);
     fetcher.start(&fetching).unwrap();
+    assert!(!fetcher.status(&fetching).unwrap().held);
     fetcher
         .connect_peer(&fetching, "127.0.0.1", seeder.listen_port())
         .unwrap();
