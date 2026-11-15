@@ -115,11 +115,7 @@ fn selected_files_download_and_resume_without_peers() {
     wait_until(&fetcher, Duration::from_secs(60), |s| done(s, &id));
     assert_eq!(fetcher.status(&id).unwrap().total_wanted, 100_000 + 250_000);
     for (path, data) in [&files[0], &files[2]] {
-        assert_eq!(
-            &std::fs::read(fetch_dir.join(path)).unwrap(),
-            data,
-            "{path}"
-        );
+        assert_file(&fetch_dir, path, data);
     }
     assert!(!fetch_dir.join("album/b.bin").exists());
 
@@ -245,6 +241,54 @@ fn wait_until(session: &Session, limit: Duration, mut done: impl FnMut(&Session)
     }
 }
 
+/// `dir` 下的 `relative`（`/` 分隔）是 `expected`：不在时列出 `dir` 下实际有的，不同时报两边的长度与第一个不同的位置
+/// （整个内容打出来太长，CI 的日志里看不到）。
+fn assert_file(dir: &Path, relative: &str, expected: &[u8]) {
+    let path = relative
+        .split('/')
+        .fold(dir.to_path_buf(), |path, part| path.join(part));
+    let actual = std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "读不出 {}（{error}）；{} 下有：{:?}",
+            path.display(),
+            dir.display(),
+            tree(dir)
+        )
+    });
+    if actual != expected {
+        let first = actual.iter().zip(expected).position(|(a, b)| a != b);
+        panic!(
+            "{relative} 的内容不对：{} 字节，应为 {} 字节；第一个不同在 {first:?}",
+            actual.len(),
+            expected.len()
+        );
+    }
+}
+
+/// `dir` 下各文件的相对路径与字节数。
+fn tree(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => pending.push(path),
+                Ok(meta) => found.push((
+                    path.strip_prefix(dir).unwrap_or(&path).to_path_buf(),
+                    meta.len(),
+                )),
+                Err(_) => {}
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("临时目录的路径是 UTF-8")
 }
@@ -299,10 +343,7 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     assert_eq!(status.name, "sample.bin");
     assert_eq!(status.total_wanted, i64::try_from(content.len()).unwrap());
     assert_eq!(status.reachable_pieces, status.pieces);
-    assert_eq!(
-        std::fs::read(fetch_dir.join("sample.bin")).unwrap(),
-        content
-    );
+    assert_file(&fetch_dir, "sample.bin", &content);
 
     drop(fetcher);
     drop(seeder);
