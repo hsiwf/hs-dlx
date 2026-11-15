@@ -387,6 +387,28 @@ impl Service {
         Ok(())
     }
 
+    /// 诊断在下或做种的 BT 任务（见 [`crate::Check`]）：要一次 BT 会话的统计并查种子与 tracker 的状况。不是在下或做种
+    /// 的 BT 任务时报 [`Error::InvalidInput`]（BT 会话还没建也是），统计 10 秒内没到时报 [`Error::Torrent`]。返回的
+    /// 句柄在任何执行器上都可等待。
+    pub fn diagnose(&self, id: TaskId) -> JoinHandle<Result<Vec<crate::Check>, Error>> {
+        let shared = self.shared.clone();
+        self.runtime().spawn(async move {
+            let (spec, limit) = {
+                let mut store = lock(&shared.store);
+                let tx = store.transaction()?;
+                let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+                (
+                    task.spec.torrent().cloned(),
+                    store::settings(&tx)?.upload_limit,
+                )
+            };
+            let not_running = || Error::InvalidInput("只有在下或做种的 BT 任务能诊断".to_owned());
+            let spec = spec.ok_or_else(not_running)?;
+            let engine = shared.bt.existing().ok_or_else(not_running)?;
+            torrent::diagnose(&engine, &spec.info_hash, limit).await
+        })
+    }
+
     /// 让下完的 BT 任务做种（照做种的设置，到了停的条件即停）：记下在做种，加入 BT 会话、校验已下的文件后只上传；文件
     /// 不全时停下（[`SeedEnd::Incomplete`]），不补下。开始与停下照常以 [`Event::SeedingStarted`] 与
     /// [`Event::SeedingEnded`] 报来。不是下完的 BT 任务时报 [`Error::InvalidInput`]，已在做种时报 [`Error::Seeding`]，

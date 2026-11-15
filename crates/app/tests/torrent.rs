@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hs_dlx_app::{
-    Draft, DraftKind, Error, Event, SeedEnd, Seeding, Service, Status, Store, TaskId, TorrentInfo,
-    TorrentNetwork, TorrentPhase, TorrentProgress,
+    CheckItem, CheckLevel, Draft, DraftKind, Error, Event, SeedEnd, Seeding, Service, Status,
+    Store, TaskId, TorrentInfo, TorrentNetwork, TorrentPhase, TorrentProgress,
 };
 use hs_dlx_torrent::{AddOptions, Session, SessionConfig, State, TorrentId, create_torrent};
 use tokio::runtime::Runtime;
@@ -203,6 +203,11 @@ fn a_magnet_link_downloads_the_chosen_file() {
     let done = service.task(task.id).unwrap();
     assert!(!done.seeding);
     assert_eq!(done.result.unwrap().bytes, u64::from(A));
+    // 不在下也不在做种：不能诊断
+    assert!(matches!(
+        rt.block_on(service.diagnose(task.id)).unwrap(),
+        Err(Error::InvalidInput(_))
+    ));
     assert_eq!(
         std::fs::read(folder.join("album 2").join("a.bin")).unwrap(),
         content(A, 1)
@@ -304,6 +309,14 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     // 连着节点而凑不齐，持续一阵才算资源不足
     let scarce = rt.block_on(until(&mut events, task.id, |progress| progress.scarce));
     assert_eq!(scarce, None, "继续后的任务停下了");
+
+    // 诊断：在回环地址上监听着；测试的会话不开 DHT，种子里没有 tracker
+    let checks = rt.block_on(service.diagnose(task.id)).unwrap().unwrap();
+    let level = |item| checks.iter().find(|c| c.item == item).unwrap().level;
+    assert_eq!(checks.len(), 7);
+    assert_eq!(level(CheckItem::Listen), CheckLevel::Ok);
+    assert_eq!(level(CheckItem::Dht), CheckLevel::Bad);
+    assert_eq!(level(CheckItem::Trackers), CheckLevel::Warn);
 
     // 根里有用户自己放的文件：删不干净，写明留下了什么，任务留着
     let root = folder.join("album");

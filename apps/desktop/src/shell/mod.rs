@@ -100,6 +100,8 @@ pub struct Shell {
     confirm_discard: Option<TaskId>,
     /// 正在改请求头的停着的任务与编辑框
     editing_headers: Option<(TaskId, Entity<HeadersEditor>)>,
+    /// BT 任务的诊断（见 task_view 的诊断一节）
+    diagnosis: Option<task_view::Diagnosis>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,6 +178,7 @@ impl Shell {
             standby_proxy: Ok(hs_m3u8_core::Proxy::System),
             confirm_discard: None,
             editing_headers: None,
+            diagnosis: None,
             _subscriptions: vec![typed, activated, changed],
         };
         shell.refresh_clipboard(cx);

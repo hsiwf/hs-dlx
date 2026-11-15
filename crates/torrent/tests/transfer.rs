@@ -461,6 +461,24 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     let status = fetcher.status(&fetching).unwrap();
     assert!(status.finished);
     assert_eq!(status.total_wanted, i64::try_from(content.len()).unwrap());
+    // 网络状况：在回环地址上监听着，没开 DHT（统计过后为 0 个节点），没映射端口；种子里没有 tracker
+    let network = fetcher.network();
+    assert_ne!(network.listen_port, 0);
+    assert_eq!(network.dht_nodes, -1, "还没统计过");
+    fetcher.request_stats();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fetcher
+        .pop_alerts(100)
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::Stats)
+    {
+        assert!(Instant::now() < deadline, "没等到统计");
+    }
+    assert_eq!(fetcher.network().dht_nodes, 0);
+    assert_eq!((network.upnp_port, network.natpmp_port), (0, 0));
+    assert!(fetcher.trackers(&fetching).unwrap().is_empty());
+    assert_eq!(status.swarm_seeds, -1);
     // 做种的一方累计上传了全部内容（libtorrent 每秒统计一次）
     let sent = i64::try_from(content.len()).unwrap();
     wait_until(&seeder, Duration::from_secs(10), |s| {

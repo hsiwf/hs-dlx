@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, linear_color_stop,
-    linear_gradient, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
+    linear_color_stop, linear_gradient, px,
 };
+use hs_dlx_app::{Check, CheckLevel, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
@@ -35,6 +36,13 @@ const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
 pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA, 0.);
+
+/// 一个 BT 任务的诊断：在诊断中，或诊断的结果（诊断不了时为原因）。
+pub(super) struct Diagnosis {
+    id: TaskId,
+    result: Option<Result<Vec<Check>, String>>,
+    _running: Task<()>,
+}
 
 /// 检查面板底栏里的操作：最该按的一个与其余的。
 struct Foot {
@@ -154,6 +162,9 @@ impl Shell {
         if live {
             body.push(live_view::legend(row).into_any_element());
         }
+        if let Some(section) = self.diagnosis_section(row, cx) {
+            body.push(section.into_any_element());
+        }
         body.push(signals(&row.signals).into_any_element());
         let Foot { primary, rest } = self.foot(row, cx);
         let mut foot: Vec<AnyElement> = Vec::new();
@@ -172,6 +183,78 @@ impl Shell {
             );
         }
         ui::inspector(row.task.spec.title.clone(), host, body, foot)
+    }
+
+    /// 在下或做种的 BT 任务的诊断一节：没诊断过时是「诊断」按钮，诊断中写在诊断，诊断过的逐项列出结论（可再诊断）。
+    fn diagnosis_section(&self, row: &Row, cx: &Context<Self>) -> Option<Div> {
+        let active = row.task.status == Status::Running || row.task.seeding;
+        if row.task.spec.torrent().is_none() || !active {
+            return None;
+        }
+        let id = row.task.id;
+        let shown = self
+            .diagnosis
+            .as_ref()
+            .filter(|diagnosis| diagnosis.id == id);
+        let button = |label: &'static str| {
+            ui::button(
+                "diagnose",
+                label,
+                Tone::Plain,
+                cx.listener(move |this, _, _, cx| this.diagnose(id, cx)),
+            )
+        };
+        let body: AnyElement = match shown.map(|diagnosis| &diagnosis.result) {
+            None => button("诊断网络与节点").into_any_element(),
+            Some(None) => ui::note("在诊断…", false).into_any_element(),
+            Some(Some(Err(reason))) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(ui::error_text(reason.clone()))
+                .child(button("再诊断一次"))
+                .into_any_element(),
+            Some(Some(Ok(checks))) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .children(checks.iter().map(check_line))
+                .child(button("再诊断一次"))
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(ui::caption("诊断"))
+                .child(body),
+        )
+    }
+
+    /// 诊断 BT 任务 `id`，结果写进诊断一节；之前的结果作废。
+    fn diagnose(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        let handle = self.tasks.read(cx).service().diagnose(id);
+        let running = cx.spawn(async move |this, cx| {
+            let result = match handle.await {
+                Ok(Ok(checks)) => Ok(checks),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(join) => Err(format!("诊断中途出错：{join}")),
+            };
+            // 诊断期间窗口关掉时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                if let Some(diagnosis) = this.diagnosis.as_mut().filter(|d| d.id == id) {
+                    diagnosis.result = Some(result);
+                    cx.notify();
+                }
+            });
+        });
+        self.diagnosis = Some(Diagnosis {
+            id,
+            result: None,
+            _running: running,
+        });
+        cx.notify();
     }
 
     /// 正在改这个任务的请求头时，检查面板最上面的编辑卡片。
@@ -600,6 +683,29 @@ fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cell("大小", format::bytes(wanted)),
         ],
     }
+}
+
+/// 诊断的一项：按结论着色的圆点与说明。
+fn check_line(check: &Check) -> AnyElement {
+    let color = match check.level {
+        CheckLevel::Ok => theme::accent(),
+        CheckLevel::Warn => theme::alpha(theme::warn(), 0.55),
+        CheckLevel::Bad => theme::warn(),
+    };
+    div()
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .child(div().pt(px(6.)).child(ui::dot(color, 7.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(13.))
+                .line_height(px(ui::TEXT_LINE))
+                .child(check.text.clone()),
+        )
+        .into_any_element()
 }
 
 /// 输出所在的目录：占着输出路径的东西就在里面。

@@ -59,6 +59,11 @@ mod ffi {
         finished_seconds: i64,
         /// 选了的文件都有了
         finished: bool,
+        /// 私有种子（只经种子里的 tracker 找节点）；没有种子信息时为否
+        private_torrent: bool,
+        /// tracker 报的整个种子的做种与在下的人数；-1 为没报
+        swarm_seeds: i32,
+        swarm_leechers: i32,
         /// 下载与上传的速度，字节每秒，只算内容
         download_rate: i32,
         upload_rate: i32,
@@ -109,6 +114,45 @@ mod ffi {
         PortMapFailed,
         /// tracker 回了错误或连不上：`message` 里有 tracker 的地址与原因
         TrackerError,
+        /// [`Session::request_stats`] 要的统计到了，[`Session::network`] 里已是新的
+        Stats,
+    }
+
+    /// 会话的网络状况：监听、端口映射、DHT 与有没有节点从外面连进来。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct NetworkStatus {
+        /// 在监听的端口；0 为没在监听
+        listen_port: u16,
+        /// 最近一次监听失败的说明（英文）；没失败过为空
+        listen_error: String,
+        /// UPnP 映射到的外部端口；0 为没映射成
+        upnp_port: u16,
+        /// UPnP 最近一次映射失败的说明（英文）；没失败过为空
+        upnp_error: String,
+        /// NAT-PMP（或 PCP）映射到的外部端口与最近一次失败的说明，同上
+        natpmp_port: u16,
+        natpmp_error: String,
+        /// DHT 路由表里的节点数；-1 为还没统计过（[`Session::request_stats`]）
+        dht_nodes: i64,
+        /// 有过节点从外面连进来（统计过才知道）
+        incoming: bool,
+    }
+
+    /// 种子的一个 tracker 此刻的状况。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TrackerState {
+        url: String,
+        /// 最近一次通告成功了
+        working: bool,
+        /// 正在通告
+        updating: bool,
+        /// 连续失败的次数
+        fails: i32,
+        /// tracker 回的错误或警告，或连不上的原因（英文）；没有时为空
+        message: String,
+        /// tracker 报的做种与在下的人数；-1 为没报
+        seeds: i32,
+        leechers: i32,
     }
 
     /// 种子里的一个文件（不含对齐用的填充文件）。
@@ -198,6 +242,9 @@ mod ffi {
         fn save_resume_data(self: &Session, id: &str) -> Result<()>;
         fn listen_port(self: &Session) -> u16;
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
+        fn network(self: &Session) -> NetworkStatus;
+        fn request_stats(self: &Session);
+        fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
@@ -206,7 +253,10 @@ mod ffi {
     }
 }
 
-pub use ffi::{AddOptions, Alert, AlertKind, FileEntry, Removal, SessionConfig, Status};
+pub use ffi::{
+    AddOptions, Alert, AlertKind, FileEntry, NetworkStatus, Removal, SessionConfig, Status,
+    TrackerState,
+};
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
 // messages to the network thread」）；C++ 那一层自己的状态（种子表、取事件）各有一把锁。
@@ -380,6 +430,21 @@ impl Session {
     /// 改整个会话的上传限速，字节每秒；0 为不限。
     pub fn set_upload_limit(&self, bytes_per_second: i32) {
         self.inner().set_upload_limit(bytes_per_second);
+    }
+
+    /// 网络状况（监听与端口映射随事件更新，DHT 与连入要 [`Session::request_stats`] 之后才新）。
+    pub fn network(&self) -> NetworkStatus {
+        self.inner().network()
+    }
+
+    /// 要一次会话的统计（DHT 的节点数、有没有节点连进来），到了以 [`AlertKind::Stats`] 报来。
+    pub fn request_stats(&self) {
+        self.inner().request_stats();
+    }
+
+    /// 种子的各 tracker 此刻的状况；没有这个种子时报错。
+    pub fn trackers(&self, id: &TorrentId) -> Result<Vec<TrackerState>, Error> {
+        Ok(self.inner().trackers(id.as_str())?)
     }
 
     /// 实际监听的端口；还没监听成功时为 0。

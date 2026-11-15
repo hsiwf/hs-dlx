@@ -2,6 +2,7 @@
 //! hs-dlx-torrent（BT）之上，不依赖界面框架。
 
 pub mod curl;
+mod diagnosis;
 mod error;
 mod failure;
 mod naming;
@@ -13,6 +14,7 @@ mod store;
 mod task;
 mod torrent;
 
+pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
 pub use failure::{Failure, FailureKind, not_a_playlist};
 pub use naming::{file_name, task_title, title_of};

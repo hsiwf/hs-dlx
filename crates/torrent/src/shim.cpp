@@ -15,6 +15,7 @@
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/session_params.hpp>
+#include <libtorrent/session_stats.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/write_resume_data.hpp>
@@ -235,6 +236,10 @@ Status Session::status(rust::Str id) const {
 	out.all_time_upload = s.all_time_upload;
 	out.finished_seconds = s.finished_duration.count();
 	out.finished = s.is_finished;
+	std::shared_ptr<lt::torrent_info const> const info = h.torrent_file();
+	out.private_torrent = info && info->priv();
+	out.swarm_seeds = s.num_complete;
+	out.swarm_leechers = s.num_incomplete;
 	out.downloaded = s.total_payload_download;
 	out.download_rate = s.download_payload_rate;
 	out.upload_rate = s.upload_payload_rate;
@@ -306,6 +311,52 @@ void Session::save_resume_data(rust::Str id) const {
 
 std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
 
+NetworkStatus Session::network() const {
+	std::lock_guard<std::mutex> lock(m_network_mutex);
+	NetworkStatus out;
+	out.listen_port = m_network.listening ? m_session.listen_port() : 0;
+	out.listen_error = text_of(m_network.listen_error);
+	out.upnp_port = m_network.upnp_port;
+	out.upnp_error = text_of(m_network.upnp_error);
+	out.natpmp_port = m_network.natpmp_port;
+	out.natpmp_error = text_of(m_network.natpmp_error);
+	out.dht_nodes = m_network.dht_nodes;
+	out.incoming = m_network.incoming;
+	return out;
+}
+
+void Session::request_stats() const { m_session.post_session_stats(); }
+
+rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
+	rust::Vec<TrackerState> out;
+	for (lt::announce_entry const& entry : handle(id).trackers()) {
+		TrackerState state;
+		state.url = text_of(entry.url);
+		state.working = false;
+		state.updating = false;
+		state.fails = 0;
+		state.seeds = -1;
+		state.leechers = -1;
+		// 各监听地址、v1 与 v2 各通告一次：有一次成功就算正常，人数取最多的，说明取第一条
+		for (lt::announce_endpoint const& endpoint : entry.endpoints) {
+			for (lt::announce_infohash const& ih : endpoint.info_hashes) {
+				if (ih.start_sent && ih.fails == 0) state.working = true;
+				if (ih.updating) state.updating = true;
+				state.fails = std::max(state.fails, static_cast<std::int32_t>(ih.fails));
+				state.seeds = std::max(state.seeds, ih.scrape_complete);
+				state.leechers = std::max(state.leechers, ih.scrape_incomplete);
+				if (state.message.empty()) {
+					std::string const message = !ih.message.empty() ? ih.message
+						: ih.last_error ? ih.last_error.message() : std::string();
+					state.message = text_of(message);
+				}
+			}
+		}
+		out.push_back(std::move(state));
+	}
+	return out;
+}
+
 void Session::set_upload_limit(std::int32_t bytes_per_second) const {
 	lt::settings_pack pack;
 	pack.set_int(lt::settings_pack::upload_rate_limit, bytes_per_second);
@@ -365,14 +416,51 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
-		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
+		} else if (auto* t = lt::alert_cast<lt::listen_succeeded_alert>(a)) {
+			if (t->socket_type == lt::socket_type_t::tcp) {
+				std::lock_guard<std::mutex> net(m_network_mutex);
+				m_network.listening = true;
+			}
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
+			{
+				std::lock_guard<std::mutex> net(m_network_mutex);
+				m_network.listen_error = a->message();
+			}
 			out.push_back(alert_of(AlertKind::ListenFailed, *a, std::string()));
-		} else if (lt::alert_cast<lt::portmap_alert>(a)) {
+		} else if (auto* t = lt::alert_cast<lt::portmap_alert>(a)) {
+			{
+				std::lock_guard<std::mutex> net(m_network_mutex);
+				auto const port = static_cast<std::uint16_t>(t->external_port);
+				if (t->map_transport == lt::portmap_transport::upnp) {
+					m_network.upnp_port = port;
+					m_network.upnp_error.clear();
+				} else {
+					m_network.natpmp_port = port;
+					m_network.natpmp_error.clear();
+				}
+			}
 			out.push_back(alert_of(AlertKind::PortMapped, *a, std::string()));
-		} else if (lt::alert_cast<lt::portmap_error_alert>(a)) {
+		} else if (auto* t = lt::alert_cast<lt::portmap_error_alert>(a)) {
+			{
+				std::lock_guard<std::mutex> net(m_network_mutex);
+				if (t->map_transport == lt::portmap_transport::upnp) {
+					m_network.upnp_error = t->error.message();
+				} else {
+					m_network.natpmp_error = t->error.message();
+				}
+			}
 			out.push_back(alert_of(AlertKind::PortMapFailed, *a, std::string()));
+		} else if (auto* t = lt::alert_cast<lt::session_stats_alert>(a)) {
+			static int const dht_nodes = lt::find_metric_idx("dht.dht_nodes");
+			static int const incoming = lt::find_metric_idx("net.has_incoming_connections");
+			auto const counters = t->counters();
+			{
+				std::lock_guard<std::mutex> net(m_network_mutex);
+				m_network.dht_nodes = counters[dht_nodes];
+				m_network.incoming = counters[incoming] != 0;
+			}
+			out.push_back(alert_of(AlertKind::Stats, *a, std::string()));
 		}
 	}
 	return out;

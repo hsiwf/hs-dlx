@@ -19,6 +19,7 @@ use hs_dlx_torrent::{
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::diagnosis::{Check, Facts, Tracker, checks};
 use crate::{Error, Failure, FailureKind, Seeding};
 
 /// 取事件时最多等多久（毫秒）：关闭时取事件的线程最晚这么久后发现要退出。
@@ -240,6 +241,8 @@ pub(crate) struct Engine {
     routes: Mutex<HashMap<TorrentId, mpsc::UnboundedSender<Routed>>>,
     /// 每有一个种子移除了（或删完文件）就通知：等 [`Session::removing`] 变为否的在等它
     removed: Notify,
+    /// 每到一次会话的统计（[`Session::request_stats`]）就通知
+    stats: Notify,
     /// 关闭了：取事件的线程退出
     stop: AtomicBool,
 }
@@ -267,7 +270,8 @@ impl Engine {
                     let _gone = route.send(Routed::Lost);
                 }
             }
-            // 简化：监听与端口映射的结果、加入失败（同步的加入已报错）都不用，诊断时再报给界面
+            AlertKind::Stats => self.stats.notify_waiters(),
+            // 监听与端口映射的结果由绑定记下、诊断时读（Session::network）；加入失败时同步的加入已报错
             AlertKind::ListenSucceeded
             | AlertKind::ListenFailed
             | AlertKind::PortMapped
@@ -494,6 +498,7 @@ impl Bt {
             session,
             routes: Mutex::new(HashMap::new()),
             removed: Notify::new(),
+            stats: Notify::new(),
             stop: AtomicBool::new(false),
         });
         let pumped = engine.clone();
@@ -545,6 +550,13 @@ impl Bt {
                 .session
                 .set_upload_limit(limit_of(upload_limit));
         }
+    }
+
+    /// 已建的引擎；还没建会话时为 None。
+    pub fn existing(&self) -> Option<Arc<Engine>> {
+        lock(&self.running)
+            .as_ref()
+            .map(|running| running.engine.clone())
     }
 
     pub fn probe_dir(&self) -> &Path {
@@ -1165,6 +1177,61 @@ fn sweep(path: &Path) -> Vec<PathBuf> {
         left.push(path.to_path_buf());
     }
     left
+}
+
+/// 诊断种子 `info_hash`：要一次会话的统计、等它到，再查网络状况、种子的状态与 tracker；上传限速为 `upload_limit`。
+/// 种子不在会话里（没在下也没在做种）时报 [`Error::InvalidInput`]，统计 [`STEP_TIMEOUT`] 内没到时报
+/// [`Error::Torrent`]。
+pub(crate) async fn diagnose(
+    engine: &Engine,
+    info_hash: &str,
+    upload_limit: Option<NonZeroU32>,
+) -> Result<Vec<Check>, Error> {
+    let id = TorrentId::parse(info_hash)
+        .map_err(|error| Error::Corrupt(format!("种子的编号：{error}")))?;
+    let absent = |_| Error::InvalidInput("只有在下或做种的 BT 任务能诊断".to_owned());
+    let status = engine.session.status(&id).map_err(absent)?;
+    let trackers = engine.session.trackers(&id).map_err(absent)?;
+    let arrived = engine.stats.notified();
+    tokio::pin!(arrived);
+    arrived.as_mut().enable();
+    engine.session.request_stats();
+    tokio::time::timeout(STEP_TIMEOUT, arrived)
+        .await
+        .map_err(|_| Error::Torrent("10 秒内没等到 BT 会话的统计".to_owned()))?;
+    let network = engine.session.network();
+    let count = |value: i32| u32::try_from(value).ok();
+    let most =
+        |of_status: i32, of_trackers: Option<i32>| count(of_status.max(of_trackers.unwrap_or(-1)));
+    let facts = Facts {
+        listen_port: network.listen_port,
+        listen_error: network.listen_error,
+        upnp_port: network.upnp_port,
+        upnp_error: network.upnp_error,
+        natpmp_port: network.natpmp_port,
+        natpmp_error: network.natpmp_error,
+        dht_nodes: u64::try_from(network.dht_nodes).ok(),
+        incoming: network.incoming,
+        private: status.private_torrent,
+        seeds: most(
+            status.swarm_seeds,
+            trackers.iter().map(|tracker| tracker.seeds).max(),
+        ),
+        leechers: most(
+            status.swarm_leechers,
+            trackers.iter().map(|tracker| tracker.leechers).max(),
+        ),
+        trackers: trackers
+            .into_iter()
+            .map(|tracker| Tracker {
+                working: tracker.working,
+                fails: u32::try_from(tracker.fails).expect("连续失败的次数不为负"),
+                message: tracker.message,
+            })
+            .collect(),
+        upload_limit,
+    };
+    Ok(checks(&facts))
 }
 
 fn utf8(path: &Path) -> Result<&str, Error> {

@@ -22,6 +22,8 @@ struct Alert;
 struct FileEntry;
 struct AddOptions;
 struct Described;
+struct NetworkStatus;
+struct TrackerState;
 enum class Removal : std::uint8_t;
 
 class Session {
@@ -43,6 +45,9 @@ public:
 	void save_resume_data(rust::Str id) const;
 	std::uint16_t listen_port() const;
 	void set_upload_limit(std::int32_t bytes_per_second) const;
+	NetworkStatus network() const;
+	void request_stats() const;
+	rust::Vec<TrackerState> trackers(rust::Str id) const;
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
 
 private:
@@ -89,6 +94,21 @@ private:
 	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取
 	mutable std::mutex m_alerts_mutex;
+
+	// 取事件时记下的网络状况（见 network()）
+	struct Network {
+		bool listening = false;
+		std::string listen_error;
+		std::uint16_t upnp_port = 0;
+		std::string upnp_error;
+		std::uint16_t natpmp_port = 0;
+		std::string natpmp_error;
+		std::int64_t dht_nodes = -1;
+		bool incoming = false;
+	};
+	mutable Network m_network;
+	// 守着 m_network
+	mutable std::mutex m_network_mutex;
 };
 
 std::unique_ptr<Session> new_session(SessionConfig const& config);
