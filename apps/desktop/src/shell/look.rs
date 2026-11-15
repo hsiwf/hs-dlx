@@ -92,7 +92,7 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             Look {
                 state: state("已暂停"),
                 color: theme::muted(),
-                ticks: ticks(theme::cyan_dim()),
+                ticks: ticks(theme::accent_dim()),
                 short: if known && !recording {
                     big.clone()
                 } else {
@@ -102,7 +102,7 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 line,
                 hint: None,
                 fraction,
-                orb: theme::cyan_dim(),
+                orb: theme::accent_dim(),
             }
         }
         Stopped::Failed(failure) => {
@@ -110,13 +110,13 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             let (_, line) = kept_text(row, amount.as_ref(), recording, false);
             Look {
                 state: state("需要处理"),
-                color: theme::orange(),
+                color: theme::warn(),
                 ticks: ticks(theme::finished()),
                 big,
                 line,
                 hint: Some(hint),
                 fraction,
-                orb: theme::orange(),
+                orb: theme::warn(),
                 short: "!".to_owned(),
             }
         }
@@ -203,7 +203,7 @@ fn running(row: &Row, amount: Amount) -> Look {
         let ticks = Ticks::of(amount.total, amount.done, false);
         return Look {
             state: kind.to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks {
                 lit: ticks.count,
                 written: (written * ticks.count as f32) as usize,
@@ -216,49 +216,49 @@ fn running(row: &Row, amount: Amount) -> Look {
             ),
             hint: None,
             fraction: written,
-            orb: theme::cyan_pale(),
+            orb: theme::accent_pale(),
             short: percent,
         };
     }
     if row.task.write_only {
         return Look {
             state: "准备写出".to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks::of(0, 0, true),
             big: format::clock(amount.duration.max(row.recorded_before_writing)),
             line: "不联网，只写出已录的".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::cyan(),
+            orb: theme::accent(),
             short: "…".to_owned(),
         };
     }
     if row.recording() {
         return Look {
             state: "● 录制中".to_owned(),
-            color: theme::red(),
+            color: theme::live(),
             ticks: Ticks {
-                color: theme::red(),
+                color: theme::live(),
                 ..Ticks::of(amount.total, amount.done, true)
             },
             big: format::clock(amount.duration),
             line: format!("{} 片 · {}", amount.done, format::bytes(amount.bytes)),
             hint: None,
             fraction: 1.0,
-            orb: theme::red(),
+            orb: theme::live(),
             short: "REC".to_owned(),
         };
     }
     if amount.total == 0 {
         return Look {
             state: "准备中".to_owned(),
-            color: theme::cyan(),
+            color: theme::accent(),
             ticks: Ticks::of(0, 0, true),
             big: "—".to_owned(),
             line: "拉取播放列表".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::cyan(),
+            orb: theme::accent(),
             short: "…".to_owned(),
         };
     }
@@ -269,13 +269,13 @@ fn running(row: &Row, amount: Amount) -> Look {
         .is_some_and(|p| !p.retrying.is_empty());
     Look {
         state: "下载中".to_owned(),
-        color: theme::cyan(),
+        color: theme::accent(),
         ticks,
         big: percent(amount.fraction()),
         line: format!("{} / {} 片", amount.done, amount.total),
         hint: None,
         fraction: amount.fraction(),
-        orb: theme::cyan(),
+        orb: theme::accent(),
         short: percent(amount.fraction()),
     }
 }

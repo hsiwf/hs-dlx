@@ -27,7 +27,7 @@ use crate::preference::StoredPreference;
 use crate::store::{self, Store};
 use crate::{
     Draft, DraftKind, Error, Failure, Finished, HlsSpec, Kind, OutputSpec, Settings, Status, Task,
-    TaskId, TaskSpec, naming,
+    TaskId, TaskSpec, Theme, naming,
 };
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
@@ -218,6 +218,15 @@ impl Service {
         let mut store = lock(&self.shared.store);
         let tx = store.transaction()?;
         store::set_folder(&tx, folder)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 记下外观主题。
+    pub fn set_theme(&self, theme: Theme) -> Result<(), Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_theme(&tx, theme)?;
         tx.commit()?;
         Ok(())
     }

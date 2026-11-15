@@ -54,36 +54,35 @@ impl Shell {
         let charged = link.is_some();
         let figure = dial::figure(move |bounds, window, _| {
             if charged {
-                let ticks = ring::Ticks::full(ring::COMET_TICKS, theme::cyan(), true);
+                let ticks = ring::Ticks::full(ring::COMET_TICKS, theme::accent(), true);
                 ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
             } else {
-                ring::paint_comet(bounds, ring::RADIUS, head, theme::cyan(), window)
+                ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
             }
         });
         let readout = match &link {
             Some(url) if links::stream_url(url.as_str()).is_some() => dial::readout(
                 "认出 m3u8 地址",
-                theme::cyan(),
+                theme::accent(),
                 dial::Big::Phrase(url.host_str().unwrap_or_default().to_owned()),
                 "回车探测清晰度与音轨",
             ),
             Some(url) => dial::readout(
                 "认出链接",
-                theme::cyan(),
+                theme::accent(),
                 dial::Big::Phrase(url.host_str().unwrap_or_default().to_owned()),
                 "回车探测；是网页就在后台找视频流",
             ),
             None => dial::readout(
                 "就绪",
-                theme::cyan(),
+                theme::accent(),
                 dial::Big::Phrase("粘贴链接开始".to_owned()),
                 "m3u8 地址，或有视频的网页",
             ),
         };
         let figure = dial::lit_dial(
-            theme::cyan(),
+            theme::accent(),
             dial::LIGHT_STRENGTH + breath + lift,
-            dial::Backdrop::Guides,
             figure,
             readout,
         );

@@ -6,6 +6,7 @@ members = [
     "crates/instance",
     "crates/macos",
     "crates/relay",
+    "crates/scene",
     "crates/torrent",
     "crates/webview",
 ]

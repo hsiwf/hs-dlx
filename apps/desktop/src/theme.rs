@@ -1,8 +1,43 @@
 //! 界面配色。底色由暗到亮分三层：窗口底色（中间的舞台直接在它上面；输入框也用它，在面板上显得凹下去）、面板（任务栏、
-//! 检查面板、整页面板）、面板里的卡片与读数格。颜色即含义：发光的青色为在进行与可操作，橙色为重试与要处理的问题，红色
-//! 为录制与失败级别的信号。
+//! 检查面板、整页面板）、面板里的卡片与读数格。颜色即含义：发光的主色为在进行与可操作，警告色为重试与要处理的问题，
+//! 直播色为录制，失败级别的信号另有一色。
+//!
+//! 主色、警告色与直播色随主题（[`Theme`]）：日蚀为青色与深蓝，血月为火红与暗红；中性的底色、线与字两套共用。主题是
+//! 整个应用的状态（只有一个窗口），启动时按设置由 [`set`] 定，在设置页换了之后要让窗口重画。
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use gpui_kit::{Hsla, rgb};
+pub use hs_dlx_app::Theme;
+
+/// 当前主题：0 为日蚀，1 为血月。
+static CURRENT: AtomicU8 = AtomicU8::new(0);
+
+/// 换主题；之后取的颜色都按它。
+pub fn set(theme: Theme) {
+    let code = match theme {
+        Theme::Eclipse => 0,
+        Theme::BloodMoon => 1,
+    };
+    CURRENT.store(code, Ordering::Relaxed);
+}
+
+/// 当前主题。
+pub fn current() -> Theme {
+    match CURRENT.load(Ordering::Relaxed) {
+        0 => Theme::Eclipse,
+        _ => Theme::BloodMoon,
+    }
+}
+
+/// 按当前主题取 `eclipse` 或 `blood_moon` 里的一色。
+fn pick(eclipse: u32, blood_moon: u32) -> Hsla {
+    rgb(match current() {
+        Theme::Eclipse => eclipse,
+        Theme::BloodMoon => blood_moon,
+    })
+    .into()
+}
 
 /// 窗口底色：中间的舞台直接在它上面
 pub fn ground() -> Hsla {
@@ -90,22 +125,22 @@ pub fn muted() -> Hsla {
 }
 
 /// 主色：进度、选中、每屏最该按的那一个
-pub fn cyan() -> Hsla {
-    rgb(0x5BE7F5).into()
+pub fn accent() -> Hsla {
+    pick(0x5BE7F5, 0xFF6A3D)
 }
 
 /// 主色的浅一档：主色悬停时、写出阶段
-pub fn cyan_pale() -> Hsla {
-    rgb(0xA8F3FA).into()
+pub fn accent_pale() -> Hsla {
+    pick(0xA8F3FA, 0xFFC59E)
 }
 
 /// 主色的暗一档：不在动的进度（暂停）、正在下的刻度
-pub fn cyan_dim() -> Hsla {
-    rgb(0x2C7F88).into()
+pub fn accent_dim() -> Hsla {
+    pick(0x2C7F88, 0x8A2E18)
 }
 
-/// 橙色实心上的文字
-pub fn on_amber() -> Hsla {
+/// 警告色实心上的文字
+pub fn on_warn() -> Hsla {
     rgb(0x1F1204).into()
 }
 
@@ -114,9 +149,9 @@ pub fn warn_ground() -> Hsla {
     rgb(0x140F08).into()
 }
 
-/// 青色实心上的文字
-pub fn on_cyan() -> Hsla {
-    rgb(0x04161A).into()
+/// 主色实心上的文字
+pub fn on_accent() -> Hsla {
+    pick(0x04161A, 0x1F0A04)
 }
 
 /// 直播钟面上相邻会话交替的第二种颜色（第一种是主色）
@@ -129,14 +164,14 @@ pub fn written() -> Hsla {
     rgb(0xE8ECF5).into()
 }
 
-/// 要留意的：重试、失败、要用户处理的提示
-pub fn orange() -> Hsla {
-    rgb(0xFFA24C).into()
+/// 要留意的：重试、失败、要用户处理的提示；血月下为琥珀黄，与火红的主色分开
+pub fn warn() -> Hsla {
+    pick(0xFFA24C, 0xFFD25E)
 }
 
-/// 直播录制
-pub fn red() -> Hsla {
-    rgb(0xFF5A5F).into()
+/// 直播录制；血月下偏玫红，与火红的主色分开
+pub fn live() -> Hsla {
+    pick(0xFF5A5F, 0xFF4D8A)
 }
 
 /// 不再需要注意的：已完成、作废的进度
@@ -146,7 +181,7 @@ pub fn finished() -> Hsla {
 
 /// 要留意级别的信号的字
 pub fn signal_warn() -> Hsla {
-    rgb(0xFFC48C).into()
+    pick(0xFFC48C, 0xFFE29A)
 }
 
 /// 失败级别的信号的字

@@ -185,7 +185,7 @@ impl Render for Dock {
             .bg(theme::deck())
             .border_1()
             .border_color(if focused {
-                theme::cyan_dim()
+                theme::accent_dim()
             } else {
                 theme::edge()
             })
@@ -198,9 +198,9 @@ impl Render for Dock {
                     inset: false,
                 }]
                 .into_iter()
-                // 输入时外面一圈淡青的光环
+                // 输入时外面一圈淡淡的主色光环
                 .chain(focused.then(|| gpui_kit::BoxShadow {
-                    color: theme::alpha(theme::cyan(), 0.1),
+                    color: theme::alpha(theme::accent(), 0.1),
                     offset: gpui_kit::point(px(0.), px(0.)),
                     blur_radius: px(0.),
                     spread_radius: px(3.),
@@ -208,7 +208,7 @@ impl Render for Dock {
                 }))
                 .collect(),
             )
-            .child(ui::dot(theme::cyan(), 8.))
+            .child(ui::dot(theme::accent(), 8.))
             .child(div().flex_1().min_w_0().text_size(px(14.)).child(
                 Input::new(&self.input).appearance(false).on_paste({
                     let dock = cx.entity().downgrade();

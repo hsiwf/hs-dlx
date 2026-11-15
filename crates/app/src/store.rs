@@ -13,18 +13,19 @@ use hs_m3u8_core::{Proxy, Url};
 use crate::preference::StoredPreference;
 use crate::{
     Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
-    Status, Task, TaskId, TaskSpec, naming,
+    Status, Task, TaskId, TaskSpec, Theme, naming,
 };
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
     rebuild_with_kinds,
+    add_theme,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -788,6 +789,15 @@ fn named_utf8(path: &Path) -> Result<String, Error> {
     utf8(path)
 }
 
+/// 第 5 版：设置加外观主题，写法见 [`theme_code`]，没设过为日蚀。
+fn add_theme(tx: &Transaction<'_>) -> Result<(), Error> {
+    tx.execute_batch(
+        "ALTER TABLE settings ADD COLUMN
+            theme TEXT NOT NULL DEFAULT 'eclipse' CHECK (theme IN ('eclipse', 'blood-moon'));",
+    )?;
+    Ok(())
+}
+
 /// 路径在表里的写法：须是 UTF-8（核心对输出路径的要求相同）。
 fn utf8(path: &Path) -> Result<String, Error> {
     path.to_str()
@@ -795,12 +805,12 @@ fn utf8(path: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::InvalidInput(format!("路径不是 UTF-8：{}", path.display())))
 }
 
-/// 读出设置；保存目录不是绝对路径、代理认不出时报 [`Error::Corrupt`]。
+/// 读出设置；保存目录不是绝对路径、代理或主题认不出时报 [`Error::Corrupt`]。
 pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
-    let (folder, proxy): (Option<String>, String) = tx.query_row(
-        "SELECT folder, proxy FROM settings WHERE id = 1",
+    let (folder, proxy, theme): (Option<String>, String, String) = tx.query_row(
+        "SELECT folder, proxy, theme FROM settings WHERE id = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let folder = folder
         .map(PathBuf::from)
@@ -814,6 +824,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
     Ok(Settings {
         folder,
         proxy: parse_proxy(&proxy)?,
+        theme: parse_theme(&theme)?,
     })
 }
 
@@ -833,6 +844,32 @@ pub fn set_proxy(tx: &Transaction<'_>, proxy: &Proxy) -> Result<(), Error> {
         params![proxy_code(proxy)],
     )?;
     Ok(())
+}
+
+/// 记下外观主题。
+pub fn set_theme(tx: &Transaction<'_>, theme: Theme) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET theme = ?1 WHERE id = 1",
+        params![theme_code(theme)],
+    )?;
+    Ok(())
+}
+
+/// 主题在存储里的写法：`eclipse`、`blood-moon`。存储格式的一部分，表上有 CHECK。
+fn theme_code(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Eclipse => "eclipse",
+        Theme::BloodMoon => "blood-moon",
+    }
+}
+
+/// 读回 [`theme_code`] 的写法；认不出时报 [`Error::Corrupt`]。
+fn parse_theme(code: &str) -> Result<Theme, Error> {
+    match code {
+        "eclipse" => Ok(Theme::Eclipse),
+        "blood-moon" => Ok(Theme::BloodMoon),
+        _ => Err(Error::Corrupt("设置里的外观主题".to_owned())),
+    }
 }
 
 /// 代理在存储里的写法：`system`、`direct`，或 `url:<代理地址>`（明文，可带口令，与请求头一样只有本人可读写）。
@@ -1257,11 +1294,17 @@ mod tests {
         set_folder(&tx, &m("影片")).unwrap();
         let proxy = Proxy::Url(hs_m3u8_core::Url::parse("http://127.0.0.1:7890").unwrap());
         set_proxy(&tx, &proxy).unwrap();
+        set_theme(&tx, Theme::BloodMoon).unwrap();
         let read = settings(&tx).unwrap();
         assert_eq!(read.folder.as_deref(), Some(m("影片").as_path()));
         assert!(read.proxy == proxy);
+        assert_eq!(read.theme, Theme::BloodMoon);
         assert!(
             tx.execute("UPDATE settings SET proxy = 'pac' WHERE id = 1", [])
+                .is_err()
+        );
+        assert!(
+            tx.execute("UPDATE settings SET theme = 'aurora' WHERE id = 1", [])
                 .is_err()
         );
     }

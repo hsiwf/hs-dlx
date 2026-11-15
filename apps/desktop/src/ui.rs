@@ -12,7 +12,7 @@ use gpui_kit::{
     Stateful, StatefulInteractiveElement as _, Styled, Window, div, point, px,
 };
 
-use crate::theme;
+use crate::{backdrop, theme};
 
 /// 顶栏高度；macOS 的红绿灯按它垂直居中，右上角的提示从它下面开始。
 pub const TITLE_HEIGHT: f32 = 52.;
@@ -54,7 +54,7 @@ pub const fn max(a: f32, b: f32) -> f32 {
 pub enum Tone {
     /// 描边，深色底
     Plain,
-    /// 发光的青色实心：每屏最该按的那一个（在检查面板里时用主操作 [`primary`]）
+    /// 发光的主色实心：每屏最该按的那一个（在检查面板里时用主操作 [`primary`]）
     Glow,
     /// 只有文字：退出当前流程
     Ghost,
@@ -63,11 +63,11 @@ pub enum Tone {
 /// 实心的样子：按钮的三种实心，也是主操作（[`primary`]）能用的全部样子。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Solid {
-    /// 青色：每屏最该按的那一个
+    /// 主色：每屏最该按的那一个
     Glow,
-    /// 橙色：要处理时最该按的那一个
+    /// 警告色：要处理时最该按的那一个
     Amber,
-    /// 红色：停止录制
+    /// 直播色：停止录制
     Rec,
 }
 
@@ -75,16 +75,16 @@ impl Solid {
     /// 底色、悬停时的底色与上面的字色。
     fn colors(self) -> (Hsla, Hsla, Hsla) {
         match self {
-            Solid::Glow => (theme::cyan(), theme::cyan_pale(), theme::on_cyan()),
+            Solid::Glow => (theme::accent(), theme::accent_pale(), theme::on_accent()),
             Solid::Rec => (
-                theme::red(),
-                theme::alpha(theme::red(), 0.85),
+                theme::live(),
+                theme::alpha(theme::live(), 0.85),
                 gpui_kit::white(),
             ),
             Solid::Amber => (
-                theme::orange(),
-                theme::alpha(theme::orange(), 0.85),
-                theme::on_amber(),
+                theme::warn(),
+                theme::alpha(theme::warn(), 0.85),
+                theme::on_warn(),
             ),
         }
     }
@@ -218,17 +218,18 @@ pub fn caption(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// 面板：任务栏、检查面板与整页面板的外框（深一档的底、细边、大圆角）。
+/// 面板：任务栏、检查面板与整页面板的外框（细边、大圆角）；底见 [`backdrop::panel_floor`]。
 pub fn deck() -> Div {
     div()
+        .relative()
         .flex()
         .flex_col()
         .min_h_0()
         .overflow_hidden()
         .rounded(px(DECK_RADIUS))
-        .bg(theme::deck())
         .border_1()
         .border_color(theme::deck_edge())
+        .child(backdrop::panel_floor())
 }
 
 /// 检查面板：标题栏（`title` 与下面一行 `sub`）、可以滚动的正文 `body`、底栏 `foot`（当前对象的操作）。
@@ -395,7 +396,7 @@ pub enum Step {
     Waiting,
 }
 
-/// 按先后的几步：做完的实心点，正在做的带光圈，没成的橙色。
+/// 按先后的几步：做完的实心点，正在做的带光圈，没成的为警告色。
 pub fn steps(items: impl IntoIterator<Item = (SharedString, Step)>) -> Div {
     div()
         .flex()
@@ -403,23 +404,23 @@ pub fn steps(items: impl IntoIterator<Item = (SharedString, Step)>) -> Div {
         .children(items.into_iter().map(|(text, step)| {
             let marker = div().size(px(10.)).flex_none().rounded_full().border_2();
             let marker = match step {
-                Step::Done => marker.bg(theme::cyan()).border_color(theme::cyan()),
+                Step::Done => marker.bg(theme::accent()).border_color(theme::accent()),
                 Step::Now => {
                     marker
-                        .border_color(theme::cyan())
-                        .shadow(glow(theme::cyan(), 8., 0.5))
+                        .border_color(theme::accent())
+                        .shadow(glow(theme::accent(), 8., 0.5))
                 }
                 Step::Failed => {
                     marker
-                        .border_color(theme::orange())
-                        .shadow(glow(theme::orange(), 8., 0.5))
+                        .border_color(theme::warn())
+                        .shadow(glow(theme::warn(), 8., 0.5))
                 }
                 Step::Waiting => marker.border_color(theme::edge()),
             };
             let color = match step {
                 Step::Done => theme::soft(),
                 Step::Now => theme::text(),
-                Step::Failed => theme::orange(),
+                Step::Failed => theme::warn(),
                 Step::Waiting => theme::muted(),
             };
             div()
@@ -480,7 +481,7 @@ pub fn well() -> Div {
         .border_color(theme::deck_edge())
 }
 
-/// 面板里的一段说明：`warn` 时为要处理的（橙色描边、暖色底）。
+/// 面板里的一段说明：`warn` 时为要处理的（警告色描边、暖色底）。
 pub fn note(text: impl Into<SharedString>, warn: bool) -> Div {
     let note = well()
         .px(px(14.))
@@ -581,7 +582,7 @@ pub fn stage(
         .flex_1()
         .min_w(px(min_width))
         .min_h_0()
-        // 表盘的背光与待机的引导线不画出舞台
+        // 表盘的背光不画出舞台
         .overflow_hidden()
         .flex()
         .flex_col()
@@ -637,7 +638,7 @@ pub fn error_text(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(13.))
         .line_height(px(TEXT_LINE))
-        .text_color(theme::orange())
+        .text_color(theme::warn())
         .child(text.into())
 }
 
@@ -658,6 +659,6 @@ pub fn rings(size: f32, width: f32, inset: f32) -> Div {
         .relative()
         .size(px(size))
         .flex_none()
-        .child(ring(size, width, theme::cyan()))
-        .child(ring(size - inset, 2., theme::cyan_dim()))
+        .child(ring(size, width, theme::accent()))
+        .child(ring(size - inset, 2., theme::accent_dim()))
 }

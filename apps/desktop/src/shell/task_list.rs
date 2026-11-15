@@ -190,7 +190,7 @@ fn new_task_item(phase: Phase) -> impl IntoElement {
                 .rounded_full()
                 .border(px(2.5))
                 .border_dashed()
-                .border_color(theme::cyan()),
+                .border_color(theme::accent()),
         )
         .child(two_lines("新任务".to_owned(), phase.label().to_owned()))
 }

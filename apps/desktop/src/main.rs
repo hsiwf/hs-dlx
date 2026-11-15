@@ -2,6 +2,7 @@
 //! 转交给它后退出（见 hs-dlx-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
 //! main_window）。
 
+mod backdrop;
 mod dial;
 mod dock;
 mod format;
@@ -134,9 +135,11 @@ fn main() {
                     let handoffs = hs_dlx_instance::listen(&path);
                     let (service, events) = Service::new(store, MAX_REQUESTS)
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
-                    let folder = service
+                    let settings = service
                         .settings()
-                        .map_err(|error| Failure::new("启动失败", error.to_string()))?
+                        .map_err(|error| Failure::new("启动失败", error.to_string()))?;
+                    theme::set(settings.theme);
+                    let folder = settings
                         .folder
                         .or_else(default_folder)
                         .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
@@ -233,7 +236,7 @@ impl Render for Failure {
                         div()
                             .text_size(px(20.))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(theme::orange())
+                            .text_color(theme::warn())
                             .child(self.title.clone()),
                     )
                     .child(

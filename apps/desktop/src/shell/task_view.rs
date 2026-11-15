@@ -95,9 +95,9 @@ impl Shell {
                     div()
                         .id("probe-clipboard-hint")
                         .flex_none()
-                        .text_color(theme::cyan())
+                        .text_color(theme::accent())
                         .cursor_pointer()
-                        .hover(|s| s.text_color(theme::cyan_pale()))
+                        .hover(|s| s.text_color(theme::accent_pale()))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.probe_text(url.as_str(), window, cx)
                         }))
@@ -215,7 +215,7 @@ impl Shell {
         stopped_plan(failure, row.recording(), row.task.write_only, editing)
     }
 
-    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为橙色），其余在下面一行。
+    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
     fn stopped_foot(&self, row: &Row, discard: Stateful<Div>, cx: &Context<Self>) -> Foot {
         let id = row.task.id;
         let failed = matches!(row.task.status, Status::Failed(_));
@@ -293,8 +293,8 @@ impl Shell {
             if confirming {
                 button
                     .w_full()
-                    .border_color(theme::orange())
-                    .text_color(theme::orange())
+                    .border_color(theme::warn())
+                    .text_color(theme::warn())
             } else {
                 button
             }

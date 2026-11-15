@@ -307,18 +307,18 @@ impl Tray {
 }
 
 /// 托盘的环：从正上方顺时针画到 `arc`（0 到 1），其余是淡的底环；`dot` 时中间加一个实心点。macOS 上是模板图（只看
-/// 透明度，系统按菜单栏配色），别处是应用的青色，点为录制的红色。
+/// 透明度，系统按菜单栏配色），别处是应用的主色，点为直播色。
 fn ring_icon(arc: f32, dot: bool) -> Result<Icon, String> {
     let (ink, track, mark) = if cfg!(target_os = "macos") {
         ([0, 0, 0, 255], [0, 0, 0, 90], [0, 0, 0, 255])
     } else {
         (
-            rgba8(theme::cyan()),
+            rgba8(theme::accent()),
             {
                 let [r, g, b, _] = rgba8(theme::muted());
                 [r, g, b, 150]
             },
-            rgba8(theme::red()),
+            rgba8(theme::live()),
         )
     };
     Icon::from_rgba(ring(ICON, arc, dot, ink, track, mark), ICON, ICON)

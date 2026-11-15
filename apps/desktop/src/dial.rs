@@ -3,14 +3,13 @@
 
 use std::time::Duration;
 
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Div, FontWeight, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _,
     canvas, div, px,
 };
 
 use crate::ring::{self, AREA};
-use crate::{theme, ui};
+use crate::{backdrop, theme, ui};
 
 /// 圆盘离绘制区域边缘多远。
 const DISC_INSET: f32 = 70.;
@@ -43,13 +42,8 @@ pub const LIGHT_STRENGTH: f32 = 0.09;
 const FIGURE_SIZE: f32 = 66.;
 const PHRASE_SIZE: f32 = 26.;
 
-/// 表盘下面垫什么。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Backdrop {
-    Plain,
-    /// 待机时：几圈引导环与十字线（见 [`ring::paint_scope`]，超出舞台的部分由舞台裁掉）
-    Guides,
-}
+/// 圆盘的半径：窗口背景的日冕从这圈边上放出（见 [`crate::backdrop`]）。
+pub const DISC_RADIUS: f32 = AREA / 2. - DISC_INSET;
 
 /// 圆盘里的大字。
 pub enum Big {
@@ -61,17 +55,11 @@ pub enum Big {
 
 /// 表盘：`light` 为背光的颜色（随状态），`figure` 为撑满整块区域的刻度，圆盘压在中间，`center` 放在圆盘里。
 pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
-    lit_dial(light, LIGHT_STRENGTH, Backdrop::Plain, figure, center)
+    lit_dial(light, LIGHT_STRENGTH, figure, center)
 }
 
-/// [`dial`]，背光的强度为 `strength`（0 到 1），下面垫 `backdrop`。
-pub fn lit_dial(
-    light: Hsla,
-    strength: f32,
-    backdrop: Backdrop,
-    figure: AnyElement,
-    center: impl IntoElement,
-) -> Div {
+/// [`dial`]，背光的强度为 `strength`（0 到 1）。
+pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl IntoElement) -> Div {
     let disc = AREA - 2. * DISC_INSET;
     let place = || {
         div()
@@ -80,7 +68,7 @@ pub fn lit_dial(
             .left(px(DISC_INSET))
             .size(px(disc))
     };
-    lit_face(light, strength, backdrop)
+    lit_face(light, strength)
         .child(figure)
         .child(
             place()
@@ -101,20 +89,24 @@ pub fn lit_dial(
 
 /// 没有圆盘的表盘（直播钟面的指针扫过圆心）：背光与表圈，`figure` 与其余的字由调用方叠上去。
 pub fn face(light: Hsla) -> Div {
-    lit_face(light, LIGHT_STRENGTH, Backdrop::Plain)
+    lit_face(light, LIGHT_STRENGTH)
 }
 
-fn lit_face(light: Hsla, strength: f32, backdrop: Backdrop) -> Div {
+/// 表盘的底：背光、表圈；圆心报给窗口背景（[`backdrop::report_disc`]），日冕从圆盘边上放出。
+fn lit_face(light: Hsla, strength: f32) -> Div {
     let offset = (AREA - LIGHT) / 2.;
     div()
         .relative()
         .size(px(AREA))
         .flex_none()
-        .when(backdrop == Backdrop::Guides, |face| {
-            face.child(figure(|bounds, window, _| {
-                ring::paint_scope(bounds, window)
-            }))
-        })
+        .child(
+            canvas(
+                |bounds, _, cx| backdrop::report_disc(bounds.center(), cx),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
         .child(
             div()
                 .absolute()
