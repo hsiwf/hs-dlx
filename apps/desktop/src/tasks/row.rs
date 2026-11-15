@@ -383,6 +383,7 @@ pub mod sample {
             total,
             result: None,
             write_only: false,
+            seeding: false,
         };
         Row::new(task, Instant::now())
     }

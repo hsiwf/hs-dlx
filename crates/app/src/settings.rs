@@ -1,5 +1,6 @@
 //! 应用的设置，与任务一起存在任务存储里。
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use hs_m3u8_core::Proxy;
@@ -12,6 +13,10 @@ pub struct Settings {
     /// 探测与开始任务时请求经的代理；任务开始后不随设置改变，暂停再继续后才换
     pub proxy: Proxy,
     pub theme: Theme,
+    /// BT 任务下完之后做不做种
+    pub seeding: Seeding,
+    /// 整个 BT 会话的上传限速，字节每秒；None 为不限
+    pub upload_limit: Option<NonZeroU32>,
 }
 
 impl Default for Settings {
@@ -20,6 +25,52 @@ impl Default for Settings {
             folder: None,
             proxy: Proxy::System,
             theme: Theme::Eclipse,
+            seeding: Seeding::default(),
+            upload_limit: None,
+        }
+    }
+}
+
+/// BT 任务下完之后做不做种、做到什么时候停。分享率为累计上传的与选了的文件的字节数之比，累计上传与做种时长都含之前
+/// 各次运行的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seeding {
+    /// 下完即停
+    Off,
+    /// 做种，任一条件到了即停；都为 None 时一直做到手动停
+    Until {
+        /// 分享率的百分数：100 为 1.0
+        ratio_percent: Option<NonZeroU32>,
+        /// 累计做种的分钟数
+        minutes: Option<NonZeroU32>,
+    },
+}
+
+impl Default for Seeding {
+    /// 分享率 1.0（传回与下的一样多）或做种 24 小时，先到为准。
+    fn default() -> Self {
+        Seeding::Until {
+            ratio_percent: NonZeroU32::new(100),
+            minutes: NonZeroU32::new(24 * 60),
+        }
+    }
+}
+
+impl Seeding {
+    /// 累计上传 `uploaded` 字节、做种 `seconds` 秒、选了的文件共 `wanted` 字节时，到了停的条件没有；不做种时总是到了。
+    pub fn reached(self, uploaded: u64, wanted: u64, seconds: u64) -> bool {
+        match self {
+            Seeding::Off => true,
+            Seeding::Until {
+                ratio_percent,
+                minutes,
+            } => {
+                let ratio = ratio_percent.is_some_and(|percent| {
+                    u128::from(uploaded) * 100 >= u128::from(wanted) * u128::from(percent.get())
+                });
+                let time = minutes.is_some_and(|minutes| seconds >= u64::from(minutes.get()) * 60);
+                ratio || time
+            }
         }
     }
 }
@@ -31,4 +82,35 @@ pub enum Theme {
     Eclipse,
     /// 血月：火红的光，外缘偏暗红
     BloodMoon,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn until(ratio_percent: u32, minutes: u32) -> Seeding {
+        Seeding::Until {
+            ratio_percent: NonZeroU32::new(ratio_percent),
+            minutes: NonZeroU32::new(minutes),
+        }
+    }
+
+    #[test]
+    fn seeding_stops_at_whichever_comes_first() {
+        let wanted = 1_000;
+        // 默认：分享率 1.0 或 24 小时
+        let default = Seeding::default();
+        assert!(!default.reached(999, wanted, 24 * 3600 - 1));
+        assert!(default.reached(1_000, wanted, 0));
+        assert!(default.reached(0, wanted, 24 * 3600));
+        // 只按分享率（150%）：时长再长也不停
+        let ratio = until(150, 0);
+        assert!(!ratio.reached(1_499, wanted, u64::MAX));
+        assert!(ratio.reached(1_500, wanted, 0));
+        // 都不限：一直做；不做种：总是到了
+        assert!(!until(0, 0).reached(u64::MAX, wanted, u64::MAX));
+        assert!(Seeding::Off.reached(0, wanted, 0));
+        // 大数不溢出
+        assert!(!until(u32::MAX, 0).reached(u64::MAX, u64::MAX, 0));
+    }
 }

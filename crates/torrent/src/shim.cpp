@@ -49,6 +49,7 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_bool(lt::settings_pack::enable_lsd, config.lsd);
 	pack.set_str(lt::settings_pack::user_agent, string_of(config.user_agent));
 	pack.set_str(lt::settings_pack::peer_fingerprint, string_of(config.peer_fingerprint));
+	pack.set_int(lt::settings_pack::upload_rate_limit, config.upload_limit);
 	// 协议加密：两个方向都允许，优先加密，对方只会明文时照样连
 	pack.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
 	pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
@@ -161,8 +162,12 @@ rust::String Session::add_resume(rust::Slice<std::uint8_t const> resume, rust::S
 		params.unfinished_pieces.clear();
 		params.flags &= ~lt::torrent_flags::seed_mode;
 	}
-	// 写盘出错时 libtorrent 改成的只上传随续传数据存下，再加入即是要再试
-	params.flags &= ~lt::torrent_flags::upload_mode;
+	// 写盘出错时 libtorrent 改成的只上传随续传数据存下，再加入即是要再试；做种时另要只上传
+	if (options.upload_only) {
+		params.flags |= lt::torrent_flags::upload_mode;
+	} else {
+		params.flags &= ~lt::torrent_flags::upload_mode;
+	}
 	if (options.paused) {
 		params.flags |= lt::torrent_flags::paused;
 	} else {
@@ -214,6 +219,9 @@ Status Session::status(rust::Str id) const {
 	out.name = text_of(s.name);
 	out.total_wanted = s.total_wanted;
 	out.total_wanted_done = s.total_wanted_done;
+	out.all_time_upload = s.all_time_upload;
+	out.seeding_seconds = s.seeding_duration.count();
+	out.finished = s.is_finished;
 	out.downloaded = s.total_payload_download;
 	out.download_rate = s.download_payload_rate;
 	out.upload_rate = s.upload_payload_rate;
@@ -296,6 +304,12 @@ void Session::save_resume_data(rust::Str id) const {
 }
 
 std::uint16_t Session::listen_port() const { return m_session.listen_port(); }
+
+void Session::set_upload_limit(std::int32_t bytes_per_second) const {
+	lt::settings_pack pack;
+	pack.set_int(lt::settings_pack::upload_rate_limit, bytes_per_second);
+	m_session.apply_settings(std::move(pack));
+}
 
 rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 	rust::Vec<Alert> out;

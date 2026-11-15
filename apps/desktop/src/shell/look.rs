@@ -61,6 +61,7 @@ pub fn look(row: &Row) -> Look {
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
+        Status::Done if row.task.seeding => seeding_look(row),
         Status::Done => done_look(row),
     }
 }
@@ -275,7 +276,8 @@ fn running_torrent(row: &Row) -> Look {
             percent(share),
             "校验磁盘上已有的文件".to_owned(),
         ),
-        TorrentPhase::Finishing => look(
+        // 做种的进度只在任务完成之后（见 seeding_look）
+        TorrentPhase::Finishing | TorrentPhase::Seeding => look(
             "收尾",
             theme::accent(),
             1.0,
@@ -425,6 +427,41 @@ fn kept_text(
 }
 
 /// 已完成的任务：整圈点亮（刻度数按存储里的总片数，与下载时一致），大字为时长，下面写输出的种类、视频的宽高与大小。
+/// 在做种的 BT 任务：刻度全亮；大字为分享率，说明为已上传、上传速度与节点数。开始做种时先校验已下的文件，写校验到
+/// 哪；还没报来进度时只写在做种。
+fn seeding_look(row: &Row) -> Look {
+    let ticks = Ticks::of(FILE_TICKS, FILE_TICKS, true);
+    let (big, line) = match row.torrent_progress.as_ref() {
+        Some(progress) if progress.phase == TorrentPhase::Seeding => (
+            format::ratio(progress.uploaded, progress.wanted),
+            format!(
+                "已上传 {} · {}/s · {} 个节点",
+                format::bytes(progress.uploaded),
+                format::bytes(progress.upload_rate),
+                progress.peers
+            ),
+        ),
+        Some(progress) => match progress.phase {
+            TorrentPhase::Checking { progress: share } => {
+                (percent(share), "校验已下的文件".to_owned())
+            }
+            _ => ("↑".to_owned(), String::new()),
+        },
+        None => ("↑".to_owned(), String::new()),
+    };
+    Look {
+        state: "做种中".to_owned(),
+        color: theme::accent(),
+        ticks,
+        big,
+        line,
+        hint: None,
+        fraction: 1.0,
+        orb: theme::accent(),
+        short: "↑".to_owned(),
+    }
+}
+
 fn done_look(row: &Row) -> Look {
     let total = row.task.total.unwrap_or(0);
     let ticks = Ticks::of(total, total, false);

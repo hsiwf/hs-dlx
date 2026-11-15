@@ -13,15 +13,16 @@ use hs_m3u8_core::{Proxy, Url};
 use crate::preference::StoredPreference;
 use crate::torrent::{Resume, SessionState};
 use crate::{
-    Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
-    Status, Task, TaskId, TaskSpec, Theme, TorrentSpec, naming,
+    Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Seeding,
+    Settings, Status, Task, TaskId, TaskSpec, Theme, TorrentSpec, naming,
 };
+use std::num::NonZeroU32;
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -29,6 +30,7 @@ const MIGRATIONS: [Migration; 7] = [
     add_theme,
     rebuild_with_ranges,
     rebuild_with_torrents,
+    rebuild_with_seeding,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -405,6 +407,92 @@ fn rebuild_with_torrents(tx: &Transaction<'_>) -> Result<(), Error> {
     keep_task_counter(tx, counter)
 }
 
+/// 第 8 版：
+/// - 重建任务表，BT 任务加做种标记（只用于它且必有）：1 为在做种、或下次打开要接着做，只在已完成时；第 7 版的 BT 任务都
+///   为 0（那时下完即停）。其余约束不变。
+/// - 设置加做种与上传限速（见 [`crate::Seeding`]）：下完做不做种、到哪个分享率（百分数）或累计做种多少分钟停（NULL 为
+///   不按它停），与整个 BT 会话的上传限速（字节每秒，NULL 为不限）。没设过为做种、分享率 1.0 或 24 小时先到为准、不限速。
+fn rebuild_with_seeding(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v8 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file', 'torrent')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            torrent_info_hash TEXT UNIQUE CHECK (length(torrent_info_hash) = 40
+                                                 AND torrent_info_hash NOT GLOB '*[^0-9a-f]*'),
+            torrent_root TEXT,
+            torrent_resume BLOB,
+            torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
+            torrent_seeding INTEGER CHECK (torrent_seeding IN (0, 1)),
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (kind != 'hls' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL)),
+            CHECK ((kind = 'torrent') = (torrent_info_hash IS NOT NULL AND torrent_root IS NOT NULL
+                                         AND torrent_resume IS NOT NULL AND torrent_trusted IS NOT NULL
+                                         AND torrent_seeding IS NOT NULL)),
+            CHECK (kind = 'torrent' OR (torrent_info_hash IS NULL AND torrent_root IS NULL AND torrent_resume IS NULL
+                                        AND torrent_trusted IS NULL AND torrent_seeding IS NULL)),
+            CHECK (torrent_seeding IS NOT 1 OR status = 'done'),
+            CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]'))
+        ) STRICT;
+        INSERT INTO task_v8 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                             file_length, file_accepts_ranges, file_etag, file_last_modified, file_content_type,
+                             chunk_size, torrent_info_hash, torrent_root, torrent_resume, torrent_trusted, torrent_seeding,
+                             work_dir, status, error, failure, created_at, total, duration_ms, bytes, width, height,
+                             write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                   file_length, file_accepts_ranges, file_etag, file_last_modified, file_content_type, chunk_size,
+                   torrent_info_hash, torrent_root, torrent_resume, torrent_trusted,
+                   CASE WHEN kind = 'torrent' THEN 0 END,
+                   work_dir, status, error, failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v8 RENAME TO task;
+        ALTER TABLE settings ADD COLUMN seed INTEGER NOT NULL DEFAULT 1 CHECK (seed IN (0, 1));
+        ALTER TABLE settings ADD COLUMN seed_ratio_percent INTEGER DEFAULT 100 CHECK (seed_ratio_percent > 0);
+        ALTER TABLE settings ADD COLUMN seed_minutes INTEGER DEFAULT 1440 CHECK (seed_minutes > 0);
+        ALTER TABLE settings ADD COLUMN upload_limit INTEGER CHECK (upload_limit > 0);",
+    )?;
+    keep_task_counter(tx, counter)
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -507,7 +595,7 @@ impl Store {
 const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path, \
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
-                       file_accepts_ranges, torrent_info_hash, torrent_root";
+                       file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
@@ -566,8 +654,8 @@ pub fn insert(
                 .map(|size| i64::try_from(size.get()).expect("每个请求的字节数远小于 i64 的上限")),
         ),
     };
-    let (info_hash, root, trusted) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) => (None, None, None),
+    let (info_hash, root, trusted, seeding) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) => (None, None, None, None),
         Kind::Torrent(torrent) => {
             if let Some(existing) = tx
                 .query_row(
@@ -579,11 +667,12 @@ pub fn insert(
             {
                 return Err(Error::TorrentTaken(TaskId(existing)));
             }
-            // 新建时的续传数据还没有已有的块
+            // 新建时的续传数据还没有已有的块；还在下，不做种
             (
                 Some(torrent.info_hash.as_str()),
                 Some(named_utf8(&torrent.root)?),
                 Some(true),
+                Some(false),
             )
         }
     };
@@ -600,9 +689,9 @@ pub fn insert(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
-                           torrent_trusted)
+                           torrent_trusted, torrent_seeding)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22)",
+                 ?21, ?22, ?23)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -626,6 +715,7 @@ pub fn insert(
             root,
             resume,
             trusted,
+            seeding,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -886,6 +976,7 @@ struct Row {
     file_accepts_ranges: Option<bool>,
     torrent_info_hash: Option<String>,
     torrent_root: Option<String>,
+    torrent_seeding: Option<bool>,
 }
 
 impl Row {
@@ -921,6 +1012,7 @@ impl Row {
             file_accepts_ranges: row.get(27)?,
             torrent_info_hash: row.get(28)?,
             torrent_root: row.get(29)?,
+            torrent_seeding: row.get(30)?,
         })
     }
 
@@ -1034,6 +1126,7 @@ impl Row {
             total,
             result,
             write_only: self.write_only,
+            seeding: self.torrent_seeding.unwrap_or(false),
         })
     }
 }
@@ -1097,13 +1190,48 @@ fn utf8(path: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::InvalidInput(format!("路径不是 UTF-8：{}", path.display())))
 }
 
-/// 读出设置；保存目录不是绝对路径、代理或主题认不出时报 [`Error::Corrupt`]。
+/// 读出设置；保存目录不是绝对路径、代理或主题认不出、做种的数不是正数时报 [`Error::Corrupt`]。
 pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
-    let (folder, proxy, theme): (Option<String>, String, String) = tx.query_row(
-        "SELECT folder, proxy, theme FROM settings WHERE id = 1",
+    type Columns = (
+        Option<String>,
+        String,
+        String,
+        bool,
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+    );
+    let (folder, proxy, theme, seed, ratio, minutes, upload): Columns = tx.query_row(
+        "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit FROM settings WHERE id = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
     )?;
+    let positive = |value: Option<u32>, what: &str| {
+        value
+            .map(|value| {
+                NonZeroU32::new(value).ok_or_else(|| Error::Corrupt(format!("设置里的{what}")))
+            })
+            .transpose()
+    };
+    let seeding = if seed {
+        Seeding::Until {
+            ratio_percent: positive(ratio, "做种分享率")?,
+            minutes: positive(minutes, "做种时长")?,
+        }
+    } else {
+        Seeding::Off
+    };
+    let upload_limit = positive(upload, "上传限速")?;
     let folder = folder
         .map(PathBuf::from)
         .map(|folder| {
@@ -1117,7 +1245,56 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         folder,
         proxy: parse_proxy(&proxy)?,
         theme: parse_theme(&theme)?,
+        seeding,
+        upload_limit,
     })
+}
+
+/// 记下做种的设置。
+pub fn set_seeding(tx: &Transaction<'_>, seeding: Seeding) -> Result<(), Error> {
+    let (seed, ratio, minutes) = match seeding {
+        Seeding::Off => (false, None, None),
+        Seeding::Until {
+            ratio_percent,
+            minutes,
+        } => (
+            true,
+            ratio_percent.map(NonZeroU32::get),
+            minutes.map(NonZeroU32::get),
+        ),
+    };
+    // 不做种时分享率与时长照旧留着，改回做种时还是原来的
+    if seed {
+        tx.execute(
+            "UPDATE settings SET seed = 1, seed_ratio_percent = ?1, seed_minutes = ?2 WHERE id = 1",
+            params![ratio, minutes],
+        )?;
+    } else {
+        tx.execute("UPDATE settings SET seed = 0 WHERE id = 1", [])?;
+    }
+    Ok(())
+}
+
+/// 记下 BT 的上传限速（字节每秒；None 为不限）。
+pub fn set_upload_limit(tx: &Transaction<'_>, limit: Option<NonZeroU32>) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET upload_limit = ?1 WHERE id = 1",
+        params![limit.map(NonZeroU32::get)],
+    )?;
+    Ok(())
+}
+
+/// 记下 BT 任务做不做种（[`Task::seeding`]）；没有这个 BT 任务时报 [`Error::NotFound`]，任务没完成时由表上的 CHECK
+/// 拦下。
+pub fn set_seeding_task(tx: &Transaction<'_>, id: TaskId, seeding: bool) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET torrent_seeding = ?2 WHERE id = ?1 AND kind = 'torrent'",
+        params![id.0, seeding],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
 }
 
 /// 记下新建任务默认保存到的目录 `folder`（绝对路径，调用方已核对）；不是 UTF-8 时报 [`Error::InvalidInput`]。
@@ -1478,6 +1655,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 第 7 版的 BT 任务升到第 8 版后原样读回，续传数据照旧，不做种；设置补上默认的做种。
+    #[test]
+    fn rebuilding_for_seeding_keeps_torrent_rows() {
+        let dir = scratch("v7-rows");
+        let path = dir.join("tasks.sqlite");
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..7] {
+                migration(&tx).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, torrent_info_hash, torrent_root, torrent_resume,
+                                   torrent_trusted, status, created_at, bytes)
+                 VALUES ('torrent', '专辑', 'magnet:?xt=urn:btih:x', '[]', ?1, ?2, x'0102', 0, 'done', 3, 9)",
+                params![hash, text("专辑")],
+            )
+            .unwrap();
+            tx.pragma_update(None, "user_version", 7).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let tx = store.transaction().unwrap();
+        let task = &list(&tx).unwrap()[0];
+        assert_eq!(
+            (&task.spec.title, task.status.clone(), task.seeding),
+            (&"专辑".to_owned(), Status::Done, false)
+        );
+        assert_eq!(
+            task.spec.torrent().unwrap(),
+            &TorrentSpec {
+                info_hash: hash.into(),
+                root: m("专辑")
+            }
+        );
+        assert_eq!(
+            torrent_resume(&tx, task.id).unwrap(),
+            Resume {
+                data: vec![1, 2],
+                trusted: false
+            }
+        );
+        assert_eq!(settings(&tx).unwrap().seeding, Seeding::default());
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// 新建任务，任务目录取核心的默认位置。
     fn add(tx: &Transaction<'_>, output: OutputSpec, created_at: i64) -> Result<TaskId, Error> {
         let work_dir = output.options().resolved_work_dir().unwrap();
@@ -1624,25 +1850,28 @@ mod tests {
                 [],
             )
         };
-        let all = ", torrent_info_hash, torrent_root, torrent_resume, torrent_trusted";
-        insert("torrent", all, &format!(", {hash}, '/m/a', x'00', 1")).unwrap();
+        let all =
+            ", torrent_info_hash, torrent_root, torrent_resume, torrent_trusted, torrent_seeding";
+        insert("torrent", all, &format!(", {hash}, '/m/a', x'00', 1, 0")).unwrap();
         tx.execute("DELETE FROM task", []).unwrap();
         for (kind, columns, values) in [
-            ("torrent", all, ", '0123', '/m/a', x'00', 1".to_owned()),
+            ("torrent", all, ", '0123', '/m/a', x'00', 1, 0".to_owned()),
+            // 没完成的不做种（插入的状态为暂停）
+            ("torrent", all, format!(", {hash}, '/m/a', x'00', 1, 1")),
             (
                 "torrent",
                 all,
-                ", '0123456789ABCDEF0123456789ABCDEF01234567', '/m/a', x'00', 1".to_owned(),
+                ", '0123456789ABCDEF0123456789ABCDEF01234567', '/m/a', x'00', 1, 0".to_owned(),
             ),
             (
                 "torrent",
-                ", torrent_info_hash, torrent_root, torrent_trusted",
-                format!(", {hash}, '/m/a', 1"),
+                ", torrent_info_hash, torrent_root, torrent_trusted, torrent_seeding",
+                format!(", {hash}, '/m/a', 1, 0"),
             ),
             (
                 "torrent",
                 &format!("{all}, work_dir"),
-                format!(", {hash}, '/m/a', x'00', 1, '/m/a.hsdl'"),
+                format!(", {hash}, '/m/a', x'00', 1, 0, '/m/a.hsdl'"),
             ),
             (
                 "hls",
@@ -1828,6 +2057,28 @@ mod tests {
         .unwrap();
         let saved = torrent_session(&tx).unwrap();
         assert_eq!((saved.port, saved.dht), (Some(51413), b"dht".to_vec()));
+        // 做种：改成不做种再改回时分享率与时长照旧；只按时长
+        assert_eq!(read.seeding, Seeding::default());
+        set_seeding(&tx, Seeding::Off).unwrap();
+        assert_eq!(settings(&tx).unwrap().seeding, Seeding::Off);
+        tx.execute("UPDATE settings SET seed = 1 WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(settings(&tx).unwrap().seeding, Seeding::default());
+        let minutes_only = Seeding::Until {
+            ratio_percent: None,
+            minutes: NonZeroU32::new(90),
+        };
+        set_seeding(&tx, minutes_only).unwrap();
+        assert_eq!(settings(&tx).unwrap().seeding, minutes_only);
+        set_upload_limit(&tx, NonZeroU32::new(1 << 20)).unwrap();
+        assert_eq!(
+            settings(&tx).unwrap().upload_limit,
+            NonZeroU32::new(1 << 20)
+        );
+        assert!(
+            tx.execute("UPDATE settings SET upload_limit = 0 WHERE id = 1", [])
+                .is_err()
+        );
     }
 
     /// 同一份存储同时只能被一个进程（这里是同一进程里的第二个连接）打开；先打开的释放后才能再开。

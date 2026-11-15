@@ -133,6 +133,15 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
     }
 }
 
+/// 分享率（累计上传与选了的文件的字节数之比），两位小数；要下的为 0 时为「—」。
+pub fn ratio(uploaded: u64, wanted: u64) -> String {
+    if wanted == 0 {
+        "—".to_owned()
+    } else {
+        format!("{:.2}", uploaded as f64 / wanted as f64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter, Subscription, Task};
-use hs_dlx_app::{Event, Events, Finished, Service, Status, TaskId};
+use hs_dlx_app::{Event, Events, Finished, SeedEnd, Service, Status, TaskId};
 use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
 
@@ -259,6 +259,46 @@ impl Tasks {
                         row.signal(level, text);
                     }
                     row.torrent_progress = Some(*progress);
+                }
+            }
+            Event::SeedingStarted { id } => {
+                if let Some(row) = self.row_mut(id) {
+                    row.task.seeding = true;
+                    // 下载时的进度不再适用
+                    row.torrent_progress = None;
+                    row.signal(Level::Info, "开始做种".to_owned());
+                }
+            }
+            Event::SeedingEnded { id, end, unsaved } => {
+                let title = self.title(id);
+                if let Some(row) = self.row_mut(id) {
+                    row.task.seeding = false;
+                    let uploaded = row.torrent_progress.as_ref().map(|progress| {
+                        format!(
+                            "已上传 {} · 分享率 {}",
+                            crate::format::bytes(progress.uploaded),
+                            crate::format::ratio(progress.uploaded, progress.wanted)
+                        )
+                    });
+                    let (level, text) = match end {
+                        SeedEnd::Reached => (Level::Info, "做种到了设置里的条件，停下".to_owned()),
+                        SeedEnd::Stopped => (Level::Info, "停止做种".to_owned()),
+                        SeedEnd::Incomplete => (
+                            Level::Warn,
+                            "磁盘上的文件不全或改过，停止做种（不补下）".to_owned(),
+                        ),
+                        SeedEnd::Failed(message) => (Level::Error, format!("做种出错：{message}")),
+                    };
+                    let text = match uploaded {
+                        Some(uploaded) => format!("{text} · {uploaded}"),
+                        None => text,
+                    };
+                    row.signal(level, text);
+                }
+                if let Some(error) = unsaved {
+                    self.add_notice(format!(
+                        "「{title}」的做种状态没能存下（{error}），下次打开可能接着做种"
+                    ));
                 }
             }
             Event::Ended {

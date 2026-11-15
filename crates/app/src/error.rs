@@ -71,6 +71,9 @@ pub enum Error {
     /// BT 引擎（libtorrent）报的错误，或等它一步的结果超时；说明里 libtorrent 的部分为英文
     #[error("BT：{0}")]
     Torrent(String),
+    /// BT 任务在做种：要先停止做种（[`crate::Service::stop_seeding`]）
+    #[error("{0}正在做种，先停止做种")]
+    Seeding(TaskId),
     /// 新建的 BT 任务的种子已在这个任务里：两个任务会写同一批文件
     #[error("这个种子已在{0}里")]
     TorrentTaken(TaskId),

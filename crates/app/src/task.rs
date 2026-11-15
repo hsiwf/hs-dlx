@@ -226,6 +226,8 @@ pub struct Task {
     /// 最近一次运行是只写出已录的（[`crate::Service::write_recorded`] 置上，[`crate::Service::resume`] 清掉）：用户选了
     /// 不再续录；文件任务总是 false
     pub write_only: bool,
+    /// BT 任务在做种，或下次打开应用要接着做（只在已完成时）；别的任务总是 false
+    pub seeding: bool,
 }
 
 /// 完成时写出的结果，供之后显示。

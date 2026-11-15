@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hs_dlx_app::{
-    Draft, DraftKind, Error, Event, Service, Status, Store, TaskId, TorrentInfo, TorrentNetwork,
-    TorrentProgress,
+    Draft, DraftKind, Error, Event, SeedEnd, Seeding, Service, Status, Store, TaskId, TorrentInfo,
+    TorrentNetwork, TorrentPhase, TorrentProgress,
 };
 use hs_dlx_torrent::{AddOptions, Session, SessionConfig, State, TorrentId, create_torrent};
 use tokio::runtime::Runtime;
@@ -60,12 +60,14 @@ fn seed(dir: &Path, without_b: bool) -> (Session, TorrentId) {
         lsd: false,
         user_agent: "hs-dlx-test-seeder".into(),
         peer_fingerprint: "-HD0000-".into(),
+        upload_limit: 0,
         state: Vec::new(),
     })
     .unwrap();
     let options = AddOptions {
         trust_pieces: false,
         paused: false,
+        upload_only: false,
     };
     seeder
         .add_resume(&resume, &id, dir.to_str().unwrap(), options)
@@ -166,8 +168,8 @@ fn index_of(info: &TorrentInfo, name: &str) -> i32 {
         .index
 }
 
-/// 磁力链接取种子信息、只选一个文件下完：根名避开保存目录里已有的，完成的结果为选了的字节数；同一个种子不能再建，
-/// 完成的可以从列表移除；关闭时记下 BT 会话的端口与 DHT 状态。
+/// 磁力链接取种子信息、只选一个文件下完（设置为下完不做种）：根名避开保存目录里已有的，完成的结果为选了的字节数，不
+/// 做种；同一个种子不能再建，完成的可以从列表移除；关闭时记下 BT 会话的端口与 DHT 状态。
 #[test]
 fn a_magnet_link_downloads_the_chosen_file() {
     let dir = test_dir("download");
@@ -177,6 +179,7 @@ fn a_magnet_link_downloads_the_chosen_file() {
     let store = dir.join("tasks.sqlite");
     let rt = runtime();
     let (service, mut events) = service(&store);
+    service.set_seeding(Seeding::Off).unwrap();
 
     let uri = magnet(&id, &seeder);
     let resume = fetch(&rt, &service, &uri);
@@ -197,6 +200,7 @@ fn a_magnet_link_downloads_the_chosen_file() {
     let status = rt.block_on(until(&mut events, task.id, |_| false));
     assert_eq!(status, Some(Status::Done));
     let done = service.task(task.id).unwrap();
+    assert!(!done.seeding);
     assert_eq!(done.result.unwrap().bytes, u64::from(A));
     assert_eq!(
         std::fs::read(folder.join("album 2").join("a.bin")).unwrap(),
@@ -356,6 +360,130 @@ fn torrent_drafts_are_checked() {
         Err(Error::InvalidInput(_))
     ));
     assert!(service.tasks().unwrap().is_empty());
+    drop(service);
+    drop(seeder);
+}
+
+/// 等到 `pick` 认的一个事件（期间的别的丢掉），返回它认出的；60 秒内没等到即失败。
+async fn event<T>(
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    mut pick: impl FnMut(Event) -> Option<T>,
+) -> T {
+    let waiting = async {
+        loop {
+            let event = events.recv().await.expect("服务还在，事件通道不会关闭");
+            if let Some(found) = pick(event) {
+                return found;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), waiting)
+        .await
+        .expect("60 秒内没等到")
+}
+
+/// 任务 `id` 的做种停了，返回原因（停下时的进度与「不再做种」都写进了存储）。
+async fn seeding_ended(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> SeedEnd {
+    event(events, |event| match event {
+        Event::SeedingEnded {
+            id: at,
+            end,
+            unsaved,
+        } if at == id => {
+            assert!(unsaved.is_none(), "没写进存储：{unsaved:?}");
+            Some(end)
+        }
+        _ => None,
+    })
+    .await
+}
+
+/// 任务 `id` 做着种（校验完、在上传）的一次进度。
+async fn seeding(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> TorrentProgress {
+    event(events, |event| match event {
+        Event::TorrentProgress { id: at, progress }
+            if at == id && progress.phase == TorrentPhase::Seeding =>
+        {
+            Some(*progress)
+        }
+        _ => None,
+    })
+    .await
+}
+
+/// 照默认的设置下完接着做种，做种时不能从列表移除；重开应用接着做；设置改成下完不做种即停；手动停止与再做种；文件
+/// 不全时停下、不补下。
+#[test]
+fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
+    let dir = test_dir("seeding");
+    let (seeder, id) = seed(&dir.join("seed"), false);
+    let folder = dir.join("downloads");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let (service, mut events) = service(&store);
+
+    let uri = magnet(&id, &seeder);
+    let resume = fetch(&rt, &service, &uri);
+    let info = TorrentInfo::of(&resume).unwrap();
+    let all = info.files.iter().map(|file| file.index).collect();
+    let task = rt
+        .block_on(service.create(draft(&uri, &folder, resume, all), 1))
+        .unwrap()
+        .unwrap();
+    let status = rt.block_on(until(&mut events, task.id, |_| false));
+    assert_eq!(status, Some(Status::Done));
+    let progress = rt.block_on(seeding(&mut events, task.id));
+    assert_eq!(progress.done, u64::from(A + B));
+    assert!(service.task(task.id).unwrap().seeding);
+    assert!(matches!(service.forget(task.id), Err(Error::Seeding(_))));
+    // 别的 BT 任务没在做种，不能停
+    service.stop_seeding(TaskId(task.id.0 + 100));
+
+    // 退出时停下、记着在做种，重开接着做
+    service.close().unwrap();
+    drop(service);
+    let (service, mut events) = self::service(&store);
+    assert!(service.task(task.id).unwrap().seeding);
+    rt.block_on(event(&mut events, |event| {
+        matches!(event, Event::SeedingStarted { id } if id == task.id).then_some(())
+    }));
+    rt.block_on(seeding(&mut events, task.id));
+
+    // 设置改成下完不做种：到了停的条件
+    service.set_seeding(Seeding::Off).unwrap();
+    assert_eq!(
+        rt.block_on(seeding_ended(&mut events, task.id)),
+        SeedEnd::Reached
+    );
+    assert!(!service.task(task.id).unwrap().seeding);
+    assert!(matches!(
+        service.seed(TaskId(task.id.0 + 100)),
+        Err(Error::NotFound(_))
+    ));
+
+    // 手动再做种、再停
+    service.set_seeding(Seeding::default()).unwrap();
+    service.seed(task.id).unwrap();
+    assert!(matches!(service.seed(task.id), Err(Error::Seeding(_))));
+    rt.block_on(seeding(&mut events, task.id));
+    service.stop_seeding(task.id);
+    assert_eq!(
+        rt.block_on(seeding_ended(&mut events, task.id)),
+        SeedEnd::Stopped
+    );
+    assert!(!service.task(task.id).unwrap().seeding);
+
+    // 删了一个文件再做种：校验出不全即停，不补下
+    let b = folder.join("album").join("b.bin");
+    std::fs::remove_file(&b).unwrap();
+    service.seed(task.id).unwrap();
+    assert_eq!(
+        rt.block_on(seeding_ended(&mut events, task.id)),
+        SeedEnd::Incomplete
+    );
+    assert!(!b.exists(), "做种时补下了");
+    assert!(!service.task(task.id).unwrap().seeding);
+    service.forget(task.id).unwrap();
     drop(service);
     drop(seeder);
 }

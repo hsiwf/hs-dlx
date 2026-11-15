@@ -25,6 +25,8 @@ mod ffi {
         user_agent: String,
         /// 节点 ID 的前缀，标明客户端（如 `-HD0100-`）
         peer_fingerprint: String,
+        /// 整个会话的上传限速，字节每秒；0 为不限
+        upload_limit: i32,
         /// 上次 [`Session::session_state`] 写出的 DHT 状态（路由表里的节点），启动时载入就不必从头找节点；空时从头找
         state: Vec<u8>,
     }
@@ -50,6 +52,12 @@ mod ffi {
         total_wanted_done: i64,
         /// 这次加入会话以来收到的内容字节数（含校验没过、丢掉的）
         downloaded: i64,
+        /// 累计上传的内容字节数，含之前各次加入时的（随续传数据存下）
+        all_time_upload: i64,
+        /// 累计做种的秒数，含之前各次加入时的（随续传数据存下）
+        seeding_seconds: i64,
+        /// 选了的文件都有了
+        finished: bool,
         /// 下载与上传的速度，字节每秒，只算内容
         download_rate: i32,
         upload_rate: i32,
@@ -135,6 +143,8 @@ mod ffi {
         trust_pieces: bool,
         /// 加入后暂停：不连节点、不下载
         paused: bool,
+        /// 只上传、不下载（做种）：缺了块也不补，[`Status::finished`] 为否即文件不全
+        upload_only: bool,
     }
 
     /// 续传数据里的种子信息。
@@ -186,6 +196,7 @@ mod ffi {
         fn remove(self: &Session, id: &str, removal: Removal) -> Result<()>;
         fn save_resume_data(self: &Session, id: &str) -> Result<()>;
         fn listen_port(self: &Session) -> u16;
+        fn set_upload_limit(self: &Session, bytes_per_second: i32);
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, piece_size: i32) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
@@ -363,6 +374,11 @@ impl Session {
     /// 校验中的记到校验到的那块）。
     pub fn save_resume_data(&self, id: &TorrentId) -> Result<(), Error> {
         Ok(self.inner().save_resume_data(id.as_str())?)
+    }
+
+    /// 改整个会话的上传限速，字节每秒；0 为不限。
+    pub fn set_upload_limit(&self, bytes_per_second: i32) {
+        self.inner().set_upload_limit(bytes_per_second);
     }
 
     /// 实际监听的端口；还没监听成功时为 0。

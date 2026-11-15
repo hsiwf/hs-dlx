@@ -382,6 +382,19 @@ impl Tasks {
         .detach();
     }
 
+    /// 让下完的 BT 任务做种；开始不了时提示原因。
+    pub fn seed(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        if let Err(error) = self.service.seed(id) {
+            let title = self.title(id);
+            self.add_notice(format!("「{title}」没能开始做种：{error}"));
+        }
+        cx.notify();
+    }
+
+    pub fn stop_seeding(&self, id: TaskId) {
+        self.service.stop_seeding(id);
+    }
+
     /// 从列表移除已完成的任务（输出归用户）与没有自己的任务目录的任务：只删记录。
     pub fn forget(&mut self, id: TaskId, cx: &mut Context<Self>) {
         match self.service.forget(id) {

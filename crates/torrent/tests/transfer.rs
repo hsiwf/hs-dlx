@@ -13,11 +13,13 @@ use hs_dlx_torrent::{
 const TRUSTED: AddOptions = AddOptions {
     trust_pieces: true,
     paused: false,
+    upload_only: false,
 };
 /// 不信续传数据里的已有块（磁盘上有文件就整体校验），加入后就运行。
 const CHECKED: AddOptions = AddOptions {
     trust_pieces: false,
     paused: false,
+    upload_only: false,
 };
 
 /// 测试用的空目录，名字带进程号。
@@ -40,6 +42,7 @@ fn local_session() -> Session {
         lsd: false,
         user_agent: "hs-dlx-test".into(),
         peer_fingerprint: "-HD0000-".into(),
+        upload_limit: 0,
         state: Vec::new(),
     })
     .unwrap()
@@ -214,10 +217,19 @@ fn placed_files_download_and_resume_without_peers() {
     );
     restored.remove(&id, Removal::Keep).unwrap();
     removed(&restored, &id, false);
-    // 只删 .parts 时同样等到删的结果才算移除完，下了的文件留着
+    // 只删 .parts 时同样等到删的结果才算移除完，下了的文件留着；做种时只上传
     restored
-        .add_resume(&saved, &id, path_str(&fetch_dir), TRUSTED)
+        .add_resume(
+            &saved,
+            &id,
+            path_str(&fetch_dir),
+            AddOptions {
+                upload_only: true,
+                ..TRUSTED
+            },
+        )
         .unwrap();
+    assert!(restored.status(&id).unwrap().held);
     restored.remove(&id, Removal::PartFile).unwrap();
     removed(&restored, &id, true);
     assert!(fetch_dir.join("专辑").join("a.bin").exists());
@@ -230,10 +242,12 @@ fn placed_files_download_and_resume_without_peers() {
             AddOptions {
                 trust_pieces: true,
                 paused: true,
+                upload_only: false,
             },
         )
         .unwrap();
     assert!(restored.status(&id).unwrap().paused);
+    assert!(!restored.status(&id).unwrap().held);
     // 连文件一起删：libtorrent 先发删的结果、后发移除的事件，两个都到了才算移除完
     restored.remove(&id, Removal::Files).unwrap();
     removed(&restored, &id, true);
@@ -288,6 +302,7 @@ fn session_state_round_trips() {
         lsd: false,
         user_agent: "hs-dlx-test".into(),
         peer_fingerprint: "-HD0000-".into(),
+        upload_limit: 0,
         state,
     };
     Session::new(&config(state)).unwrap();
@@ -445,7 +460,13 @@ fn a_magnet_link_downloads_from_a_local_seed() {
 
     flushed(&fetcher, &fetching);
     let status = fetcher.status(&fetching).unwrap();
+    assert!(status.finished);
     assert_eq!(status.total_wanted, i64::try_from(content.len()).unwrap());
+    // 做种的一方累计上传了全部内容（libtorrent 每秒统计一次）
+    let sent = i64::try_from(content.len()).unwrap();
+    wait_until(&seeder, Duration::from_secs(10), |s| {
+        s.status(&seeding).unwrap().all_time_upload >= sent
+    });
     assert_eq!(status.reachable_pieces, status.pieces);
     assert_file(&fetch_dir, "样本 (2).bin", &content);
 

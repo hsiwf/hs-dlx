@@ -318,8 +318,8 @@ impl Shell {
             self.show(Page::Task, cx);
             return;
         }
-        let proxy = match self.tasks.read(cx).service().settings() {
-            Ok(settings) => settings.proxy,
+        let settings = match self.tasks.read(cx).service().settings() {
+            Ok(settings) => settings,
             Err(error) => {
                 self.tell(format!("读不出设置：{error}"), cx);
                 return;
@@ -327,7 +327,7 @@ impl Shell {
         };
         let home = self.home.clone();
         let tasks = self.tasks.clone();
-        let view = cx.new(|cx| SettingsView::new(tasks, home, proxy, window, cx));
+        let view = cx.new(|cx| SettingsView::new(tasks, home, settings, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
                 SettingsEvent::Dismissed => this.show(Page::Task, cx),

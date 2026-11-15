@@ -18,13 +18,13 @@ pub use failure::{Failure, FailureKind, not_a_playlist};
 pub use naming::{file_name, task_title, title_of};
 pub use preference::StoredPreference;
 pub use service::{Event, Events, MetadataFetch, Service};
-pub use settings::{Settings, Theme};
+pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{
     Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec, Kind, OutputKind, OutputSpec, Status,
     Task, TaskId, TaskSpec, TorrentSpec,
 };
 pub use torrent::{
-    MetadataProgress, SavedTorrent, TorrentFile, TorrentInfo, TorrentNetwork, TorrentPhase,
-    TorrentProgress, torrent_from_file,
+    MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,
+    TorrentPhase, TorrentProgress, torrent_from_file,
 };

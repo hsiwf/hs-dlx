@@ -42,6 +42,7 @@ public:
 	void remove(rust::Str id, Removal removal) const;
 	void save_resume_data(rust::Str id) const;
 	std::uint16_t listen_port() const;
+	void set_upload_limit(std::int32_t bytes_per_second) const;
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
 
 private:

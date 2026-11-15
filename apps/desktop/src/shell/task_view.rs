@@ -8,7 +8,7 @@ use gpui_kit::{
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, linear_color_stop,
     linear_gradient, px,
 };
-use hs_dlx_app::Status;
+use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
@@ -409,6 +409,29 @@ impl Shell {
                         .flex_1(),
                     );
                 }
+                // BT：做种时只能停止做种（停了才能从列表移除），没在做种时可以再做
+                if row.task.spec.torrent().is_some() {
+                    if row.task.seeding {
+                        rest.push(ui::button(
+                            "stop-seeding",
+                            "停止做种",
+                            Tone::Ghost,
+                            cx.listener(move |this, _, _, cx| {
+                                this.tasks.read(cx).stop_seeding(id);
+                                cx.notify();
+                            }),
+                        ));
+                        return Foot { primary, rest };
+                    }
+                    rest.push(ui::button(
+                        "seed",
+                        "做种",
+                        Tone::Ghost,
+                        cx.listener(move |this, _, _, cx| {
+                            this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
+                        }),
+                    ));
+                }
                 rest.push(forget(Tone::Ghost, cx));
                 Foot { primary, rest }
             }
@@ -424,6 +447,22 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         let Some(result) = row.task.result.as_ref() else {
             return Vec::new();
         };
+        if row.task.seeding
+            && let Some(progress) = row
+                .torrent_progress
+                .as_ref()
+                .filter(|progress| progress.phase == TorrentPhase::Seeding)
+        {
+            return vec![
+                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+                cell("已上传", format::bytes(progress.uploaded)),
+                cell("分享率", format::ratio(progress.uploaded, progress.wanted)),
+                cell(
+                    "节点",
+                    format!("{}（做种 {}）", progress.peers, progress.seeds),
+                ),
+            ];
+        }
         let mut cells = Vec::new();
         if row.task.spec.hls().is_some() {
             cells.push(cell(

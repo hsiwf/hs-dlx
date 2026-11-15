@@ -1,6 +1,7 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、外观、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种与上传限速、外观、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -9,6 +10,7 @@ use gpui_kit::{
     IntoElement, ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _,
     Styled as _, Subscription, Task, Window, div, px,
 };
+use hs_dlx_app::{Seeding, Settings};
 use hs_m3u8_core::{Proxy, Url};
 
 use crate::route::Route;
@@ -24,6 +26,19 @@ const MAX_WIDTH: f32 = 720.;
 const LABEL_WIDTH: f32 = 160.;
 /// 指定代理时输入框里的示例。
 const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
+/// 做种的几种选择：名字与设置。「分享率 1.0 或 24 小时」为默认（见 [`Seeding::default`]）
+const SEEDING_CHOICES: [(&str, &str); 3] = [
+    ("seed-off", "下完不做种"),
+    ("seed-default", "分享率 1.0 或 24 小时"),
+    ("seed-forever", "一直做，手动停"),
+];
+/// 上传限速的几档：名字与字节每秒（None 为不限）。
+const UPLOAD_CHOICES: [(&str, &str, Option<u32>); 4] = [
+    ("upload-none", "不限", None),
+    ("upload-512k", "512 KB/s", Some(512 << 10)),
+    ("upload-2m", "2 MB/s", Some(2 << 20)),
+    ("upload-10m", "10 MB/s", Some(10 << 20)),
+];
 
 /// 发给外面的事件。
 pub enum SettingsEvent {
@@ -55,6 +70,11 @@ pub struct SettingsView {
     proxy_error: Option<String>,
     /// 外观最近一次没存进去的原因
     theme_error: Option<String>,
+    /// 存着的做种设置与上传限速
+    seeding: Seeding,
+    upload_limit: Option<NonZeroU32>,
+    /// 做种或上传限速最近一次没存进去的原因
+    seeding_error: Option<String>,
     /// 第三方声明打不开的原因
     notices_error: Option<String>,
     _system: Task<()>,
@@ -64,14 +84,15 @@ pub struct SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
-    /// `proxy` 为存着的代理。
+    /// `settings` 为存着的设置。
     pub fn new(
         tasks: Entity<Tasks>,
         home: Option<PathBuf>,
-        proxy: Proxy,
+        settings: Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let proxy = settings.proxy;
         let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
         if let Proxy::Url(url) = &proxy {
             address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
@@ -109,6 +130,9 @@ impl SettingsView {
             folder_error: None,
             proxy_error: None,
             theme_error: None,
+            seeding: settings.seeding,
+            upload_limit: settings.upload_limit,
+            seeding_error: None,
             notices_error: None,
             _system: system,
             _typed: typed,
@@ -193,6 +217,79 @@ impl SettingsView {
                 )
                 .children(self.theme_error.clone().map(ui::error_text)),
         )
+    }
+
+    /// 换做种的设置：存进了才选中，在做种的随即照它判停不停。
+    fn pick_seeding(&mut self, picked: Seeding, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_seeding(picked) {
+            Ok(()) => {
+                self.seeding = picked;
+                self.seeding_error = None;
+            }
+            Err(error) => self.seeding_error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// 换上传限速：存进了才选中。
+    fn pick_upload(&mut self, picked: Option<NonZeroU32>, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_upload_limit(picked) {
+            Ok(()) => {
+                self.upload_limit = picked;
+                self.seeding_error = None;
+            }
+            Err(error) => self.seeding_error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// 做种与上传限速两行；存着的不是这里的几种选择之一时都不选中。
+    fn render_seeding(&self, cx: &mut Context<Self>) -> [Div; 2] {
+        let choices = [
+            Seeding::Off,
+            Seeding::default(),
+            Seeding::Until {
+                ratio_percent: None,
+                minutes: None,
+            },
+        ];
+        let seeding = SEEDING_CHOICES
+            .into_iter()
+            .zip(choices)
+            .map(|((id, label), value)| {
+                ui::chip(
+                    id,
+                    label,
+                    self.seeding == value,
+                    cx.listener(move |this, _, _, cx| this.pick_seeding(value, cx)),
+                )
+            });
+        let upload = UPLOAD_CHOICES.into_iter().map(|(id, label, limit)| {
+            let value = limit.and_then(NonZeroU32::new);
+            ui::chip(
+                id,
+                label,
+                self.upload_limit == value,
+                cx.listener(move |this, _, _, cx| this.pick_upload(value, cx)),
+            )
+        });
+        [
+            row(
+                "做种",
+                Some("BT 任务下完后接着上传给别人；退出应用时停下，下次打开接着做"),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(div().flex().flex_wrap().gap(px(8.)).children(seeding))
+                    .children(self.seeding_error.clone().map(ui::error_text)),
+            ),
+            row(
+                "上传限速",
+                Some("BT 所有任务合计"),
+                div().flex().flex_wrap().gap(px(8.)).children(upload),
+            ),
+        ]
     }
 
     /// 在访达（资源管理器、文件管理器）里打开随安装包附上的第三方声明目录；不是从安装包运行时写明原因。
@@ -421,6 +518,10 @@ impl Render for SettingsView {
                                 self.render_proxy(cx)
                                     .border_b_1()
                                     .border_color(theme::hairline()),
+                            )
+                            .children(
+                                self.render_seeding(cx)
+                                    .map(|row| row.border_b_1().border_color(theme::hairline())),
                             )
                             .child(
                                 self.render_theme(cx)
