@@ -7,10 +7,12 @@ set -euo pipefail
 rules=(
   "hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-relay"
   # 桌面应用的平台 crate 互不依赖，只由 hs-dlx 组合
-  "hs-dlx-webview hs-m3u8-core hs-dlx-app hs-dlx-instance hs-dlx-macos hs-dlx-relay"
-  "hs-dlx-instance hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-macos hs-dlx-relay"
-  "hs-dlx-macos hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-relay"
-  "hs-dlx-relay hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos"
+  "hs-dlx-webview hs-m3u8-core hs-dlx-app hs-dlx-instance hs-dlx-macos hs-dlx-relay hs-dlx-torrent"
+  "hs-dlx-instance hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-macos hs-dlx-relay hs-dlx-torrent"
+  "hs-dlx-macos hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-relay hs-dlx-torrent"
+  "hs-dlx-relay hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-torrent"
+  # BT 引擎只包一层 libtorrent，不知道任务、界面与 HLS
+  "hs-dlx-torrent hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-relay"
 )
 
 # 每行：<包> <不得直接依赖的包>...：只经由 core 的再导出（core::hls、core::remux）使用

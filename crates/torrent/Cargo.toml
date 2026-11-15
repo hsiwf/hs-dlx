@@ -1,0 +1,26 @@
+[package]
+name = "hs-dlx-torrent"
+version.workspace = true
+description = "BitTorrent engine for the hs-dlx desktop app: a thin cxx binding over a statically linked libtorrent-rasterbar"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+links = "torrent-rasterbar"
+
+[dependencies]
+# Rust 与 C++ 之间的绑定；cxx-build 须是同一版
+cxx = "1.0.205"
+
+[build-dependencies]
+cxx-build = "1.0.205"
+
+# 这个 crate 经 cxx 调 libtorrent（C++）：cxx 生成的桥接代码与给 C++ 类型声明 Send、Sync 只能用 unsafe，所以不沿用
+# 工作区禁止 unsafe 的规则；其余 crate 照旧禁止。手写的 unsafe 只有给 C++ 类型声明 Send、Sync，都要写明为什么成立。
+# 不开 multiple_unsafe_ops_per_block：cxx 为每个桥接函数生成的代码里有两处 unsafe 调用，不是本 crate 写的、也改不了。
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

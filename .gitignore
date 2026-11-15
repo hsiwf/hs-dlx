@@ -20,3 +20,7 @@ target/
 # FFmpeg 的源码与静态库，由 make ffmpeg 生成
 third_party/ffmpeg/build/
 third_party/ffmpeg/dist/
+
+# libtorrent、OpenSSL 与 Boost 的源码与静态库，由 third_party/libtorrent/build.sh 生成
+third_party/libtorrent/build/
+third_party/libtorrent/dist/

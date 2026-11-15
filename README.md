@@ -144,11 +144,12 @@ flowchart TD
 
 ## 从源码构建
 
-要 Rust（版本见 `rust-toolchain.toml`）与 [uv](https://docs.astral.sh/uv/)；Linux 上另要 WebKitGTK 4.1、GTK 3、xkbcommon
-与 fontconfig 的开发包。
+要 Rust（版本见 `rust-toolchain.toml`）、[uv](https://docs.astral.sh/uv/)、CMake、Ninja 与 Perl；Linux 上另要
+WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包。
 
 ```sh
 make ffmpeg          # 编译静态链接的精简 FFmpeg（只需一次）
+make libtorrent      # 编译 BT 引擎用的 libtorrent 与 OpenSSL（只需一次，要 CMake、Ninja、Perl）
 cargo run -p hs-dlx  # 运行
 make check           # 全部检查
 make package         # 本机平台的安装包
