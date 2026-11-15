@@ -4,8 +4,10 @@
 #   装过的目录。
 # - 工作目录放源码包与解开的源码，默认 third_party/libtorrent/build；源码包已在其中且核对一致时不再下载，解开的源码
 #   每次删掉重解。
-# Windows：在已加载 MSVC 环境的 MSYS2 bash 中运行，OpenSSL 的配置要 Windows 原生的 perl（Strawberry Perl），产物为
-# MSVC 静态库（*.lib）。
+# 支持 macOS（arm64、x86_64）、Linux（x86_64、aarch64）与 Windows（x86_64），编出本机架构的库。Windows：在已加载 MSVC
+# 环境的 MSYS2 bash 中运行，OpenSSL 的配置要 Windows 原生的 perl（Strawberry Perl），产物为 MSVC 静态库（*.lib）。
+# 只用这里下载的 Boost 与 OpenSSL：会让编译器或 CMake 找到别处的头文件与库的环境变量先清掉，配置完核对 CMake 找到的
+# 路径。
 set -euo pipefail
 
 LIBTORRENT=2.1.2
@@ -31,6 +33,12 @@ case "$(uname -s)" in
   Linux) PLATFORM=linux ;;
   *) echo "不支持的平台: $(uname -s)" >&2; exit 1 ;;
 esac
+ARCH=$(uname -m)
+
+# 编译器与 CMake 会从这些变量里找头文件与库：系统里另装的 Boost、OpenSSL（Homebrew、发行版的包）混进来时编译与链接
+# 都不报错，类型布局对不上，运行时才出错。只用这里下载的
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH CMAKE_PREFIX_PATH CMAKE_INCLUDE_PATH \
+  CMAKE_LIBRARY_PATH BOOST_ROOT BOOSTROOT BOOST_INCLUDEDIR Boost_DIR OPENSSL_ROOT_DIR OPENSSL_DIR OPENSSL_CONF
 
 # macOS：静态库的最低系统版本与桌面应用的一致（apps/desktop/Cargo.toml 的 minimum-system-version），不设时 clang 按
 # SDK 的版本编译，链接时报「built for newer macOS version」
@@ -88,15 +96,26 @@ tar -xJf "$WORK/boost-$BOOST-b2-nodocs.tar.xz" -C "$WORK"
 mkdir -p "$PREFIX"
 jobs=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
 
-# OpenSSL：只要 libssl 与 libcrypto 的静态库，不要命令行程序、测试与文档
-openssl_flags=(no-shared no-tests no-docs no-apps --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib)
-cd "$WORK/openssl-$OPENSSL"
-case $PLATFORM in
-  macos) perl Configure darwin64-arm64-cc "${openssl_flags[@]}" ;;
-  linux) perl Configure linux-x86_64 "${openssl_flags[@]}" ;;
-  # /MD：与 Rust MSVC 目标一致用动态 C 运行库；no-asm：汇编要另装 NASM
-  windows) perl Configure VC-WIN64A no-asm "${openssl_flags[@]}" ;;
+# OpenSSL：只要 libssl 与 libcrypto 的静态库，不要命令行程序、测试与文档；不在运行时读配置文件（openssldir 是编译机上
+# 的路径，用户机器上没有，有同名路径时会读进别人的配置）
+openssl_flags=(no-shared no-tests no-docs no-apps no-autoload-config --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+  --libdir=lib)
+case "$PLATFORM-$ARCH" in
+  macos-arm64) openssl_target=darwin64-arm64-cc ;;
+  macos-x86_64) openssl_target=darwin64-x86_64-cc ;;
+  linux-x86_64) openssl_target=linux-x86_64 ;;
+  linux-aarch64) openssl_target=linux-aarch64 ;;
+  # 汇编要另装 NASM，不用
+  windows-x86_64) openssl_target=VC-WIN64A; openssl_flags+=(no-asm) ;;
+  *) echo "不支持的平台与架构: $PLATFORM $ARCH" >&2; exit 1 ;;
 esac
+if [[ $PLATFORM == windows && "$(perl -e 'print $^O')" != MSWin32 ]]; then
+  # MSYS2 的 perl 生成的 makefile 路径是 POSIX 写法，nmake 用不了
+  echo "OpenSSL 在 Windows 上要用 Windows 原生的 perl（如 Strawberry Perl），PATH 里先找到的是 $(command -v perl)" >&2
+  exit 1
+fi
+cd "$WORK/openssl-$OPENSSL"
+perl Configure "$openssl_target" "${openssl_flags[@]}"
 if [[ $PLATFORM == windows ]]; then
   nmake
   nmake install_sw
@@ -123,8 +142,28 @@ libtorrent_flags=(
   -DOPENSSL_USE_STATIC_LIBS=TRUE
   -DBoost_INCLUDE_DIR="$WORK/boost-$BOOST"
   -DBoost_NO_SYSTEM_PATHS=ON
+  -DBoost_NO_BOOST_CMAKE=ON
 )
 cmake -S "$WORK/libtorrent-rasterbar-$LIBTORRENT" -B "$WORK/libtorrent-cmake" "${libtorrent_flags[@]}"
+# 核对 CMake 找到的 Boost 与 OpenSSL 是这里下载、编译的那份
+cache="$WORK/libtorrent-cmake/CMakeCache.txt"
+# 路径在 CMake 里的写法：Windows 上为 `D:/a/b`（MSYS2 的 `/d/a/b` 转过去）
+cmake_path() {
+  if [[ $PLATFORM == windows ]]; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+expect_cache() {
+  local entry=$1 value
+  value=$(cmake_path "$2")
+  if ! grep -qxF "$entry=$value" "$cache"; then
+    echo "CMake 用的 ${entry%%:*} 不是这里装的：期望 $value，实际 $(grep "^${entry%%:*}:" "$cache" || echo 没有)" >&2
+    exit 1
+  fi
+}
+if [[ $PLATFORM == windows ]]; then static=lib; else static=a; fi
+expect_cache Boost_INCLUDE_DIR:PATH "$WORK/boost-$BOOST"
+expect_cache OPENSSL_INCLUDE_DIR:PATH "$PREFIX/include"
+expect_cache OPENSSL_SSL_LIBRARY:FILEPATH "$PREFIX/lib/libssl.$static"
+expect_cache OPENSSL_CRYPTO_LIBRARY:FILEPATH "$PREFIX/lib/libcrypto.$static"
 cmake --build "$WORK/libtorrent-cmake" --parallel "$jobs"
 cmake --install "$WORK/libtorrent-cmake"
 # libtorrent 的公开头文件包含 Boost 的头文件：一并装进安装目录，绑定只看这一个目录

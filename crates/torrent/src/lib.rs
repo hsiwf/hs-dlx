@@ -77,8 +77,8 @@ mod ffi {
         Removed,
         Deleted,
         DeleteFailed,
-        /// 事件来得太快、队列满了丢了一些，哪些种子的哪种事件说不清：在等续传数据的种子要重新要，在移除的种子要查它是否
-        /// 还在（移除完的事件丢了时这个会话里再也加不进它）
+        /// 事件来得太快、队列满了丢了一些，哪些种子的哪种事件说不清（可能有续传数据、移除的结果）：会话里靠事件维持的
+        /// 状态不再可信，要重新要续传数据，并在之后重建会话（移除的结果丢了的种子，这个会话里再也加不进）
         AlertsDropped,
         ListenSucceeded,
         ListenFailed,
@@ -215,7 +215,8 @@ impl Status {
     }
 }
 
-/// 一个 BT 会话：监听端口、连节点、管理加进来的种子。释放时等 libtorrent 关好会话（向 tracker 报告停止，最多几秒）。
+/// 一个 BT 会话：监听端口、连节点、管理加进来的种子。释放会阻塞：等 libtorrent 关好会话，其中向 tracker 报告停止最多
+/// 等 2 秒，此外还有写完缓存在内存里的数据、关闭文件；不要在界面线程上释放。
 pub struct Session(cxx::UniquePtr<ffi::Session>);
 
 impl Session {

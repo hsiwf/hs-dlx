@@ -54,6 +54,8 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
 	pack.set_int(lt::settings_pack::allowed_enc_level, lt::settings_pack::pe_both);
 	pack.set_bool(lt::settings_pack::prefer_rc4, true);
+	// 关会话时向 tracker 报告停止最多等这么久（秒）：释放会话要等它，默认 5 秒，退出应用时界面一直等着
+	pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
 	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大，诊断时另开
 	pack.set_int(lt::settings_pack::alert_mask,
 		static_cast<int>(static_cast<std::uint32_t>(lt::alert_category::error
@@ -251,14 +253,21 @@ void Session::remove(rust::Str id, bool delete_files) const {
 	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
 	m_session.remove_torrent(found->second, delete_files ? lt::session::delete_files : lt::remove_flags_t{});
 	m_handles.erase(found);
-	m_removing[key] = delete_files;
+	m_removing[key] = Removing{delete_files, false, false};
 }
 
 void Session::removed(std::string const& id, bool files_settled) const {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	auto found = m_removing.find(id);
-	// 不删文件的在移除的事件时就移除完了；删文件的要等删的结果
-	if (found != m_removing.end() && (files_settled || !found->second)) m_removing.erase(found);
+	if (found == m_removing.end()) return;
+	Removing& removing = found->second;
+	if (files_settled) {
+		removing.files_settled = true;
+	} else {
+		removing.removed = true;
+	}
+	// 移除的事件与（要删文件时）删的结果都来了才算移除完，两者先后不定
+	if (removing.removed && (!removing.deleting || removing.files_settled)) m_removing.erase(found);
 }
 
 void Session::save_resume_data(rust::Str id) const {

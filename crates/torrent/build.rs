@@ -23,11 +23,17 @@ fn main() {
         )
     });
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("cargo 给构建脚本设了目标系统");
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").expect("cargo 给构建脚本设了目标环境");
     let mut build = cxx_build::bridge("src/lib.rs");
     build
         .file("src/shim.cpp")
         .include(dist.join("include"))
         .std("c++17");
+    if target_env == "msvc" {
+        // shim.cpp 里有中文的字面量：MSVC 默认按系统的代码页读源码
+        build.flag("/utf-8");
+    }
     for define in property(&cmake, "INTERFACE_COMPILE_DEFINITIONS") {
         // 只在调试配置里定义的（`$<$<CONFIG:Debug>:…>`）不用：库按发布配置编译
         if define.starts_with("$<") {
@@ -48,6 +54,15 @@ fn main() {
     }
     for library in property(&cmake, "INTERFACE_LINK_LIBRARIES") {
         link_system_library(&library);
+    }
+    // 静态的 OpenSSL 用到的系统库：它的依赖不在 libtorrent 导出的配置里（那里只写了 OpenSSL::SSL）
+    let openssl_system: &[&str] = match target_os.as_str() {
+        "windows" => &["ws2_32", "gdi32", "advapi32", "crypt32", "user32"],
+        "linux" => &["dl"],
+        _ => &[],
+    };
+    for library in openssl_system {
+        println!("cargo:rustc-link-lib={library}");
     }
 }
 
@@ -80,12 +95,21 @@ fn static_name(lib: &Path, name: &str) -> String {
 }
 
 /// 链接 CMake 导出的依赖里的系统库：`-framework X` 为 macOS 的框架，`$<LINK_ONLY:x>` 与普通的名字为系统库；
-/// `Threads::Threads` 由 Rust 的标准库带上，`OpenSSL::SSL` 与 `Boost::headers` 是上面单独处理的静态库与头文件。
+/// `Threads::Threads` 由 Rust 的标准库带上，`OpenSSL::SSL` 与 `Boost::headers` 是上面单独处理的静态库与头文件；只在调试
+/// 配置里用的（`$<$<CONFIG:Debug>:…>`）不用，库按发布配置编译。认不出的生成表达式报错：当成库名链接会报一个看不懂的
+/// 「找不到库」。
 fn link_system_library(library: &str) {
     let library = library
         .strip_prefix("$<LINK_ONLY:")
         .and_then(|inner| inner.strip_suffix('>'))
         .unwrap_or(library);
+    if library.starts_with("$<$<CONFIG:Debug>:") {
+        return;
+    }
+    assert!(
+        !library.starts_with("$<"),
+        "libtorrent 的 CMake 配置里有认不出的链接依赖 {library}：在 build.rs 里加上它的处理"
+    );
     if let Some(framework) = library.strip_prefix("-framework ") {
         println!("cargo:rustc-link-lib=framework={framework}");
     } else if !library.contains("::") && !library.is_empty() {

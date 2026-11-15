@@ -171,6 +171,33 @@ fn selected_files_download_and_resume_without_peers() {
     restored
         .add_resume(&resume, &id, path_str(&fetch_dir))
         .unwrap();
+    // 连文件一起删：libtorrent 先发删的结果、后发移除的事件，两个都到了才算移除完
+    restored.remove(&id, true).unwrap();
+    let (mut removed, mut deleted) = (false, false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(removed && deleted) {
+        assert!(Instant::now() < deadline, "没等到移除与删文件的事件");
+        assert!(
+            restored
+                .add_resume(&resume, &id, path_str(&fetch_dir))
+                .is_err(),
+            "移除完之前加得进"
+        );
+        for alert in restored.pop_alerts(100).unwrap() {
+            if alert.torrent != id.as_str() {
+                continue;
+            }
+            match alert.kind {
+                AlertKind::Removed => removed = true,
+                AlertKind::Deleted | AlertKind::DeleteFailed => deleted = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(!fetch_dir.join("album/a.bin").exists(), "文件删掉了");
+    restored
+        .add_resume(&resume, &id, path_str(&fetch_dir))
+        .unwrap();
     assert!(
         local_session()
             .add_resume(b"not bencode", &id, path_str(&fetch_dir))
