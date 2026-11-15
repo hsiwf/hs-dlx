@@ -21,7 +21,7 @@ pub struct Request {
     /// 交给核心的请求头，已按 [`check_option_header`] 校验，名字不分大小写各不相同
     pub headers: Vec<(String, String)>,
     /// 命令里有、没带上的请求头名（按命令里的写法，不分大小写去重）：Host、Content-Length、Connection 等由连接决定，
-    /// Accept-Encoding、Range、If-* 由下载器决定
+    /// Accept-Encoding、Range、If-* 由下载器决定，Proxy-Authorization 要写进代理地址
     pub dropped: Vec<String>,
 }
 
@@ -94,8 +94,9 @@ pub enum CurlError {
     CrossOrigin { command: String, target: String },
 }
 
-/// 不带上的请求头（小写）：前一组由连接决定，后一组由下载器决定（核心不接受，见 [`check_option_header`]）。
-const DROPPED: [&str; 17] = [
+/// 不带上的请求头（小写）：前一组由连接决定，后一组由下载器决定（核心不接受，见 [`check_option_header`]）；
+/// Proxy-Authorization 是代理的认证，要写进设置里的代理地址（核心同样不接受）。
+const DROPPED: [&str; 18] = [
     "host",
     "content-length",
     "connection",
@@ -113,6 +114,7 @@ const DROPPED: [&str; 17] = [
     "if-match",
     "if-unmodified-since",
     "if-range",
+    "proxy-authorization",
 ];
 
 /// `text` 的第一个词是 `curl` 或 `curl.exe`（不分大小写）：看作 curl 命令，交给 [`parse`]。
@@ -1071,6 +1073,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.headers, Vec::new());
+        // 代理的认证要写进代理地址，核心不接受这个请求头
+        let proxied =
+            parse("curl https://a.example/ -H 'Proxy-Authorization: Basic eDp5'").unwrap();
+        assert_eq!(
+            (proxied.headers, proxied.dropped),
+            (Vec::new(), vec!["Proxy-Authorization".to_owned()])
+        );
         assert_eq!(
             parse("curl https://a.example/ -H 'X;  '"),
             Err(CurlError::Header("-H 后面要写成「名称: 值」".into()))
