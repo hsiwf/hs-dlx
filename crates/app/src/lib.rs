@@ -7,6 +7,7 @@ mod error;
 mod failure;
 mod naming;
 mod preference;
+mod public_trackers;
 mod service;
 mod settings;
 pub mod special_link;

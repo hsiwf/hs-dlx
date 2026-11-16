@@ -1,5 +1,5 @@
-//! BT 任务下得慢、下不动时的逐项诊断：监听、路由器的端口映射、有没有节点从外面连进来、DHT、tracker、种子的人数与上传
-//! 限速，每项一个结论与说明。这里只按查到的情况下结论，查由服务做（[`crate::Service::diagnose`]）。
+//! BT 任务下得慢、下不动时的逐项诊断：监听、路由器的端口映射、有没有节点从外面连进来、DHT、tracker、公共 tracker、
+//! 种子的人数与上传限速，每项一个结论与说明。这里只按查到的情况下结论，查由服务做（[`crate::Service::diagnose`]）。
 
 use std::num::NonZeroU32;
 
@@ -14,6 +14,8 @@ pub enum CheckItem {
     Incoming,
     Dht,
     Trackers,
+    /// 补没补上公共 tracker（ngosang/trackerslist 的列表，补给不是私有的种子）
+    PublicTrackers,
     /// tracker 报的做种与在下的人数
     Swarm,
     Upload,
@@ -60,8 +62,22 @@ pub(crate) struct Facts {
     /// 种子的做种与在下的人数（tracker 报的，取各处最多的）；None 为没报
     pub seeds: Option<u32>,
     pub leechers: Option<u32>,
+    pub public: Public,
     /// 上传限速，字节每秒；None 为不限
     pub upload_limit: Option<NonZeroU32>,
+}
+
+/// 公共 tracker 的状况。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Public {
+    /// 不补（没有列表的来源）
+    Off,
+    /// 列表还在取
+    Fetching,
+    /// 列表这次没取到，为原因
+    Failed(String),
+    /// 列表取到了，种子的 tracker 里有其中这么多个
+    Added(usize),
 }
 
 /// 一个 tracker 的状况。
@@ -217,6 +233,40 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             format!("{total} 个 tracker 还没回应"),
         ),
     });
+    checks.push(match &facts.public {
+        _ if facts.private => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Ok,
+            "私有种子不补公共 tracker".to_owned(),
+        ),
+        Public::Off => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Ok,
+            "不补公共 tracker".to_owned(),
+        ),
+        Public::Fetching => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Warn,
+            "公共 tracker 列表还在取".to_owned(),
+        ),
+        Public::Failed(why) => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Warn,
+            format!(
+                "公共 tracker 列表没取到（{why}）：隔一阵再取；取到之前只靠种子里的 tracker 与 DHT 找节点，可检查代理设置"
+            ),
+        ),
+        Public::Added(0) => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Warn,
+            "公共 tracker 列表取到了，还没补上".to_owned(),
+        ),
+        Public::Added(added) => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Ok,
+            format!("补了 {added} 个公共 tracker"),
+        ),
+    });
     let counted = |seeds: u32, leechers: Option<u32>| {
         format!(
             "tracker 报做种 {seeds} 人{}",
@@ -306,6 +356,7 @@ mod tests {
             }],
             seeds: Some(12),
             leechers: Some(3),
+            public: Public::Added(20),
             upload_limit: None,
         }
     }
@@ -374,6 +425,13 @@ mod tests {
         assert!(text(&facts, CheckItem::Trackers).contains("其余的还没回应"));
         facts.trackers = vec![tracker(false)];
         assert!(text(&facts, CheckItem::Trackers).contains("还没回应"));
+        // 公共 tracker：没取到时带上原因；私有种子不补
+        let mut facts = healthy();
+        facts.public = Public::Failed("connection refused".into());
+        assert_eq!(level(&facts, CheckItem::PublicTrackers), CheckLevel::Warn);
+        assert!(text(&facts, CheckItem::PublicTrackers).contains("connection refused"));
+        facts.private = true;
+        assert_eq!(level(&facts, CheckItem::PublicTrackers), CheckLevel::Ok);
         // 人数：没人且没连着节点为不通；tracker 报没人而连着节点的不算
         let mut facts = healthy();
         facts.seeds = Some(0);

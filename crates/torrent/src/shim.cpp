@@ -58,6 +58,9 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_bool(lt::settings_pack::prefer_rc4, true);
 	// 关会话时向 tracker 报告停止最多等这么久（秒）：释放会话要等它，默认 5 秒，退出应用时界面一直等着
 	pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
+	// 每层 tracker 各通告一个（uTorrent 的做法）：种子自己的 tracker 能用时，补在后面一层的公共 tracker 照样通告；默认
+	// 按多 tracker 规范只用最前面能用的那层
+	pack.set_bool(lt::settings_pack::announce_to_all_tiers, true);
 	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大；诊断要的统计另由 post_session_stats 要（它的事件
 	// 不受这个设置管）
 	pack.set_int(lt::settings_pack::alert_mask,
@@ -124,6 +127,7 @@ rust::String Session::add(lt::add_torrent_params params, std::string const& id, 
 	lt::torrent_handle h = m_session.add_torrent(std::move(params));
 	m_handles[id] = h;
 	m_ids[h] = id;
+	m_added_trackers.erase(id);
 	return rust::String(id);
 }
 
@@ -370,6 +374,47 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 	return out;
 }
 
+std::uint32_t Session::add_trackers(rust::Str id, rust::Slice<rust::String const> urls) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	std::string const key = string_of(id);
+	auto found = m_handles.find(key);
+	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
+	std::vector<lt::announce_entry> const present = found->second.trackers();
+	// 补在已有的之后的一层（层号最大 255）
+	int tier = 0;
+	for (lt::announce_entry const& entry : present) tier = std::max(tier, std::min(int(entry.tier) + 1, 255));
+	std::set<std::string>& added = m_added_trackers[key];
+	std::uint32_t count = 0;
+	for (rust::String const& url : urls) {
+		std::string const text(url.data(), url.size());
+		bool const has = added.count(text) > 0 || std::any_of(present.begin(), present.end(),
+			[&](lt::announce_entry const& entry) { return entry.url == text; });
+		if (has) continue;
+		lt::announce_entry entry(text);
+		entry.tier = static_cast<std::uint8_t>(tier);
+		found->second.add_tracker(entry);
+		added.insert(text);
+		++count;
+	}
+	return count;
+}
+
+void Session::drop_added_trackers(std::string const& id, lt::add_torrent_params& params) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_added_trackers.find(id);
+	if (found == m_added_trackers.end() || found->second.empty()) return;
+	// tracker_tiers 与 trackers 一一对应，短了的按 0 层（write_resume_data.cpp 的 build_tracker_list）
+	std::vector<std::string> trackers;
+	std::vector<int> tiers;
+	for (std::size_t i = 0; i < params.trackers.size(); ++i) {
+		if (found->second.count(params.trackers[i]) > 0) continue;
+		trackers.push_back(params.trackers[i]);
+		tiers.push_back(i < params.tracker_tiers.size() ? params.tracker_tiers[i] : 0);
+	}
+	params.trackers = std::move(trackers);
+	params.tracker_tiers = std::move(tiers);
+}
+
 void Session::set_upload_limit(std::int32_t bytes_per_second) const {
 	lt::settings_pack pack;
 	pack.set_int(lt::settings_pack::upload_rate_limit, bytes_per_second);
@@ -399,7 +444,9 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (auto* t = lt::alert_cast<lt::torrent_finished_alert>(a)) {
 			out.push_back(alert_of(AlertKind::Finished, *a, id_of(t->handle)));
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_alert>(a)) {
-			Alert alert = alert_of(AlertKind::ResumeData, *a, id_of(t->handle));
+			std::string const id = id_of(t->handle);
+			drop_added_trackers(id, t->params);
+			Alert alert = alert_of(AlertKind::ResumeData, *a, id);
 			alert.data = bytes_out(lt::write_resume_data_buf(t->params));
 			out.push_back(std::move(alert));
 		} else if (auto* t = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {

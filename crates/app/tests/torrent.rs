@@ -11,6 +11,7 @@ use hs_dlx_app::{
     Store, TaskId, TorrentInfo, TorrentNetwork, TorrentPhase, TorrentProgress,
 };
 use hs_dlx_torrent::{AddOptions, Session, SessionConfig, State, TorrentId, create_torrent};
+use hs_m3u8_core::{Proxy, Url};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -93,10 +94,18 @@ fn magnet(id: &TorrentId, seeder: &Session) -> String {
 }
 
 fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
+    service_with(store, Vec::new())
+}
+
+/// 公共 tracker 列表依次从 `public_trackers` 取的服务。
+fn service_with(
+    store: &Path,
+    public_trackers: Vec<Url>,
+) -> (Service, mpsc::UnboundedReceiver<Event>) {
     Service::new(
         Store::open(store).unwrap(),
         NonZeroUsize::new(8).unwrap(),
-        TorrentNetwork::Loopback,
+        TorrentNetwork::Loopback { public_trackers },
     )
     .unwrap()
 }
@@ -313,7 +322,7 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     // 诊断：在回环地址上监听着；测试的会话不开 DHT，种子里没有 tracker
     let checks = rt.block_on(service.diagnose(task.id)).unwrap().unwrap();
     let level = |item| checks.iter().find(|c| c.item == item).unwrap().level;
-    assert_eq!(checks.len(), 7);
+    assert_eq!(checks.len(), 8);
     assert_eq!(level(CheckItem::Listen), CheckLevel::Ok);
     assert_eq!(level(CheckItem::Dht), CheckLevel::Warn);
     assert_eq!(level(CheckItem::Trackers), CheckLevel::Warn);
@@ -556,6 +565,113 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     assert!(
         folder.join("album").join("a.bin").exists(),
         "下的文件归用户"
+    );
+    drop(service);
+    drop(seeder);
+}
+
+/// 测试的 tracker：在回环地址上的 HTTP 服务，`/list` 为只有它自己的公共 tracker 列表，`/announce` 回 `peer` 这一个节点；
+/// 记下通告来的信息哈希（十六进制）。在自己的线程与运行时上跑，随测试进程结束。
+struct Tracker {
+    list: Url,
+    announce: String,
+    announced: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Tracker {
+    fn start(peer: std::net::SocketAddrV4) -> Tracker {
+        use axum::extract::{RawQuery, State as Shared};
+        type Announced = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+        async fn announce(
+            Shared((peer, announced)): Shared<(std::net::SocketAddrV4, Announced)>,
+            RawQuery(query): RawQuery,
+        ) -> Vec<u8> {
+            let query = query.unwrap_or_default();
+            let hash = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("info_hash="))
+                .map(|hash| {
+                    percent_encoding::percent_decode_str(hash)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            announced.lock().unwrap().push(hash);
+            let mut body = b"d8:intervali60e5:peers6:".to_vec();
+            body.extend_from_slice(&peer.ip().octets());
+            body.extend_from_slice(&peer.port().to_be_bytes());
+            body.push(b'e');
+            body
+        }
+        let announced = Announced::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let shared = (peer, announced.clone());
+        std::thread::spawn(move || {
+            let rt = runtime();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let list = format!("{base}/announce\n");
+                let app = axum::Router::new()
+                    .route("/list", axum::routing::get(move || async move { list }))
+                    .route("/announce", axum::routing::get(announce))
+                    .with_state(shared);
+                sender.send(base).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let base = receiver.recv().unwrap();
+        Tracker {
+            list: Url::parse(&format!("{base}/list")).unwrap(),
+            announce: format!("{base}/announce"),
+            announced,
+        }
+    }
+}
+
+/// 磁力链接既没带 tracker 也没给节点（测试的会话不开 DHT）：只能经补的公共 tracker（测试的 tracker，回做种一方的地址）
+/// 找到节点、取到种子信息；取到的续传数据里没有补的 tracker。下完接着做种时诊断报补上了它。
+#[test]
+fn public_trackers_find_peers_for_bare_magnet_links() {
+    let dir = test_dir("public-trackers");
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
+    let tracker = Tracker::start(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        seeder.listen_port(),
+    ));
+    let rt = runtime();
+    let (service, mut events) = service_with(&dir.join("tasks.sqlite"), vec![tracker.list.clone()]);
+    // 系统代理可能不放过回环地址
+    service.set_proxy(&Proxy::Direct).unwrap();
+
+    let uri = format!("magnet:?xt=urn:btih:{id}");
+    let resume = fetch(&rt, &service, &uri);
+    assert!(tracker.announced.lock().unwrap().contains(&id.to_string()));
+    let contains = |data: &[u8], text: &str| data.windows(text.len()).any(|w| w == text.as_bytes());
+    assert!(
+        !contains(&resume, &tracker.announce),
+        "补的 tracker 存进了续传数据"
+    );
+
+    let info = TorrentInfo::of(&resume).unwrap();
+    let all = info.files.iter().map(|file| file.index).collect();
+    let task = rt
+        .block_on(service.create(draft(&uri, &dir.join("downloads"), resume, all), 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.block_on(until(&mut events, task.id, |_| false)),
+        Some(Status::Done)
+    );
+    rt.block_on(seeding(&mut events, task.id));
+    let checks = rt.block_on(service.diagnose(task.id)).unwrap().unwrap();
+    let public = checks
+        .iter()
+        .find(|check| check.item == CheckItem::PublicTrackers)
+        .unwrap();
+    assert_eq!(
+        (public.level, public.text.as_str()),
+        (CheckLevel::Ok, "补了 1 个公共 tracker")
     );
     drop(service);
     drop(seeder);

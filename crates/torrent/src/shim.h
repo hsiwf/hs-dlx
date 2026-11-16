@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,7 @@ public:
 	NetworkStatus network() const;
 	void request_stats() const;
 	rust::Vec<TrackerState> trackers(rust::Str id) const;
+	std::uint32_t add_trackers(rust::Str id, rust::Slice<rust::String const> urls) const;
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
 
 private:
@@ -74,6 +76,8 @@ private:
 	bool still_removing(std::string const& id) const;
 	// 丢了事件：在移除中的都记下
 	void mark_lost() const;
+	// 从种子 `id` 的续传数据里去掉 add_trackers 补的 tracker
+	void drop_added_trackers(std::string const& id, lt::add_torrent_params& params) const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
 	// `handle` 是编号 `id` 现在登记的那一份（在会话里，或移除中还没移除完）：同一个种子移除后再加入时，旧的那份的事件
@@ -93,7 +97,9 @@ private:
 	// 调了 flush、还没报来写完的次数，按编号：写完的事件按它转出，其余的（种子下完时 libtorrent 自己发的）不转。下完时
 	// 自发的那条若在请求之后才到，会被当作请求的结果：它写盘时已下的就是全部要下的，与请求的保证相同
 	mutable std::map<std::string, int> m_flush_requests;
-	// 守着上面两张表；加入时整个过程持有，取事件时查编号不会早于登记
+	// add_trackers 给各种子补的 tracker，按编号：写续传数据时去掉，不随种子存下；再加入同一个种子时清空
+	mutable std::map<std::string, std::set<std::string>> m_added_trackers;
+	// 守着上面几张表；加入时整个过程持有，取事件时查编号不会早于登记
 	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取
 	mutable std::mutex m_alerts_mutex;

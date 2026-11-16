@@ -245,6 +245,7 @@ mod ffi {
         fn network(self: &Session) -> NetworkStatus;
         fn request_stats(self: &Session);
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
+        fn add_trackers(self: &Session, id: &str, urls: &[String]) -> Result<u32>;
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
@@ -445,6 +446,13 @@ impl Session {
     /// 种子的各 tracker 此刻的状况；没有这个种子时报错。
     pub fn trackers(&self, id: &TorrentId) -> Result<Vec<TrackerState>, Error> {
         Ok(self.inner().trackers(id.as_str())?)
+    }
+
+    /// 给种子 `id` 补上 `urls` 里它还没有的 tracker（放在已有的之后的一层），返回补了几个；没有这个种子时报错。补的只在
+    /// 这次加入期间有效：写出的续传数据（[`AlertKind::ResumeData`]）里没有它们，再加入时要再补。会话对每层 tracker
+    /// 各通告一个（不止最前面能用的那层），种子自己的 tracker 能用时补的照样通告。
+    pub fn add_trackers(&self, id: &TorrentId, urls: &[String]) -> Result<u32, Error> {
+        Ok(self.inner().add_trackers(id.as_str(), urls)?)
     }
 
     /// 实际监听的端口；还没监听成功时为 0。

@@ -3,7 +3,8 @@
 //! 管它的那个（[`Owner`]）。
 //!
 //! 种子的一切（种子信息、tracker、根名、选了的文件、已有的块）都在它的续传数据里，存进任务存储；停下时先把缓存写到
-//! 磁盘、再要续传数据（libtorrent 只记写完的块），存下的已有块不多于磁盘上的（标为可信）。
+//! 磁盘、再要续传数据（libtorrent 只记写完的块），存下的已有块不多于磁盘上的（标为可信）。公共 tracker（见
+//! [`crate::public_trackers`]）不在其内：每次加入会话后，列表取到了就补给不是私有的种子。
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -16,10 +17,12 @@ use std::time::Duration;
 use hs_dlx_torrent::{
     AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, State, TorrentId,
 };
+use hs_m3u8_core::Url;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::diagnosis::{Check, Facts, Tracker, checks};
+use crate::diagnosis::{Check, Facts, Public, Tracker, checks};
+use crate::public_trackers::{PublicTrackers, SOURCES};
 use crate::{Error, Failure, FailureKind, Seeding};
 
 /// 取事件时最多等多久（毫秒）：关闭时取事件的线程最晚这么久后发现要退出。
@@ -38,12 +41,26 @@ const SCARCE_TICKS: u32 = 6;
 const OS_LITTER: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
 
 /// BT 会话连哪里。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorrentNetwork {
-    /// 监听本机的全部地址（端口沿用上次的，第一次由系统挑），用 DHT、UPnP、NAT-PMP 与本地发现
+    /// 监听本机的全部地址（端口沿用上次的，第一次由系统挑），用 DHT、UPnP、NAT-PMP 与本地发现，从网上取公共 tracker
+    /// 列表
     Internet,
-    /// 只监听回环地址、不找外面的节点：用于测试
-    Loopback,
+    /// 只监听回环地址、不找外面的节点：用于测试。公共 tracker 列表依次从 `public_trackers` 取，空时不补
+    Loopback { public_trackers: Vec<Url> },
+}
+
+impl TorrentNetwork {
+    /// 公共 tracker 列表的来源；空时不补。
+    fn public_trackers(&self) -> Vec<Url> {
+        match self {
+            TorrentNetwork::Internet => SOURCES
+                .iter()
+                .map(|source| Url::parse(source).expect("列表的来源是写死的有效地址"))
+                .collect(),
+            TorrentNetwork::Loopback { public_trackers } => public_trackers.clone(),
+        }
+    }
 }
 
 /// 种子里的一个文件（不含对齐用的填充文件）。
@@ -143,6 +160,8 @@ pub struct MetadataProgress {
     pub peers: u32,
     /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None
     pub tracker_error: Option<String>,
+    /// 磁力链接没带 tracker、要补公共 tracker，而列表这次没取到时为原因（隔一阵再取）；别的时候为 None
+    pub public_trackers_error: Option<String>,
 }
 
 /// 运行中的 BT 任务在做什么。
@@ -245,6 +264,8 @@ pub(crate) struct Engine {
     stats: Notify,
     /// 关闭了：取事件的线程退出
     stop: AtomicBool,
+    /// 公共 tracker 列表的状况（[`Bt::set_public`] 改）
+    public: watch::Receiver<PublicTrackers>,
 }
 
 impl Engine {
@@ -392,6 +413,22 @@ impl Owner {
             .map_err(|_| Error::Torrent(format!("10 秒内没等到{what}（种子 {}）", self.id)))?
     }
 
+    /// 等着给这个种子补公共 tracker；`wanted` 为否时不补。
+    fn supplement(&self, wanted: bool) -> Supplement {
+        Supplement {
+            public: self.engine.public.clone(),
+            done: !wanted,
+        }
+    }
+
+    /// 补上公共 tracker `trackers`；种子已不在会话里时报 [`Error::Torrent`]。
+    fn add_public(&self, trackers: &[String]) -> Result<(), Error> {
+        self.session()
+            .add_trackers(&self.id, trackers)
+            .map(drop)
+            .map_err(self.libtorrent("补公共 tracker"))
+    }
+
     /// 从会话里移除（照 `removal` 连带删文件）并等它移除完；删文件失败时报 [`Error::Torrent`]，说明为 libtorrent 的。
     async fn remove(&mut self, removal: Removal) -> Result<(), Error> {
         self.session()
@@ -428,6 +465,38 @@ impl Owner {
     }
 }
 
+/// 一个种子等着补的公共 tracker。
+struct Supplement {
+    public: watch::Receiver<PublicTrackers>,
+    /// 补过了，或不补
+    done: bool,
+}
+
+impl Supplement {
+    /// 列表取到了、还没补时返回它（之后算补过了）；补过、不补或不会再取到（BT 引擎已释放）时一直不返回，放在
+    /// `select!` 里等。
+    async fn ready(&mut self) -> Arc<[String]> {
+        while !self.done {
+            if let PublicTrackers::Ready(trackers) = &*self.public.borrow_and_update() {
+                self.done = true;
+                return trackers.clone();
+            }
+            if self.public.changed().await.is_err() {
+                break;
+            }
+        }
+        std::future::pending().await
+    }
+
+    /// 要补而列表这次没取到时为原因。
+    fn failure(&self) -> Option<String> {
+        match &*self.public.borrow() {
+            PublicTrackers::Failed(why) if !self.done => Some(why.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// 引擎的持有者：第一次用到时建会话与取事件的线程，关闭时收掉。
 pub(crate) struct Bt {
     network: TorrentNetwork,
@@ -437,6 +506,9 @@ pub(crate) struct Bt {
     upload_limit: Mutex<Option<NonZeroU32>>,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
+    /// 公共 tracker 列表的来源（空时不补）与状况
+    public_sources: Vec<Url>,
+    public: watch::Sender<PublicTrackers>,
     running: Mutex<Option<Running>>,
 }
 
@@ -456,13 +528,40 @@ pub(crate) struct SessionState {
 impl Bt {
     /// `upload_limit` 为设置里的上传限速。
     pub fn new(network: TorrentNetwork, upload_limit: Option<NonZeroU32>) -> Bt {
+        let public_sources = network.public_trackers();
+        let public = if public_sources.is_empty() {
+            PublicTrackers::Off
+        } else {
+            PublicTrackers::Idle
+        };
         Bt {
             network,
             upload_limit: Mutex::new(upload_limit),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
+            public_sources,
+            public: watch::Sender::new(public),
             running: Mutex::new(None),
         }
+    }
+
+    /// 公共 tracker 列表还没开始取时记为在取，返回列表的来源（由调用方去取，结果交给 [`Bt::set_public`]）；已开始取
+    /// 过或不补时为 None。
+    pub fn begin_public(&self) -> Option<Vec<Url>> {
+        self.public
+            .send_if_modified(|public| {
+                let idle = *public == PublicTrackers::Idle;
+                if idle {
+                    *public = PublicTrackers::Fetching;
+                }
+                idle
+            })
+            .then(|| self.public_sources.clone())
+    }
+
+    /// 记下取公共 tracker 列表的结果：取到的随即补给会话里该补的种子。
+    pub fn set_public(&self, public: PublicTrackers) {
+        self.public.send_replace(public);
     }
 
     /// 引擎；还没有时照上次存下的 `saved`（端口与 DHT 状态）建会话。已关闭时报 [`Error::Closed`]，会话建不出时报
@@ -477,12 +576,12 @@ impl Bt {
             return Ok(running.engine.clone());
         }
         let version = env!("CARGO_PKG_VERSION");
-        let (listen, discovery) = match self.network {
+        let (listen, discovery) = match &self.network {
             TorrentNetwork::Internet => {
                 let port = saved.port.unwrap_or(0);
                 (format!("0.0.0.0:{port},[::]:{port}"), true)
             }
-            TorrentNetwork::Loopback => ("127.0.0.1:0".to_owned(), false),
+            TorrentNetwork::Loopback { .. } => ("127.0.0.1:0".to_owned(), false),
         };
         let session = Session::new(&SessionConfig {
             listen_interfaces: listen,
@@ -502,6 +601,7 @@ impl Bt {
             removed: Notify::new(),
             stats: Notify::new(),
             stop: AtomicBool::new(false),
+            public: self.public.subscribe(),
         });
         let pumped = engine.clone();
         let pump = std::thread::Builder::new()
@@ -607,6 +707,13 @@ pub(crate) async fn fetch_metadata(
     };
     // 加进去之后才登记：同一个种子已在会话里时上面就报错了，不会抢别人的事件
     let mut owner = engine.own(&id)?;
+    // 还不知道私不私有：链接没带 tracker 时才补（带了的可能是私有种子的 tracker，不让信息哈希经公共 tracker 传出去）
+    let bare = owner
+        .session()
+        .trackers(&id)
+        .map_err(owner.libtorrent("查 tracker"))?
+        .is_empty();
+    let mut public = owner.supplement(bare);
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     let mut tracker_error = None;
     // 登记之前已取到的，事件不会再来：每次先看状态
@@ -621,6 +728,7 @@ pub(crate) async fn fetch_metadata(
         progress.send_replace(MetadataProgress {
             peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
             tracker_error: tracker_error.clone(),
+            public_trackers_error: public.failure(),
         });
         // 取到种子信息的事件丢了也不要紧：每次都看状态
         tokio::select! {
@@ -631,6 +739,7 @@ pub(crate) async fn fetch_metadata(
                     tracker_error = Some(alert.message);
                 }
             }
+            trackers = public.ready() => owner.add_public(&trackers)?,
             _ = ticks.tick() => {}
         }
     }
@@ -856,6 +965,7 @@ pub(crate) async fn seed(
     mut save: impl FnMut(Result<Resume, String>),
 ) -> Seeded {
     let mut owner = seeder.owner;
+    let mut public = owner.supplement(public_wanted(&owner));
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     let mut saves =
         tokio::time::interval_at(tokio::time::Instant::now() + SAVE_INTERVAL, SAVE_INTERVAL);
@@ -890,6 +1000,11 @@ pub(crate) async fn seed(
                 // 做种不等哪一步的结果，状态每半秒照查，丢了事件不影响
                 Routed::Lost => {}
             },
+            trackers = public.ready() => {
+                if let Err(error) = owner.add_public(&trackers) {
+                    break SeedEnd::Failed(error.to_string());
+                }
+            }
             // 设置改了：下一次状态时按新的判
             _ = seeding.changed() => {}
             _ = ticks.tick() => {
@@ -935,6 +1050,7 @@ async fn drive(
     cancel: &CancellationToken,
     each: &mut impl FnMut(TorrentProgress),
 ) -> Outcome {
+    let mut public = owner.supplement(public_wanted(owner));
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     // 连续几次状态凑不齐全部内容（见 SCARCE_TICKS）
     let mut short = 0;
@@ -968,6 +1084,14 @@ async fn drive(
                     });
                 }
             },
+            trackers = public.ready() => {
+                if let Err(error) = owner.add_public(&trackers) {
+                    return Outcome::Failed(Failure {
+                        kind: FailureKind::Other,
+                        message: error.to_string(),
+                    });
+                }
+            }
             _ = ticks.tick() => match owner.session().status(&owner.id) {
                 Ok(status) => {
                     let mut progress = TorrentProgress::of(&status);
@@ -991,6 +1115,15 @@ async fn drive(
             },
         }
     }
+}
+
+/// 加入了的种子要补公共 tracker：不是私有的（私有种子只许经它自己的 tracker 找节点）。查不到状态时不补，接下来查状态
+/// 时照常报出。
+fn public_wanted(owner: &Owner) -> bool {
+    owner
+        .session()
+        .status(&owner.id)
+        .is_ok_and(|status| !status.private_torrent)
 }
 
 /// 下完了：结果为要下的字节数。
@@ -1209,6 +1342,17 @@ pub(crate) async fn diagnose(
         return Err(Error::Closed);
     }
     let network = engine.session.network();
+    let public = match &*engine.public.borrow() {
+        PublicTrackers::Off => Public::Off,
+        PublicTrackers::Idle | PublicTrackers::Fetching => Public::Fetching,
+        PublicTrackers::Failed(why) => Public::Failed(why.clone()),
+        PublicTrackers::Ready(list) => Public::Added(
+            trackers
+                .iter()
+                .filter(|tracker| list.contains(&tracker.url))
+                .count(),
+        ),
+    };
     let count = |value: i32| u32::try_from(value).ok();
     let most =
         |of_status: i32, of_trackers: Option<i32>| count(of_status.max(of_trackers.unwrap_or(-1)));
@@ -1240,6 +1384,7 @@ pub(crate) async fn diagnose(
                 message: tracker.message,
             })
             .collect(),
+        public,
         upload_limit,
     };
     Ok(checks(&facts))

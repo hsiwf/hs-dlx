@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use hs_m3u8_core::hls::Preference;
@@ -16,15 +16,16 @@ use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, FileOutput, FileOutputOptions, FileProgress, FileRequest, Job,
     JobControl, JobRequest, Leftover, LeftoverKind, Output, OutputOptions, Probe, Progress, Proxy,
-    Resource, Saved, Source, Stage, Unsettled, check_option_header,
+    Resource, Saved, Source, Stage, Unsettled, Url, check_option_header,
 };
 use rusqlite::Transaction;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
+use crate::public_trackers::{self, PublicTrackers};
 use crate::store::{self, Store};
 use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
 use crate::{
@@ -205,6 +206,10 @@ struct Shared {
     events: mpsc::UnboundedSender<Event>,
     /// BT 引擎，第一次用到时建会话
     bt: Bt,
+    /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
+    public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
+    runtime: Handle,
     /// 做种的设置，随 [`Service::set_seeding`] 改；在做种的随时照它判停不停
     seeding: watch::Sender<Seeding>,
     /// 在做种的（含正在加入会话、还没开始的）：停止做种经它找到，登记与查询都在 `store` 锁内
@@ -267,6 +272,8 @@ impl Service {
             tracker: TaskTracker::new(),
             events,
             bt: Bt::new(network, settings.upload_limit),
+            public_fetch: Mutex::new(None),
+            runtime: runtime.handle().clone(),
             seeding: watch::Sender::new(settings.seeding),
             seeders: Mutex::new(HashMap::new()),
         });
@@ -333,6 +340,8 @@ impl Service {
                 seeder.cancel.cancel();
             }
         }
+        // 取公共 tracker 列表的不改存储，不用等
+        drop(lock(&self.shared.public_fetch).take());
         let tracker = &self.shared.tracker;
         tracker.close();
         let _timed_out = self
@@ -775,10 +784,45 @@ impl Drop for DiscardGuard {
     }
 }
 
+/// 从 `sources` 取公共 tracker 列表，经设置里的代理（每次取时读），结果交给 BT 引擎（[`Bt::set_public`]）；没取到隔一阵
+/// 再取（[`public_trackers::FIRST_RETRY`] 起每次翻倍），取到或服务已释放即止。
+async fn fetch_public_trackers(shared: Weak<Shared>, engine: Engine, sources: Vec<Url>) {
+    let mut wait = public_trackers::FIRST_RETRY;
+    loop {
+        let proxy = match shared.upgrade() {
+            Some(shared) => {
+                let mut store = lock(&shared.store);
+                store
+                    .transaction()
+                    .and_then(|tx| store::settings(&tx))
+                    .map(|settings| settings.proxy)
+            }
+            None => return,
+        };
+        let fetched = match proxy {
+            Ok(proxy) => public_trackers::fetch(&engine, &sources, &proxy).await,
+            Err(error) => Err(format!("读不出代理设置：{error}")),
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        match fetched {
+            Ok(trackers) => {
+                shared.bt.set_public(PublicTrackers::Ready(trackers.into()));
+                return;
+            }
+            Err(why) => shared.bt.set_public(PublicTrackers::Failed(why)),
+        }
+        drop(shared);
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(public_trackers::LAST_RETRY);
+    }
+}
+
 /// [`Service::discard`] 的步骤：等任务停下、删任务目录、删存储里的记录。
 async fn run_discard(
     id: TaskId,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     stopped: Option<watch::Receiver<bool>>,
 ) -> Result<Vec<Leftover>, Error> {
     if let Some(mut stopped) = stopped {
@@ -900,14 +944,31 @@ impl Shared {
         store::get(&tx, id)?.ok_or(Error::NotFound(id))
     }
 
-    /// BT 引擎；还没有时照存储里上次关闭时的端口与 DHT 状态建会话（见 [`Bt::engine`]）。不持 `store` 锁调用。
-    fn bt_engine(&self) -> Result<Arc<torrent::Engine>, Error> {
+    /// BT 引擎；还没有时照存储里上次关闭时的端口与 DHT 状态建会话（见 [`Shared::torrent_engine`]）。不持 `store` 锁调用。
+    fn bt_engine(self: &Arc<Self>) -> Result<Arc<torrent::Engine>, Error> {
         let saved = {
             let mut store = lock(&self.store);
             let tx = store.transaction()?;
             store::torrent_session(&tx)?
         };
-        self.bt.engine(saved)
+        self.torrent_engine(saved)
+    }
+
+    /// BT 引擎；还没有时照 `saved` 建会话（见 [`Bt::engine`]），第一次建时开始取公共 tracker 列表。
+    fn torrent_engine(
+        self: &Arc<Self>,
+        saved: torrent::SessionState,
+    ) -> Result<Arc<torrent::Engine>, Error> {
+        let engine = self.bt.engine(saved)?;
+        if let Some(sources) = self.bt.begin_public() {
+            let fetching = self.runtime.spawn(fetch_public_trackers(
+                Arc::downgrade(self),
+                self.engine.clone(),
+                sources,
+            ));
+            *lock(&self.public_fetch) = Some(AbortOnDropHandle::new(fetching));
+        }
+        Ok(engine)
     }
 
     /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；
@@ -932,7 +993,7 @@ impl Shared {
                     )));
                 }
             };
-            let engine = self.bt.engine(store::torrent_session(&tx)?)?;
+            let engine = self.torrent_engine(store::torrent_session(&tx)?)?;
             let resume = store::torrent_resume(&tx, id)?;
             store::set_seeding_task(&tx, id, true)?;
             self.commit(tx, applied)?;
@@ -1195,7 +1256,7 @@ impl Shared {
 
     /// 照任务 `task` 开始下载或录制，经设置里的代理（BT 不经代理），设置与 BT 任务的续传数据从 `tx` 读；调用方须在
     /// 运行时里。
-    fn launch(&self, tx: &Transaction<'_>, task: &Task) -> Result<Launched, Error> {
+    fn launch(self: &Arc<Self>, tx: &Transaction<'_>, task: &Task) -> Result<Launched, Error> {
         Ok(match &task.spec.kind {
             Kind::Hls(_) => {
                 let proxy = store::settings(tx)?.proxy;
@@ -1211,12 +1272,12 @@ impl Shared {
 
     /// 开始 BT 任务 `id`：BT 会话还没有时照 `tx` 里存的端口与 DHT 状态建，续传数据从 `tx` 读；调用方须在运行时里。
     fn launch_torrent(
-        &self,
+        self: &Arc<Self>,
         tx: &Transaction<'_>,
         id: TaskId,
         spec: &TorrentSpec,
     ) -> Result<TorrentRun, Error> {
-        let engine = self.bt.engine(store::torrent_session(tx)?)?;
+        let engine = self.torrent_engine(store::torrent_session(tx)?)?;
         let resume = store::torrent_resume(tx, id)?;
         let data = resume.data.clone();
         let cancel = CancellationToken::new();

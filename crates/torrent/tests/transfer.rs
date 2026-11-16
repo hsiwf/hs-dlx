@@ -492,3 +492,34 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     std::fs::remove_dir_all(&seed_dir).unwrap();
     std::fs::remove_dir_all(&fetch_dir).unwrap();
 }
+
+/// 补的 tracker：已有的（种子自己的、补过的）不重复补；写出的续传数据里只去掉补的，种子自己的留着；再加入时清空，
+/// 要再补。
+#[test]
+fn added_trackers_stay_out_of_resume_data() {
+    let dir = scratch("added-trackers");
+    let session = local_session();
+    let own = "http://127.0.0.1:9/announce";
+    let public = "udp://127.0.0.1:9/announce";
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let uri = format!("magnet:?xt=urn:btih:{hash}&tr={own}");
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let urls = [own.to_owned(), public.to_owned()];
+    assert_eq!(session.add_trackers(&id, &urls).unwrap(), 1);
+    assert_eq!(session.add_trackers(&id, &urls).unwrap(), 0);
+    let listed: Vec<String> = session
+        .trackers(&id)
+        .unwrap()
+        .into_iter()
+        .map(|tracker| tracker.url)
+        .collect();
+    assert_eq!(listed, urls);
+    let contains = |data: &[u8], text: &str| data.windows(text.len()).any(|w| w == text.as_bytes());
+    let resume = resume_data(&session, &id);
+    assert!(contains(&resume, own) && !contains(&resume, public));
+
+    session.remove(&id, Removal::Keep).unwrap();
+    wait_until(&session, Duration::from_secs(10), |s| !s.removing(&id));
+    let again = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    assert_eq!(session.add_trackers(&again, &urls).unwrap(), 1);
+}

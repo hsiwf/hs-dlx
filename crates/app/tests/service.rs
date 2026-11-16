@@ -163,7 +163,9 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
     Service::new(
         Store::open(store).unwrap(),
         NonZeroUsize::new(8).unwrap(),
-        hs_dlx_app::TorrentNetwork::Loopback,
+        hs_dlx_app::TorrentNetwork::Loopback {
+            public_trackers: Vec::new(),
+        },
     )
     .unwrap()
 }

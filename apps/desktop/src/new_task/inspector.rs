@@ -242,6 +242,15 @@ impl NewTask {
             if let Some(error) = &progress.tracker_error {
                 body.push(ui::note(format!("tracker 报错：{error}"), true).into_any_element());
             }
+            if let Some(error) = &progress.public_trackers_error {
+                body.push(
+                    ui::note(
+                        format!("公共 tracker 列表没取到，隔一阵再取：{error}"),
+                        true,
+                    )
+                    .into_any_element(),
+                );
+            }
         }
         ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
     }

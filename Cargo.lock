@@ -2033,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "bindgen",
  "cc",
@@ -3630,7 +3630,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-core"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "aes 0.9.3",
  "cbc 0.2.1",
@@ -3654,7 +3654,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-hls"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "thiserror 2.0.21",
  "url",
@@ -3663,7 +3663,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-remux"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -3673,7 +3673,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-sysproxy"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "system-configuration 0.7.0",
  "windows-registry 0.6.1",
@@ -7123,7 +7123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -7843,7 +7843,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
