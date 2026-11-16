@@ -591,6 +591,10 @@ pub(crate) struct Bt {
     /// libtorrent 可能已放弃连代理、还没让它重连：探出过握手被拒（[`ProxyCheck::Refused`]），或用户在还没探到能用时
     /// 重新保存了同一个；探到能用时重连并清掉。持着 `running` 的锁改与读
     proxy_reconnect: AtomicBool,
+    /// BT 会话在时探出过引导节点被 TUN 代理解析成假地址（[`crate::netcheck::PROXY_FAKE_IP`]）：libtorrent 只在启动
+    /// DHT 时解析一次，之后探到能用也要重启才生效。换了代理的设置时清掉（经 TUN 代理自己的端口时假地址通）；持着
+    /// `running` 的锁改与读
+    proxy_fake_ip: AtomicBool,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     /// 公共 tracker 列表的来源（空时不补）与状况
@@ -636,6 +640,7 @@ impl Bt {
             proxy: Mutex::new(proxy),
             proxy_doubted: AtomicBool::new(false),
             proxy_reconnect: AtomicBool::new(false),
+            proxy_fake_ip: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
             public_sources,
@@ -789,6 +794,7 @@ impl Bt {
         self.proxy_doubted.store(false, Ordering::Relaxed);
         // 换了设置，libtorrent 随即照新的连
         self.proxy_reconnect.store(false, Ordering::Relaxed);
+        self.proxy_fake_ip.store(false, Ordering::Relaxed);
         self.proxy_check.send_replace(if direct {
             ProxyCheck::Direct
         } else {
@@ -833,9 +839,10 @@ impl Bt {
         self.record(url, check, true);
     }
 
-    /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次探到能用时：
-    /// libtorrent 可能已放弃连代理（见 `proxy_reconnect`，或它自己报过不再重试的出错）时让它重连；否则只清掉它记着的
-    /// 出错（它自己重连上了）。重连会断开经代理的 uTP 连接，别的时候不重连。
+    /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次探到能用、而
+    /// libtorrent 可能已放弃连代理（见 `proxy_reconnect`）或经它报过错时，让它重连并清掉那条出错：报过错即原来的转发
+    /// 已断，它之后的重试可能在握手时被拒而不再重试、也不报错。重连会断开经代理的 uTP 连接，别的时候不重连。BT 会话
+    /// 在时探出过引导节点是 TUN 的假地址（见 `proxy_fake_ip`），之后探到能用也记为没转发出去，说明要重启。
     pub fn record_proxy_check(&self, url: &Url, check: ProxyCheck) {
         self.record(url, check, false);
     }
@@ -845,6 +852,15 @@ impl Bt {
         if lock(&self.proxy).as_ref() != Some(url) {
             return;
         }
+        if running.is_some() && check.problem() == Some(crate::netcheck::PROXY_FAKE_IP.as_str()) {
+            self.proxy_fake_ip.store(true, Ordering::Relaxed);
+        }
+        // 假地址改好了，BT 还用着旧的：直到重启都算没转发出去
+        let check = if check == ProxyCheck::Usable && self.proxy_fake_ip.load(Ordering::Relaxed) {
+            ProxyCheck::Silent(crate::netcheck::RESTART_AFTER_FAKE_IP.to_owned())
+        } else {
+            check
+        };
         let usable = *self.proxy_check.borrow() == ProxyCheck::Usable;
         if doubt
             && matches!(check, ProxyCheck::Silent(_))
@@ -862,11 +878,10 @@ impl Bt {
             && let Some(running) = &*running
         {
             let session = &running.engine.session;
-            let network = session.network();
-            if self.proxy_reconnect.swap(false, Ordering::Relaxed) || network.proxy_gave_up {
+            if self.proxy_reconnect.swap(false, Ordering::Relaxed)
+                || !session.network().proxy_error.is_empty()
+            {
                 session.reconnect_proxy(&libtorrent_proxy(Some(url)));
-            } else if !network.proxy_error.is_empty() {
-                session.clear_proxy_error();
             }
         }
     }

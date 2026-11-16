@@ -143,13 +143,10 @@ mod ffi {
         dht_nodes: i64,
         /// 有过节点从外面连进来（统计过才知道）
         incoming: bool,
-        /// 经代理的 UDP（DHT、uTP、UDP 的 tracker）最近一次连代理或握手失败的说明（英文）；没失败过、改过代理或清掉
-        /// （[`Session::clear_proxy_error`]）之后为空。代理拒绝转发 UDP、认证被拒、回了 IPv6 地址时 libtorrent 不报这个，
+        /// 经代理的 UDP（DHT、uTP、UDP 的 tracker）最近一次连代理或握手失败的说明（英文）；没失败过、改过代理或重连过
+        /// （[`Session::reconnect_proxy`]）之后为空。代理拒绝转发 UDP、认证被拒、回了 IPv6 地址时 libtorrent 不报这个，
         /// UDP 就此不通
         proxy_error: String,
-        /// 报过的出错里有 libtorrent 不再自己重试的（代理的版本不对、要认证、认证方式不支持）：要让它重连
-        /// （[`Session::reconnect_proxy`]）才再连代理；与 `proxy_error` 一起清掉
-        proxy_gave_up: bool,
     }
 
     /// 种子的一个 tracker 此刻的状况。
@@ -286,7 +283,6 @@ mod ffi {
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
         fn set_proxy(self: &Session, proxy: &SocksProxy);
         fn reconnect_proxy(self: &Session, proxy: &SocksProxy);
-        fn clear_proxy_error(self: &Session);
         fn network(self: &Session) -> NetworkStatus;
         fn request_stats(self: &Session);
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
@@ -490,11 +486,6 @@ impl Session {
     /// 才用得上；其间不会直连。
     pub fn reconnect_proxy(&self, proxy: &SocksProxy) {
         self.inner().reconnect_proxy(proxy);
-    }
-
-    /// 清掉记着的代理出错（[`NetworkStatus::proxy_error`] 与 `proxy_gave_up`）：已确认代理能用、libtorrent 自己重连上了时。
-    pub fn clear_proxy_error(&self) {
-        self.inner().clear_proxy_error();
     }
 
     /// 网络状况（监听与端口映射随事件更新，DHT 与连入要 [`Session::request_stats`] 之后才新）。

@@ -140,7 +140,7 @@ pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, ProxyCheck> {
         .await
         .map_err(|_| {
             ProxyCheck::Refused(format!(
-                "代理 {at} 连上了，但 10 秒内没回应握手：BT 会一直等在这一步"
+                "代理 {at} 连上了，但 10 秒内没回应 SOCKS5 握手：这个端口可能不是 SOCKS5（如 HTTP 代理的端口），改成代理的 SOCKS5 端口"
             ))
         })?
 }

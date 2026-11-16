@@ -177,6 +177,9 @@ pub(crate) static PROXY_FAKE_IP: std::sync::LazyLock<String> = std::sync::LazyLo
     )
 });
 
+/// TUN 代理的 fake-ip 改好之后、BT 还拿着之前解析到的假地址时的说明（见 [`crate::torrent::Bt::set_proxy_check`]）。
+pub(crate) const RESTART_AFTER_FAKE_IP: &str = "DHT 引导节点现在解析得到真实地址了，但 BT 还用着之前解析到的假地址（只在启动时解析一次）：重启 hs-dlx 后生效";
+
 /// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为 [`crate::socks::associate`] 的
 /// 结论）的结论，网络检测与后台看护记进 BT 引擎的都照它：只看经代理的，不拿直连的比。收发出错、引导节点一个都没回为
 /// [`ProxyCheck::Silent`]（解析成 TUN 的假地址时说明为 [`PROXY_FAKE_IP`]）。引导节点都解析不出、没问成时握手成了即
@@ -477,10 +480,13 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
         },
         Some((proxy, health)) => {
             // 改法：没转发 UDP 时换节点或打开 UDP；连不上、被拒时看上面那一项写的原因
-            let fix = if matches!(proxy.check, ProxyCheck::Silent(_)) {
-                "换节点或在代理里打开 UDP"
-            } else {
+            let fix = if matches!(
+                proxy.check,
+                ProxyCheck::Unreachable(_) | ProxyCheck::Refused(_)
+            ) {
                 "见上面「BT 代理」一项"
+            } else {
+                "换节点或在代理里打开 UDP"
             };
             match (health, direct) {
             (Health::Healthy, Health::Healthy) => {
