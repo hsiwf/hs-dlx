@@ -2,7 +2,7 @@
 //! 获得焦点时背光提亮，框里是可探测的链接时整圈点亮、圆盘写认出了什么。检查面板是新任务照着开始的设置；剪贴板里有
 //! 链接时，底栏的主操作是探测它。
 
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 use gpui_kit::{
     AnyElement, Context, Div, FontWeight, IntoElement, ParentElement as _, PathBuilder,
@@ -67,17 +67,23 @@ impl Shell {
                 dial::Big::Phrase(url.host_str().unwrap_or_default().to_owned()),
                 "回车探测清晰度与音轨",
             ),
+            Some(url) if links::torrent_url(url.as_str()).is_some() => dial::readout(
+                "认出链接",
+                theme::accent(),
+                dial::Big::Phrase(links::source(url)),
+                "回车取种子信息，再选要下的文件",
+            ),
             Some(url) => dial::readout(
                 "认出链接",
                 theme::accent(),
-                dial::Big::Phrase(url.host_str().unwrap_or_default().to_owned()),
+                dial::Big::Phrase(links::source(url)),
                 "回车探测；是网页就在后台找视频流，是文件就下载",
             ),
             None => dial::readout(
                 "就绪",
                 theme::accent(),
                 dial::Big::Phrase("粘贴链接开始".to_owned()),
-                "m3u8 地址、有视频的网页，或文件",
+                "m3u8 地址、网页、文件或磁力链接",
             ),
         };
         let figure = dial::lit_dial(
@@ -143,6 +149,11 @@ impl Shell {
                     "文件",
                     "服务器支持时分段并行下载、断点续传",
                 ))
+                .child(kind(
+                    magnet_icon(),
+                    "磁力链接与种子文件",
+                    "取到种子信息后选要下的文件",
+                ))
                 .into_any_element(),
         );
         let foot = self.clipboard.clone().map(|url| {
@@ -165,6 +176,8 @@ impl Shell {
 fn kind(icon: AnyElement, name: &'static str, does: &'static str) -> Div {
     div().flex().items_start().gap(px(12.)).child(icon).child(
         div()
+            .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -200,6 +213,37 @@ fn file_icon() -> AnyElement {
             let path = path
                 .build()
                 .expect("几条线段的描边，顶点远低于曲面细分的上限");
+            window.paint_path(path, theme::hover_edge());
+        },
+    )
+    .size(px(KIND_ICON))
+    .flex_none()
+    .into_any_element()
+}
+
+/// 磁力链接的小图形：U 形磁铁，两极各一道横线。
+fn magnet_icon() -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        |bounds, (), window, _| {
+            let at = |x: f32, y: f32| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+            let mut path = PathBuilder::stroke(px(2.));
+            path.move_to(at(6., 4.));
+            path.line_to(at(6., 14.));
+            // 底下的半圆：圆心 (14, 14)、半径 8，从左经最低点到右，折线逼近
+            const STEPS: u8 = 16;
+            for step in 1..=STEPS {
+                let angle = PI * (1. - f32::from(step) / f32::from(STEPS));
+                path.line_to(at(14. + 8. * angle.cos(), 14. + 8. * angle.sin()));
+            }
+            path.line_to(at(22., 4.));
+            path.move_to(at(3., 9.));
+            path.line_to(at(9., 9.));
+            path.move_to(at(19., 9.));
+            path.line_to(at(25., 9.));
+            let path = path
+                .build()
+                .expect("几十个顶点的描边，远低于曲面细分的上限");
             window.paint_path(path, theme::hover_edge());
         },
     )
