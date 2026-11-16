@@ -25,8 +25,23 @@ pub(crate) enum ProxyCheck {
     Checking,
     /// 连得上、认证过了、接了 UDP 转发；问得了 DHT 引导节点时经它问通了
     Usable,
-    /// 用不了，为原因
-    Unusable(String),
+    /// 连不上、握手、认证或申请转发 UDP 没成，为原因。握手被拒后 libtorrent 不再自己重试，恢复后要让它重连
+    Refused(String),
+    /// 接了 UDP 转发，但经它问 DHT 引导节点一个都没回、或发不到转发地址，为原因；libtorrent 那边的转发照旧
+    Silent(String),
+}
+
+impl ProxyCheck {
+    /// 用不了时的原因。
+    pub(crate) fn problem(&self) -> Option<&str> {
+        match self {
+            ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => Some(why),
+            ProxyCheck::Direct
+            | ProxyCheck::Unchecked
+            | ProxyCheck::Checking
+            | ProxyCheck::Usable => None,
+        }
+    }
 }
 
 /// 地址里的用户名或密码解开百分号编码；不是 UTF-8 时为 None。

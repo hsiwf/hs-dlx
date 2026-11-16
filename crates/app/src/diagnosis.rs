@@ -142,7 +142,7 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     if let Some(proxy) = &facts.proxy {
         let address = &proxy.address;
         checks.push(match &proxy.check {
-            ProxyCheck::Unusable(why) => check(
+            ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => check(
                 CheckItem::Listen,
                 CheckLevel::Bad,
                 format!("BT 代理用不了：{why}"),
@@ -585,7 +585,7 @@ mod tests {
         let proxy = facts.proxy.as_mut().unwrap();
         proxy.error = "connection refused".into();
         assert_eq!(level(&facts, CheckItem::Listen), CheckLevel::Warn);
-        facts.proxy.as_mut().unwrap().check = ProxyCheck::Unusable("代理不转发 UDP".into());
+        facts.proxy.as_mut().unwrap().check = ProxyCheck::Refused("代理不转发 UDP".into());
         assert_eq!(level(&facts, CheckItem::Listen), CheckLevel::Bad);
         assert!(text(&facts, CheckItem::Listen).contains("不转发 UDP"));
         facts.dht_nodes = Some(0);

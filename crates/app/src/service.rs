@@ -26,7 +26,6 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
-use crate::socks::ProxyCheck;
 use crate::store::{self, Store};
 use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
 use crate::update::{self, Release, Restart, UpdateFeed, Version};
@@ -1239,18 +1238,13 @@ impl Shared {
         let proxy = match (proxy_url, proxied) {
             (Some(url), Some(through)) => {
                 let through = through.map_err(socket)?;
+                let check = netcheck::judge_proxy(&through);
                 // 记进 BT 引擎：取种子信息的界面与诊断随之更新
-                self.bt
-                    .set_proxy_check(&url, netcheck::judge_proxy(&through));
-                let (check, dht) = match through {
-                    // 报告里「没转发出去」另有说明，握手本身算通
-                    Ok(through) => (ProxyCheck::Usable, Some(through)),
-                    Err(why) => (ProxyCheck::Unusable(why), None),
-                };
+                self.bt.set_proxy_check(&url, check.clone());
                 Some(netcheck::Proxied {
                     address: hs_m3u8_core::bare_url(&url),
                     check,
-                    dht,
+                    dht: through.ok(),
                 })
             }
             _ => None,
@@ -1267,8 +1261,7 @@ impl Shared {
     /// 照现在的 BT 代理看着它：已在看着同一个地址时不动；改了或改成直连时停下看着旧的，设了时开始看着新的。开始时探
     /// 一次（之前记下的结果可能是 BT 会话建起前量的）；之后每 [`PROXY_RECHECK`] 看一眼，还没探、探出用不了，或
     /// libtorrent 经它报过错时再探，能用时每 [`PROXY_RECHECK_USABLE`] 复查一次。探只经代理发包（见
-    /// [`crate::netcheck::probe_proxy`]），探到的记下（见 [`Bt::set_proxy_check`]）；记着能用而引导节点一个都没回时，
-    /// 下一轮再探一次也没回才改记用不了（UDP 偶尔整轮丢包）。服务释放即止。
+    /// [`crate::netcheck::probe_proxy`]），探到的记下（见 [`Bt::set_proxy_check`]）。服务释放即止。
     fn watch_torrent_proxy(self: &Arc<Self>) {
         let mut watching = lock(&self.proxy_probe);
         // 在锁内读：与同时改代理的不会把新地址的看护换成旧地址的
@@ -1288,13 +1281,11 @@ impl Shared {
         let probing = self.runtime.spawn(async move {
             let mut ticks = tokio::time::interval(PROXY_RECHECK);
             let mut last_probe: Option<tokio::time::Instant> = None;
-            // 记着能用时探到一个都没回、还没改记
-            let mut doubted = false;
             loop {
                 ticks.tick().await;
                 let stale = last_probe.is_none_or(|at| at.elapsed() >= PROXY_RECHECK_USABLE);
                 match shared.upgrade().map(|shared| shared.bt.proxy_due(&url)) {
-                    Some(Some(due)) if due || stale || doubted => {}
+                    Some(Some(due)) if due || stale => {}
                     Some(Some(_)) => continue,
                     // 代理改了或服务已释放
                     Some(None) | None => return,
@@ -1304,17 +1295,6 @@ impl Shared {
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                let silent =
-                    check == ProxyCheck::Unusable(crate::netcheck::PROXY_SILENT.to_owned());
-                let usable = shared
-                    .bt
-                    .proxy()
-                    .is_some_and(|(_, recorded)| recorded == ProxyCheck::Usable);
-                if silent && usable && !doubted {
-                    doubted = true;
-                    continue;
-                }
-                doubted = false;
                 shared.bt.set_proxy_check(&url, check);
             }
         });

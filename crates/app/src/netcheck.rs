@@ -117,9 +117,10 @@ pub(crate) struct Proxied {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Measured {
     pub dht: Dht,
-    /// UDP 的 tracker 握手；没测时为原因（公共 tracker 列表还没取到等）
+    /// UDP 的 tracker 握手；没测成时为原因（公共 tracker 列表还没取到、收发出错等）
     pub trackers: Result<Ratio, String>,
-    /// IPv6：没有公网地址时为 None；有时为 IPv6 的 DHT 引导节点（解析不出的不算），开不了套接字时为原因
+    /// IPv6：没有公网地址时为 None；有时为 IPv6 的 DHT 引导节点（解析不出的不算），没测成（开不了套接字、收发出错）
+    /// 时为原因
     pub ipv6: Option<Result<Ratio, String>>,
     /// 设了 BT 代理时
     pub proxy: Option<Proxied>,
@@ -164,19 +165,26 @@ pub(crate) fn drops_udp(direct: &Dht, proxied: &Dht) -> bool {
 pub(crate) const DROPS_UDP: &str =
     "代理接了 UDP 转发，但没转发出去：代理的节点可能不支持 UDP，换节点或在代理里打开 UDP";
 
+/// 经代理问的 DHT 引导节点被 TUN 代理解析成假地址、一个都没回时的说明。libtorrent 解析引导节点同样用本机的 DNS，
+/// 拿到的也是这些假地址。
+pub(crate) const PROXY_FAKE_IP: &str = "DHT 引导节点被系统里的 TUN 代理解析成了 198.18 开头的假地址，经这个代理到不了（BT 同样照这些地址问）：在 TUN 代理里把它们排除出 fake-ip，或把 BT 代理设成 TUN 代理自己的 SOCKS 端口";
+
 /// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为原因）的结论，网络检测与后台看护
-/// 记进 BT 引擎的都照它：只看经代理的，不拿直连的比。握手没成、收发出错、引导节点一个都没回时为用不了；问不了（引导
-/// 节点都解析不出，或解析成了 TUN 代理的假地址，经别的代理本来就到不了）时握手成了即算能用。
+/// 记进 BT 引擎的都照它：只看经代理的，不拿直连的比。握手没成为 [`ProxyCheck::Refused`]；收发出错、引导节点一个都
+/// 没回为 [`ProxyCheck::Silent`]（解析成 TUN 的假地址时说明为 [`PROXY_FAKE_IP`]）。引导节点都解析不出、没问成时握手
+/// 成了即算能用。
 pub(crate) fn judge_proxy(through: &Result<Dht, String>) -> ProxyCheck {
     match through {
-        Err(why) => ProxyCheck::Unusable(why.clone()),
+        Err(why) => ProxyCheck::Refused(why.clone()),
         Ok(Dht {
             failure: Some(why), ..
-        }) => ProxyCheck::Unusable(why.clone()),
-        Ok(through) if through.tun || through.bootstrap.asked == 0 => ProxyCheck::Usable,
-        Ok(through) if through.bootstrap.replied == 0 => {
-            ProxyCheck::Unusable(PROXY_SILENT.to_owned())
-        }
+        }) => ProxyCheck::Silent(why.clone()),
+        Ok(through) if through.bootstrap.asked == 0 => ProxyCheck::Usable,
+        Ok(through) if through.bootstrap.replied == 0 => ProxyCheck::Silent(if through.tun {
+            PROXY_FAKE_IP.to_owned()
+        } else {
+            PROXY_SILENT.to_owned()
+        }),
         Ok(_) => ProxyCheck::Usable,
     }
 }
@@ -204,11 +212,11 @@ pub(crate) const PROXY_SILENT: &str = "经代理问 DHT 引导节点一个都没
 pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> ProxyCheck {
     let relay = match crate::socks::associate(url).await {
         Ok(relay) => relay,
-        Err(why) => return ProxyCheck::Unusable(why),
+        Err(why) => return ProxyCheck::Refused(why),
     };
     let udp = match Udp::via(relay).await {
         Ok(udp) => udp,
-        Err(error) => return ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}")),
+        Err(error) => return ProxyCheck::Silent(format!("开不了 UDP 套接字：{error}")),
     };
     let (found, unresolved) = bootstrap(hosts, false).await;
     let requests: Vec<_> = found.iter().map(|to| (*to, krpc("find_node"))).collect();
@@ -292,7 +300,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
         Err(why) => check(
             NetItem::UdpTrackers,
             CheckLevel::Warn,
-            format!("没测 UDP 的 tracker：{why}"),
+            format!("UDP 的 tracker 没测成：{why}"),
         ),
         Ok(ratio) if ratio.asked == 0 => check(
             NetItem::UdpTrackers,
@@ -318,7 +326,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
         Some(Err(why)) => check(
             NetItem::Ipv6,
             CheckLevel::Warn,
-            format!("有公网 IPv6，开不了 IPv6 的 UDP 套接字：{why}"),
+            format!("有公网 IPv6，IPv6 的 UDP 没测完：{why}"),
         ),
         Some(Ok(ratio)) if ratio.asked == 0 => check(
             NetItem::Ipv6,
@@ -337,43 +345,38 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             "有公网 IPv6，但 IPv6 的 UDP 发出去没有回应".to_owned(),
         ),
     });
+    // 经代理的：用不了的为大多不通；握手正常而问不了引导节点的（解析不出、TUN 的假地址）为没测
     let proxied = measured.proxy.as_ref().map(|proxy| {
         let health = match (&proxy.check, &proxy.dht) {
-            (ProxyCheck::Usable, Some(through))
-                if through.failure.is_some() || drops_udp(dht, through) =>
-            {
-                Health::Blocked
-            }
-            (ProxyCheck::Usable, Some(through)) => through.health(),
-            _ => Health::Blocked,
+            (check, _) if check.problem().is_some() => Health::Blocked,
+            (_, Some(through)) if through.tun => Health::Untested,
+            (_, Some(through)) => through.health(),
+            (_, None) => Health::Blocked,
         };
         (proxy, health)
     });
     checks.push(match &proxied {
         None => check(NetItem::Proxy, CheckLevel::Ok, "没设 BT 代理".to_owned()),
-        Some((proxy, health)) => match (&proxy.check, &proxy.dht, health) {
-            (ProxyCheck::Unusable(why), _, _) => check(
-                NetItem::Proxy,
-                CheckLevel::Bad,
-                format!("BT 代理用不了：{why}"),
-            ),
-            (
-                _,
-                Some(Dht {
-                    failure: Some(why), ..
-                }),
-                _,
-            ) => check(
-                NetItem::Proxy,
-                CheckLevel::Bad,
-                format!("BT 代理 {}：{why}", proxy.address),
-            ),
+        Some((proxy, health)) => match (proxy.check.problem(), &proxy.dht, health) {
             (_, Some(through), _) if drops_udp(dht, through) => check(
                 NetItem::Proxy,
                 CheckLevel::Bad,
                 format!("BT 代理 {}：{DROPS_UDP}", proxy.address),
             ),
-            (_, Some(through), Health::Healthy) => check(
+            (Some(why), _, _) => check(
+                NetItem::Proxy,
+                CheckLevel::Bad,
+                format!("BT 代理 {} 用不了：{why}", proxy.address),
+            ),
+            (None, _, Health::Untested) => check(
+                NetItem::Proxy,
+                CheckLevel::Warn,
+                format!(
+                    "BT 代理 {} 握手正常，但问不了 DHT 引导节点（解析不出，或解析成了 TUN 代理的假地址），没测它转发的 UDP",
+                    proxy.address
+                ),
+            ),
+            (None, Some(through), Health::Healthy) => check(
                 NetItem::Proxy,
                 CheckLevel::Ok,
                 format!(
@@ -443,6 +446,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
         }
     });
     let verdict = match &proxied {
+        _ if dht.failure.is_some() => "直连的 DHT 没测完：可再测一次".to_owned(),
         None => match direct {
             Health::Healthy => "网络正常：BT 能直接连".to_owned(),
             Health::Uncertain => "结果说不准：可再测一次".to_owned(),
@@ -458,6 +462,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             }
             (Health::Healthy, _) => "直连受限，经 BT 代理正常：保持开着 BT 代理".to_owned(),
             (Health::Uncertain, _) => "经 BT 代理的结果说不准：可再测一次".to_owned(),
+            (Health::Untested, _) => "BT 代理握手正常，经它的 UDP 没测成：见上面「BT 代理」一项".to_owned(),
             (_, Health::Healthy) => {
                 "BT 现在经的代理不通，直连正常：关掉 BT 代理，或换一个能转发 UDP 的代理".to_owned()
             }
@@ -506,10 +511,12 @@ impl Udp {
         })
     }
 
-    /// 经已谈好的 UDP 转发。
+    /// 经已谈好的 UDP 转发：套接字连到转发地址，转发端口没开时收包即报错（Windows），只收它发来的。
     pub async fn via(relay: UdpRelay) -> std::io::Result<Udp> {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+        socket.connect(relay.address).await?;
         Ok(Udp {
-            socket: UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?,
+            socket,
             relay: Some(relay),
         })
     }
@@ -527,30 +534,29 @@ impl Udp {
                 wrapped.extend_from_slice(&to.ip().octets());
                 wrapped.extend_from_slice(&to.port().to_be_bytes());
                 wrapped.extend_from_slice(data);
-                self.socket
-                    .send_to(&wrapped, relay.address)
-                    .await
-                    .map(drop)
-                    .map_err(|error| {
-                        format!("发不到代理的 UDP 转发地址 {}：{error}", relay.address)
-                    })
+                self.socket.send(&wrapped).await.map(drop).map_err(|error| {
+                    format!("发不到代理的 UDP 转发地址 {}：{error}", relay.address)
+                })
             }
             // 经代理只转发 IPv4（libtorrent 同样只用 IPv4）
             (Some(_), SocketAddr::V6(_)) => Ok(()),
         }
     }
 
-    /// 收一个包，返回内容与真正的来源；经代理时去掉 SOCKS5 的头，认不出的包丢掉接着收。之前发往已下线的地址回来的
-    /// 「端口不可达」（Windows 上未连接的 UDP 套接字照样报给收的一方）不算失败，接着收。
+    /// 收一个包，返回内容与真正的来源；经代理时去掉 SOCKS5 的头，认不出的包丢掉接着收。直连时之前发往已下线的地址回来
+    /// 的「端口不可达」（Windows 上未连接的 UDP 套接字照样报给收的一方）不算失败，接着收；经代理时它只能是代理的转发
+    /// 端口没开，报错。
     async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<(Vec<u8>, SocketAddr)> {
         loop {
             let (len, from) = match self.socket.recv_from(buffer).await {
                 Ok(received) => received,
                 Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                    ) =>
+                    if self.relay.is_none()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
                 {
                     continue;
                 }
@@ -998,7 +1004,7 @@ mod tests {
         assert!(report(&both).verdict.contains("可关掉 BT 代理"));
         // 代理用不了、直连正常：不能说「网络正常」
         let mut broken = healthy();
-        broken.proxy = proxied(ProxyCheck::Unusable("连不上代理".into()), None);
+        broken.proxy = proxied(ProxyCheck::Refused("连不上代理".into()), None);
         let broken = report(&broken);
         assert_eq!(level(&broken, NetItem::Proxy), CheckLevel::Bad);
         assert!(
@@ -1009,7 +1015,7 @@ mod tests {
         // 代理用不了、直连说不准：不说直连大多不通
         let mut unsure = healthy();
         unsure.dht = dht_of(ratio(4, 2), ratio(4, 1));
-        unsure.proxy = proxied(ProxyCheck::Unusable("连不上代理".into()), None);
+        unsure.proxy = proxied(ProxyCheck::Refused("连不上代理".into()), None);
         let unsure = report(&unsure);
         assert!(!unsure.verdict.contains("大多不通"), "{}", unsure.verdict);
         // 代理接了 UDP 转发却没转发出去
@@ -1072,29 +1078,36 @@ mod tests {
         let silent = dht_of(ratio(4, 0), ratio(0, 0));
         assert_eq!(
             judge_proxy(&Ok(silent.clone())),
-            ProxyCheck::Unusable(PROXY_SILENT.into())
+            ProxyCheck::Silent(PROXY_SILENT.into())
         );
         assert_eq!(
             judge_proxy(&Ok(dht_of(ratio(4, 1), ratio(0, 0)))),
             ProxyCheck::Usable
         );
-        // 问不了：解析不出、TUN 的假地址
+        // 问不成（解析不出）：按握手算
         assert_eq!(
             judge_proxy(&Ok(dht_of(ratio(0, 0), ratio(0, 0)))),
             ProxyCheck::Usable
         );
+        // 解析成 TUN 的假地址而没回：BT 同样照这些地址问，用不了，写明怎么改
         let mut tun = silent.clone();
         tun.tun = true;
-        assert_eq!(judge_proxy(&Ok(tun)), ProxyCheck::Usable);
+        assert_eq!(
+            judge_proxy(&Ok(tun.clone())),
+            ProxyCheck::Silent(PROXY_FAKE_IP.into())
+        );
+        let mut report_of_tun = healthy();
+        report_of_tun.proxy = proxied(ProxyCheck::Silent(PROXY_FAKE_IP.into()), Some(tun));
+        assert!(text(&report(&report_of_tun), NetItem::Proxy).contains("fake-ip"));
         let mut unsent = silent;
         unsent.failure = Some("发不到代理的 UDP 转发地址".into());
         assert_eq!(
             judge_proxy(&Ok(unsent)),
-            ProxyCheck::Unusable("发不到代理的 UDP 转发地址".into())
+            ProxyCheck::Silent("发不到代理的 UDP 转发地址".into())
         );
         assert_eq!(
             judge_proxy(&Err("连不上代理".into())),
-            ProxyCheck::Unusable("连不上代理".into())
+            ProxyCheck::Refused("连不上代理".into())
         );
     }
 
@@ -1250,7 +1263,7 @@ mod tests {
         let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
         assert_eq!(
             probe_proxy(&proxy, &[("127.0.0.1", silent.port())]).await,
-            ProxyCheck::Unusable(PROXY_SILENT.to_owned())
+            ProxyCheck::Silent(PROXY_SILENT.to_owned())
         );
         let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let unreachable = Url::parse(&format!(
@@ -1260,7 +1273,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             probe_proxy(&unreachable, &[("127.0.0.1", answering.port())]).await,
-            ProxyCheck::Unusable(why) if why.contains("连不上代理")
+            ProxyCheck::Refused(why) if why.contains("连不上代理")
         ));
     }
 }
