@@ -8,7 +8,7 @@ use std::time::Duration;
 use hs_dlx_cloud::pikpak::{self, Client, Entry, Phase, Reason, Session, gcid::Gcid};
 use hs_m3u8_core::{
     CancellationToken, FileOutputOptions, FileProgress, FileRequest, HttpErrorKind, HttpOptions,
-    Proxy, Source, WorkDirProblem,
+    Proxy, Source,
 };
 use tokio::task::JoinHandle;
 
@@ -19,7 +19,7 @@ use crate::{CloudFile, CloudSpec, Error, Failure, FailureKind, Status, Task, Tas
 
 /// 网盘还在下时多久问一次进度。
 const POLL: Duration = Duration::from_secs(5);
-/// 一个文件的直链被拒、或换了直链后核心认不出是不是同一个文件时，最多重取几次直链。
+/// 一个文件的直链被拒时最多重取几次直链。
 const RELINKS: u32 = 3;
 /// 等网盘下完时，接口连着暂时失败（网络、5xx、请求太频繁）多久才算失败：几小时的离线下载里偶尔一次不算。
 const POLL_TOLERANCE: Duration = Duration::from_secs(5 * 60);
@@ -456,8 +456,8 @@ impl Shared {
     }
 
     /// 取直链、交给核心下载第 `at.index` 个文件到 `output`（任务目录 `file_dir`），返回从网络读到的字节数（各次合计）。
-    /// 直链被拒时重取；换了直链后核心认不出是不是同一个文件（直链不带验证器、或带的变了）时删掉这个文件的任务目录、
-    /// 从头下，最后有 GCID 校验。两种合计最多 [`RELINKS`] 次，用完以云端失败报出（可再继续）。
+    /// 以网盘的文件编号加 GCID 担保内容身份，直链每次签名不同也沿用已下的范围（内容对不对由之后的 GCID 校验核对）。
+    /// 直链被拒时重取，最多 [`RELINKS`] 次，用完以云端失败报出（可再继续）。
     async fn fetch_cloud_file(
         self: &Arc<Self>,
         at: Position,
@@ -485,6 +485,7 @@ impl Shared {
             let mut options = FileOutputOptions::new(output.to_path_buf());
             options.work_dir = Some(file_dir.to_path_buf());
             let mut request = FileRequest::new(source, options);
+            request.identity = Some(format!("pikpak:{}:{}", file.id, file.gcid));
             request.expected = Some(hs_m3u8_core::Expected {
                 length: Some(file.size),
                 ..hs_m3u8_core::Expected::default()
@@ -531,14 +532,7 @@ impl Shared {
                 Err(hs_m3u8_core::Error::Cancelled) => return Err(Stop::Paused),
                 Err(error) => error,
             };
-            let stale = matches!(
-                error,
-                hs_m3u8_core::Error::WorkDir {
-                    problem: WorkDirProblem::SourceUnverified | WorkDirProblem::FileChanged,
-                    ..
-                }
-            );
-            if !(stale || link_rejected(&error)) {
+            if !link_rejected(&error) {
                 return Err(Stop::core(error));
             }
             if relinked == RELINKS {
@@ -551,19 +545,6 @@ impl Shared {
                 ));
             }
             relinked += 1;
-            if stale {
-                let leftovers = self
-                    .engine
-                    .discard(file_dir, hs_m3u8_core::Unsettled::Fail, cancel)
-                    .await
-                    .map_err(Stop::core)?;
-                if let Some(leftover) = leftovers.first() {
-                    return Err(Stop::failed(
-                        FailureKind::Disk,
-                        format!("重下 {} 前删不掉它的任务目录：{leftover}", output.display()),
-                    ));
-                }
-            }
         }
     }
 

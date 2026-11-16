@@ -57,6 +57,8 @@ struct Fake {
     user: &'static str,
     /// b.bin 的直链不带 ETag、每次最多给 64 KiB，第一个直链的第二个请求回 403
     b_unverifiable: bool,
+    /// 下载 b.bin 的各个请求：（第几个直链，Range 的起点）
+    b_requests: Vec<(String, u64)>,
     /// b.bin 在网盘上还没处理完（没有 GCID）
     b_incomplete: bool,
     /// b.bin 在回收站里
@@ -241,9 +243,12 @@ async fn download(
         .and_then(|value| value.split_once('-'))
         .map_or(0, |(start, _)| start.parse::<u64>().unwrap());
     let (data, hold, unverifiable) = {
-        let fake = fake.lock().unwrap();
+        let mut fake = fake.lock().unwrap();
         if query["n"] == "1" && fake.expire_once.contains(&id.as_str()) {
             return StatusCode::FORBIDDEN.into_response();
+        }
+        if id == "VB" {
+            fake.b_requests.push((query["n"].clone(), range_start));
         }
         let unverifiable = id == "VB" && fake.b_unverifiable;
         if unverifiable && query["n"] == "1" && range_start > 0 {
@@ -317,6 +322,7 @@ async fn start(files: Vec<Remote>) -> (Url, Shared) {
         jobs: Vec::new(),
         user: "user-1",
         b_unverifiable: false,
+        b_requests: Vec::new(),
         b_incomplete: false,
         b_trashed: false,
         jobs_hidden: false,
@@ -606,10 +612,9 @@ fn a_paused_cloud_task_resumes_after_reopening() {
     );
 }
 
-/// 直链不带 ETag：取回到一半直链被拒，换了直链后核心认不出是不是同一个文件，删掉这个文件的任务目录从头下，照样下完、
-/// 校验通过。
+/// 直链不带 ETag：取回到一半直链被拒，换了直链后凭担保的内容身份接着已下的范围下完，校验通过。
 #[test]
-fn a_link_that_cannot_be_verified_is_fetched_again_from_scratch() {
+fn a_link_without_a_validator_resumes_by_the_vouched_identity() {
     let dir = test_dir("unverifiable");
     let folder = dir.join("out");
     let rt = runtime();
@@ -629,8 +634,20 @@ fn a_link_that_cannot_be_verified_is_fetched_again_from_scratch() {
         std::fs::read(folder.join("Show").join("Sub").join("b.bin")).unwrap(),
         remotes(None)[1].body
     );
-    // 第一个被拒、第二个认不出、第三个从头下完
-    assert_eq!(fake.lock().unwrap().links["VB"], 3);
+    let fake = fake.lock().unwrap();
+    // 第一个被拒，第二个接着下完
+    assert_eq!(fake.links["VB"], 2);
+    let resumed: Vec<u64> = fake
+        .b_requests
+        .iter()
+        .filter(|(link, _)| link == "2")
+        .map(|&(_, start)| start)
+        .collect();
+    assert!(
+        !resumed.is_empty() && !resumed.contains(&0),
+        "第二个直链应从已下的地方接着请求：{:?}",
+        fake.b_requests
+    );
 }
 
 /// 网盘上有文件还没处理完：不取回缺了的内容当作完成，以云端失败报出。
