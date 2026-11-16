@@ -1238,9 +1238,12 @@ impl Shared {
         let proxy = match (proxy_url, proxied) {
             (Some(url), Some(through)) => {
                 let through = through.map_err(socket)?;
-                let check = netcheck::judge_proxy(&through);
-                // 记进 BT 引擎：取种子信息的界面与诊断随之更新
-                self.bt.record_proxy_check(&url, check.clone());
+                // 记进 BT 引擎（取种子信息的界面与诊断随之更新），报告照记下的出
+                let check = self.bt.record_proxy_check(
+                    &url,
+                    netcheck::judge_proxy(&through),
+                    netcheck::resolved_fake(&through),
+                );
                 Some(netcheck::Proxied {
                     address: hs_m3u8_core::bare_url(&url),
                     check,
@@ -1291,11 +1294,11 @@ impl Shared {
                     Some(None) | None => return,
                 }
                 last_probe = Some(tokio::time::Instant::now());
-                let check = crate::netcheck::probe_proxy(&url, hosts).await;
+                let (check, fake) = crate::netcheck::probe_proxy(&url, hosts).await;
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                shared.bt.set_proxy_check(&url, check);
+                shared.bt.set_proxy_check(&url, check, fake);
             }
         });
         *watching = Some((watched, AbortOnDropHandle::new(probing)));

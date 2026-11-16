@@ -591,9 +591,10 @@ pub(crate) struct Bt {
     /// libtorrent 可能已放弃连代理、还没让它重连：探出过握手被拒（[`ProxyCheck::Refused`]），或用户在还没探到能用时
     /// 重新保存了同一个；探到能用时重连并清掉。持着 `running` 的锁改与读
     proxy_reconnect: AtomicBool,
-    /// BT 会话在时探出过引导节点被 TUN 代理解析成假地址（[`crate::netcheck::PROXY_FAKE_IP`]）：libtorrent 只在启动
-    /// DHT 时解析一次，之后探到能用也要重启才生效。换了代理的设置时清掉（经 TUN 代理自己的端口时假地址通）；持着
-    /// `running` 的锁改与读
+    /// BT 会话在时探出过引导节点被 TUN 代理解析成假地址、经代理问不通：libtorrent 只在启动 DHT 时解析一次，手里的多半
+    /// 也是假地址，之后解析到真实地址也要重启才生效。与代理的设置无关，到进程退出都在；持着 `running` 的锁改与读。
+    /// 简化：从探测推断，会话建起之后才开 TUN 的 fake-ip 时（libtorrent 手里是真实地址）也会这样记；要准时改为建会话时
+    /// 照同一个解析器解析一次引导节点来定。
     proxy_fake_ip: AtomicBool,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
@@ -794,7 +795,6 @@ impl Bt {
         self.proxy_doubted.store(false, Ordering::Relaxed);
         // 换了设置，libtorrent 随即照新的连
         self.proxy_reconnect.store(false, Ordering::Relaxed);
-        self.proxy_fake_ip.store(false, Ordering::Relaxed);
         self.proxy_check.send_replace(if direct {
             ProxyCheck::Direct
         } else {
@@ -835,28 +835,35 @@ impl Bt {
 
     /// 后台看着时记下探 `url` 的结果（见 [`Bt::record_proxy_check`]）：记着能用而这次经它的 UDP 没回
     /// （[`ProxyCheck::Silent`]）时先不改记，再探一次也是才改记（UDP 偶尔整轮丢包）。
-    pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
-        self.record(url, check, true);
+    pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck, fake: Option<bool>) {
+        self.record(url, check, fake, true);
     }
 
     /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次探到能用、而
     /// libtorrent 可能已放弃连代理（见 `proxy_reconnect`）或经它报过错时，让它重连并清掉那条出错：报过错即原来的转发
     /// 已断，它之后的重试可能在握手时被拒而不再重试、也不报错。重连会断开经代理的 uTP 连接，别的时候不重连。BT 会话
-    /// 在时探出过引导节点是 TUN 的假地址（见 `proxy_fake_ip`），之后探到能用也记为没转发出去，说明要重启。
-    pub fn record_proxy_check(&self, url: &Url, check: ProxyCheck) {
-        self.record(url, check, false);
+    /// 在时解析到过 TUN 的假地址而问不通（见 `proxy_fake_ip`），之后这次解析到真实地址而能用时，记为没转发出去并说明
+    /// 要重启。`fake` 为这次引导节点解析到的有没有 TUN 的假地址，一个都没解析出来时为 None。返回现在记着的（报告照它
+    /// 出）；代理已改成别的时原样返回 `check`。
+    pub fn record_proxy_check(
+        &self,
+        url: &Url,
+        check: ProxyCheck,
+        fake: Option<bool>,
+    ) -> ProxyCheck {
+        self.record(url, check, fake, false)
     }
 
-    fn record(&self, url: &Url, check: ProxyCheck, doubt: bool) {
+    fn record(&self, url: &Url, check: ProxyCheck, fake: Option<bool>, doubt: bool) -> ProxyCheck {
         let running = lock(&self.running);
         if lock(&self.proxy).as_ref() != Some(url) {
-            return;
+            return check;
         }
-        if running.is_some() && check.problem() == Some(crate::netcheck::PROXY_FAKE_IP.as_str()) {
-            self.proxy_fake_ip.store(true, Ordering::Relaxed);
-        }
-        // 假地址改好了，BT 还用着旧的：直到重启都算没转发出去
-        let check = if check == ProxyCheck::Usable && self.proxy_fake_ip.load(Ordering::Relaxed) {
+        // 假地址改好了，BT 还用着旧的：直到重启都算没转发出去。仍是假地址而能用的（代理是 TUN 自己的 SOCKS 端口）照实记
+        let check = if check == ProxyCheck::Usable
+            && fake == Some(false)
+            && self.proxy_fake_ip.load(Ordering::Relaxed)
+        {
             ProxyCheck::Silent(crate::netcheck::RESTART_AFTER_FAKE_IP.to_owned())
         } else {
             check
@@ -867,7 +874,10 @@ impl Bt {
             && usable
             && !self.proxy_doubted.swap(true, Ordering::Relaxed)
         {
-            return;
+            return ProxyCheck::Usable;
+        }
+        if running.is_some() && fake == Some(true) && check.problem().is_some() {
+            self.proxy_fake_ip.store(true, Ordering::Relaxed);
         }
         self.proxy_doubted.store(false, Ordering::Relaxed);
         if matches!(check, ProxyCheck::Refused(_)) {
@@ -884,6 +894,7 @@ impl Bt {
                 session.reconnect_proxy(&libtorrent_proxy(Some(url)));
             }
         }
+        check
     }
 
     /// 经的代理还是 `url` 时，该不该再探：还没探（随即记为在探）、在探、探出用不了、记着能用而上次没回（见
@@ -1754,23 +1765,23 @@ mod tests {
             Some(url.clone()),
         );
         let recorded = |bt: &Bt| bt.proxy().unwrap().1;
-        bt.set_proxy_check(&url, ProxyCheck::Usable);
+        bt.set_proxy_check(&url, ProxyCheck::Usable, Some(false));
         let silent = ProxyCheck::Silent("没回".into());
-        bt.set_proxy_check(&url, silent.clone());
+        bt.set_proxy_check(&url, silent.clone(), Some(false));
         assert_eq!(recorded(&bt), ProxyCheck::Usable);
         assert_eq!(bt.proxy_due(&url), Some(true), "存疑时下一轮要再探");
-        bt.set_proxy_check(&url, silent.clone());
+        bt.set_proxy_check(&url, silent.clone(), Some(false));
         assert_eq!(recorded(&bt), silent);
 
         // 握手被拒之后要重连，中间探到经它的 UDP 没回也不忘
-        bt.set_proxy_check(&url, ProxyCheck::Refused("认证被拒".into()));
-        bt.set_proxy_check(&url, silent.clone());
+        bt.set_proxy_check(&url, ProxyCheck::Refused("认证被拒".into()), Some(false));
+        bt.set_proxy_check(&url, silent.clone(), Some(false));
         assert!(bt.proxy_reconnect.load(Ordering::Relaxed));
         let equivalent = Url::parse("socks5h://127.0.0.1:7897/").unwrap();
         bt.set_proxy(Some(equivalent.clone()));
         assert_eq!(recorded(&bt), silent);
         assert_eq!(bt.proxy_url(), Some(equivalent.clone()));
-        bt.set_proxy_check(&equivalent, ProxyCheck::Usable);
+        bt.set_proxy_check(&equivalent, ProxyCheck::Usable, Some(false));
         // 没有会话时没得重连，记着的照旧要重连
         assert!(bt.proxy_reconnect.load(Ordering::Relaxed));
         bt.set_proxy(Some(Url::parse("socks5://127.0.0.1:1080").unwrap()));
