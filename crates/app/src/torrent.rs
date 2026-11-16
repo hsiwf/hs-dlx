@@ -453,12 +453,12 @@ impl Owner {
         move |error| Error::Torrent(format!("{what}：{error}"))
     }
 
-    /// 下一条事件；事件丢了时为 [`Routed::Lost`]。转发的一端只在引擎释放时丢弃，而引擎在这里还被持有。
+    /// 下一条事件；事件丢了时为 [`Routed::Lost`]。接收不会结束：自己持有一个发送端（`route`）。
     async fn next(&mut self) -> Routed {
         self.alerts
             .recv()
             .await
-            .expect("转发事件的一端随引擎释放，这里还持有引擎")
+            .expect("Owner 自己持有一个发送端，接收不会结束")
     }
 
     /// 等到 `wanted` 认的那条事件并返回它，[`STEP_TIMEOUT`] 内没等到、或事件丢了时报 [`Error::Torrent`]；其间的别的事件
@@ -748,7 +748,8 @@ impl Bt {
         }
     }
 
-    /// 改经的代理（None 为直连；调用方已校验，见 [`crate::socks::check`]）：已建的会话随即照它，之后建的也照它。
+    /// 改经的代理（None 为直连；调用方已校验，见 [`crate::socks::check`]）：已建的会话随即照它，之后建的也照它。与之前
+    /// 相同的代理重新设一次时让会话重连它（libtorrent 设成同样的值不重连）。
     pub fn set_proxy(&self, proxy: Option<Url>) {
         let running = lock(&self.running);
         let socks = libtorrent_proxy(proxy.as_ref());
@@ -757,9 +758,18 @@ impl Bt {
         } else {
             ProxyCheck::Direct
         });
-        *lock(&self.proxy) = proxy;
+        let same = {
+            let mut current = lock(&self.proxy);
+            let same = proxy.is_some() && *current == proxy;
+            *current = proxy;
+            same
+        };
         if let Some(running) = &*running {
-            running.engine.session.set_proxy(&socks);
+            if same {
+                running.engine.session.reconnect_proxy(&socks);
+            } else {
+                running.engine.session.set_proxy(&socks);
+            }
         }
     }
 
@@ -791,9 +801,9 @@ impl Bt {
         }
     }
 
-    /// 记下探 `url` 的结果；代理已改成别的时不记。之前不是能用（还没探、在探、用不了）或 libtorrent 经它报过错，而这次
-    /// 探到能用时，让 libtorrent 重连代理并清掉那条出错：它在握手、认证或转发 UDP 被拒后不再自己重试，有的还不报错，
-    /// 重新保存同样的设置也不会让它重连。
+    /// 记下探 `url` 的结果；代理已改成别的时不记。之前探出用不了、或 libtorrent 经它报过错，而这次探到能用时，让
+    /// libtorrent 重连代理并清掉那条出错：它在握手被拒后不再自己重试，其中认证被拒与申请转发 UDP 被拒时还不报错。重连
+    /// 会断开经代理的 uTP 连接，别的时候不重连。
     pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
         let running = lock(&self.running);
         if lock(&self.proxy).as_ref() != Some(url) {
@@ -804,7 +814,9 @@ impl Bt {
             && let Some(running) = &*running
         {
             let session = &running.engine.session;
-            if previous != ProxyCheck::Usable || !session.network().proxy_error.is_empty() {
+            if matches!(previous, ProxyCheck::Unusable(_))
+                || !session.network().proxy_error.is_empty()
+            {
                 session.reconnect_proxy(&libtorrent_proxy(Some(url)));
             }
         }

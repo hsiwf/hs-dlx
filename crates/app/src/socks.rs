@@ -23,7 +23,7 @@ pub(crate) enum ProxyCheck {
     /// 设了代理，还没探（BT 会话建起时探）
     Unchecked,
     Checking,
-    /// 连得上、认证过了、转发 UDP
+    /// 连得上、认证过了、接了 UDP 转发；问得了 DHT 引导节点时经它问通了
     Usable,
     /// 用不了，为原因
     Unusable(String),

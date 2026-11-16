@@ -945,25 +945,34 @@ impl Socks {
     }
 }
 
-/// 取 `uri` 的种子信息，等到报出 BT 代理的问题（最多 20 秒）；取到种子信息或超时还没报时为 None。
-fn proxy_problem(rt: &Runtime, service: &Service, uri: &str) -> Option<String> {
+/// 取 `uri` 的种子信息，等到报出含 `wanted` 的 BT 代理的问题（最多 20 秒；之前报的别的问题，如 libtorrent 自己连代理
+/// 出的错，跳过）；取到种子信息或超时还没报时为最后报的问题（没报过为 None）。
+fn proxy_problem(
+    rt: &Runtime,
+    service: &Service,
+    uri: &str,
+    wanted: &str,
+) -> Result<String, Option<String>> {
     let fetch = service.fetch_metadata(uri.to_owned()).unwrap();
     let mut progress = fetch.progress;
     let _resume = fetch.resume;
+    let mut last = None;
     rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        let found = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Some(problem) = progress.borrow_and_update().proxy_problem.clone() {
-                    return Some(problem);
+                    if problem.contains(wanted) {
+                        return Some(problem);
+                    }
+                    last = Some(problem);
                 }
                 if progress.changed().await.is_err() {
                     return None;
                 }
             }
         })
-        .await
-        .ok()
-        .flatten()
+        .await;
+        found.ok().flatten().ok_or(last)
     })
 }
 
@@ -1003,16 +1012,15 @@ fn torrents_connect_through_the_socks_proxy() {
     // 不转发 UDP 的代理
     let tcp_only = Socks::start(false);
     service.set_torrent_proxy(Some(tcp_only.url())).unwrap();
-    let problem =
-        proxy_problem(&rt, &service, &magnet(&id, &seeder)).expect("没报出代理不转发 UDP");
-    assert!(problem.contains("不转发 UDP"), "{problem}");
+    let problem = proxy_problem(&rt, &service, &magnet(&id, &seeder), "不转发 UDP");
+    assert!(problem.is_ok(), "没报出代理不转发 UDP：{problem:?}");
 
     // 连不上的代理：端口上没人
     let closed = tcp_only.url();
     drop(tcp_only);
     service.set_torrent_proxy(Some(closed)).unwrap();
-    let problem = proxy_problem(&rt, &service, &magnet(&id, &seeder)).expect("没报出代理连不上");
-    assert!(problem.contains("连不上代理"), "{problem}");
+    let problem = proxy_problem(&rt, &service, &magnet(&id, &seeder), "连不上代理");
+    assert!(problem.is_ok(), "没报出代理连不上：{problem:?}");
     drop(service);
     drop(seeder);
 }

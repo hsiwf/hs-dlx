@@ -63,6 +63,8 @@ pub(crate) struct Dht {
     pub external: Option<IpAddr>,
     /// 引导节点解析成了 198.18.0.0/15：系统里的 TUN 代理（fake-ip）接管了，「直连」其实经它
     pub tun: bool,
+    /// 收发本身出的错（见 [`Udp::exchange`]）；有时上面的回应数不可信
+    pub failure: Option<String>,
 }
 
 impl Dht {
@@ -162,11 +164,19 @@ pub(crate) fn drops_udp(direct: &Dht, proxied: &Dht) -> bool {
 pub(crate) const DROPS_UDP: &str =
     "代理接了 UDP 转发，但没转发出去：代理的节点可能不支持 UDP，换节点或在代理里打开 UDP";
 
-/// 探 BT 代理的结论：握手或申请转发 UDP 没成（`through` 为原因）、或没转发出去（见 [`drops_udp`]）时为用不了。
-pub(crate) fn judge_proxy(direct: &Dht, through: &Result<Dht, String>) -> ProxyCheck {
+/// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为原因）的结论，网络检测与后台看护
+/// 记进 BT 引擎的都照它：只看经代理的，不拿直连的比。握手没成、收发出错、引导节点一个都没回时为用不了；问不了（引导
+/// 节点都解析不出，或解析成了 TUN 代理的假地址，经别的代理本来就到不了）时握手成了即算能用。
+pub(crate) fn judge_proxy(through: &Result<Dht, String>) -> ProxyCheck {
     match through {
         Err(why) => ProxyCheck::Unusable(why.clone()),
-        Ok(through) if drops_udp(direct, through) => ProxyCheck::Unusable(DROPS_UDP.to_owned()),
+        Ok(Dht {
+            failure: Some(why), ..
+        }) => ProxyCheck::Unusable(why.clone()),
+        Ok(through) if through.tun || through.bootstrap.asked == 0 => ProxyCheck::Usable,
+        Ok(through) if through.bootstrap.replied == 0 => {
+            ProxyCheck::Unusable(PROXY_SILENT.to_owned())
+        }
         Ok(_) => ProxyCheck::Usable,
     }
 }
@@ -190,32 +200,30 @@ pub(crate) async fn through_proxy(
 pub(crate) const PROXY_SILENT: &str = "经代理问 DHT 引导节点一个都没回：代理可能没转发 UDP（换节点或在代理里打开 UDP），也可能网络不通";
 
 /// 后台看着 BT 代理时探它（只经代理发包，不从本机直连发）：握手、申请转发 UDP，再经它向引导节点 `hosts` 各发一个
-/// find_node。握手或申请没成、引导节点一个都没回时为用不了；`hosts` 为空时只握手。判断不了时为 None：引导节点都解析
-/// 不出，或解析成了 TUN 代理的假地址（见 [`Dht::tun`]）。开不了本机的 UDP 套接字时也算用不了，原因写明。
-pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> Option<ProxyCheck> {
+/// find_node（不 ping 别的节点），照 [`judge_proxy`] 下结论。开不了本机的 UDP 套接字时也算用不了，原因写明。
+pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> ProxyCheck {
     let relay = match crate::socks::associate(url).await {
         Ok(relay) => relay,
-        Err(why) => return Some(ProxyCheck::Unusable(why)),
+        Err(why) => return ProxyCheck::Unusable(why),
     };
-    if hosts.is_empty() {
-        return Some(ProxyCheck::Usable);
-    }
     let udp = match Udp::via(relay).await {
         Ok(udp) => udp,
-        Err(error) => {
-            return Some(ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}")));
-        }
+        Err(error) => return ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}")),
     };
-    let (found, _unresolved) = bootstrap(hosts, false).await;
-    if found.is_empty() || found.iter().any(fake_ip) {
-        return None;
-    }
+    let (found, unresolved) = bootstrap(hosts, false).await;
     let requests: Vec<_> = found.iter().map(|to| (*to, krpc("find_node"))).collect();
-    Some(if udp.exchange(&requests, is_krpc_reply).await.is_empty() {
-        ProxyCheck::Unusable(PROXY_SILENT.to_owned())
-    } else {
-        ProxyCheck::Usable
-    })
+    let exchanged = udp.exchange(&requests, is_krpc_reply).await;
+    judge_proxy(&Ok(Dht {
+        bootstrap: Ratio {
+            asked: found.len(),
+            replied: exchanged.replies.len(),
+        },
+        unresolved,
+        nodes: Ratio::default(),
+        external: None,
+        tun: found.iter().any(fake_ip),
+        failure: exchanged.failure,
+    }))
 }
 
 /// 198.18.0.0/15 里的地址：TUN 代理（fake-ip）给域名的假地址。
@@ -230,13 +238,26 @@ fn fake_ip(address: &SocketAddr) -> bool {
 pub(crate) fn report(measured: &Measured) -> NetworkReport {
     let check = |item, level, text: String| NetCheck { item, level, text };
     let dht = &measured.dht;
-    let direct = dht.health();
+    // 收发出错时回应数不可信
+    let direct = if dht.failure.is_some() {
+        Health::Uncertain
+    } else {
+        dht.health()
+    };
     let tun = if dht.tun {
         "；引导节点解析成了 198.18 开头的地址，系统里的 TUN 代理接管了，这里的「直连」其实经它"
     } else {
         ""
     };
     let mut checks = vec![match direct {
+        _ if dht.failure.is_some() => check(
+            NetItem::Dht,
+            CheckLevel::Bad,
+            format!(
+                "直连的 DHT 没测完：{}",
+                dht.failure.as_deref().unwrap_or_default()
+            ),
+        ),
         Health::Untested => check(
             NetItem::Dht,
             CheckLevel::Warn,
@@ -318,7 +339,11 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
     });
     let proxied = measured.proxy.as_ref().map(|proxy| {
         let health = match (&proxy.check, &proxy.dht) {
-            (ProxyCheck::Usable, Some(through)) if drops_udp(dht, through) => Health::Blocked,
+            (ProxyCheck::Usable, Some(through))
+                if through.failure.is_some() || drops_udp(dht, through) =>
+            {
+                Health::Blocked
+            }
             (ProxyCheck::Usable, Some(through)) => through.health(),
             _ => Health::Blocked,
         };
@@ -331,6 +356,17 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
                 NetItem::Proxy,
                 CheckLevel::Bad,
                 format!("BT 代理用不了：{why}"),
+            ),
+            (
+                _,
+                Some(Dht {
+                    failure: Some(why), ..
+                }),
+                _,
+            ) => check(
+                NetItem::Proxy,
+                CheckLevel::Bad,
+                format!("BT 代理 {}：{why}", proxy.address),
             ),
             (_, Some(through), _) if drops_udp(dht, through) => check(
                 NetItem::Proxy,
@@ -478,20 +514,30 @@ impl Udp {
         })
     }
 
-    async fn send(&self, to: SocketAddr, data: &[u8]) {
-        // 发不出（网络不可达等）即算那个节点没回，照常量下去
-        let _unsent = match (&self.relay, to) {
-            (None, _) => self.socket.send_to(data, to).await,
+    /// 发一个包。直连时发往单个节点发不出（网络不可达等）算那个节点没回，不报错；经代理时都发往代理的转发地址，发不
+    /// 出即经不了代理，为原因。
+    async fn send(&self, to: SocketAddr, data: &[u8]) -> Result<(), String> {
+        match (&self.relay, to) {
+            (None, _) => {
+                let _unreachable = self.socket.send_to(data, to).await;
+                Ok(())
+            }
             (Some(relay), SocketAddr::V4(to)) => {
                 let mut wrapped = vec![0, 0, 0, 1];
                 wrapped.extend_from_slice(&to.ip().octets());
                 wrapped.extend_from_slice(&to.port().to_be_bytes());
                 wrapped.extend_from_slice(data);
-                self.socket.send_to(&wrapped, relay.address).await
+                self.socket
+                    .send_to(&wrapped, relay.address)
+                    .await
+                    .map(drop)
+                    .map_err(|error| {
+                        format!("发不到代理的 UDP 转发地址 {}：{error}", relay.address)
+                    })
             }
             // 经代理只转发 IPv4（libtorrent 同样只用 IPv4）
-            (Some(_), SocketAddr::V6(_)) => return,
-        };
+            (Some(_), SocketAddr::V6(_)) => Ok(()),
+        }
     }
 
     /// 收一个包，返回内容与真正的来源；经代理时去掉 SOCKS5 的头，认不出的包丢掉接着收。之前发往已下线的地址回来的
@@ -523,34 +569,56 @@ impl Udp {
     }
 
     /// 发出 `requests`（地址与内容），在 [`REPLY_WAIT`] 内收各地址的回应（每个地址算一次，`accept` 认的才算）；没回的
-    /// 再发一次、再等 [`REPLY_WAIT`]。
+    /// 再发一次、再等 [`REPLY_WAIT`]。发（见 [`Udp::send`]）或收出错即停，记下原因。
     async fn exchange(
         &self,
         requests: &[(SocketAddr, Vec<u8>)],
         accept: impl Fn(&[u8]) -> bool,
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
+    ) -> Exchanged {
         let mut replies = Vec::new();
         let mut seen = HashSet::new();
         let mut buffer = vec![0; 65536];
         for _round in 0..2 {
             for (to, data) in requests.iter().filter(|(to, _)| !seen.contains(to)) {
-                self.send(*to, data).await;
+                if let Err(why) = self.send(*to, data).await {
+                    return Exchanged {
+                        replies,
+                        failure: Some(why),
+                    };
+                }
             }
             let deadline = tokio::time::Instant::now() + REPLY_WAIT;
             while seen.len() < requests.len() {
-                let Ok(Ok((data, from))) =
-                    tokio::time::timeout_at(deadline, self.recv(&mut buffer)).await
-                else {
-                    break;
-                };
+                let (data, from) =
+                    match tokio::time::timeout_at(deadline, self.recv(&mut buffer)).await {
+                        Ok(Ok(received)) => received,
+                        Ok(Err(error)) => {
+                            return Exchanged {
+                                replies,
+                                failure: Some(format!("收 UDP 包出错：{error}")),
+                            };
+                        }
+                        Err(_) => break,
+                    };
                 let wanted = requests.iter().any(|(to, _)| *to == from);
                 if wanted && accept(&data) && seen.insert(from) {
                     replies.push((from, data));
                 }
             }
         }
-        replies
+        Exchanged {
+            replies,
+            failure: None,
+        }
     }
+}
+
+/// 一次收发的结果。
+struct Exchanged {
+    /// 回了的地址与回应
+    replies: Vec<(SocketAddr, Vec<u8>)>,
+    /// 发或收出的错；有时 `replies` 只是出错之前收到的
+    failure: Option<String>,
 }
 
 /// 并行解析各引导节点的地址（各最多等 [`RESOLVE_TIMEOUT`]）：`v6` 时取 IPv6 的（不含 IPv4 映射的），否则取 IPv4 的。
@@ -608,7 +676,7 @@ pub(crate) async fn dht(udp: &Udp, bootstrap: &[SocketAddr], unresolved: usize) 
         .iter()
         .map(|to| (*to, krpc("find_node")))
         .collect();
-    let replies = udp.exchange(&requests, is_krpc_reply).await;
+    let Exchanged { replies, failure } = udp.exchange(&requests, is_krpc_reply).await;
     let mut seen_ips: HashMap<IpAddr, usize> = HashMap::new();
     let mut nodes = Vec::new();
     for (_, data) in &replies {
@@ -634,7 +702,16 @@ pub(crate) async fn dht(udp: &Udp, bootstrap: &[SocketAddr], unresolved: usize) 
     }
     nodes.truncate(NODES_PINGED);
     let requests: Vec<_> = nodes.iter().map(|to| (*to, krpc("ping"))).collect();
-    let pinged = udp.exchange(&requests, is_krpc_reply).await;
+    let pinged = if failure.is_none() {
+        udp.exchange(&requests, is_krpc_reply).await
+    } else {
+        Exchanged {
+            replies: Vec::new(),
+            failure: None,
+        }
+    };
+    let failure = failure.or(pinged.failure);
+    let pinged = pinged.replies;
     for (_, data) in &pinged {
         if let Some(ip) =
             bencode::decode(data).and_then(|message| message.get(b"ip").and_then(external_ip))
@@ -659,6 +736,7 @@ pub(crate) async fn dht(udp: &Udp, bootstrap: &[SocketAddr], unresolved: usize) 
         },
         external,
         tun: bootstrap.iter().any(fake_ip),
+        failure,
     }
 }
 
@@ -674,8 +752,8 @@ fn external_ip(value: &bencode::Value) -> Option<IpAddr> {
     }
 }
 
-/// 对 `trackers` 里 udp:// 开头、主机为 IP 的做 BEP 15 的 connect（事务号随机），看回不回。
-pub(crate) async fn udp_trackers(udp: &Udp, trackers: &[String]) -> Ratio {
+/// 对 `trackers` 里 udp:// 开头、主机为 IP 的做 BEP 15 的 connect（事务号随机），看回不回；收发出错时为原因。
+pub(crate) async fn udp_trackers(udp: &Udp, trackers: &[String]) -> Result<Ratio, String> {
     let addresses: Vec<SocketAddr> = trackers
         .iter()
         .filter_map(|tracker| Url::parse(tracker).ok())
@@ -687,14 +765,17 @@ pub(crate) async fn udp_trackers(udp: &Udp, trackers: &[String]) -> Ratio {
     connect.extend_from_slice(&0_u32.to_be_bytes());
     connect.extend_from_slice(&transaction);
     let requests: Vec<_> = addresses.iter().map(|to| (*to, connect.clone())).collect();
-    let replies = udp
+    let exchanged = udp
         .exchange(&requests, |data| {
             data.len() >= 16 && data[..4] == [0, 0, 0, 0] && data[4..8] == transaction
         })
         .await;
-    Ratio {
-        asked: addresses.len(),
-        replied: replies.len(),
+    match exchanged.failure {
+        Some(why) => Err(why),
+        None => Ok(Ratio {
+            asked: addresses.len(),
+            replied: exchanged.replies.len(),
+        }),
     }
 }
 
@@ -814,6 +895,7 @@ mod tests {
             nodes,
             external: Some(Ipv4Addr::new(203, 0, 113, 7).into()),
             tun: false,
+            failure: None,
         }
     }
 
@@ -967,6 +1049,12 @@ mod tests {
         let mut proxied_tun = dht_of(ratio(4, 0), ratio(0, 0));
         proxied_tun.tun = true;
         assert!(!drops_udp(&healthy().dht, &proxied_tun));
+        // 收发出错：不说网络正常，写明原因
+        let mut broken = healthy();
+        broken.dht.failure = Some("收 UDP 包出错：boom".into());
+        let broken = report(&broken);
+        assert!(text(&broken, NetItem::Dht).contains("boom"));
+        assert!(!broken.verdict.contains("网络正常"));
         // BT 没用过、监听失败
         let mut fresh = healthy();
         fresh.session = None;
@@ -977,6 +1065,37 @@ mod tests {
             incoming: false,
         });
         assert_eq!(level(&report(&fresh), NetItem::Incoming), CheckLevel::Bad);
+    }
+
+    #[test]
+    fn the_engine_records_only_what_went_through_the_proxy() {
+        let silent = dht_of(ratio(4, 0), ratio(0, 0));
+        assert_eq!(
+            judge_proxy(&Ok(silent.clone())),
+            ProxyCheck::Unusable(PROXY_SILENT.into())
+        );
+        assert_eq!(
+            judge_proxy(&Ok(dht_of(ratio(4, 1), ratio(0, 0)))),
+            ProxyCheck::Usable
+        );
+        // 问不了：解析不出、TUN 的假地址
+        assert_eq!(
+            judge_proxy(&Ok(dht_of(ratio(0, 0), ratio(0, 0)))),
+            ProxyCheck::Usable
+        );
+        let mut tun = silent.clone();
+        tun.tun = true;
+        assert_eq!(judge_proxy(&Ok(tun)), ProxyCheck::Usable);
+        let mut unsent = silent;
+        unsent.failure = Some("发不到代理的 UDP 转发地址".into());
+        assert_eq!(
+            judge_proxy(&Ok(unsent)),
+            ProxyCheck::Unusable("发不到代理的 UDP 转发地址".into())
+        );
+        assert_eq!(
+            judge_proxy(&Err("连不上代理".into())),
+            ProxyCheck::Unusable("连不上代理".into())
+        );
     }
 
     #[test]
@@ -1126,12 +1245,12 @@ mod tests {
         let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
         assert_eq!(
             probe_proxy(&proxy, &[("127.0.0.1", answering.port())]).await,
-            Some(ProxyCheck::Usable)
+            ProxyCheck::Usable
         );
         let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
         assert_eq!(
             probe_proxy(&proxy, &[("127.0.0.1", silent.port())]).await,
-            Some(ProxyCheck::Unusable(PROXY_SILENT.to_owned()))
+            ProxyCheck::Unusable(PROXY_SILENT.to_owned())
         );
         let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let unreachable = Url::parse(&format!(
@@ -1141,7 +1260,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             probe_proxy(&unreachable, &[("127.0.0.1", answering.port())]).await,
-            Some(ProxyCheck::Unusable(why)) if why.contains("连不上代理")
+            ProxyCheck::Unusable(why) if why.contains("连不上代理")
         ));
     }
 }
