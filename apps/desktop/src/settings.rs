@@ -1,5 +1,5 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种、上传限速与 BT 经的代理、外观、更新、版本与第三方
-//! 声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种、上传限速与 BT 经的代理、PikPak 账号、外观、更新、
+//! 版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
 use std::num::NonZeroU32;
@@ -88,6 +88,8 @@ pub struct SettingsView {
     _system: Task<()>,
     _typed: Subscription,
     _updates: Subscription,
+    /// 任务状态变了（PikPak 登录的进展在那里）即重画
+    _tasks: Subscription,
     /// 存着的 BT 代理（None 为直连）与选中的方式：选了经代理而还没存进地址时为 true
     torrent_proxy: Option<hs_m3u8_core::Url>,
     torrent_proxy_picked: bool,
@@ -116,6 +118,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let watched = cx.observe(&updates, |_, _, cx| cx.notify());
+        let tasks_watched = cx.observe(&tasks, |_, _, cx| cx.notify());
         let proxy = settings.proxy;
         let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
         let torrent_address = cx.new(|cx| {
@@ -181,6 +184,7 @@ impl SettingsView {
             _system: system,
             _typed: typed,
             _updates: watched,
+            _tasks: tasks_watched,
             torrent_proxy_picked: settings.torrent_proxy.is_some(),
             torrent_proxy: settings.torrent_proxy,
             torrent_address,
@@ -525,6 +529,85 @@ impl SettingsView {
                 .children(self.torrent_proxy_error.clone().map(ui::error_text))
                 .child(ui::caption(
                     "很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来；改了之后的连接经它，已连着的不断",
+                )),
+        )
+    }
+
+    /// PikPak 一行：没登录时登录（在系统浏览器里确认），在登录时写确认页上的码，登录了可退出。
+    fn render_pikpak(&self, cx: &mut Context<Self>) -> Div {
+        let tasks = self.tasks.clone();
+        let act = move |key: &'static str,
+                        label: &'static str,
+                        tone: Tone,
+                        f: fn(&mut Tasks, &mut Context<Tasks>)| {
+            let tasks = tasks.clone();
+            ui::button(key, label, tone, move |_, _, cx| tasks.update(cx, f))
+        };
+        let pikpak = self.tasks.read(cx).pikpak();
+        let line = div().flex().items_center().gap(px(8.));
+        let state = match (&pikpak.login, &pikpak.user) {
+            (Some(None), _) => line.child(ui::field("在要登录码…").flex_1()).child(act(
+                "pikpak-cancel",
+                "取消",
+                Tone::Ghost,
+                |tasks, cx| tasks.cancel_pikpak_login(cx),
+            )),
+            (Some(Some(pending)), _) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    line.child(
+                        ui::field(format!("在浏览器里登录并确认 · 码 {}", pending.user_code))
+                            .flex_1(),
+                    )
+                    .child(act(
+                        "pikpak-reopen",
+                        "重新打开网页",
+                        Tone::Plain,
+                        |tasks, cx| tasks.reopen_pikpak_login(cx),
+                    ))
+                    .child(act(
+                        "pikpak-cancel",
+                        "取消",
+                        Tone::Ghost,
+                        |tasks, cx| tasks.cancel_pikpak_login(cx),
+                    )),
+                )
+                .child(ui::caption("确认页上的码与这里的相同才确认")),
+            (None, Some(Ok(user))) => line
+                .child(ui::field(format!("已登录 · 用户 {user}")).flex_1())
+                .child(act(
+                    "pikpak-logout",
+                    "退出登录",
+                    Tone::Ghost,
+                    |tasks, cx| tasks.logout_pikpak(cx),
+                )),
+            (None, user) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    line.child(act("pikpak-login", "登录", Tone::Plain, |tasks, cx| {
+                        tasks.login_pikpak(cx)
+                    })),
+                )
+                .children(match user {
+                    Some(Err(reason)) => Some(ui::error_text(reason.clone())),
+                    _ => None,
+                }),
+        };
+        row(
+            "PikPak",
+            Some("云离线用你自己的账号：网盘替你下完磁力链接，再取回本机"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(state)
+                .children(pikpak.error.clone().map(ui::error_text))
+                .child(ui::caption(
+                    "接口是非官方的，有违反服务条款、被封号的风险；大陆网络多半要经上面设的代理才连得上",
                 )),
         )
     }
@@ -901,6 +984,7 @@ impl Render for SettingsView {
         rows.extend(self.render_seeding(cx));
         rows.push(self.render_torrent_proxy(cx));
         rows.push(self.render_network_check(cx));
+        rows.push(self.render_pikpak(cx));
         rows.push(self.render_theme(cx));
         let updates_row = rows.len();
         rows.push(self.render_updates(cx));

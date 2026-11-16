@@ -13,16 +13,18 @@ use hs_m3u8_core::{Proxy, Url};
 use crate::preference::StoredPreference;
 use crate::torrent::{Resume, SessionState};
 use crate::{
-    Error, Expected, Failure, FailureKind, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Seeding,
-    Settings, Status, Task, TaskId, TaskSpec, Theme, TorrentSpec, naming,
+    CloudFile, CloudProvider, CloudSpec, Error, Expected, Failure, FailureKind, FileSpec, Finished,
+    HlsSpec, Kind, OutputSpec, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
+    TorrentSpec, naming,
 };
+use hs_dlx_cloud::pikpak::Account;
 use std::num::NonZeroU32;
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -33,6 +35,7 @@ const MIGRATIONS: [Migration; 10] = [
     rebuild_with_seeding,
     add_check_updates,
     add_torrent_proxy,
+    rebuild_with_cloud,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -510,6 +513,118 @@ fn add_torrent_proxy(tx: &Transaction<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// 第 11 版：
+/// - 重建任务表，加云离线任务（种类 `cloud`，见 [`crate::CloudSpec`]）：网盘（`cloud_provider`）、网盘上离线任务的编号
+///   （`cloud_job`）与保存目录（`cloud_folder`）必有，内容的根（`cloud_root`）与任务目录一起在列出文件时定下，没有请求头；
+///   失败的种类加 `cloud-login`、`cloud-quota`、`cloud-failed`、`cloud-api`、`integrity`。其余约束不变。
+/// - 云离线任务的文件（`cloud_file`，见 [`crate::CloudFile`]）：按任务与序号（列出时的次序，从 0 起）。不用外键：迁移在
+///   事务里跑，关不了外键检查，之后重建任务表时 DROP TABLE 会连带删掉这里的行；删任务时由 [`delete`] 一起删。
+/// - 网盘账号（`cloud_account`，见 [`hs_dlx_cloud::pikpak::Account`]）：每个网盘至多一个。
+fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v11 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file', 'torrent', 'cloud')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            torrent_info_hash TEXT UNIQUE CHECK (length(torrent_info_hash) = 40
+                                                 AND torrent_info_hash NOT GLOB '*[^0-9a-f]*'),
+            torrent_root TEXT,
+            torrent_resume BLOB,
+            torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
+            torrent_seeding INTEGER CHECK (torrent_seeding IN (0, 1)),
+            cloud_provider TEXT CHECK (cloud_provider IN ('pikpak')),
+            cloud_job TEXT CHECK (cloud_job != ''),
+            cloud_folder TEXT,
+            cloud_root TEXT,
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
+                                    'integrity', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (kind != 'hls' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL)),
+            CHECK ((kind = 'torrent') = (torrent_info_hash IS NOT NULL AND torrent_root IS NOT NULL
+                                         AND torrent_resume IS NOT NULL AND torrent_trusted IS NOT NULL
+                                         AND torrent_seeding IS NOT NULL)),
+            CHECK (kind = 'torrent' OR (torrent_info_hash IS NULL AND torrent_root IS NULL AND torrent_resume IS NULL
+                                        AND torrent_trusted IS NULL AND torrent_seeding IS NULL)),
+            CHECK (torrent_seeding IS NOT 1 OR status = 'done'),
+            CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]')),
+            CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_job IS NOT NULL
+                                       AND cloud_folder IS NOT NULL)),
+            CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_job IS NULL AND cloud_folder IS NULL
+                                      AND cloud_root IS NULL)),
+            CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)))
+        ) STRICT;
+        INSERT INTO task_v11 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
+                              file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
+                              file_content_type, chunk_size, torrent_info_hash, torrent_root, torrent_resume,
+                              torrent_trusted, torrent_seeding, work_dir, status, error, failure, created_at, total,
+                              duration_ms, bytes, width, height, write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
+                   file_length, file_accepts_ranges, file_etag, file_last_modified, file_content_type, chunk_size,
+                   torrent_info_hash, torrent_root, torrent_resume, torrent_trusted, torrent_seeding, work_dir, status,
+                   error, failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v11 RENAME TO task;
+        CREATE TABLE cloud_file (
+            task_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL CHECK (seq >= 0),
+            file_id TEXT NOT NULL CHECK (file_id != ''),
+            path TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            gcid TEXT NOT NULL CHECK (length(gcid) = 40 AND gcid NOT GLOB '*[^0-9a-f]*'),
+            done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1)),
+            PRIMARY KEY (task_id, seq),
+            UNIQUE (task_id, path)
+        ) STRICT;
+        CREATE TABLE cloud_account (
+            provider TEXT PRIMARY KEY CHECK (provider IN ('pikpak')),
+            user_id TEXT NOT NULL CHECK (user_id != ''),
+            device_id TEXT NOT NULL CHECK (device_id != ''),
+            refresh_token TEXT NOT NULL CHECK (refresh_token != ''),
+            access_token TEXT NOT NULL CHECK (access_token != ''),
+            access_expires_at INTEGER NOT NULL
+        ) STRICT;",
+    )?;
+    keep_task_counter(tx, counter)
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -612,7 +727,8 @@ impl Store {
 const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path, \
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
-                       file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding";
+                       file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding, cloud_provider, \
+                       cloud_job, cloud_folder, cloud_root";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
@@ -646,12 +762,14 @@ pub fn insert(
                 Some(spec.live),
             )
         }
-        Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None),
+        Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => (None, None, None, None, None),
     };
     let (file_path, length, accepts_ranges, etag, last_modified, content_type, chunk) = match &spec
         .kind
     {
-        Kind::Hls(_) | Kind::Torrent(_) => (None, None, None, None, None, None, None),
+        Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) => {
+            (None, None, None, None, None, None, None)
+        }
         Kind::File(file) => (
             Some(named_utf8(&file.path)?),
             // 服务器报的，可能大得离谱
@@ -672,7 +790,7 @@ pub fn insert(
         ),
     };
     let (info_hash, root, trusted, seeding) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) => (None, None, None, None),
+        Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) => (None, None, None, None),
         Kind::Torrent(torrent) => {
             if let Some(existing) = tx
                 .query_row(
@@ -693,8 +811,25 @@ pub fn insert(
             )
         }
     };
+    let (provider, job, folder, cloud_root) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None),
+        Kind::Cloud(cloud) => {
+            if !cloud.folder.is_absolute() {
+                return Err(Error::InvalidInput(format!(
+                    "保存目录不是绝对路径：{}",
+                    cloud.folder.display()
+                )));
+            }
+            (
+                Some(provider_code(cloud.provider)),
+                Some(cloud.job.as_str()),
+                Some(utf8(&cloud.folder)?),
+                cloud.root.as_deref().map(named_utf8).transpose()?,
+            )
+        }
+    };
     let taken = taken_paths(tx)?;
-    for path in [&mp4, &hls, &file_path, &root, &work_dir_text]
+    for path in [&mp4, &hls, &file_path, &root, &cloud_root, &work_dir_text]
         .into_iter()
         .flatten()
     {
@@ -706,9 +841,9 @@ pub fn insert(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
-                           torrent_trusted, torrent_seeding)
+                           torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22, ?23)",
+                 ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -733,6 +868,10 @@ pub fn insert(
             resume,
             trusted,
             seeding,
+            provider,
+            job,
+            folder,
+            cloud_root,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -757,8 +896,8 @@ pub fn get(tx: &Transaction<'_>, id: TaskId) -> Result<Option<Task>, Error> {
     .transpose()
 }
 
-/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录、文件、BT 内容的根与任务目录。新建任务选主名时避开
-/// 它们。
+/// 已有任务占用的路径的比较键（[`naming::path_key`]）：各任务的 MP4、本地 HLS 目录、文件、BT 与云离线内容的根与任务
+/// 目录。新建任务选主名时避开它们。
 pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
     taken_except(tx, None)
 }
@@ -766,7 +905,8 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
 /// 除任务 `except` 之外的任务占用的路径的比较键；`except` 为 None 时为全部任务的。
 fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<String>, Error> {
     let mut statement = tx.prepare(
-        "SELECT mp4_path, hls_path, file_path, torrent_root, work_dir FROM task WHERE ?1 IS NULL OR id != ?1",
+        "SELECT mp4_path, hls_path, file_path, torrent_root, cloud_root, work_dir FROM task
+         WHERE ?1 IS NULL OR id != ?1",
     )?;
     let rows = statement.query_map([except.map(|id| id.0)], |row| {
         Ok([
@@ -775,6 +915,7 @@ fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ])
     })?;
     let mut taken = HashSet::new();
@@ -953,11 +1094,162 @@ pub fn set_torrent_session(tx: &Transaction<'_>, state: &SessionState) -> Result
     Ok(())
 }
 
-/// 删除任务；没有时报 [`Error::NotFound`]。
+/// 删除任务（云离线任务连同它的文件）；没有时报 [`Error::NotFound`]。
 pub fn delete(tx: &Transaction<'_>, id: TaskId) -> Result<(), Error> {
+    tx.execute("DELETE FROM cloud_file WHERE task_id = ?1", [id.0])?;
     if tx.execute("DELETE FROM task WHERE id = ?1", [id.0])? == 0 {
         return Err(Error::NotFound(id));
     }
+    Ok(())
+}
+
+/// 定下云离线任务的内容的根 `root`、任务目录 `work_dir`（都是以文件名结尾的绝对路径）与要下的文件 `files`（次序即
+/// 序号），标题改为根名。根或任务目录与别的任务占用的相同时报 [`Error::PathTaken`]；`files` 为空、路径重复、GCID 不是
+/// 40 位小写十六进制时报 [`Error::InvalidInput`]；没有这个云离线任务、或它已定下了根时报 [`Error::NotFound`]。
+pub fn set_cloud_root(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    root: &Path,
+    work_dir: &Path,
+    files: &[CloudFile],
+) -> Result<(), Error> {
+    let (root_text, work_dir_text) = (named_utf8(root)?, named_utf8(work_dir)?);
+    if files.is_empty() {
+        return Err(Error::InvalidInput(format!("{id}没有要下的文件")));
+    }
+    let others = taken_except(tx, Some(id))?;
+    for path in [&root_text, &work_dir_text] {
+        if others.contains(&naming::path_key(path)) {
+            return Err(Error::PathTaken(path.into()));
+        }
+    }
+    let title = root
+        .file_name()
+        .expect("上面已核对以文件名结尾")
+        .to_string_lossy()
+        .into_owned();
+    if tx.execute(
+        "UPDATE task SET cloud_root = ?2, work_dir = ?3, title = ?4
+         WHERE id = ?1 AND kind = 'cloud' AND cloud_root IS NULL",
+        params![id.0, root_text, work_dir_text, title],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    for (seq, file) in files.iter().enumerate() {
+        let size = i64::try_from(file.size).map_err(|_| {
+            Error::InvalidInput(format!("网盘报的文件大小 {} 字节超出范围", file.size))
+        })?;
+        let inserted = tx.execute(
+            "INSERT INTO cloud_file (task_id, seq, file_id, path, size, gcid, done) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id.0,
+                i64::try_from(seq).expect("文件数远小于 i64 的上限"),
+                file.id,
+                file.path,
+                size,
+                file.gcid,
+                file.done
+            ],
+        );
+        match inserted {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{id}的文件不合要求（路径重复或 GCID 不对）：{}",
+                    file.path
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 云离线任务的文件，按序号；还没定下根的为空。
+pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, Error> {
+    let mut statement = tx.prepare(
+        "SELECT file_id, path, size, gcid, done FROM cloud_file WHERE task_id = ?1 ORDER BY seq",
+    )?;
+    let rows = statement.query_map([id.0], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, bool>(4)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (file_id, path, size, gcid, done) = row?;
+        Ok(CloudFile {
+            id: file_id,
+            path,
+            size: u64::try_from(size).map_err(|_| Error::Corrupt(format!("{id}的文件大小")))?,
+            gcid,
+            done,
+        })
+    })
+    .collect()
+}
+
+/// 记下云离线任务第 `seq` 个文件下完没有；没有这个文件时报 [`Error::NotFound`]。
+pub fn set_cloud_file_done(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    seq: usize,
+    done: bool,
+) -> Result<(), Error> {
+    let seq = i64::try_from(seq).expect("文件数远小于 i64 的上限");
+    if tx.execute(
+        "UPDATE cloud_file SET done = ?3 WHERE task_id = ?1 AND seq = ?2",
+        params![id.0, seq, done],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 登录了的 PikPak 账号；没登录时为 None。
+pub fn pikpak_account(tx: &Transaction<'_>) -> Result<Option<Account>, Error> {
+    Ok(tx
+        .query_row(
+            "SELECT user_id, device_id, refresh_token, access_token, access_expires_at
+             FROM cloud_account WHERE provider = 'pikpak'",
+            [],
+            |row| {
+                Ok(Account {
+                    user_id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    refresh_token: row.get(2)?,
+                    access_token: row.get(3)?,
+                    access_expires_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// 记下 PikPak 账号（替换已有的）；None 为退出登录。
+pub fn set_pikpak_account(tx: &Transaction<'_>, account: Option<&Account>) -> Result<(), Error> {
+    match account {
+        Some(account) => tx.execute(
+            "INSERT OR REPLACE INTO cloud_account
+                 (provider, user_id, device_id, refresh_token, access_token, access_expires_at)
+             VALUES ('pikpak', ?1, ?2, ?3, ?4, ?5)",
+            params![
+                account.user_id,
+                account.device_id,
+                account.refresh_token,
+                account.access_token,
+                account.access_expires_at
+            ],
+        )?,
+        None => tx.execute("DELETE FROM cloud_account WHERE provider = 'pikpak'", [])?,
+    };
     Ok(())
 }
 
@@ -994,6 +1286,10 @@ struct Row {
     torrent_info_hash: Option<String>,
     torrent_root: Option<String>,
     torrent_seeding: Option<bool>,
+    cloud_provider: Option<String>,
+    cloud_job: Option<String>,
+    cloud_folder: Option<String>,
+    cloud_root: Option<String>,
 }
 
 impl Row {
@@ -1030,6 +1326,10 @@ impl Row {
             torrent_info_hash: row.get(28)?,
             torrent_root: row.get(29)?,
             torrent_seeding: row.get(30)?,
+            cloud_provider: row.get(31)?,
+            cloud_job: row.get(32)?,
+            cloud_folder: row.get(33)?,
+            cloud_root: row.get(34)?,
         })
     }
 
@@ -1039,6 +1339,30 @@ impl Row {
         let url = self.url.parse().map_err(|_| corrupt("地址"))?;
         let headers: Vec<(String, String)> =
             serde_json::from_str(&self.headers).map_err(|_| corrupt("请求头"))?;
+        let cloud = match (
+            self.cloud_provider,
+            self.cloud_job,
+            self.cloud_folder,
+            self.cloud_root,
+        ) {
+            (None, None, None, None) => None,
+            (Some(provider), Some(job), Some(folder), root) => {
+                let folder = PathBuf::from(folder);
+                let root = root.map(PathBuf::from);
+                if !folder.is_absolute()
+                    || root.as_deref().is_some_and(|root| !named_absolute(root))
+                {
+                    return Err(corrupt("云离线的保存目录或内容的根"));
+                }
+                Some(CloudSpec {
+                    provider: parse_provider(&provider).ok_or_else(|| corrupt("网盘"))?,
+                    job,
+                    folder,
+                    root,
+                })
+            }
+            _ => return Err(corrupt("云离线的各列")),
+        };
         let kind = match (
             self.kind.as_str(),
             self.preference,
@@ -1049,7 +1373,9 @@ impl Row {
             self.torrent_info_hash,
             self.torrent_root,
         ) {
-            ("hls", Some(preference), Some(output_kind), Some(live), None, None, None, None) => {
+            ("hls", Some(preference), Some(output_kind), Some(live), None, None, None, None)
+                if cloud.is_none() =>
+            {
                 let preference: StoredPreference =
                     serde_json::from_str(&preference).map_err(|_| corrupt("选轨偏好"))?;
                 let output = output_spec(&output_kind, self.mp4_path, self.hls_path)
@@ -1060,7 +1386,9 @@ impl Row {
                     live,
                 })
             }
-            ("file", None, None, None, Some(path), Some(accepts_ranges), None, None) => {
+            ("file", None, None, None, Some(path), Some(accepts_ranges), None, None)
+                if cloud.is_none() =>
+            {
                 let path = PathBuf::from(path);
                 if !named_absolute(&path) {
                     return Err(corrupt("输出"));
@@ -1087,12 +1415,17 @@ impl Row {
                     chunk_size,
                 })
             }
-            ("torrent", None, None, None, None, None, Some(info_hash), Some(root)) => {
+            ("torrent", None, None, None, None, None, Some(info_hash), Some(root))
+                if cloud.is_none() =>
+            {
                 let root = PathBuf::from(root);
                 if !named_absolute(&root) {
                     return Err(corrupt("内容的根"));
                 }
                 Kind::Torrent(TorrentSpec { info_hash, root })
+            }
+            ("cloud", None, None, None, None, None, None, None) => {
+                Kind::Cloud(cloud.ok_or_else(|| corrupt("云离线的各列"))?)
             }
             _ => return Err(corrupt("种类")),
         };
@@ -1177,6 +1510,22 @@ fn kind_code(kind: &Kind) -> &'static str {
         Kind::Hls(_) => "hls",
         Kind::File(_) => "file",
         Kind::Torrent(_) => "torrent",
+        Kind::Cloud(_) => "cloud",
+    }
+}
+
+/// 网盘在表里的写法（表上有 CHECK）。
+fn provider_code(provider: CloudProvider) -> &'static str {
+    match provider {
+        CloudProvider::PikPak => "pikpak",
+    }
+}
+
+/// [`provider_code`] 的反过来；认不出时为 None。
+fn parse_provider(code: &str) -> Option<CloudProvider> {
+    match code {
+        "pikpak" => Some(CloudProvider::PikPak),
+        _ => None,
     }
 }
 
@@ -1933,6 +2282,255 @@ mod tests {
         ] {
             assert!(insert(kind, columns, &values).is_err(), "{kind}{columns}");
         }
+    }
+
+    fn cloud_spec(root: Option<PathBuf>) -> TaskSpec {
+        TaskSpec {
+            title: "Show".into(),
+            url: "magnet:?xt=urn:btih:x".parse().unwrap(),
+            headers: Vec::new(),
+            kind: Kind::Cloud(CloudSpec {
+                provider: CloudProvider::PikPak,
+                job: "VTask1".into(),
+                folder: m(""),
+                root,
+            }),
+        }
+    }
+
+    fn cloud_file(id: &str, path: &str) -> CloudFile {
+        CloudFile {
+            id: id.into(),
+            path: path.into(),
+            size: 7,
+            gcid: "6805ed701e6ea96597858628f8999a955d441d9d".into(),
+            done: false,
+        }
+    }
+
+    /// 云离线任务新建时没有根与任务目录；列出文件时一起定下（标题换成根名）、占用路径，各文件按次序记下与改完成；删任务
+    /// 连同文件。
+    #[test]
+    fn cloud_tasks_round_trip() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let id = insert(&tx, &cloud_spec(None), None, None, 1).unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!((task.spec.clone(), task.work_dir), (cloud_spec(None), None));
+        assert!(cloud_files(&tx, id).unwrap().is_empty());
+        let files = [cloud_file("VA", "a.bin"), cloud_file("VB", "Sub/b.bin")];
+        // 没有文件、同一路径两次都不收
+        assert!(matches!(
+            set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &[]),
+            Err(Error::InvalidInput(_))
+        ));
+        let other = add(&tx, OutputSpec::Mp4(m("节目")), 2).unwrap();
+        assert!(matches!(
+            set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files),
+            Err(Error::PathTaken(_))
+        ));
+        delete(&tx, other).unwrap();
+        set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files).unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!(task.spec.title, "节目");
+        assert_eq!(
+            task.spec,
+            TaskSpec {
+                title: "节目".into(),
+                ..cloud_spec(Some(m("节目")))
+            }
+        );
+        assert_eq!(task.work_dir, Some(m("节目.hsdl")));
+        assert!(
+            taken_paths(&tx)
+                .unwrap()
+                .contains(&naming::path_key(&text("节目")))
+        );
+        // 只能定一次
+        assert!(matches!(
+            set_cloud_root(&tx, id, &m("别处"), &m("别处.hsdl"), &files),
+            Err(Error::NotFound(_))
+        ));
+        set_cloud_file_done(&tx, id, 1, true).unwrap();
+        let stored = cloud_files(&tx, id).unwrap();
+        assert_eq!(stored[0], files[0]);
+        assert_eq!(
+            stored[1],
+            CloudFile {
+                done: true,
+                ..files[1].clone()
+            }
+        );
+        assert!(matches!(
+            set_cloud_file_done(&tx, id, 2, true),
+            Err(Error::NotFound(_))
+        ));
+        delete(&tx, id).unwrap();
+        let left: i64 = tx
+            .query_row("SELECT count(*) FROM cloud_file", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn cloud_files_must_be_distinct_and_hashed() {
+        let mut store = Store::in_memory().unwrap();
+        let id = {
+            let tx = store.transaction().unwrap();
+            let id = insert(&tx, &cloud_spec(None), None, None, 1).unwrap();
+            tx.commit().unwrap();
+            id
+        };
+        let upper = CloudFile {
+            gcid: "6805ED701E6EA96597858628F8999A955D441D9D".into(),
+            ..cloud_file("VB", "b.bin")
+        };
+        for files in [
+            [cloud_file("VA", "a.bin"), cloud_file("VB", "a.bin")],
+            [cloud_file("VA", "a.bin"), upper],
+        ] {
+            // 出错时调用方不提交，事务回滚（同服务里的写法）
+            let tx = store.transaction().unwrap();
+            assert!(matches!(
+                set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+    }
+
+    /// 云离线的三列必有且只用于它，根与任务目录一起有，没有请求头。
+    #[test]
+    fn cloud_columns_must_agree() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let insert = |kind: &str, columns: &str, values: &str| {
+            tx.execute(
+                &format!(
+                    "INSERT INTO task (kind, title, url, headers, status, created_at{columns})
+                     VALUES ('{kind}', 'x', 'magnet:?', '[]', 'paused', 1{values})"
+                ),
+                [],
+            )
+        };
+        let all = ", cloud_provider, cloud_job, cloud_folder";
+        insert("cloud", all, ", 'pikpak', 'VTask1', '/m'").unwrap();
+        insert(
+            "cloud",
+            &format!("{all}, cloud_root, work_dir"),
+            ", 'pikpak', 'VTask2', '/m', '/m/a', '/m/a.hsdl'",
+        )
+        .unwrap();
+        tx.execute("DELETE FROM task", []).unwrap();
+        for (kind, columns, values) in [
+            (
+                "cloud",
+                ", cloud_provider, cloud_job",
+                ", 'pikpak', 'VTask1'".to_owned(),
+            ),
+            ("cloud", all, ", 'baidu', 'VTask1', '/m'".to_owned()),
+            ("cloud", all, ", 'pikpak', '', '/m'".to_owned()),
+            (
+                "cloud",
+                &format!("{all}, cloud_root"),
+                ", 'pikpak', 'VTask1', '/m', '/m/a'".to_owned(),
+            ),
+            (
+                "cloud",
+                &format!("{all}, work_dir"),
+                ", 'pikpak', 'VTask1', '/m', '/m/a.hsdl'".to_owned(),
+            ),
+            (
+                "hls",
+                ", preference, output_kind, live, cloud_job",
+                ", '{}', 'mp4', 0, 'VTask1'".to_owned(),
+            ),
+        ] {
+            assert!(
+                insert(kind, columns, &values).is_err(),
+                "{kind}{columns}{values}"
+            );
+        }
+        let headers = tx.execute(
+            "INSERT INTO task (kind, title, url, headers, status, created_at, cloud_provider, cloud_job, cloud_folder)
+             VALUES ('cloud', 'x', 'magnet:?', '[[\"a\",\"b\"]]', 'paused', 1, 'pikpak', 'V', '/m')",
+            [],
+        );
+        assert!(headers.is_err());
+    }
+
+    #[test]
+    fn rebuilding_for_cloud_keeps_rows_and_the_id_counter() {
+        let dir = scratch("v10-rows");
+        let path = dir.join("tasks.sqlite");
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..10] {
+                migration(&tx).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, torrent_info_hash, torrent_root, torrent_resume,
+                                   torrent_trusted, torrent_seeding, status, created_at, bytes)
+                 VALUES ('torrent', '专辑', 'magnet:?xt=urn:btih:x', '[]', ?1, ?2, x'0102', 1, 1, 'done', 3, 9)",
+                params![hash, text("专辑")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, torrent_info_hash, torrent_root, torrent_resume,
+                                   torrent_trusted, torrent_seeding, status, created_at)
+                 VALUES ('torrent', '删了', 'magnet:?xt=urn:btih:y', '[]', ?1, ?2, x'00', 1, 0, 'paused', 4)",
+                params!["1123456789abcdef0123456789abcdef01234567", text("删了")],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM task WHERE title = '删了'", [])
+                .unwrap();
+            tx.pragma_update(None, "user_version", 10).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let tx = store.transaction().unwrap();
+        let tasks = list(&tx).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            (
+                &tasks[0].spec.title,
+                tasks[0].status.clone(),
+                tasks[0].seeding
+            ),
+            (&"专辑".to_owned(), Status::Done, true)
+        );
+        assert_eq!(pikpak_account(&tx).unwrap(), None);
+        // 删掉的任务的编号不再用
+        let id = insert(&tx, &cloud_spec(None), None, None, 5).unwrap();
+        assert_eq!(id, TaskId(3));
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_pikpak_account_round_trips() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        assert_eq!(pikpak_account(&tx).unwrap(), None);
+        let account = Account {
+            user_id: "user-1".into(),
+            device_id: "0123456789abcdef0123456789abcdef".into(),
+            refresh_token: "r1".into(),
+            access_token: "a1".into(),
+            access_expires_at: 1_794_819_746,
+        };
+        set_pikpak_account(&tx, Some(&account)).unwrap();
+        let renewed = Account {
+            refresh_token: "r2".into(),
+            access_token: "a2".into(),
+            ..account
+        };
+        set_pikpak_account(&tx, Some(&renewed)).unwrap();
+        assert_eq!(pikpak_account(&tx).unwrap(), Some(renewed));
+        set_pikpak_account(&tx, None).unwrap();
+        assert_eq!(pikpak_account(&tx).unwrap(), None);
     }
 
     /// 删掉编号最大的任务后，新任务也不拿它的编号。

@@ -124,6 +124,7 @@ impl Tasks {
                     }
                     Kind::File(file) => (None, Some(file.path.clone())),
                     Kind::Torrent(torrent) => (None, Some(torrent.root.clone())),
+                    Kind::Cloud(cloud) => (None, cloud.root.clone()),
                 };
                 let checking = cx.background_executor().spawn(async move {
                     let mp4 = mp4.filter(|p| p.is_file());
@@ -150,13 +151,20 @@ impl Tasks {
     /// 读任务目录里已完成的内容（BT 任务读存着的续传数据）；`then_resume` 时读完即继续，读到的片数作本次运行的起点
     /// （读不出时不估剩余时间）。读完（及继续）后，选了退出、都已停下的即退出。
     fn inspect(&mut self, id: TaskId, then_resume: bool, cx: &mut Context<Self>) {
-        let Some((reading, torrent)) = self
-            .row(id)
-            .map(|row| (row.reading, row.task.spec.torrent().is_some()))
-        else {
+        let Some((reading, torrent, cloud)) = self.row(id).map(|row| {
+            (
+                row.reading,
+                row.task.spec.torrent().is_some(),
+                row.task.spec.cloud().is_some(),
+            )
+        }) else {
             return;
         };
-        let read = if torrent {
+        let read = if cloud {
+            // 只读存储，不碰磁盘
+            let files = self.service.cloud_files(id).map(Disk::Cloud);
+            cx.background_executor().spawn(async move { Ok(files) })
+        } else if torrent {
             let handle = self.service.inspect_torrent(id);
             cx.background_executor()
                 .spawn(async move { handle.await.map(|result| result.map(Disk::Torrent)) })
@@ -298,6 +306,10 @@ impl Tasks {
             Disk::Read(None) => (Some(0), Some(Duration::ZERO), None),
             // BT 的说法另写，见下面
             Disk::Torrent(_) => (Some(0), None, None),
+            Disk::Cloud(files) => {
+                let done: u64 = files.iter().filter(|f| f.done).map(|f| f.size).sum();
+                (Some(0), None, (done > 0).then(|| format::bytes(done)))
+            }
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
@@ -311,6 +323,7 @@ impl Tasks {
                 row.progress = None;
                 row.file_progress = None;
                 row.torrent_progress = None;
+                row.cloud_progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
@@ -322,6 +335,7 @@ impl Tasks {
                     (Disk::Torrent(saved), _) if saved.info.done > 0 => {
                         format!("{label}：已有 {}", format::bytes(saved.info.done))
                     }
+                    (Disk::Cloud(_), Some(already)) => format!("{label}：已取回 {already}"),
                     (_, Some(already)) => format!("{label}：任务目录里已有 {already}"),
                     (_, None) => label.to_owned(),
                 };

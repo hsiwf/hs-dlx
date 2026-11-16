@@ -166,6 +166,7 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
         hs_dlx_app::TorrentNetwork::Loopback {
             public_trackers: Vec::new(),
         },
+        hs_dlx_app::pikpak::Endpoints::official(),
     )
     .unwrap()
 }

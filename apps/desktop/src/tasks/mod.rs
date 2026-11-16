@@ -3,6 +3,7 @@
 //! 落进各行），窗口只发起与显示，窗口不在时照常进行。
 
 mod operations;
+mod pikpak;
 mod quit;
 mod row;
 
@@ -16,6 +17,7 @@ use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
 
 pub use self::operations::resume_label;
+pub use self::pikpak::PikPak;
 pub use self::quit::{Asked, Departure, Quit};
 #[cfg(test)]
 pub use self::row::sample;
@@ -83,6 +85,7 @@ pub struct Tasks {
     early: Vec<Event>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
+    pikpak: PikPak,
     /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）；macOS 上总能点程序坞回到窗口，用不到
     #[cfg(not(target_os = "macos"))]
     receives_handoffs: bool,
@@ -173,6 +176,7 @@ impl Tasks {
             creating: 0,
             early: Vec::new(),
             free_space: None,
+            pikpak: PikPak::default(),
             #[cfg(not(target_os = "macos"))]
             receives_handoffs,
             _events: receiving,
@@ -184,6 +188,7 @@ impl Tasks {
         for problem in problems {
             tasks.add_notice(problem);
         }
+        tasks.reload_pikpak();
         let ids: Vec<TaskId> = tasks.rows.iter().map(|r| r.task.id).collect();
         for id in ids {
             tasks.after_stop(id, cx);
@@ -264,6 +269,33 @@ impl Tasks {
                     row.torrent_progress = Some(*progress);
                 }
             }
+            Event::CloudProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    if let hs_dlx_app::CloudProgress::Fetching { received, .. } = progress.as_ref()
+                    {
+                        // 没有片数：剩余时间另按字节算
+                        row.rate.update(Instant::now(), *received, 0);
+                    }
+                    for (level, text) in
+                        crate::signals::between_cloud(row.cloud_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.cloud_progress = Some(*progress);
+                }
+            }
+            Event::Renamed { id } => match self.service.task(id) {
+                Ok(task) => {
+                    if let Some(row) = self.row_mut(id) {
+                        row.task.work_dir = task.work_dir;
+                        row.set_spec(task.spec);
+                    }
+                }
+                Err(error) => {
+                    let title = self.title(id);
+                    self.add_notice(format!("「{title}」的保存位置定了，但读不出来：{error}"));
+                }
+            },
             Event::SeedingStarted { id } => {
                 if let Some(row) = self.row_mut(id) {
                     row.task.seeding = true;
@@ -547,7 +579,7 @@ fn ended_signal(
                 (Some(r), None) => format!("下载完成 · {}", crate::format::bytes(r.bytes)),
             },
         ),
-        Status::Paused if spec.torrent().is_some() => {
+        Status::Paused if spec.torrent().is_some() || spec.cloud().is_some() => {
             (Level::Info, "已暂停，已下的保留".to_owned())
         }
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),

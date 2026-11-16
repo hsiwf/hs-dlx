@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 base64.workspace = true
+hs-dlx-cloud = { path = "../cloud" }
 hs-dlx-torrent = { path = "../torrent" }
 hs-m3u8-core.workspace = true
 icu_normalizer.workspace = true

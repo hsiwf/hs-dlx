@@ -68,12 +68,14 @@ pub enum DraftKind {
         /// 要下的文件（[`crate::TorrentFile::index`]），至少一个
         wanted: Vec<i32>,
     },
+    /// 云离线：[`Draft::url`] 为磁力链接，没有请求头；新建时提交给网盘（要先登录），网盘下完后取回全部文件
+    Cloud { provider: CloudProvider },
 }
 
 /// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Service::set_headers`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
-    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名
+    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名，云离线为网盘给的名字（定下根之后为根名）
     pub title: String,
     pub url: Url,
     /// 额外的请求头，原样存储（含凭据时同样明文，存储文件只有本人可读写）
@@ -87,6 +89,7 @@ pub enum Kind {
     Hls(HlsSpec),
     File(FileSpec),
     Torrent(TorrentSpec),
+    Cloud(CloudSpec),
 }
 
 /// HLS 任务特有的内容。
@@ -119,6 +122,40 @@ pub struct TorrentSpec {
     pub root: PathBuf,
 }
 
+/// 云离线任务特有的内容；各文件的进度另存（见 [`CloudFile`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSpec {
+    pub provider: CloudProvider,
+    /// 网盘上离线任务的编号，提交时网盘给的
+    pub job: String,
+    /// 保存目录（绝对路径），内容的根放在这里
+    pub folder: PathBuf,
+    /// 内容的根：保存目录下的文件（网盘下到的是单个文件）或目录（文件夹），以文件名结尾的绝对路径。网盘下完、列出
+    /// 文件时定下，之前为 None；定下时任务目录（[`Task::work_dir`]）随之定下
+    pub root: Option<PathBuf>,
+}
+
+/// 提供云离线的网盘。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudProvider {
+    PikPak,
+}
+
+/// 云离线任务里的一个文件：网盘下完、列出文件时记下。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudFile {
+    /// 网盘上的文件编号
+    pub id: String,
+    /// 相对内容的根的路径，以 `/` 分隔、各段都是清理过的文件名；内容的根就是这个文件时为空串
+    pub path: String,
+    /// 字节数
+    pub size: u64,
+    /// 网盘给的 GCID（见 [`hs_dlx_cloud::pikpak::gcid`]），40 位小写十六进制
+    pub gcid: String,
+    /// 已下完、校验过并放到了输出位置
+    pub done: bool,
+}
+
 /// 新建前认出地址是文件时服务器报的（响应头原样）。总字节数、ETag、Last-Modified、Content-Type 都没有时第一次下载
 /// 无从核对。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,7 +171,7 @@ pub struct Expected {
 
 impl TaskSpec {
     /// 输出占用的路径（以文件名结尾的绝对路径）：HLS 为 MP4 与本地 HLS 目录中要的那些（MP4 在前），文件任务为文件，
-    /// BT 为内容的根。首项是主要的那个：显示的文件名、所在的目录取它。
+    /// BT 与定下了根的云离线任务为内容的根，还没定下根的云离线任务没有。首项是主要的那个：显示的文件名、所在的目录取它。
     pub fn outputs(&self) -> Vec<&std::path::Path> {
         match &self.kind {
             Kind::Hls(hls) => match &hls.output {
@@ -143,6 +180,7 @@ impl TaskSpec {
             },
             Kind::File(file) => vec![&file.path],
             Kind::Torrent(torrent) => vec![&torrent.root],
+            Kind::Cloud(cloud) => cloud.root.iter().map(PathBuf::as_path).collect(),
         }
     }
 
@@ -150,7 +188,7 @@ impl TaskSpec {
     pub fn hls(&self) -> Option<&HlsSpec> {
         match &self.kind {
             Kind::Hls(hls) => Some(hls),
-            Kind::File(_) | Kind::Torrent(_) => None,
+            Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
         }
     }
 
@@ -158,7 +196,7 @@ impl TaskSpec {
     pub fn file(&self) -> Option<&FileSpec> {
         match &self.kind {
             Kind::File(file) => Some(file),
-            Kind::Hls(_) | Kind::Torrent(_) => None,
+            Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
         }
     }
 
@@ -166,7 +204,15 @@ impl TaskSpec {
     pub fn torrent(&self) -> Option<&TorrentSpec> {
         match &self.kind {
             Kind::Torrent(torrent) => Some(torrent),
-            Kind::Hls(_) | Kind::File(_) => None,
+            Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) => None,
+        }
+    }
+
+    /// 云离线任务特有的内容；别的任务为 None。
+    pub fn cloud(&self) -> Option<&CloudSpec> {
+        match &self.kind {
+            Kind::Cloud(cloud) => Some(cloud),
+            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => None,
         }
     }
 }
@@ -212,9 +258,10 @@ pub struct Task {
     pub id: TaskId,
     pub spec: TaskSpec,
     pub status: Status,
-    /// 任务目录（绝对路径），新建时定下、之后不变。BT 任务没有任务目录（内容直接下到保存目录，续传数据存在存储里），
-    /// 总是 None；HLS 与文件任务为 None 时没有自己的任务目录：旧版本存储里已完成的，或与别的任务共用任务目录、迁移时
-    /// 让给了那个任务的（状态为失败），这样的任务不能继续，只能从列表移除
+    /// 任务目录（绝对路径），定下后不变。HLS 与文件任务新建时定下，为 None 时没有自己的任务目录：旧版本存储里已完成
+    /// 的，或与别的任务共用任务目录、迁移时让给了那个任务的（状态为失败），这样的任务不能继续，只能从列表移除。BT 任务
+    /// 没有任务目录（内容直接下到保存目录，续传数据存在存储里），总是 None。云离线任务与内容的根
+    /// （[`CloudSpec::root`]）一起定下，之前为 None；里面每个文件一个核心的任务目录
     pub work_dir: Option<PathBuf>,
     /// 新建时间，Unix 秒
     pub created_at: i64,

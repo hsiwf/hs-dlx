@@ -128,6 +128,7 @@ fn service_with(
         Store::open(store).unwrap(),
         NonZeroUsize::new(8).unwrap(),
         TorrentNetwork::Loopback { public_trackers },
+        hs_dlx_app::pikpak::Endpoints::official(),
     )
     .unwrap()
 }

@@ -24,16 +24,21 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
+mod cloud;
+
+pub use cloud::CloudProgress;
+
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
 use crate::store::{self, Store};
 use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
 use crate::update::{self, Release, Restart, UpdateFeed, Version};
 use crate::{
-    Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind, MetadataProgress,
-    OutputSpec, SavedTorrent, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
-    TorrentInfo, TorrentNetwork, TorrentProgress, TorrentSpec, naming,
+    CloudSpec, Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind,
+    MetadataProgress, OutputSpec, SavedTorrent, Seeding, Settings, Status, Task, TaskId, TaskSpec,
+    Theme, TorrentInfo, TorrentNetwork, TorrentProgress, TorrentSpec, naming,
 };
+use hs_dlx_cloud::pikpak::{self, Session};
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -84,6 +89,13 @@ pub enum Event {
         id: TaskId,
         progress: Box<TorrentProgress>,
     },
+    /// 运行中的云离线任务的进度：网盘在下时约每 5 秒一次，下文件时节流同上
+    CloudProgress {
+        id: TaskId,
+        progress: Box<CloudProgress>,
+    },
+    /// 任务的标题或输出变了（云离线任务列出文件、定下内容的根），要重读任务（[`Service::task`]）
+    Renamed { id: TaskId },
     /// 已完成的 BT 任务开始做种（下完接着做、[`Service::seed`]，或打开应用时接着上次的）
     SeedingStarted { id: TaskId },
     /// 做种时定时存进度没存成（`reason` 为原因）：照常做种，下一次再存；这期间的上传与做种时长要等存成了才记下
@@ -147,6 +159,17 @@ impl Drop for MetadataHandle {
     }
 }
 
+/// 进行中的 PikPak 登录（[`Service::login_pikpak`]）：在系统浏览器里打开 `url`，登录后点确认。
+pub struct PikPakLogin {
+    /// 确认页上显示的码，供用户核对
+    pub user_code: String,
+    pub url: Url,
+    /// 登录码到期的时刻，Unix 秒
+    pub expires_at: i64,
+    /// 确认了、账号记进存储即完成；释放即不再等
+    pub done: AbortOnDropHandle<Result<(), Error>>,
+}
+
 /// 一个正在运行的任务。
 struct Running {
     control: Control,
@@ -161,6 +184,8 @@ enum Control {
     File(JobControl<FileProgress>),
     /// 取消即暂停
     Torrent(CancellationToken),
+    /// 取消即暂停
+    Cloud(CancellationToken),
 }
 
 impl Control {
@@ -168,15 +193,15 @@ impl Control {
         match self {
             Control::Hls(control) => control.cancel(),
             Control::File(control) => control.cancel(),
-            Control::Torrent(cancel) => cancel.cancel(),
+            Control::Torrent(cancel) | Control::Cloud(cancel) => cancel.cancel(),
         }
     }
 
-    /// 停止录制；文件与 BT 任务没有录制，什么也不做。
+    /// 停止录制；文件、BT 与云离线任务没有录制，什么也不做。
     fn stop(&self) {
         match self {
             Control::Hls(control) => control.stop(),
-            Control::File(_) | Control::Torrent(_) => {}
+            Control::File(_) | Control::Torrent(_) | Control::Cloud(_) => {}
         }
     }
 }
@@ -186,6 +211,7 @@ enum Launched {
     Hls(Job),
     File(Job<FileOutput, FileProgress>),
     Torrent(TorrentRun),
+    Cloud(cloud::CloudRun),
 }
 
 /// 开始了的 BT 任务。
@@ -204,6 +230,7 @@ impl Launched {
             Launched::Hls(job) => job.control().cancel(),
             Launched::File(job) => job.control().cancel(),
             Launched::Torrent(run) => run.cancel.cancel(),
+            Launched::Cloud(run) => run.cancel.cancel(),
         }
     }
 }
@@ -266,6 +293,11 @@ struct Shared {
     seeding: watch::Sender<Seeding>,
     /// 在做种的（含正在加入会话、还没开始的）：停止做种经它找到，登记与查询都在 `store` 锁内
     seeders: Mutex<HashMap<TaskId, SeedControl>>,
+    /// PikPak 的登录状态，各云离线任务共用（refresh_token 只能用一次，各用各的会互相作废）；第一次用到时照存储里的
+    /// 账号建，登录换掉、退出登录清掉
+    pikpak: Mutex<Option<Arc<Session>>>,
+    /// PikPak 的接口所在
+    pikpak_endpoints: pikpak::Endpoints,
 }
 
 /// 一个在做种的任务的控制。
@@ -284,12 +316,13 @@ pub struct Service {
 
 impl Service {
     /// 用 `store` 建服务，HTTP 同时最多 `max_requests` 个请求（见 [`hs_m3u8_core::Engine::new`]），BT 会话连
-    /// `network`；返回服务与事件的接收端。上次异常退出时还标着运行中的任务改为暂停；其中 BT 任务存的续传数据改为不可信
+    /// `network`，PikPak 的接口在 `pikpak`（官方的为 [`pikpak::Endpoints::official`]）；返回服务与事件的接收端。上次异常退出时还标着运行中的任务改为暂停；其中 BT 任务存的续传数据改为不可信
     /// （可能比磁盘上的多），下次继续时先整体校验已下的文件。
     pub fn new(
         mut store: Store,
         max_requests: NonZeroUsize,
         network: TorrentNetwork,
+        pikpak: pikpak::Endpoints,
     ) -> Result<(Service, Events), Error> {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
@@ -334,6 +367,8 @@ impl Service {
             runtime: runtime.handle().clone(),
             seeding: watch::Sender::new(settings.seeding),
             seeders: Mutex::new(HashMap::new()),
+            pikpak: Mutex::new(None),
+            pikpak_endpoints: pikpak,
         });
         let service = Service {
             shared,
@@ -649,6 +684,68 @@ impl Service {
             .spawn_blocking(move || update::install(&downloaded.path, &downloaded.dir))
     }
 
+    /// 开始登录 PikPak（经设置里的代理）：要一个登录码，之后在后台按间隔问确认了没有，确认了即把账号记进存储、换上新的
+    /// 登录状态（之后开始的云离线任务用它）。返回的句柄在任何执行器上都可等待，释放它即取消；登录码过期报
+    /// [`Error::PikPak`]（[`pikpak::Error::LoginExpired`]）。
+    pub fn login_pikpak(&self) -> AbortOnDropHandle<Result<PikPakLogin, Error>> {
+        let shared = self.shared.clone();
+        AbortOnDropHandle::new(self.runtime().spawn(async move {
+            let http = hs_m3u8_core::HttpOptions {
+                proxy: shared.settings()?.proxy,
+                ..hs_m3u8_core::HttpOptions::default()
+            };
+            let endpoints = shared.pikpak_endpoints.clone();
+            let mut login = pikpak::login::start(&shared.engine, &http, &endpoints).await?;
+            let (user_code, url, expires_at) =
+                (login.user_code.clone(), login.url.clone(), login.expires_at);
+            let runtime = shared.runtime.clone();
+            let polling = runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(login.interval).await;
+                    match login.poll(&shared.engine, &http, &endpoints).await? {
+                        pikpak::login::Poll::Pending => {}
+                        pikpak::login::Poll::Done(account) => {
+                            shared.write(|tx| store::set_pikpak_account(tx, Some(&account)))?;
+                            let session = Arc::new(shared.new_pikpak_session(account));
+                            *lock(&shared.pikpak) = Some(session);
+                            return Ok(());
+                        }
+                    }
+                }
+            });
+            Ok(PikPakLogin {
+                user_code,
+                url,
+                expires_at,
+                done: AbortOnDropHandle::new(polling),
+            })
+        }))
+    }
+
+    /// 退出 PikPak：从存储里删掉账号；之后开始的云离线任务要重新登录，在运行的照用已有的令牌跑完这一次。
+    pub fn logout_pikpak(&self) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_pikpak_account(tx, None))?;
+        *lock(&self.shared.pikpak) = None;
+        Ok(())
+    }
+
+    /// 云离线任务的文件与各自下完没有（列出文件之前为空），任务不在运行时显示已下多少；没有这个任务时报
+    /// [`Error::NotFound`]。
+    pub fn cloud_files(&self, id: TaskId) -> Result<Vec<crate::CloudFile>, Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+        store::cloud_files(&tx, id)
+    }
+
+    /// 登录了的 PikPak 账号的用户编号；没登录时为 None。
+    pub fn pikpak_user(&self) -> Result<Option<String>, Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        Ok(store::pikpak_account(&tx)?.map(|account| account.user_id))
+    }
+
     /// 记下外观主题。
     pub fn set_theme(&self, theme: Theme) -> Result<(), Error> {
         let mut store = lock(&self.shared.store);
@@ -903,8 +1000,8 @@ impl Service {
         }
         self.shared.write(|tx| {
             let task = self.shared.stopped(tx, id)?;
-            if task.spec.torrent().is_some() {
-                return Err(Error::InvalidInput(format!("{id}是 BT 任务，没有请求头")));
+            if task.spec.torrent().is_some() || task.spec.cloud().is_some() {
+                return Err(Error::InvalidInput(format!("{id}没有请求头")));
             }
             store::set_headers(tx, id, &headers)
         })
@@ -1045,6 +1142,19 @@ async fn run_discard(
     // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
     shared.write(|tx| store::set_status(tx, id, &Status::DiscardUnfinished))?;
     let task = shared.get(id)?;
+    if let Some(spec) = task.spec.cloud() {
+        shared
+            .discard_cloud(id, spec, task.work_dir.as_deref())
+            .await?;
+        return shared
+            .write(|tx| store::delete(tx, id))
+            .map(|()| Vec::new())
+            .map_err(|cause| Error::RecordNotDeleted {
+                id,
+                leftovers: Vec::new(),
+                cause: Box::new(cause),
+            });
+    }
     if let Some(spec) = task.spec.torrent() {
         let resume = {
             let mut store = lock(&shared.store);
@@ -1467,16 +1577,28 @@ impl Shared {
                 Some(info)
             }
             DraftKind::Hls { .. } | DraftKind::File { .. } => None,
+            DraftKind::Cloud { provider } => {
+                return self
+                    .create_cloud(
+                        draft.url,
+                        folder,
+                        *provider,
+                        !draft.headers.is_empty(),
+                        created_at,
+                    )
+                    .await;
+            }
         };
         let base = match (&draft.kind, &info) {
             (DraftKind::Hls { title, .. }, _) => naming::task_title(&draft.url, title.as_deref()),
             (DraftKind::File { name, .. }, _) => naming::file_name(&draft.url, name.as_deref()),
             (DraftKind::Torrent { .. }, Some(info)) => info.name.clone(),
             (DraftKind::Torrent { .. }, None) => unreachable!("BT 的草稿上面已读出种子信息"),
+            (DraftKind::Cloud { .. }, _) => unreachable!("云离线的草稿上面已交给 create_cloud"),
         };
         let preference = match &draft.kind {
             DraftKind::Hls { preference, .. } => Some(StoredPreference::try_from(preference)?),
-            DraftKind::File { .. } | DraftKind::Torrent { .. } => None,
+            DraftKind::File { .. } | DraftKind::Torrent { .. } | DraftKind::Cloud { .. } => None,
         };
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
@@ -1539,6 +1661,7 @@ impl Shared {
                     let kind = Kind::Torrent(TorrentSpec { info_hash, root });
                     (root_name, None, Some(placed), kind)
                 }
+                DraftKind::Cloud { .. } => unreachable!("云离线的草稿上面已交给 create_cloud"),
             };
             let spec = TaskSpec {
                 title,
@@ -1552,6 +1675,54 @@ impl Shared {
                 result => return result,
             }
         }
+    }
+
+    /// 新建云离线任务：把磁力链接 `url` 提交给网盘 `provider`，记下网盘给的离线任务并开始等它下完；内容的根到列出文件
+    /// 时才在保存目录 `folder` 里定下。带了请求头（`has_headers`）、不是磁力链接时报 [`Error::InvalidInput`]，没登录时报
+    /// [`Error::NotLoggedIn`]，网盘拒绝或连不上时报 [`Error::PikPak`]。提交发出后没等到结果就断了的，按链接在网盘最近的
+    /// 离线任务里找，找到即用它，找不到照原样报错。
+    async fn create_cloud(
+        self: &Arc<Self>,
+        url: Url,
+        folder: PathBuf,
+        provider: crate::CloudProvider,
+        has_headers: bool,
+        created_at: i64,
+    ) -> Result<Task, Error> {
+        if has_headers {
+            return Err(Error::InvalidInput("云离线任务没有请求头".to_owned()));
+        }
+        if url.scheme() != "magnet" {
+            return Err(Error::InvalidInput("云离线只收磁力链接".to_owned()));
+        }
+        let crate::CloudProvider::PikPak = provider;
+        let proxy = self.settings()?.proxy;
+        let client = self.pikpak_client(proxy)?;
+        let job = match client.submit(url.as_str()).await {
+            Ok(job) => job,
+            Err(pikpak::Error::Transport(error)) if may_have_taken_effect(&error) => {
+                match client.find_job(url.as_str()).await? {
+                    Some(job) => job,
+                    None => return Err(pikpak::Error::Transport(error).into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let spec = CloudSpec {
+            provider,
+            job: job.id,
+            folder,
+            root: None,
+        };
+        let spec = cloud::draft_spec(spec, &job.name, url);
+        self.insert_and_start(&spec, None, None, created_at)
+    }
+
+    /// 设置（[`Service::settings`] 的服务内用法）。
+    fn settings(&self) -> Result<Settings, Error> {
+        let mut store = lock(&self.store);
+        let tx = store.transaction()?;
+        store::settings(&tx)
     }
 
     /// 把任务存进存储并开始，任务目录为 `work_dir`、BT 任务的续传数据为 `resume`（见 [`store::insert`]）；调用方须在
@@ -1600,6 +1771,10 @@ impl Shared {
                 Launched::File(self.engine.start_file(file_request(task, file, proxy)?)?)
             }
             Kind::Torrent(spec) => Launched::Torrent(self.launch_torrent(tx, task.id, spec)?),
+            Kind::Cloud(_) => {
+                let proxy = store::settings(tx)?.proxy;
+                Launched::Cloud(self.launch_cloud(task, proxy)?)
+            }
         })
     }
 
@@ -1704,6 +1879,11 @@ impl Shared {
                     }
                     return;
                 }
+                // 新建时还没定下内容的根，磁盘上没有它的东西
+                Launched::Cloud(run) => {
+                    let _ended = run.done.await;
+                    return;
+                }
             };
             let work_dir = work_dir.expect("HLS 与文件任务有任务目录");
             let (paths, reason) = match written {
@@ -1737,6 +1917,7 @@ impl Shared {
             Launched::Hls(job) => self.track_hls(task, job, run),
             Launched::File(job) => self.track_file(task, job),
             Launched::Torrent(job) => self.track_torrent(task, job),
+            Launched::Cloud(run) => self.track_cloud(task, run),
         }
     }
 
@@ -1920,6 +2101,28 @@ impl Shared {
             if let Some(seeder) = ended.seeder {
                 shared.track_seeding(id, async move { Ok(seeder) });
             }
+        });
+    }
+
+    /// 云离线任务的 [`Shared::track`]。
+    fn track_cloud(self: &Arc<Self>, task: &Task, run: cloud::CloudRun) {
+        let id = task.id;
+        let guard = self.register(id, Control::Cloud(run.cancel.clone()));
+        let shared = self.clone();
+        self.tracker.spawn(async move {
+            let outcome = run
+                .done
+                .await
+                .expect("云离线任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
+            let (status, result) = cloud::ending(outcome);
+            let ending = Ending {
+                status,
+                result,
+                total: None,
+                resume: None,
+                seeding: None,
+            };
+            shared.conclude(id, ending, Vec::new(), guard);
         });
     }
 }
@@ -2115,6 +2318,17 @@ fn output_options(task: &Task) -> Result<OutputOptions, Error> {
     let mut options = hls.output.options();
     options.work_dir = Some(task.work_dir.clone().ok_or(Error::NoWorkDir(task.id))?);
     Ok(options)
+}
+
+/// 调用接口失败时服务器可能已处理了请求（见 [`Engine::call`]）：可能已发出，或已收到响应头而没读完响应体。
+fn may_have_taken_effect(error: &hs_m3u8_core::Error) -> bool {
+    matches!(
+        error,
+        hs_m3u8_core::Error::Call {
+            sent: hs_m3u8_core::Sent::Maybe | hs_m3u8_core::Sent::Answered { .. },
+            ..
+        }
+    )
 }
 
 /// 停着的任务再运行一次的方式。
