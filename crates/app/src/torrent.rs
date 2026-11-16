@@ -586,6 +586,9 @@ pub(crate) struct Bt {
     /// 记着能用时探到经它的 UDP 没回（[`ProxyCheck::Silent`]）、还没改记：再探一次也是才改记（UDP 偶尔整轮丢包）；
     /// 持着 `running` 的锁改与读
     proxy_doubted: AtomicBool,
+    /// libtorrent 可能已放弃连代理、还没让它重连：探出过握手被拒（[`ProxyCheck::Refused`]），或用户在还没探到能用时
+    /// 重新保存了同一个；探到能用时重连并清掉。持着 `running` 的锁改与读
+    proxy_reconnect: AtomicBool,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     /// 公共 tracker 列表的来源（空时不补）与状况
@@ -630,6 +633,7 @@ impl Bt {
             }),
             proxy: Mutex::new(proxy),
             proxy_doubted: AtomicBool::new(false),
+            proxy_reconnect: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
             public_sources,
@@ -690,6 +694,8 @@ impl Bt {
             state: saved.dht,
         })
         .map_err(|error| Error::Torrent(format!("BT 会话建不出：{error}")))?;
+        // 新会话照现在的设置连代理，之前的放弃不算
+        self.proxy_reconnect.store(false, Ordering::Relaxed);
         let engine = Arc::new(Engine {
             session,
             routes: Mutex::new(HashMap::new()),
@@ -754,7 +760,8 @@ impl Bt {
 
     /// 改经的代理（None 为直连；调用方已校验，见 [`crate::socks::check`]）：已建的会话随即照它，之后建的也照它。交给
     /// libtorrent 的设置不变时（重新保存同一个，或写法不同而等价，如 socks5 与 socks5h）只换记着的地址，探到的情况与
-    /// libtorrent 的连接都照旧。
+    /// libtorrent 的连接都照旧；只是记着的不是能用时，记下探到能用时让 libtorrent 重连（它在握手被拒后不再自己重试，
+    /// 有的还不报错）。
     pub fn set_proxy(&self, proxy: Option<Url>) {
         let running = lock(&self.running);
         let socks = libtorrent_proxy(proxy.as_ref());
@@ -766,9 +773,14 @@ impl Bt {
             same
         };
         if same {
+            if *self.proxy_check.borrow() != ProxyCheck::Usable {
+                self.proxy_reconnect.store(true, Ordering::Relaxed);
+            }
             return;
         }
         self.proxy_doubted.store(false, Ordering::Relaxed);
+        // 换了设置，libtorrent 随即照新的连
+        self.proxy_reconnect.store(false, Ordering::Relaxed);
         self.proxy_check.send_replace(if direct {
             ProxyCheck::Direct
         } else {
@@ -807,29 +819,42 @@ impl Bt {
         }
     }
 
-    /// 记下探 `url` 的结果；代理已改成别的时不记。记着能用而这次经它的 UDP 没回（[`ProxyCheck::Silent`]）时先不改记，
-    /// 再探一次也是才改记（UDP 偶尔整轮丢包）。之前握手没成（[`ProxyCheck::Refused`]）或 libtorrent 经它报过错，而这次
-    /// 探到能用时，让 libtorrent 重连代理并清掉那条出错：它在握手被拒后不再自己重试，其中认证被拒与申请转发 UDP 被拒时
-    /// 还不报错。重连会断开经代理的 uTP 连接，别的时候不重连。
+    /// 后台看着时记下探 `url` 的结果（见 [`Bt::record_proxy_check`]）：记着能用而这次经它的 UDP 没回
+    /// （[`ProxyCheck::Silent`]）时先不改记，再探一次也是才改记（UDP 偶尔整轮丢包）。
     pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
+        self.record(url, check, true);
+    }
+
+    /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。libtorrent 可能已放弃
+    /// 连代理（见 `proxy_reconnect`）或经它报过错，而这次探到能用时，让它重连代理并清掉那条出错。重连会断开经代理的
+    /// uTP 连接，别的时候不重连。
+    pub fn record_proxy_check(&self, url: &Url, check: ProxyCheck) {
+        self.record(url, check, false);
+    }
+
+    fn record(&self, url: &Url, check: ProxyCheck, doubt: bool) {
         let running = lock(&self.running);
         if lock(&self.proxy).as_ref() != Some(url) {
             return;
         }
         let usable = *self.proxy_check.borrow() == ProxyCheck::Usable;
-        if matches!(check, ProxyCheck::Silent(_))
+        if doubt
+            && matches!(check, ProxyCheck::Silent(_))
             && usable
             && !self.proxy_doubted.swap(true, Ordering::Relaxed)
         {
             return;
         }
         self.proxy_doubted.store(false, Ordering::Relaxed);
-        let previous = self.proxy_check.send_replace(check.clone());
+        if matches!(check, ProxyCheck::Refused(_)) {
+            self.proxy_reconnect.store(true, Ordering::Relaxed);
+        }
+        self.proxy_check.send_replace(check.clone());
         if check == ProxyCheck::Usable
             && let Some(running) = &*running
         {
             let session = &running.engine.session;
-            if matches!(previous, ProxyCheck::Refused(_))
+            if self.proxy_reconnect.swap(false, Ordering::Relaxed)
                 || !session.network().proxy_error.is_empty()
             {
                 session.reconnect_proxy(&libtorrent_proxy(Some(url)));
@@ -1710,11 +1735,17 @@ mod tests {
         bt.set_proxy_check(&url, silent.clone());
         assert_eq!(recorded(&bt), silent);
 
+        // 握手被拒之后要重连，中间探到经它的 UDP 没回也不忘
         bt.set_proxy_check(&url, ProxyCheck::Refused("认证被拒".into()));
+        bt.set_proxy_check(&url, silent.clone());
+        assert!(bt.proxy_reconnect.load(Ordering::Relaxed));
         let equivalent = Url::parse("socks5h://127.0.0.1:7897/").unwrap();
         bt.set_proxy(Some(equivalent.clone()));
-        assert_eq!(recorded(&bt), ProxyCheck::Refused("认证被拒".into()));
-        assert_eq!(bt.proxy_url(), Some(equivalent));
+        assert_eq!(recorded(&bt), silent);
+        assert_eq!(bt.proxy_url(), Some(equivalent.clone()));
+        bt.set_proxy_check(&equivalent, ProxyCheck::Usable);
+        // 没有会话时没得重连，记着的照旧要重连
+        assert!(bt.proxy_reconnect.load(Ordering::Relaxed));
         bt.set_proxy(Some(Url::parse("socks5://127.0.0.1:1080").unwrap()));
         assert_eq!(recorded(&bt), ProxyCheck::Unchecked);
         bt.set_proxy(None);

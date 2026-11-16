@@ -186,20 +186,13 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
             stream.read_exact(&mut bound).await.map_err(io)?;
             let ip = Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]);
             let port = u16::from_be_bytes([bound[4], bound[5]]);
-            // libtorrent 照原样发往 0.0.0.0：在 macOS 与 Linux 上即本机，只有代理在本机（回环或本机网卡的地址，后者绑得
-            // 上）时才到得了它；Windows 上发不出
+            // libtorrent 照原样记下转发地址，只收从它来的包：0.0.0.0 时回包的来源（代理的真实地址）对不上，全被丢掉
             if ip.is_unspecified() {
-                let local = address.ip().is_loopback()
-                    || std::net::UdpSocket::bind((address.ip(), 0)).is_ok();
-                if !local || cfg!(target_os = "windows") {
-                    return Err(format!(
-                        "代理 {at} 回的 UDP 转发地址是 0.0.0.0：libtorrent 发不到代理那里，DHT、uTP 与 UDP 的 tracker 经不了它"
-                    ));
-                }
-                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
-            } else {
-                SocketAddr::new(ip.into(), port)
+                return Err(format!(
+                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它"
+                ));
             }
+            SocketAddr::new(ip.into(), port)
         }
         // 域名：libtorrent 不解析它，改发往代理的地址
         3 => {

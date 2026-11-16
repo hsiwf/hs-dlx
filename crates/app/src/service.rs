@@ -1240,7 +1240,7 @@ impl Shared {
                 let through = through.map_err(socket)?;
                 let check = netcheck::judge_proxy(&through);
                 // 记进 BT 引擎：取种子信息的界面与诊断随之更新
-                self.bt.set_proxy_check(&url, check.clone());
+                self.bt.record_proxy_check(&url, check.clone());
                 Some(netcheck::Proxied {
                     address: hs_m3u8_core::bare_url(&url),
                     check,

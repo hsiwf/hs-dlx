@@ -153,9 +153,11 @@ pub struct NetworkReport {
 }
 
 /// 设了 BT 代理而经它的引导节点一个都没回、直连的却有回的：代理接了 UDP 转发却没转发出去（节点不支持 UDP 等）。引导
-/// 节点解析成了 TUN 代理的假地址时（见 [`Dht::tun`]）不下这个结论：假地址经别的代理本来就到不了。
+/// 节点解析成了 TUN 代理的假地址时（见 [`Dht::tun`]，假地址经别的代理本来就到不了）、经代理收发出错时（原因另有）不下
+/// 这个结论。
 pub(crate) fn drops_udp(direct: &Dht, proxied: &Dht) -> bool {
     !proxied.tun
+        && proxied.failure.is_none()
         && direct.bootstrap.replied > 0
         && proxied.bootstrap.asked > 0
         && proxied.bootstrap.replied == 0
@@ -167,7 +169,7 @@ pub(crate) const DROPS_UDP: &str =
 
 /// 经代理问的 DHT 引导节点被 TUN 代理解析成假地址、一个都没回时的说明。libtorrent 解析引导节点同样用本机的 DNS，
 /// 拿到的也是这些假地址。
-pub(crate) const PROXY_FAKE_IP: &str = "DHT 引导节点被系统里的 TUN 代理解析成了 198.18 开头的假地址，经这个代理到不了（BT 同样照这些地址问）：在 TUN 代理里把它们排除出 fake-ip，或把 BT 代理设成 TUN 代理自己的 SOCKS 端口";
+pub(crate) const PROXY_FAKE_IP: &str = "DHT 引导节点被系统里的 TUN 代理解析成了假地址（198.18.0.0/15），经这个代理问不到；BT 同样照这些地址问，只能靠之前存下的节点连 DHT，第一次用时连不上。在 TUN 代理里把这几个域名排除出 fake-ip，或把 BT 代理设成 TUN 代理自己的 SOCKS 端口";
 
 /// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为原因）的结论，网络检测与后台看护
 /// 记进 BT 引擎的都照它：只看经代理的，不拿直连的比。握手没成为 [`ProxyCheck::Refused`]；收发出错、引导节点一个都
@@ -199,7 +201,15 @@ pub(crate) async fn through_proxy(
         Ok(relay) => relay,
         Err(why) => return Ok(Err(why)),
     };
-    let udp = Udp::via(relay).await?;
+    let udp = match Udp::via(relay).await? {
+        Ok(udp) => udp,
+        Err(why) => {
+            return Ok(Ok(Dht {
+                failure: Some(why),
+                ..Dht::default()
+            }));
+        }
+    };
     let (found, unresolved) = bootstrap(hosts, false).await;
     Ok(Ok(dht(&udp, &found, unresolved).await))
 }
@@ -215,7 +225,8 @@ pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> Pro
         Err(why) => return ProxyCheck::Refused(why),
     };
     let udp = match Udp::via(relay).await {
-        Ok(udp) => udp,
+        Ok(Ok(udp)) => udp,
+        Ok(Err(why)) => return ProxyCheck::Silent(why),
         Err(error) => return ProxyCheck::Silent(format!("开不了 UDP 套接字：{error}")),
     };
     let (found, unresolved) = bootstrap(hosts, false).await;
@@ -345,11 +356,10 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             "有公网 IPv6，但 IPv6 的 UDP 发出去没有回应".to_owned(),
         ),
     });
-    // 经代理的：用不了的为大多不通；握手正常而问不了引导节点的（解析不出、TUN 的假地址）为没测
+    // 经代理的：用不了的为大多不通；握手正常而引导节点都解析不出的为没测
     let proxied = measured.proxy.as_ref().map(|proxy| {
         let health = match (&proxy.check, &proxy.dht) {
             (check, _) if check.problem().is_some() => Health::Blocked,
-            (_, Some(through)) if through.tun => Health::Untested,
             (_, Some(through)) => through.health(),
             (_, None) => Health::Blocked,
         };
@@ -372,7 +382,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
                 NetItem::Proxy,
                 CheckLevel::Warn,
                 format!(
-                    "BT 代理 {} 握手正常，但问不了 DHT 引导节点（解析不出，或解析成了 TUN 代理的假地址），没测它转发的 UDP",
+                    "BT 代理 {} 握手正常，但解析不出 DHT 引导节点的地址，没测它转发的 UDP",
                     proxy.address
                 ),
             ),
@@ -447,6 +457,9 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
     });
     let verdict = match &proxied {
         _ if dht.failure.is_some() => "直连的 DHT 没测完：可再测一次".to_owned(),
+        Some((proxy, _)) if proxy.check.problem() == Some(PROXY_FAKE_IP) => {
+            "BT 代理问 DHT 时被系统里的 TUN 代理挡住：见上面「BT 代理」一项".to_owned()
+        }
         None => match direct {
             Health::Healthy => "网络正常：BT 能直接连".to_owned(),
             Health::Uncertain => "结果说不准：可再测一次".to_owned(),
@@ -511,14 +524,20 @@ impl Udp {
         })
     }
 
-    /// 经已谈好的 UDP 转发：套接字连到转发地址，转发端口没开时收包即报错（Windows），只收它发来的。
-    pub async fn via(relay: UdpRelay) -> std::io::Result<Udp> {
+    /// 经已谈好的 UDP 转发：套接字连到转发地址，只收它发来的，转发端口没开时收包即报错。开不了本机的套接字时为外层的
+    /// 错；连不到转发地址（没有到它的路由等）时内层为原因。
+    pub async fn via(relay: UdpRelay) -> std::io::Result<Result<Udp, String>> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-        socket.connect(relay.address).await?;
-        Ok(Udp {
+        if let Err(error) = socket.connect(relay.address).await {
+            return Ok(Err(format!(
+                "发不到代理的 UDP 转发地址 {}：{error}",
+                relay.address
+            )));
+        }
+        Ok(Ok(Udp {
             socket,
             relay: Some(relay),
-        })
+        }))
     }
 
     /// 发一个包。直连时发往单个节点发不出（网络不可达等）算那个节点没回，不报错；经代理时都发往代理的转发地址，发不
@@ -599,9 +618,21 @@ impl Udp {
                     match tokio::time::timeout_at(deadline, self.recv(&mut buffer)).await {
                         Ok(Ok(received)) => received,
                         Ok(Err(error)) => {
+                            let failure = match &self.relay {
+                                Some(relay)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::ConnectionRefused
+                                    ) =>
+                                {
+                                    format!("代理回的 UDP 转发地址 {} 没开", relay.address)
+                                }
+                                _ => format!("收 UDP 包出错：{error}"),
+                            };
                             return Exchanged {
                                 replies,
-                                failure: Some(format!("收 UDP 包出错：{error}")),
+                                failure: Some(failure),
                             };
                         }
                         Err(_) => break,
@@ -1235,19 +1266,15 @@ mod tests {
     #[tokio::test]
     async fn dht_goes_through_the_socks_relay() {
         let router = fake_network().await;
-        // 本机的代理回 0.0.0.0 时照样能用（Windows 上 libtorrent 发不出，探测即报用不了）
-        let bounds: &[Ipv4Addr] = if cfg!(target_os = "windows") {
-            &[Ipv4Addr::LOCALHOST]
-        } else {
-            &[Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED]
-        };
-        for &bound in bounds {
-            let proxy = fake_socks(bound).await;
-            let relay = crate::socks::associate(&proxy).await.unwrap();
-            let udp = Udp::via(relay).await.unwrap();
-            let measured = dht(&udp, &[router], 0).await;
-            assert_eq!(measured.nodes, ratio(4, 2), "转发地址 {bound}");
-        }
+        let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
+        let relay = crate::socks::associate(&proxy).await.unwrap();
+        let udp = Udp::via(relay).await.unwrap().unwrap();
+        let measured = dht(&udp, &[router], 0).await;
+        assert_eq!(measured.nodes, ratio(4, 2));
+        // 回 0.0.0.0 的：libtorrent 收不到经它回来的包
+        let unspecified = fake_socks(Ipv4Addr::UNSPECIFIED).await;
+        let refused = crate::socks::associate(&unspecified).await.err().unwrap();
+        assert!(refused.contains("0.0.0.0"), "{refused}");
     }
 
     /// 后台探 BT 代理只经代理：引导节点经它有回应为能用，一个都不回为用不了，连不上代理写明原因。
