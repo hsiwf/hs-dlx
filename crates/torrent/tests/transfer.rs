@@ -37,6 +37,7 @@ fn local_session() -> Session {
     Session::new(&SessionConfig {
         listen_interfaces: "127.0.0.1:0".into(),
         dht: false,
+        dht_bootstrap_nodes: String::new(),
         upnp: false,
         natpmp: false,
         lsd: false,
@@ -303,6 +304,7 @@ fn session_state_round_trips() {
     let config = |state: Vec<u8>| SessionConfig {
         listen_interfaces: "127.0.0.1:0".into(),
         dht: false,
+        dht_bootstrap_nodes: String::new(),
         upnp: false,
         natpmp: false,
         lsd: false,

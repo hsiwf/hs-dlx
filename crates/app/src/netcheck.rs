@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 use crate::diagnosis::CheckLevel;
 use crate::socks::{ProxyCheck, UdpRelay};
 
-/// DHT 的引导节点（libtorrent 与常见客户端默认的几个）。
+/// DHT 的引导节点：BT 会话照它引导 DHT（见 [`crate::torrent`] 建会话处），探 BT 代理与网络检测也问它们。
 pub(crate) const DHT_BOOTSTRAP: [(&str, u16); 4] = [
     ("dht.libtorrent.org", 25401),
     ("router.bittorrent.com", 6881),
@@ -172,7 +172,7 @@ pub(crate) const DROPS_UDP: &str =
 pub(crate) static PROXY_FAKE_IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let hosts: Vec<&str> = DHT_BOOTSTRAP.iter().map(|(host, _)| *host).collect();
     format!(
-        "DHT 引导节点被系统里的 TUN 代理解析成了假地址（198.18.0.0/15），经这个代理一个都没回；BT 同样照这些地址问，没有存下的节点时只靠 DHT 的磁力取不到种子信息。BT 代理不是 TUN 代理自己的 SOCKS 端口时，在 TUN 代理里把 {} 排除出 fake-ip，或改用它的 SOCKS 端口；已是时，是它的节点没转发 UDP，换节点或打开 UDP",
+        "DHT 引导节点被系统里的 TUN 代理解析成了假地址（198.18.0.0/15），经这个代理一个都没回；BT 同样照这些地址问，没有存下的节点时只靠 DHT 的磁力取不到种子信息。BT 代理不是 TUN 代理自己的 SOCKS 端口时，在 TUN 代理里把 {} 排除出 fake-ip（改完重启 hs-dlx：BT 只在启动时解析一次），或改用它的 SOCKS 端口；已是时，是它的节点没转发 UDP，换节点或打开 UDP",
         hosts.join("、")
     )
 });
@@ -475,7 +475,14 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             }
             Health::Untested => "解析不出 DHT 引导节点：先检查网络与 DNS".to_owned(),
         },
-        Some((_, proxy)) => match (proxy, direct) {
+        Some((proxy, health)) => {
+            // 改法：没转发 UDP 时换节点或打开 UDP；连不上、被拒时看上面那一项写的原因
+            let fix = if matches!(proxy.check, ProxyCheck::Silent(_)) {
+                "换节点或在代理里打开 UDP"
+            } else {
+                "见上面「BT 代理」一项"
+            };
+            match (health, direct) {
             (Health::Healthy, Health::Healthy) => {
                 "经 BT 代理正常；直连也正常，可关掉 BT 代理（经代理时外面连不进来）".to_owned()
             }
@@ -483,16 +490,17 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             (Health::Uncertain, _) => "经 BT 代理的结果说不准：可再测一次".to_owned(),
             (Health::Untested, _) => "BT 代理握手正常，经它的 UDP 没测成：见上面「BT 代理」一项".to_owned(),
             (_, Health::Healthy) => {
-                "BT 现在经的代理不通，直连正常：关掉 BT 代理，或换一个能转发 UDP 的代理".to_owned()
+                format!("BT 现在经的代理不通，直连正常：关掉 BT 代理，或修好它（{fix}）")
             }
-            (_, Health::Uncertain) => {
-                "BT 现在经的代理不通；直连的结果说不准：先修好代理，或关掉它再测一次直连".to_owned()
-            }
+            (_, Health::Uncertain) => format!(
+                "BT 现在经的代理不通；直连的结果说不准：先修好代理（{fix}），或关掉它再测一次直连"
+            ),
             (_, Health::Blocked) => {
-                "BT 代理不通，直连的 UDP 也大多不通：先修好代理（换节点或打开 UDP 转发）".to_owned()
+                format!("BT 代理不通，直连的 UDP 也大多不通：先修好代理（{fix}）")
             }
             (_, Health::Untested) => "BT 代理不通，也解析不出 DHT 引导节点：先检查网络与 DNS".to_owned(),
-        },
+            }
+        }
     };
     NetworkReport { checks, verdict }
 }

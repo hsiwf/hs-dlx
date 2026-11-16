@@ -127,30 +127,44 @@ pub(crate) struct UdpRelay {
 
 /// 照 libtorrent 经代理时的步骤谈 UDP 转发（`url` 已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有
 /// 用户名选认证方式、申请转发 UDP，看它回的转发地址 libtorrent 用不用得了；谈好时留着控制连接。用不了时为
-/// [`ProxyCheck::Unreachable`] 或 [`ProxyCheck::Refused`]（带原因），[`PROBE_TIMEOUT`] 内没做完算前者。
+/// [`ProxyCheck::Unreachable`] 或 [`ProxyCheck::Refused`]（带原因）。解析与连接、连上之后的握手各最多
+/// [`PROBE_TIMEOUT`]：前者超时为 Unreachable（libtorrent 连代理有超时、会重试），后者为 Refused（libtorrent 等握手的
+/// 回应没有超时，会一直卡着）。
 pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, ProxyCheck> {
     let proxy = libtorrent_proxy(Some(url));
-    tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy))
+    let at = format!("{}:{}", proxy.host, proxy.port);
+    let (address, stream) = tokio::time::timeout(PROBE_TIMEOUT, connect(&at))
+        .await
+        .map_err(|_| ProxyCheck::Unreachable(format!("代理 {at} 10 秒内没连上")))??;
+    tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy, &at, address, stream))
         .await
         .map_err(|_| {
-            ProxyCheck::Unreachable(format!(
-                "代理 {} 10 秒内没回应",
-                hs_m3u8_core::bare_url(url)
+            ProxyCheck::Refused(format!(
+                "代理 {at} 连上了，但 10 秒内没回应握手：BT 会一直等在这一步"
             ))
         })?
 }
 
-async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, ProxyCheck> {
-    let at = format!("{}:{}", proxy.host, proxy.port);
-    let refused = |why: String| ProxyCheck::Refused(why);
-    let address = tokio::net::lookup_host(&at)
+/// 解析代理的主机、取 IPv4 地址连上去。
+async fn connect(at: &str) -> Result<(SocketAddr, TcpStream), ProxyCheck> {
+    let address = tokio::net::lookup_host(at)
         .await
         .map_err(|error| ProxyCheck::Unreachable(format!("解析不出代理 {at}：{error}")))?
         .find(SocketAddr::is_ipv4)
         .ok_or_else(|| ProxyCheck::Unreachable(format!("代理 {at} 没有 IPv4 地址")))?;
-    let mut stream = TcpStream::connect(address)
+    let stream = TcpStream::connect(address)
         .await
         .map_err(|error| ProxyCheck::Unreachable(format!("连不上代理 {at}：{error}")))?;
+    Ok((address, stream))
+}
+
+async fn handshake(
+    proxy: &SocksProxy,
+    at: &str,
+    address: SocketAddr,
+    mut stream: TcpStream,
+) -> Result<UdpRelay, ProxyCheck> {
+    let refused = |why: String| ProxyCheck::Refused(why);
     let io = |error: std::io::Error| ProxyCheck::Unreachable(format!("代理 {at} 断开了：{error}"));
     let login = !proxy.username.is_empty();
     // 提供的认证方式同 libtorrent：有用户名时免认证与用户名密码都提供，由代理选
@@ -178,6 +192,13 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, ProxyCheck> {
         request.extend_from_slice(proxy.password.as_bytes());
         stream.write_all(&request).await.map_err(io)?;
         stream.read_exact(&mut reply).await.map_err(io)?;
+        // libtorrent 要求子协商的版本为 1，不是时不再往下
+        if reply[0] != 1 {
+            return Err(refused(format!(
+                "代理 {at} 回的认证应答版本不对（{}）",
+                reply[0]
+            )));
+        }
         if reply[1] != 0 {
             return Err(refused(format!("代理 {at} 的用户名或密码不对")));
         }
@@ -189,6 +210,12 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, ProxyCheck> {
         .map_err(io)?;
     let mut head = [0; 4];
     stream.read_exact(&mut head).await.map_err(io)?;
+    if head[0] != 5 {
+        return Err(refused(format!(
+            "代理 {at} 回的转发应答版本不对（{}）",
+            head[0]
+        )));
+    }
     if head[1] != 0 {
         return Err(refused(format!(
             "代理 {at} 不转发 UDP（{}）：DHT、uTP 与 UDP 的 tracker 经不了它",
@@ -204,7 +231,15 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, ProxyCheck> {
             // libtorrent 照原样记下转发地址，只收从它来的包：0.0.0.0 时回包的来源（代理的真实地址）对不上，全被丢掉
             if ip.is_unspecified() {
                 return Err(refused(format!(
-                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它。在代理里把 UDP 的绑定地址设成具体的 IP（如 127.0.0.1）"
+                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它。在代理里把 UDP 的绑定地址设成本机连得到的具体 IP（代理在本机时如 127.0.0.1）"
+                )));
+            }
+            // 代理不在本机（不是回环地址、也不是本机网卡的地址：绑不上）而回了回环地址：BT 会发到自己这台电脑上
+            let local =
+                address.ip().is_loopback() || std::net::UdpSocket::bind((address.ip(), 0)).is_ok();
+            if ip.is_loopback() && !local {
+                return Err(refused(format!(
+                    "代理 {at} 不在本机，却回了回环地址 {ip} 作 UDP 转发地址：BT 发不到它。在代理里把 UDP 的绑定地址设成本机连得到的代理 IP"
                 )));
             }
             SocketAddr::new(ip.into(), port)

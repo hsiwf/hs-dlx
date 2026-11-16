@@ -17,6 +17,7 @@
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/session_stats.hpp>
 #include <libtorrent/settings_pack.hpp>
+#include <libtorrent/socks5_stream.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/write_resume_data.hpp>
 
@@ -60,6 +61,9 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	lt::settings_pack pack;
 	pack.set_str(lt::settings_pack::listen_interfaces, string_of(config.listen_interfaces));
 	pack.set_bool(lt::settings_pack::enable_dht, config.dht);
+	if (!config.dht_bootstrap_nodes.empty()) {
+		pack.set_str(lt::settings_pack::dht_bootstrap_nodes, string_of(config.dht_bootstrap_nodes));
+	}
 	pack.set_bool(lt::settings_pack::enable_upnp, config.upnp);
 	pack.set_bool(lt::settings_pack::enable_natpmp, config.natpmp);
 	pack.set_bool(lt::settings_pack::enable_lsd, config.lsd);
@@ -357,6 +361,7 @@ NetworkStatus Session::network() const {
 	out.dht_nodes = m_network.dht_nodes;
 	out.incoming = m_network.incoming;
 	out.proxy_error = text_of(m_network.proxy_error);
+	out.proxy_gave_up = m_network.proxy_gave_up;
 	return out;
 }
 
@@ -450,9 +455,15 @@ void Session::set_proxy(SocksProxy const& proxy) const {
 	lt::settings_pack pack;
 	set_proxy_of(pack, proxy);
 	m_session.apply_settings(std::move(pack));
+	clear_proxy_error();
+}
+
+void Session::clear_proxy_error() const {
 	std::lock_guard<std::mutex> net(m_network_mutex);
 	m_network.proxy_error.clear();
+	m_network.proxy_gave_up = false;
 }
+
 
 void Session::reconnect_proxy(SocksProxy const& proxy) const {
 	// 只有代理的设置变了 libtorrent 才重连（设成同样的值不重连），而握手、认证被拒后它不再自己重试：先换成另一个端口
@@ -536,8 +547,14 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (lt::alert_cast<lt::socks5_alert>(a)) {
 			// 经代理的 UDP（DHT、uTP、UDP 的 tracker）连代理或握手失败：连不上、读写出错时 libtorrent 按退避自己重试，
 			// 握手被拒（版本不对、要认证、认证方式不支持）后不再重试
+			auto const* s = lt::alert_cast<lt::socks5_alert>(a);
+			bool const gave_up = s->error.category() == lt::socks_category()
+				&& (s->error.value() == lt::socks_error::unsupported_version
+					|| s->error.value() == lt::socks_error::username_required
+					|| s->error.value() == lt::socks_error::unsupported_authentication_method);
 			std::lock_guard<std::mutex> net(m_network_mutex);
 			m_network.proxy_error = a->message();
+			m_network.proxy_gave_up = m_network.proxy_gave_up || gave_up;
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
 			{
 				std::lock_guard<std::mutex> net(m_network_mutex);

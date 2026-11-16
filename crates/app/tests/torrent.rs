@@ -77,6 +77,7 @@ fn seed_with(
     let seeder = Session::new(&SessionConfig {
         listen_interfaces: "127.0.0.1:0".into(),
         dht: false,
+        dht_bootstrap_nodes: String::new(),
         upnp: false,
         natpmp: false,
         lsd: false,

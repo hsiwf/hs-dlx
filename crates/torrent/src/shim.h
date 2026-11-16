@@ -50,6 +50,7 @@ public:
 	void set_upload_limit(std::int32_t bytes_per_second) const;
 	void set_proxy(SocksProxy const& proxy) const;
 	void reconnect_proxy(SocksProxy const& proxy) const;
+	void clear_proxy_error() const;
 	NetworkStatus network() const;
 	void request_stats() const;
 	rust::Vec<TrackerState> trackers(rust::Str id) const;
@@ -120,6 +121,7 @@ private:
 		std::int64_t dht_nodes = -1;
 		bool incoming = false;
 		std::string proxy_error;
+		bool proxy_gave_up = false;
 	};
 	mutable Network m_network;
 	// 守着 m_network
