@@ -35,7 +35,7 @@ use crate::links;
 use crate::motion;
 use crate::new_task;
 use crate::new_task::NewTask;
-use crate::settings::{SettingsEvent, SettingsView};
+use crate::settings::{Section, SettingsEvent, SettingsView};
 use crate::sniff::SniffView;
 use crate::tasks::{Row, Tasks};
 use crate::theme;
@@ -362,11 +362,16 @@ impl Shell {
         );
     }
 
-    /// 打开设置页并滚到「更新」一行。
+    /// 打开设置页的「更新与关于」一组。
     fn open_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_at(Section::About, window, cx);
+    }
+
+    /// 打开设置页（已开着时照旧）并换到 `section` 这一组。
+    fn open_settings_at(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(window, cx);
         if let Page::Settings { view, .. } = &self.page {
-            view.update(cx, |view, cx| view.reveal_updates(cx));
+            view.update(cx, |view, cx| view.show(section, cx));
         }
     }
 
