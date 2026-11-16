@@ -841,8 +841,9 @@ impl Bt {
         self.record(url, check, resolved, true);
     }
 
-    /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次探到能用、而
-    /// libtorrent 可能已放弃连代理（见 `proxy_reconnect`）或经它报过错时，让它重连并清掉那条出错：报过错即原来的转发
+    /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次握手与申请转发成了
+    /// （能用，或接了转发而 UDP 没回）、而 libtorrent 可能已放弃连代理（见 `proxy_reconnect`）或经它报过错时，让它重连
+    /// 并清掉那条出错：报过错即原来的转发
     /// 已断，它之后的重试可能在握手时被拒而不再重试、也不报错。重连会断开经代理的 uTP 连接，别的时候不重连。BT 会话
     /// 在时解析到过 TUN 的假地址而问不通（见 `proxy_fake_ip`），之后这次有引导节点解析到真实地址而能用时，记为没转发
     /// 出去并说明要重启；全是假地址而能用的（代理就是 TUN 代理自己的 SOCKS 端口）照实记。`resolved` 为这次引导节点解析
@@ -869,7 +870,7 @@ impl Bt {
             why == crate::netcheck::PROXY_FAKE_IP.as_str()
                 || why == crate::netcheck::RESTART_AFTER_FAKE_IP
         });
-        let check = if reachable && about_fake_ip && !resolved.real && !resolved.fake {
+        let check = if reachable && fake_seen && about_fake_ip && !resolved.real && !resolved.fake {
             // 记着的是假地址的结论，这次引导节点一个都没解析出来、判断不了：照旧
             recorded.clone()
         } else if reachable && resolved.real && fake_seen {
@@ -879,8 +880,10 @@ impl Bt {
         } else {
             check
         };
-        // 代理本身能用就照需要重连，不论记下的是什么、存不存疑
-        if reachable && let Some(running) = &*running {
+        // 握手与申请转发成了（能用，或接了转发而 UDP 没回）就照需要重连，不论记下的是什么、存不存疑：libtorrent 在这之后
+        // 经代理的 UDP 至少能连上代理
+        let associated = matches!(check, ProxyCheck::Usable | ProxyCheck::Silent(_));
+        if associated && let Some(running) = &*running {
             let session = &running.engine.session;
             if self.proxy_reconnect.swap(false, Ordering::Relaxed)
                 || !session.network().proxy_error.is_empty()

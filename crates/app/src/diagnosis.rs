@@ -275,8 +275,7 @@ fn checks_after_connectivity(facts: &Facts, mut checks: Vec<Check>) -> Vec<Check
         (false, Some(0)) if facts.proxy.is_some() => check(
             CheckItem::Dht,
             CheckLevel::Warn,
-            "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有多半是 BT 代理连不上或不转发 UDP（见第一项）"
-                .to_owned(),
+            "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有时原因与改法见第一项「BT 代理」".to_owned(),
         ),
         (false, Some(0)) => check(
             CheckItem::Dht,
