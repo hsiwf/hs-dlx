@@ -1242,7 +1242,7 @@ impl Shared {
                 let check = self.bt.record_proxy_check(
                     &url,
                     netcheck::judge_proxy(&through),
-                    netcheck::resolved_fake(&through),
+                    netcheck::resolved(&through),
                 );
                 Some(netcheck::Proxied {
                     address: hs_m3u8_core::bare_url(&url),

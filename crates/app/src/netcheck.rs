@@ -61,8 +61,10 @@ pub(crate) struct Dht {
     pub nodes: Ratio,
     /// 回应里写的「对方看到的本机地址」（BEP 42 的 ip），至少两个回应一致才算
     pub external: Option<IpAddr>,
-    /// 引导节点解析成了 198.18.0.0/15：系统里的 TUN 代理（fake-ip）接管了，「直连」其实经它
+    /// 引导节点（有的）解析成了 198.18.0.0/15：系统里的 TUN 代理（fake-ip）接管了，「直连」其实经它
     pub tun: bool,
+    /// 有引导节点解析成了真实地址（不在 198.18.0.0/15 里）
+    pub real: bool,
     /// 收发本身出的错（见 [`Udp::exchange`]）；有时上面的回应数不可信
     pub failure: Option<String>,
 }
@@ -180,14 +182,23 @@ pub(crate) static PROXY_FAKE_IP: std::sync::LazyLock<String> = std::sync::LazyLo
 /// TUN 代理的 fake-ip 改好之后、BT 还拿着之前解析到的假地址时的说明（见 [`crate::torrent::Bt::set_proxy_check`]）。
 pub(crate) const RESTART_AFTER_FAKE_IP: &str = "DHT 引导节点现在解析得到真实地址了，但 BT 还用着之前解析到的假地址（只在启动时解析一次）：重启 hs-dlx 后生效";
 
-/// 经代理量到的引导节点解析得怎样：有 TUN 的假地址为 Some(true)，都是真实地址为 Some(false)，没量（握手没成）或
-/// 一个都没解析出来为 None。
-pub(crate) fn resolved_fake(through: &Result<Dht, ProxyCheck>) -> Option<bool> {
-    through
-        .as_ref()
-        .ok()
-        .filter(|through| through.bootstrap.asked > 0)
-        .map(|through| through.tun)
+/// 经代理问的引导节点解析得怎样；没量（握手没成）或一个都没解析出来时都为假。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Resolved {
+    /// 有解析成 TUN 的假地址的
+    pub fake: bool,
+    /// 有解析成真实地址的
+    pub real: bool,
+}
+
+pub(crate) fn resolved(through: &Result<Dht, ProxyCheck>) -> Resolved {
+    match through {
+        Ok(through) => Resolved {
+            fake: through.tun,
+            real: through.real,
+        },
+        Err(_) => Resolved::default(),
+    }
 }
 
 /// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为 [`crate::socks::associate`] 的
@@ -237,23 +248,23 @@ pub(crate) async fn through_proxy(
 pub(crate) const PROXY_SILENT: &str = "经代理问 DHT 引导节点一个都没回：代理可能没转发 UDP（换节点或在代理里打开 UDP），也可能网络不通";
 
 /// 后台看着 BT 代理时探它（只经代理发包，不从本机直连发）：握手、申请转发 UDP，再经它向引导节点 `hosts` 各发一个
-/// find_node（不 ping 别的节点），照 [`judge_proxy`] 下结论，并给出引导节点解析得怎样（见 [`resolved_fake`]）。开不了
-/// 本机的 UDP 套接字时也算用不了，原因写明。
+/// find_node（不 ping 别的节点），照 [`judge_proxy`] 下结论，并给出引导节点解析得怎样。开不了本机的 UDP 套接字时也
+/// 算用不了，原因写明。
 pub(crate) async fn probe_proxy(
     url: &Url,
     hosts: &[(&'static str, u16)],
-) -> (ProxyCheck, Option<bool>) {
+) -> (ProxyCheck, Resolved) {
     let relay = match crate::socks::associate(url).await {
         Ok(relay) => relay,
-        Err(check) => return (check, None),
+        Err(check) => return (check, Resolved::default()),
     };
     let udp = match Udp::via(relay).await {
         Ok(Ok(udp)) => udp,
-        Ok(Err(why)) => return (ProxyCheck::Silent(why), None),
+        Ok(Err(why)) => return (ProxyCheck::Silent(why), Resolved::default()),
         Err(error) => {
             return (
                 ProxyCheck::Silent(format!("开不了 UDP 套接字：{error}")),
-                None,
+                Resolved::default(),
             );
         }
     };
@@ -269,9 +280,10 @@ pub(crate) async fn probe_proxy(
         nodes: Ratio::default(),
         external: None,
         tun: found.iter().any(fake_ip),
+        real: found.iter().any(|address| !fake_ip(address)),
         failure: exchanged.failure,
     });
-    (judge_proxy(&through), resolved_fake(&through))
+    (judge_proxy(&through), resolved(&through))
 }
 
 /// 198.18.0.0/15 里的地址：TUN 代理（fake-ip）给域名的假地址。
@@ -401,6 +413,14 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
                 NetItem::Proxy,
                 CheckLevel::Bad,
                 format!("BT 代理 {}：{DROPS_UDP}", proxy.address),
+            ),
+            (Some(RESTART_AFTER_FAKE_IP), _, _) => check(
+                NetItem::Proxy,
+                CheckLevel::Bad,
+                format!(
+                    "BT 代理 {} 是通的，但 BT 还用着之前解析到的 DHT 引导节点的假地址：重启 hs-dlx 后生效",
+                    proxy.address
+                ),
             ),
             (Some(why), _, _) => check(
                 NetItem::Proxy,
@@ -816,6 +836,7 @@ pub(crate) async fn dht(udp: &Udp, bootstrap: &[SocketAddr], unresolved: usize) 
         },
         external,
         tun: bootstrap.iter().any(fake_ip),
+        real: bootstrap.iter().any(|address| !fake_ip(address)),
         failure,
     }
 }
@@ -975,6 +996,7 @@ mod tests {
             nodes,
             external: Some(Ipv4Addr::new(203, 0, 113, 7).into()),
             tun: false,
+            real: true,
             failure: None,
         }
     }
@@ -1331,12 +1353,24 @@ mod tests {
         let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
         assert_eq!(
             probe_proxy(&proxy, &[("127.0.0.1", answering.port())]).await,
-            (ProxyCheck::Usable, Some(false))
+            (
+                ProxyCheck::Usable,
+                Resolved {
+                    fake: false,
+                    real: true
+                }
+            )
         );
         let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
         assert_eq!(
             probe_proxy(&proxy, &[("127.0.0.1", silent.port())]).await,
-            (ProxyCheck::Silent(PROXY_SILENT.to_owned()), Some(false))
+            (
+                ProxyCheck::Silent(PROXY_SILENT.to_owned()),
+                Resolved {
+                    fake: false,
+                    real: true
+                }
+            )
         );
         let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let unreachable = Url::parse(&format!(
@@ -1346,7 +1380,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             probe_proxy(&unreachable, &[("127.0.0.1", answering.port())]).await,
-            (ProxyCheck::Unreachable(why), None) if why.contains("连不上代理")
+            (ProxyCheck::Unreachable(why), _) if why.contains("连不上代理")
         ));
     }
 }
