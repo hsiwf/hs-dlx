@@ -58,8 +58,9 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_bool(lt::settings_pack::prefer_rc4, true);
 	// 关会话时向 tracker 报告停止最多等这么久（秒）：释放会话要等它，默认 5 秒，退出应用时界面一直等着
 	pack.set_int(lt::settings_pack::stop_tracker_timeout, 2);
-	// 每层 tracker 各通告一个（uTorrent 的做法）：种子自己的 tracker 能用时，补在后面一层的公共 tracker 照样通告；默认
-	// 按多 tracker 规范只用最前面能用的那层
+	// 每层 tracker 各通告一个（uTorrent 的做法）：种子自己的 tracker 能用时，补在后面各层的照样通告；默认按多 tracker
+	// 规范只用最前面能用的那层。同一层里有了能用的，其余的不再通告（torrent.cpp 的 announce_with_tracker），所以补的各占
+	// 一层
 	pack.set_bool(lt::settings_pack::announce_to_all_tiers, true);
 	// 只要出错、状态、存储与端口映射的事件：tracker 与节点的事件量大；诊断要的统计另由 post_session_stats 要（它的事件
 	// 不受这个设置管）
@@ -342,9 +343,11 @@ void Session::request_stats() const { m_session.post_session_stats(); }
 
 rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 	rust::Vec<TrackerState> out;
+	std::string const key = string_of(id);
 	for (lt::announce_entry const& entry : handle(id).trackers()) {
 		TrackerState state;
 		state.url = text_of(entry.url);
+		state.added = added_tracker(key, entry.url);
 		state.working = false;
 		state.updating = false;
 		state.seeds = -1;
@@ -380,9 +383,9 @@ std::uint32_t Session::add_trackers(rust::Str id, rust::Slice<rust::String const
 	auto found = m_handles.find(key);
 	if (found == m_handles.end()) throw std::invalid_argument("没有这个种子：" + key);
 	std::vector<lt::announce_entry> const present = found->second.trackers();
-	// 补在已有的之后的一层（层号最大 255）
+	// 补在已有的之后，各占一层（层号最大 255，超出的同在 255 层）
 	int tier = 0;
-	for (lt::announce_entry const& entry : present) tier = std::max(tier, std::min(int(entry.tier) + 1, 255));
+	for (lt::announce_entry const& entry : present) tier = std::max(tier, int(entry.tier) + 1);
 	std::set<std::string>& added = m_added_trackers[key];
 	std::uint32_t count = 0;
 	for (rust::String const& url : urls) {
@@ -391,25 +394,32 @@ std::uint32_t Session::add_trackers(rust::Str id, rust::Slice<rust::String const
 			[&](lt::announce_entry const& entry) { return entry.url == text; });
 		if (has) continue;
 		lt::announce_entry entry(text);
-		entry.tier = static_cast<std::uint8_t>(tier);
+		entry.tier = static_cast<std::uint8_t>(std::min(tier, 255));
 		found->second.add_tracker(entry);
 		added.insert(text);
 		++count;
+		++tier;
 	}
 	return count;
+}
+
+bool Session::added_tracker(std::string const& id, std::string const& url) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	auto found = m_added_trackers.find(id);
+	return found != m_added_trackers.end() && found->second.count(url) > 0;
 }
 
 void Session::drop_added_trackers(std::string const& id, lt::add_torrent_params& params) const {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	auto found = m_added_trackers.find(id);
 	if (found == m_added_trackers.end() || found->second.empty()) return;
-	// tracker_tiers 与 trackers 一一对应，短了的按 0 层（write_resume_data.cpp 的 build_tracker_list）
+	// torrent::write_resume_data 给每个 tracker 都写了层号，与 trackers 一一对应
 	std::vector<std::string> trackers;
 	std::vector<int> tiers;
 	for (std::size_t i = 0; i < params.trackers.size(); ++i) {
 		if (found->second.count(params.trackers[i]) > 0) continue;
 		trackers.push_back(params.trackers[i]);
-		tiers.push_back(i < params.tracker_tiers.size() ? params.tracker_tiers[i] : 0);
+		tiers.push_back(params.tracker_tiers.at(i));
 	}
 	params.trackers = std::move(trackers);
 	params.tracker_tiers = std::move(tiers);
@@ -477,7 +487,9 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
 			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
-			out.push_back(alert_of(AlertKind::TrackerError, *a, id_of(t->handle)));
+			std::string const id = id_of(t->handle);
+			bool const added = added_tracker(id, t->tracker_url());
+			out.push_back(alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
@@ -530,10 +542,12 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 	return out;
 }
 
-rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size, bool v1_only) {
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, CreateOptions const& options) {
 	std::filesystem::path const full = std::filesystem::absolute(string_of(path));
-	lt::create_torrent torrent(lt::list_files(full.string()), piece_size,
-		v1_only ? lt::create_torrent::v1_only : lt::create_flags_t{});
+	lt::create_torrent torrent(lt::list_files(full.string()), options.piece_size,
+		options.v1_only ? lt::create_torrent::v1_only : lt::create_flags_t{});
+	torrent.set_priv(options.private_torrent);
+	if (!options.tracker.empty()) torrent.add_tracker(string_of(options.tracker));
 	lt::set_piece_hashes(torrent, full.parent_path().string());
 	return bytes_out(torrent.generate_buf());
 }

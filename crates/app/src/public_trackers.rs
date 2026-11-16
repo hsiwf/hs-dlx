@@ -2,6 +2,7 @@
 //! 不通的网络里尤其要紧。列表在 BT 会话建起时开始取，取不到隔一阵再取，取到为止；补的不随种子存下（见
 //! [`hs_dlx_torrent::Session::add_trackers`]），每次加入会话时补当时的列表。
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,9 @@ pub(crate) const SOURCES: [&str; 3] = [
 
 /// 列表最多多少字节：实际约 1 KB，超过即不是这份列表。
 const LIMIT: u64 = 64 << 10;
+/// 每个来源最多试几次、每次最多多久：连不上的来源尽快换下一个，外面还有隔一阵再取的退避。
+const ATTEMPTS: NonZeroU32 = NonZeroU32::new(2).unwrap();
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 没取到时第一次隔多久再取，之后每次翻倍，最多隔 [`LAST_RETRY`]。
 pub(crate) const FIRST_RETRY: Duration = Duration::from_secs(60);
 pub(crate) const LAST_RETRY: Duration = Duration::from_secs(30 * 60);
@@ -37,7 +41,8 @@ pub(crate) enum PublicTrackers {
     Failed(String),
 }
 
-/// 从 `sources` 依次取列表，经代理 `proxy`；都没取到时为各来源的原因。
+/// 从 `sources` 依次取列表，经代理 `proxy`，每个来源最多试 [`ATTEMPTS`] 次、每次最多 [`REQUEST_TIMEOUT`]；都没取到时
+/// 为各来源的原因。
 pub(crate) async fn fetch(
     engine: &Engine,
     sources: &[Url],
@@ -47,6 +52,8 @@ pub(crate) async fn fetch(
     for url in sources {
         let mut source = Source::new(url.clone());
         source.http.proxy = proxy.clone();
+        source.http.retry.attempts = ATTEMPTS;
+        source.http.timeouts.request = REQUEST_TIMEOUT;
         let fetched = match engine.fetch(&source, LIMIT).await {
             Ok(fetched) => parse(&fetched.body).map_err(|why| format!("{url} 取到的{why}")),
             Err(error) => Err(error.to_string()),

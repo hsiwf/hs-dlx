@@ -1342,16 +1342,17 @@ pub(crate) async fn diagnose(
         return Err(Error::Closed);
     }
     let network = engine.session.network();
+    let (added, own): (Vec<_>, Vec<_>) = trackers.iter().partition(|tracker| tracker.added);
+    let fact = |tracker: &hs_dlx_torrent::TrackerState| Tracker {
+        working: tracker.working,
+        failed: tracker.failed,
+        message: tracker.message.clone(),
+    };
     let public = match &*engine.public.borrow() {
         PublicTrackers::Off => Public::Off,
         PublicTrackers::Idle | PublicTrackers::Fetching => Public::Fetching,
         PublicTrackers::Failed(why) => Public::Failed(why.clone()),
-        PublicTrackers::Ready(list) => Public::Added(
-            trackers
-                .iter()
-                .filter(|tracker| list.contains(&tracker.url))
-                .count(),
-        ),
+        PublicTrackers::Ready(_) => Public::Added(added.into_iter().map(fact).collect()),
     };
     let count = |value: i32| u32::try_from(value).ok();
     let most =
@@ -1376,14 +1377,7 @@ pub(crate) async fn diagnose(
             status.swarm_leechers,
             trackers.iter().map(|tracker| tracker.leechers).max(),
         ),
-        trackers: trackers
-            .into_iter()
-            .map(|tracker| Tracker {
-                working: tracker.working,
-                failed: tracker.failed,
-                message: tracker.message,
-            })
-            .collect(),
+        trackers: own.into_iter().map(fact).collect(),
         public,
         upload_limit,
     };

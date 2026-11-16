@@ -20,7 +20,7 @@ use hs_m3u8_core::{
 };
 use rusqlite::Transaction;
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
@@ -208,6 +208,8 @@ struct Shared {
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
     public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 代理设置改了（[`Service::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
+    proxy_changed: Arc<Notify>,
     /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
     runtime: Handle,
     /// 做种的设置，随 [`Service::set_seeding`] 改；在做种的随时照它判停不停
@@ -273,6 +275,7 @@ impl Service {
             events,
             bt: Bt::new(network, settings.upload_limit),
             public_fetch: Mutex::new(None),
+            proxy_changed: Arc::new(Notify::new()),
             runtime: runtime.handle().clone(),
             seeding: watch::Sender::new(settings.seeding),
             seeders: Mutex::new(HashMap::new()),
@@ -442,16 +445,22 @@ impl Service {
     /// 停止做种：随即记为不再做种（之后应用退出或崩溃也不再接着做），再存下进度、从 BT 会话里移除；停下后发
     /// [`Event::SeedingEnded`]。没在做种时什么也不做；记不进存储时报错，做种照旧。
     pub fn stop_seeding(&self, id: TaskId) -> Result<(), Error> {
-        self.shared.write(|tx| {
-            let seeders = lock(&self.shared.seeders);
-            let Some(seeder) = seeders.get(&id) else {
-                return Ok(());
-            };
-            store::set_seeding_task(tx, id, false)?;
-            seeder.by_user.store(true, Ordering::Relaxed);
-            seeder.cancel.cancel();
-            Ok(())
-        })
+        let shared = &self.shared;
+        let mut store = lock(&shared.store);
+        let tx = store.transaction()?;
+        let applied = shared.apply_unsaved(&tx)?;
+        let Some((cancel, by_user)) = lock(&shared.seeders)
+            .get(&id)
+            .map(|seeder| (seeder.cancel.clone(), seeder.by_user.clone()))
+        else {
+            return Ok(());
+        };
+        store::set_seeding_task(&tx, id, false)?;
+        shared.commit(tx, applied)?;
+        // 提交了才停（提交失败时做种照旧，与报的错一致），仍在 `store` 锁内：与关闭的先后分明
+        by_user.store(true, Ordering::Relaxed);
+        cancel.cancel();
+        Ok(())
     }
 
     /// 记下外观主题。
@@ -473,6 +482,7 @@ impl Service {
         let tx = store.transaction()?;
         store::set_proxy(&tx, proxy)?;
         tx.commit()?;
+        self.shared.proxy_changed.notify_one();
         Ok(())
     }
 
@@ -785,7 +795,7 @@ impl Drop for DiscardGuard {
 }
 
 /// 从 `sources` 取公共 tracker 列表，经设置里的代理（每次取时读），结果交给 BT 引擎（[`Bt::set_public`]）；没取到隔一阵
-/// 再取（[`public_trackers::FIRST_RETRY`] 起每次翻倍），取到或服务已释放即止。
+/// 再取（[`public_trackers::FIRST_RETRY`] 起每次翻倍），其间代理设置改了即刻再取、间隔从头算；取到或服务已释放即止。
 async fn fetch_public_trackers(shared: Weak<Shared>, engine: Engine, sources: Vec<Url>) {
     let mut wait = public_trackers::FIRST_RETRY;
     loop {
@@ -813,9 +823,18 @@ async fn fetch_public_trackers(shared: Weak<Shared>, engine: Engine, sources: Ve
             }
             Err(why) => shared.bt.set_public(PublicTrackers::Failed(why)),
         }
+        // 等的时候不持有服务
+        let proxy_changed = shared.proxy_changed.clone();
         drop(shared);
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(public_trackers::LAST_RETRY);
+        let changed = tokio::select! {
+            () = proxy_changed.notified() => true,
+            () = tokio::time::sleep(wait) => false,
+        };
+        wait = if changed {
+            public_trackers::FIRST_RETRY
+        } else {
+            (wait * 2).min(public_trackers::LAST_RETRY)
+        };
     }
 }
 

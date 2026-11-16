@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hs_dlx_torrent::{
-    AddOptions, AlertKind, Removal, Session, SessionConfig, State, TorrentId, create_torrent,
-    describe, place, resume_from_torrent_file,
+    AddOptions, AlertKind, CreateOptions, Removal, Session, SessionConfig, State, TorrentId,
+    create_torrent, describe, place, resume_from_torrent_file,
 };
 
 /// 照续传数据里记的已有块，加入后就运行。
@@ -58,7 +58,13 @@ fn content(len: u32, seed: u32) -> Vec<u8> {
 /// 做种：`path`（`dir` 里的文件或目录，分块 `piece_size` 字节）建种子、在新会话里校验已有的文件后做种，等它可以连；
 /// 返回会话、种子与种子文件转成的续传数据。
 fn seed(dir: &Path, path: &Path, piece_size: i32) -> (Session, TorrentId, Vec<u8>) {
-    let torrent = create_torrent(path_str(path), piece_size, false).unwrap();
+    let options = CreateOptions {
+        piece_size,
+        v1_only: false,
+        private_torrent: false,
+        tracker: String::new(),
+    };
+    let torrent = create_torrent(path_str(path), &options).unwrap();
     let resume = resume_from_torrent_file(&torrent).unwrap();
     let id = describe(&resume).unwrap().id;
     let seeder = local_session();
@@ -493,27 +499,54 @@ fn a_magnet_link_downloads_from_a_local_seed() {
     std::fs::remove_dir_all(&fetch_dir).unwrap();
 }
 
-/// 补的 tracker：已有的（种子自己的、补过的）不重复补；写出的续传数据里只去掉补的，种子自己的留着；再加入时清空，
-/// 要再补。
+/// 补的 tracker：已有的（种子自己的、补过的）不重复补，查 tracker 时标为补的，报的错另成一类；写出的续传数据里只去掉
+/// 补的，种子自己的留着；再加入时清空，要再补。
 #[test]
 fn added_trackers_stay_out_of_resume_data() {
     let dir = scratch("added-trackers");
     let session = local_session();
+    // 本机这两个端口没人监听：通告随即被拒
     let own = "http://127.0.0.1:9/announce";
-    let public = "udp://127.0.0.1:9/announce";
+    let public = "http://127.0.0.1:7/announce";
     let hash = "0123456789abcdef0123456789abcdef01234567";
     let uri = format!("magnet:?xt=urn:btih:{hash}&tr={own}");
     let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
     let urls = [own.to_owned(), public.to_owned()];
     assert_eq!(session.add_trackers(&id, &urls).unwrap(), 1);
     assert_eq!(session.add_trackers(&id, &urls).unwrap(), 0);
-    let listed: Vec<String> = session
+    let listed: Vec<(String, bool)> = session
         .trackers(&id)
         .unwrap()
         .into_iter()
-        .map(|tracker| tracker.url)
+        .map(|tracker| (tracker.url, tracker.added))
         .collect();
-    assert_eq!(listed, urls);
+    assert_eq!(listed, [(own.to_owned(), false), (public.to_owned(), true)]);
+    // 两个都报错：种子自己的与补的各是一类，说明里是各自的地址
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while errors.len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "没等到两个 tracker 都报错：{errors:?}"
+        );
+        for alert in session.pop_alerts(100).unwrap() {
+            let url = if alert.message.contains(own) {
+                own
+            } else {
+                public
+            };
+            let pair = match alert.kind {
+                AlertKind::TrackerError => (false, url),
+                AlertKind::AddedTrackerError => (true, url),
+                _ => continue,
+            };
+            if !errors.contains(&pair) {
+                errors.push(pair);
+            }
+        }
+    }
+    errors.sort();
+    assert_eq!(errors, [(false, own), (true, public)]);
     let contains = |data: &[u8], text: &str| data.windows(text.len()).any(|w| w == text.as_bytes());
     let resume = resume_data(&session, &id);
     assert!(contains(&resume, own) && !contains(&resume, public));

@@ -25,6 +25,7 @@ struct AddOptions;
 struct Described;
 struct NetworkStatus;
 struct TrackerState;
+struct CreateOptions;
 enum class Removal : std::uint8_t;
 
 class Session {
@@ -76,6 +77,8 @@ private:
 	bool still_removing(std::string const& id) const;
 	// 丢了事件：在移除中的都记下
 	void mark_lost() const;
+	// `url` 是 add_trackers 给种子 `id` 补的
+	bool added_tracker(std::string const& id, std::string const& url) const;
 	// 从种子 `id` 的续传数据里去掉 add_trackers 补的 tracker
 	void drop_added_trackers(std::string const& id, lt::add_torrent_params& params) const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
@@ -129,8 +132,7 @@ Described describe(rust::Slice<std::uint8_t const> resume);
 // `wanted` 里的文件，去掉只上传、暂停、做种模式的标志；返回改后的续传数据。
 rust::Vec<std::uint8_t> place(rust::Slice<std::uint8_t const> resume, rust::Str root, rust::Slice<std::int32_t const> wanted);
 
-// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选），`v1_only` 时只有 v1 的信息哈希、
-// 文件不按块对齐；返回 bencode 写出的种子文件。
-rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size, bool v1_only);
+// 照 `options` 为 `path`（文件或目录）建种子文件，返回 bencode 写出的种子文件。
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, CreateOptions const& options);
 
 } // namespace hsdlx

@@ -58,6 +58,7 @@ pub(crate) struct Facts {
     pub seeding: bool,
     /// 这个种子连着的节点数
     pub peers: u32,
+    /// 种子自己的 tracker（补的公共 tracker 在 `public` 里）
     pub trackers: Vec<Tracker>,
     /// 种子的做种与在下的人数（tracker 报的，取各处最多的）；None 为没报
     pub seeds: Option<u32>,
@@ -76,8 +77,36 @@ pub(crate) enum Public {
     Fetching,
     /// 列表这次没取到，为原因
     Failed(String),
-    /// 列表取到了，种子的 tracker 里有其中这么多个
-    Added(usize),
+    /// 列表取到了：给这个种子补上的（还没补时为空）
+    Added(Vec<Tracker>),
+}
+
+/// 一组 tracker 有没有回应。
+enum Responses {
+    /// 有这么多个回应了
+    Working(usize),
+    /// 都连不上；为第一个说了原因的原因，带括号，没有时为空
+    AllFailed(String),
+    /// 这么多个连不上（原因同上），其余的还没回应
+    SomeFailed(usize, String),
+    /// 都还没回应
+    Pending,
+}
+
+/// 非空的一组 tracker 有没有回应。
+fn responses(trackers: &[Tracker]) -> Responses {
+    let working = trackers.iter().filter(|t| t.working).count();
+    let failed: Vec<&Tracker> = trackers.iter().filter(|t| t.failed).collect();
+    let why = failed
+        .iter()
+        .find(|t| !t.message.is_empty())
+        .map_or_else(String::new, |t| format!("（{}）", t.message));
+    match () {
+        () if working > 0 => Responses::Working(working),
+        () if failed.len() == trackers.len() => Responses::AllFailed(why),
+        () if !failed.is_empty() => Responses::SomeFailed(failed.len(), why),
+        () => Responses::Pending,
+    }
 }
 
 /// 一个 tracker 的状况。
@@ -194,43 +223,41 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
         ),
     });
     let total = facts.trackers.len();
-    let working = facts.trackers.iter().filter(|t| t.working).count();
-    let failed: Vec<&Tracker> = facts.trackers.iter().filter(|t| t.failed).collect();
-    let why = failed
-        .iter()
-        .find(|t| !t.message.is_empty())
-        .map_or_else(String::new, |t| format!("（{}）", t.message));
-    checks.push(match () {
-        () if total == 0 && facts.private => check(
+    checks.push(match responses(&facts.trackers) {
+        _ if total == 0 && facts.private => check(
             CheckItem::Trackers,
             CheckLevel::Bad,
             "私有种子里没有 tracker：找不到节点".to_owned(),
         ),
-        () if total == 0 => check(
-            CheckItem::Trackers,
-            CheckLevel::Warn,
-            "种子里没有 tracker，只靠 DHT 找节点".to_owned(),
-        ),
-        // libtorrent 找到一个能用的就不再挨个试别的，回应了的往往只有一个
-        () if working > 0 => check(
+        _ if total == 0 => check(
             CheckItem::Trackers,
             CheckLevel::Ok,
-            format!("tracker 正常（{working} 个回应了）"),
+            "种子里没有 tracker，靠 DHT 与公共 tracker 找节点".to_owned(),
         ),
-        () if failed.len() == total => check(
+        // 一层里找到一个能用的就不再挨个试同层别的，回应了的往往每层只有一个
+        Responses::Working(working) => check(
             CheckItem::Trackers,
-            CheckLevel::Bad,
-            format!("{total} 个 tracker 都连不上{why}"),
+            CheckLevel::Ok,
+            format!("种子里的 tracker 正常（{working} 个回应了）"),
         ),
-        () if !failed.is_empty() => check(
+        Responses::AllFailed(why) => check(
+            CheckItem::Trackers,
+            if facts.private {
+                CheckLevel::Bad
+            } else {
+                CheckLevel::Warn
+            },
+            format!("种子里的 {total} 个 tracker 都连不上{why}"),
+        ),
+        Responses::SomeFailed(failed, why) => check(
             CheckItem::Trackers,
             CheckLevel::Warn,
-            format!("{} 个 tracker 连不上{why}，其余的还没回应", failed.len()),
+            format!("种子里的 {failed} 个 tracker 连不上{why}，其余的还没回应"),
         ),
-        () => check(
+        Responses::Pending => check(
             CheckItem::Trackers,
             CheckLevel::Warn,
-            format!("{total} 个 tracker 还没回应"),
+            format!("种子里的 {total} 个 tracker 还没回应"),
         ),
     });
     checks.push(match &facts.public {
@@ -256,16 +283,36 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
                 "公共 tracker 列表没取到（{why}）：隔一阵再取；取到之前只靠种子里的 tracker 与 DHT 找节点，可检查代理设置"
             ),
         ),
-        Public::Added(0) => check(
+        Public::Added(added) if added.is_empty() => check(
             CheckItem::PublicTrackers,
             CheckLevel::Warn,
             "公共 tracker 列表取到了，还没补上".to_owned(),
         ),
-        Public::Added(added) => check(
-            CheckItem::PublicTrackers,
-            CheckLevel::Ok,
-            format!("补了 {added} 个公共 tracker"),
-        ),
+        Public::Added(added) => {
+            let total = added.len();
+            match responses(added) {
+                Responses::Working(working) => check(
+                    CheckItem::PublicTrackers,
+                    CheckLevel::Ok,
+                    format!("补了 {total} 个公共 tracker，{working} 个回应了"),
+                ),
+                Responses::AllFailed(why) => check(
+                    CheckItem::PublicTrackers,
+                    CheckLevel::Warn,
+                    format!("补的 {total} 个公共 tracker 都连不上{why}"),
+                ),
+                Responses::SomeFailed(failed, why) => check(
+                    CheckItem::PublicTrackers,
+                    CheckLevel::Warn,
+                    format!("补了 {total} 个公共 tracker，{failed} 个连不上{why}，其余的还没回应"),
+                ),
+                Responses::Pending => check(
+                    CheckItem::PublicTrackers,
+                    CheckLevel::Warn,
+                    format!("补了 {total} 个公共 tracker，都还没回应"),
+                ),
+            }
+        }
     });
     let counted = |seeds: u32, leechers: Option<u32>| {
         format!(
@@ -356,7 +403,11 @@ mod tests {
             }],
             seeds: Some(12),
             leechers: Some(3),
-            public: Public::Added(20),
+            public: Public::Added(vec![Tracker {
+                working: true,
+                failed: false,
+                message: String::new(),
+            }]),
             upload_limit: None,
         }
     }
@@ -418,8 +469,18 @@ mod tests {
             },
         };
         facts.trackers = vec![tracker(true), tracker(true)];
-        assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Bad);
+        assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Warn);
         assert!(text(&facts, CheckItem::Trackers).contains("timed out"));
+        // 私有种子只有自己的 tracker 能用：都连不上即不通
+        facts.private = true;
+        assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Bad);
+        facts.private = false;
+        // 补的公共 tracker 与种子自己的分开下结论
+        facts.public = Public::Added(vec![tracker(true), tracker(true)]);
+        assert_eq!(level(&facts, CheckItem::PublicTrackers), CheckLevel::Warn);
+        assert!(
+            text(&facts, CheckItem::PublicTrackers).starts_with("补的 2 个公共 tracker 都连不上")
+        );
         facts.trackers = vec![tracker(true), tracker(false)];
         assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Warn);
         assert!(text(&facts, CheckItem::Trackers).contains("其余的还没回应"));

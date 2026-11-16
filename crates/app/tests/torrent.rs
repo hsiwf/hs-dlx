@@ -2,15 +2,19 @@
 //! `x.pe` 给出它的地址（之后的任务从续传数据里记的节点连它）。服务自带 tokio 运行时，在测试自己的运行时外面建、外面
 //! 丢弃；等事件在测试的运行时里。
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hs_dlx_app::{
     CheckItem, CheckLevel, Draft, DraftKind, Error, Event, SeedEnd, Seeding, Service, Status,
     Store, TaskId, TorrentInfo, TorrentNetwork, TorrentPhase, TorrentProgress,
 };
-use hs_dlx_torrent::{AddOptions, Session, SessionConfig, State, TorrentId, create_torrent};
+use hs_dlx_torrent::{
+    AddOptions, CreateOptions, Session, SessionConfig, State, TorrentId, create_torrent,
+};
 use hs_m3u8_core::{Proxy, Url};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -44,11 +48,27 @@ const PIECE: i32 = 16 << 10;
 /// `without_b` 时建完再删掉 b.bin，做种的一方只有 a.bin 的块。在只监听回环地址的新会话里校验已有的文件后上传，返回
 /// 会话与种子的编号。
 fn seed(dir: &Path, without_b: bool, v1_only: bool) -> (Session, TorrentId) {
+    let options = CreateOptions {
+        piece_size: PIECE,
+        v1_only,
+        private_torrent: false,
+        tracker: String::new(),
+    };
+    let (seeder, id, _) = seed_with(dir, without_b, &options);
+    (seeder, id)
+}
+
+/// 同 [`seed`]，种子照 `options` 建；另返回种子文件。
+fn seed_with(
+    dir: &Path,
+    without_b: bool,
+    options: &CreateOptions,
+) -> (Session, TorrentId, Vec<u8>) {
     let album = dir.join("album");
     std::fs::create_dir_all(&album).unwrap();
     std::fs::write(album.join("a.bin"), content(A, 1)).unwrap();
     std::fs::write(album.join("b.bin"), content(B, 2)).unwrap();
-    let torrent = create_torrent(album.to_str().unwrap(), PIECE, v1_only).unwrap();
+    let torrent = create_torrent(album.to_str().unwrap(), options).unwrap();
     if without_b {
         std::fs::remove_file(album.join("b.bin")).unwrap();
     }
@@ -79,7 +99,7 @@ fn seed(dir: &Path, without_b: bool, v1_only: bool) -> (Session, TorrentId) {
     loop {
         let state = seeder.status(&id).unwrap().state();
         if matches!(state, Some(State::Seeding | State::Downloading)) && seeder.listen_port() != 0 {
-            return (seeder, id);
+            return (seeder, id, torrent);
         }
         assert!(Instant::now() < deadline, "做种的一方 20 秒内没准备好");
         seeder.pop_alerts(100).unwrap();
@@ -319,13 +339,13 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     let scarce = rt.block_on(until(&mut events, task.id, |progress| progress.scarce));
     assert_eq!(scarce, None, "继续后的任务停下了");
 
-    // 诊断：在回环地址上监听着；测试的会话不开 DHT，种子里没有 tracker
+    // 诊断：在回环地址上监听着；测试的会话不开 DHT，种子里没有 tracker（不算问题：非私有种子靠 DHT 与公共 tracker）
     let checks = rt.block_on(service.diagnose(task.id)).unwrap().unwrap();
     let level = |item| checks.iter().find(|c| c.item == item).unwrap().level;
     assert_eq!(checks.len(), 8);
     assert_eq!(level(CheckItem::Listen), CheckLevel::Ok);
     assert_eq!(level(CheckItem::Dht), CheckLevel::Warn);
-    assert_eq!(level(CheckItem::Trackers), CheckLevel::Warn);
+    assert_eq!(level(CheckItem::Trackers), CheckLevel::Ok);
 
     // 根里有用户自己放的文件：删不干净，写明留下了什么，任务留着
     let root = folder.join("album");
@@ -570,20 +590,21 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     drop(seeder);
 }
 
-/// 测试的 tracker：在回环地址上的 HTTP 服务，`/list` 为只有它自己的公共 tracker 列表，`/announce` 回 `peer` 这一个节点；
-/// 记下通告来的信息哈希（十六进制）。在自己的线程与运行时上跑，随测试进程结束。
+/// 测试的 tracker：在回环地址上的 HTTP 服务，`/list` 为只有它自己的公共 tracker 列表，`/announce` 回一个节点（建时
+/// 给出，[`Tracker::point_to`] 可改）；记下通告来的信息哈希（十六进制）。在自己的线程与运行时上跑，随测试进程结束。
 struct Tracker {
     list: Url,
     announce: String,
-    announced: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    peer: Arc<Mutex<SocketAddrV4>>,
+    announced: Arc<Mutex<Vec<String>>>,
 }
 
 impl Tracker {
-    fn start(peer: std::net::SocketAddrV4) -> Tracker {
+    fn start(peer: SocketAddrV4) -> Tracker {
         use axum::extract::{RawQuery, State as Shared};
-        type Announced = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+        type Answer = (Arc<Mutex<SocketAddrV4>>, Arc<Mutex<Vec<String>>>);
         async fn announce(
-            Shared((peer, announced)): Shared<(std::net::SocketAddrV4, Announced)>,
+            Shared((peer, announced)): Shared<Answer>,
             RawQuery(query): RawQuery,
         ) -> Vec<u8> {
             let query = query.unwrap_or_default();
@@ -597,15 +618,25 @@ impl Tracker {
                 })
                 .unwrap_or_default();
             announced.lock().unwrap().push(hash);
+            let port = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("port="))
+                .and_then(|port| port.parse::<u16>().ok());
+            let peer = *peer.lock().unwrap();
+            // 同真实的 tracker：不把请求者自己回给它
+            if port == Some(peer.port()) {
+                return b"d8:intervali60e5:peers0:e".to_vec();
+            }
             let mut body = b"d8:intervali60e5:peers6:".to_vec();
             body.extend_from_slice(&peer.ip().octets());
             body.extend_from_slice(&peer.port().to_be_bytes());
             body.push(b'e');
             body
         }
-        let announced = Announced::default();
+        let peer = Arc::new(Mutex::new(peer));
+        let announced = Arc::new(Mutex::new(Vec::new()));
         let (sender, receiver) = std::sync::mpsc::channel();
-        let shared = (peer, announced.clone());
+        let shared: Answer = (peer.clone(), announced.clone());
         std::thread::spawn(move || {
             let rt = runtime();
             rt.block_on(async move {
@@ -624,35 +655,43 @@ impl Tracker {
         Tracker {
             list: Url::parse(&format!("{base}/list")).unwrap(),
             announce: format!("{base}/announce"),
+            peer,
             announced,
         }
+    }
+
+    /// 之后的通告回 `seeder` 的地址。
+    fn point_to(&self, seeder: &Session) {
+        *self.peer.lock().unwrap() = SocketAddrV4::new(Ipv4Addr::LOCALHOST, seeder.listen_port());
+    }
+
+    fn announced(&self, id: &TorrentId) -> bool {
+        self.announced.lock().unwrap().contains(&id.to_string())
     }
 }
 
 /// 磁力链接既没带 tracker 也没给节点（测试的会话不开 DHT）：只能经补的公共 tracker（测试的 tracker，回做种一方的地址）
-/// 找到节点、取到种子信息；取到的续传数据里没有补的 tracker。下完接着做种时诊断报补上了它。
+/// 找到节点、取到种子信息；取到的续传数据里没有补的 tracker。下完接着做种时诊断报补上了它。带了 tracker 的磁力链接取
+/// 种子信息时不补；私有种子（由种子文件建）下载、做种时都不补：公共 tracker 收不到它们的通告。
 #[test]
-fn public_trackers_find_peers_for_bare_magnet_links() {
+fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
     let dir = test_dir("public-trackers");
     let (seeder, id) = seed(&dir.join("seed"), false, false);
-    let tracker = Tracker::start(std::net::SocketAddrV4::new(
-        std::net::Ipv4Addr::LOCALHOST,
-        seeder.listen_port(),
-    ));
+    let public = Tracker::start(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    public.point_to(&seeder);
     let rt = runtime();
-    let (service, mut events) = service_with(&dir.join("tasks.sqlite"), vec![tracker.list.clone()]);
+    let (service, mut events) = service_with(&dir.join("tasks.sqlite"), vec![public.list.clone()]);
     // 系统代理可能不放过回环地址
     service.set_proxy(&Proxy::Direct).unwrap();
 
     let uri = format!("magnet:?xt=urn:btih:{id}");
     let resume = fetch(&rt, &service, &uri);
-    assert!(tracker.announced.lock().unwrap().contains(&id.to_string()));
+    assert!(public.announced(&id));
     let contains = |data: &[u8], text: &str| data.windows(text.len()).any(|w| w == text.as_bytes());
     assert!(
-        !contains(&resume, &tracker.announce),
+        !contains(&resume, &public.announce),
         "补的 tracker 存进了续传数据"
     );
-
     let info = TorrentInfo::of(&resume).unwrap();
     let all = info.files.iter().map(|file| file.index).collect();
     let task = rt
@@ -664,15 +703,74 @@ fn public_trackers_find_peers_for_bare_magnet_links() {
         Some(Status::Done)
     );
     rt.block_on(seeding(&mut events, task.id));
-    let checks = rt.block_on(service.diagnose(task.id)).unwrap().unwrap();
-    let public = checks
-        .iter()
-        .find(|check| check.item == CheckItem::PublicTrackers)
+    let public_check = |id| {
+        rt.block_on(service.diagnose(id))
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|check| check.item == CheckItem::PublicTrackers)
+            .unwrap()
+    };
+    let check = public_check(task.id);
+    assert_eq!(
+        (check.level, check.text.as_str()),
+        (CheckLevel::Ok, "补了 1 个公共 tracker，1 个回应了")
+    );
+
+    // 带了 tracker 的磁力链接取种子信息时不补（经它自己的 tracker 找到做种一方）
+    let own = Tracker::start(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let (tracked_seeder, tracked_id) = seed(&dir.join("tracked-seed"), false, true);
+    own.point_to(&tracked_seeder);
+    let tracked = fetch(
+        &rt,
+        &service,
+        &format!("magnet:?xt=urn:btih:{tracked_id}&tr={}", own.announce),
+    );
+    assert!(
+        contains(&tracked, &own.announce),
+        "种子自己的 tracker 没存下"
+    );
+    assert!(own.announced(&tracked_id));
+    assert!(
+        !public.announced(&tracked_id),
+        "带了 tracker 的磁力链接补了公共 tracker"
+    );
+    drop(tracked_seeder);
+
+    // 私有种子（libtorrent 不向节点要私有种子的种子信息，只能用种子文件），自带 tracker：下载、做种都不补
+    let (private_seeder, private_id, torrent) = seed_with(
+        &dir.join("private-seed"),
+        false,
+        &CreateOptions {
+            piece_size: PIECE,
+            v1_only: true,
+            private_torrent: true,
+            tracker: own.announce.clone(),
+        },
+    );
+    own.point_to(&private_seeder);
+    let resume = hs_dlx_app::torrent_from_file(&torrent).unwrap();
+    let info = TorrentInfo::of(&resume).unwrap();
+    assert!(info.private);
+    let all = info.files.iter().map(|file| file.index).collect();
+    let file = dir.join("private.torrent");
+    let url = Url::from_file_path(&file).unwrap();
+    let task = rt
+        .block_on(service.create(draft(url.as_str(), &dir.join("downloads"), resume, all), 2))
+        .unwrap()
         .unwrap();
     assert_eq!(
-        (public.level, public.text.as_str()),
-        (CheckLevel::Ok, "补了 1 个公共 tracker")
+        rt.block_on(until(&mut events, task.id, |_| false)),
+        Some(Status::Done)
+    );
+    rt.block_on(seeding(&mut events, task.id));
+    assert_eq!(public_check(task.id).text, "私有种子不补公共 tracker");
+    assert!(own.announced(&private_id));
+    assert!(
+        !public.announced(&private_id),
+        "私有种子的信息哈希通告给了公共 tracker"
     );
     drop(service);
     drop(seeder);
+    drop(private_seeder);
 }

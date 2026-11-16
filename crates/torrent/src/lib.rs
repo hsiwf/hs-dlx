@@ -112,8 +112,10 @@ mod ffi {
         ListenFailed,
         PortMapped,
         PortMapFailed,
-        /// tracker 回了错误或连不上：`message` 里有 tracker 的地址与原因
+        /// 种子自己的 tracker 回了错误或连不上：`message` 里有 tracker 的地址与原因
         TrackerError,
+        /// 补的 tracker（[`Session::add_trackers`]）回了错误或连不上，同上
+        AddedTrackerError,
         /// [`Session::request_stats`] 要的统计到了，[`Session::network`] 里已是新的
         Stats,
     }
@@ -153,6 +155,21 @@ mod ffi {
         /// tracker 报的做种与在下的人数；-1 为没报
         seeds: i32,
         leechers: i32,
+        /// 是补的（[`Session::add_trackers`]），不是种子自己的
+        added: bool,
+    }
+
+    /// 建种子文件的选择（[`crate::create_torrent`]）。
+    struct CreateOptions {
+        /// 分块大小，字节；0 为按总大小自动选
+        piece_size: i32,
+        /// 只有 v1：文件首尾相接，一块可以跨两个文件（网上多数种子是这样）；否时建 v1 与 v2 兼有的（各文件从新的一块
+        /// 开始，中间是对齐用的填充文件）
+        v1_only: bool,
+        /// 私有种子：只经种子里的 tracker 找节点
+        private_torrent: bool,
+        /// 种子里的 tracker 的地址；空时没有
+        tracker: String,
     }
 
     /// 种子里的一个文件（不含对齐用的填充文件）。
@@ -247,7 +264,7 @@ mod ffi {
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
         fn add_trackers(self: &Session, id: &str, urls: &[String]) -> Result<u32>;
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
-        fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>>;
+        fn create_torrent(path: &str, options: &CreateOptions) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
         fn describe(resume: &[u8]) -> Result<Described>;
         fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>>;
@@ -255,8 +272,8 @@ mod ffi {
 }
 
 pub use ffi::{
-    AddOptions, Alert, AlertKind, FileEntry, NetworkStatus, Removal, SessionConfig, Status,
-    TrackerState,
+    AddOptions, Alert, AlertKind, CreateOptions, FileEntry, NetworkStatus, Removal, SessionConfig,
+    Status, TrackerState,
 };
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
@@ -448,9 +465,10 @@ impl Session {
         Ok(self.inner().trackers(id.as_str())?)
     }
 
-    /// 给种子 `id` 补上 `urls` 里它还没有的 tracker（放在已有的之后的一层），返回补了几个；没有这个种子时报错。补的只在
-    /// 这次加入期间有效：写出的续传数据（[`AlertKind::ResumeData`]）里没有它们，再加入时要再补。会话对每层 tracker
-    /// 各通告一个（不止最前面能用的那层），种子自己的 tracker 能用时补的照样通告。
+    /// 给种子 `id` 补上 `urls` 里它还没有的 tracker（放在已有的之后，各占一层），返回补了几个；没有这个种子时报错。补的
+    /// 只在这次加入期间有效：写出的续传数据（[`AlertKind::ResumeData`]）里没有它们，再加入时要再补；它们报的错为
+    /// [`AlertKind::AddedTrackerError`]。会话对每层 tracker 各通告一个（不止最前面能用的那层），所以种子自己的
+    /// tracker 能用时补的照样各自通告。
     pub fn add_trackers(&self, id: &TorrentId, urls: &[String]) -> Result<u32, Error> {
         Ok(self.inner().add_trackers(id.as_str(), urls)?)
     }
@@ -509,11 +527,9 @@ pub fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>, Error
     Ok(ffi::place(resume, root, wanted)?)
 }
 
-/// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的内容。默认
-/// 建 v1 与 v2 兼有的（各文件从新的一块开始，中间是对齐用的填充文件）；`v1_only` 时只有 v1，文件首尾相接，一块可以跨
-/// 两个文件（网上多数种子是这样）。
-pub fn create_torrent(path: &str, piece_size: i32, v1_only: bool) -> Result<Vec<u8>, Error> {
-    Ok(ffi::create_torrent(path, piece_size, v1_only)?)
+/// 照 `options` 为 `path`（文件或目录）建种子文件，返回 bencode 写出的内容。
+pub fn create_torrent(path: &str, options: &CreateOptions) -> Result<Vec<u8>, Error> {
+    Ok(ffi::create_torrent(path, options)?)
 }
 
 impl fmt::Debug for Alert {
