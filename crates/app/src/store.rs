@@ -944,10 +944,10 @@ pub fn torrent_session(tx: &Transaction<'_>) -> Result<SessionState, Error> {
     })
 }
 
-/// 记下关闭时的 BT 会话状态。
+/// 记下关闭时的 BT 会话状态；没有端口（[`SessionState::port`] 为 None）时存着的端口照旧。
 pub fn set_torrent_session(tx: &Transaction<'_>, state: &SessionState) -> Result<(), Error> {
     tx.execute(
-        "UPDATE settings SET torrent_port = ?1, torrent_dht = ?2 WHERE id = 1",
+        "UPDATE settings SET torrent_port = COALESCE(?1, torrent_port), torrent_dht = ?2 WHERE id = 1",
         params![state.port, state.dht],
     )?;
     Ok(())
@@ -1244,8 +1244,8 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         .map(|text| {
             Url::parse(&text)
                 .ok()
-                .filter(|url| crate::torrent::check_proxy(url).is_ok())
-                .ok_or_else(|| Error::Corrupt(format!("设置里的 BT 代理：{text}")))
+                .filter(|url| crate::socks::check(url).is_ok())
+                .ok_or_else(|| Error::Corrupt("设置里的 BT 代理".to_owned()))
         })
         .transpose()?;
     let positive = |value: Option<u32>, what: &str| {
@@ -1284,7 +1284,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
     })
 }
 
-/// 记下 BT 经的 SOCKS5 代理（None 为直连）；调用方已校验（见 [`crate::torrent::check_proxy`]）。
+/// 记下 BT 经的 SOCKS5 代理（None 为直连）；调用方已校验（见 [`crate::socks::check`]）。
 pub fn set_torrent_proxy(tx: &Transaction<'_>, proxy: Option<&Url>) -> Result<(), Error> {
     tx.execute(
         "UPDATE settings SET torrent_proxy = ?1 WHERE id = 1",
@@ -2109,6 +2109,36 @@ mod tests {
         .unwrap();
         let saved = torrent_session(&tx).unwrap();
         assert_eq!((saved.port, saved.dht), (Some(51413), b"dht".to_vec()));
+        // 经代理关闭时没有端口：存着的照旧
+        set_torrent_session(
+            &tx,
+            &SessionState {
+                port: None,
+                dht: b"later".to_vec(),
+            },
+        )
+        .unwrap();
+        let kept = torrent_session(&tx).unwrap();
+        assert_eq!((kept.port, kept.dht), (Some(51413), b"later".to_vec()));
+        // BT 代理：存进去读得回；存储里认不出的报为损坏，不带出原文（可能有密码）
+        let socks = Url::parse("socks5://me:secret@127.0.0.1:1080").unwrap();
+        set_torrent_proxy(&tx, Some(&socks)).unwrap();
+        assert_eq!(settings(&tx).unwrap().torrent_proxy, Some(socks));
+        tx.execute(
+            "UPDATE settings SET torrent_proxy = 'http://me:secret@127.0.0.1:1' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let Err(corrupt) = settings(&tx) else {
+            panic!("认不出的 BT 代理当作正常读出");
+        };
+        let corrupt = corrupt.to_string();
+        assert!(
+            corrupt.contains("BT 代理") && !corrupt.contains("secret"),
+            "{corrupt}"
+        );
+        set_torrent_proxy(&tx, None).unwrap();
+        assert_eq!(settings(&tx).unwrap().torrent_proxy, None);
         // 做种：改成不做种再改回时分享率与时长照旧；只按时长
         assert_eq!(read.seeding, Seeding::default());
         set_seeding(&tx, Seeding::Off).unwrap();

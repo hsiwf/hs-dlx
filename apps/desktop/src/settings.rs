@@ -112,8 +112,9 @@ impl SettingsView {
         let watched = cx.observe(&updates, |_, _, cx| cx.notify());
         let proxy = settings.proxy;
         let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
-        let torrent_address =
-            cx.new(|cx| InputState::new(window, cx).placeholder(TORRENT_PROXY_EXAMPLE));
+        let torrent_address = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(format!("如 {TORRENT_PROXY_EXAMPLE}"))
+        });
         if let Some(url) = &settings.torrent_proxy {
             torrent_address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
         }
@@ -431,7 +432,7 @@ impl SettingsView {
                         )),
                 )
                 .child(ui::caption(
-                    "要 SOCKS5（HTTP 代理转发不了 DHT），写明端口，可带用户名与密码；代理要允许转发 UDP，DHT 才经得了它",
+                    "IPv4 地址或主机名，写明端口，可带用户名与密码；代理要转发 UDP（UDP ASSOCIATE），DHT 才经得了它",
                 ))
                 .children(unsaved.map(ui::caption))
         });
@@ -446,7 +447,7 @@ impl SettingsView {
                 .children(input)
                 .children(self.torrent_proxy_error.clone().map(ui::error_text))
                 .child(ui::caption(
-                    "运营商限制 UDP、DHT 连不上时用；很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来，改了随即生效",
+                    "很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来；改了之后的连接经它，已连着的不断",
                 )),
         )
     }
@@ -569,10 +570,10 @@ impl SettingsView {
             }
             UpdateState::Installed(version) => {
                 lines.push(
-                    ui::caption(if restarting {
-                        format!("{version} 已装好：退出后打开新版本")
-                    } else {
-                        format!("{version} 已装好，重启后用新版本")
+                    ui::caption(match (restarting, hs_dlx_app::INSTALLS_ON_EXIT) {
+                        (true, _) => format!("{version} 已装好：退出后打开新版本"),
+                        (false, true) => format!("{version} 已下载并验过：应用退出时装上"),
+                        (false, false) => format!("{version} 已装好，重启后用新版本"),
                     })
                     .into_any_element(),
                 );
@@ -726,7 +727,7 @@ impl SettingsView {
         };
         row(
             "代理",
-            Some("探测、下载与嗅探页的网页经哪里出去"),
+            Some("探测、下载与嗅探页的网页经哪里出去；BT 不经它，另在「BT 代理」设"),
             div()
                 .flex()
                 .flex_col()

@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui_kit::{Context, Entity, Subscription, Task};
 use hs_dlx_app::{Release, Restart, UpdateFeed, Version};
 
-use crate::tasks::{Quit, Tasks};
+use crate::tasks::Tasks;
 
 /// 启动后多久查第一次：不和启动时读任务、开窗口抢。
 const FIRST_CHECK: Duration = Duration::from_secs(10);
@@ -65,7 +65,7 @@ pub enum UpdateState {
     },
     /// 下完验过签名，在装
     Installing(Version),
-    /// 装好了（Windows 为准备好了，退出后装）：退出时打开新版本
+    /// 装好了：macOS 已换上新版本；Windows 已下载并验过，退出时装（见 [`hs_dlx_app::INSTALLS_ON_EXIT`]）
     Installed(Version),
     /// 这一步没成：`release` 为查到的新版本（查的时候没成为 None），可再试
     Failed {
@@ -84,8 +84,8 @@ pub struct Updates {
     auto: bool,
     /// 装好后退出时要起的（[`UpdateState::Installed`] 时有）
     restart: Option<Restart>,
-    /// 这次退出是为了打开新版本（点了重启）：退出不可撤回时起 `restart`；退出被取消即复位
-    restarting: bool,
+    /// 点了重启、还没撤回的那次退出：撤回前的 [`Tasks::stays`]。退出不可撤回时起 `restart` 并打开新版本；撤回即清掉
+    restarting: Option<u64>,
     /// 在做的那一步（查、下载、装）；释放即取消
     _work: Option<Task<()>>,
     _schedule: Task<()>,
@@ -110,17 +110,20 @@ impl Updates {
                 }
             }
         });
-        // 点了重启而退出被取消（问的时候选了留下、等任务停下时出了要看的事）：之后别的退出不打开新版本
+        // 点了重启而退出被撤回（问的时候选了留下、等任务停下时出了要看的事）：之后别的退出不打开新版本
         let watched = cx.observe(&tasks, |this: &mut Self, tasks, cx| {
-            if this.restarting && tasks.read(cx).quit() == Quit::Staying {
-                this.restarting = false;
+            if this
+                .restarting
+                .is_some_and(|stays| tasks.read(cx).stays() != stays)
+            {
+                this.restarting = None;
                 cx.notify();
             }
         });
+        // 退出已不可撤回：装好了的照它接着做，点了重启的另打开新版本
         let quitting = cx.on_app_quit(|this: &mut Self, _| {
-            if this.restarting
-                && let Some(restart) = this.restart.take()
-                && let Err(error) = restart.spawn()
+            if let Some(restart) = this.restart.take()
+                && let Err(error) = restart.spawn(this.restarting.is_some())
             {
                 // 已在退出，界面没了：下次启动时报出来
                 let _unrecorded =
@@ -134,7 +137,7 @@ impl Updates {
             state: UpdateState::Idle,
             auto,
             restart: None,
-            restarting: false,
+            restarting: None,
             _work: None,
             _schedule: schedule,
             _subscriptions: [watched, quitting],
@@ -151,7 +154,7 @@ impl Updates {
 
     /// 点了重启、在等退出。
     pub fn restarting(&self) -> bool {
-        self.restarting
+        self.restarting.is_some()
     }
 
     /// 可以（重新）查：没查过、已是最新，或上次查没成。
@@ -318,6 +321,10 @@ impl Updates {
                     this.restart_now(cx);
                 }
                 Ok(Err(hs_dlx_app::Error::UpdateStranded(reason))) => {
+                    // 应用已不在原处：不只写在设置页，另推一条提示，免得没看到就退出了
+                    this.tasks.update(cx, |tasks, cx| {
+                        tasks.tell(format!("更新没换完：{reason}"), cx);
+                    });
                     this.state = UpdateState::Stranded(reason);
                     this._work = None;
                     cx.notify();
@@ -334,7 +341,7 @@ impl Updates {
         if self.restart.is_none() {
             return;
         }
-        self.restarting = true;
+        self.restarting = Some(self.tasks.read(cx).stays());
         cx.notify();
         crate::main_window::quit(cx);
     }

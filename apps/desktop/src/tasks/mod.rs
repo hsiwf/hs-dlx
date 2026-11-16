@@ -75,6 +75,8 @@ pub struct Tasks {
     notices: Vec<Notice>,
     next_notice: u64,
     quit: Quit,
+    /// 撤回过几次退出（见 [`Tasks::stays`]）
+    stays: u64,
     /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
     creating: usize,
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
@@ -167,6 +169,7 @@ impl Tasks {
             notices: Vec::new(),
             next_notice: 0,
             quit: Quit::Staying,
+            stays: 0,
             creating: 0,
             early: Vec::new(),
             free_space: None,

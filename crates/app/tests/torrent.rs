@@ -776,94 +776,222 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
     drop(private_seeder);
 }
 
-/// 测试的 SOCKS5 代理：在回环地址上，只做不认证的 TCP CONNECT（UDP ASSOCIATE 回「不支持」），记下转发到的地址。在自己的
-/// 线程上跑，随测试进程结束。
+/// 测试的 SOCKS5 代理：在回环地址上，不认证；CONNECT 照转并记下目的地址，UDP ASSOCIATE 照 `udp` 转发（记下发往的
+/// 地址）或回「不支持」。释放时停下：不再接受连接，各转发随连接断开结束。
 struct Socks {
     port: u16,
     connected: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+    relayed: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Socks {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // 叫醒在等连接的那一头，它看到停下的标记即退出
+        let _woken = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+    }
 }
 
 impl Socks {
-    fn start() -> Socks {
+    fn start(udp: bool) -> Socks {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let connected = Arc::new(Mutex::new(Vec::new()));
-        let seen = connected.clone();
-        std::thread::spawn(move || {
-            for client in listener.incoming() {
-                let Ok(mut client) = client else { continue };
-                let seen = seen.clone();
-                std::thread::spawn(move || {
-                    let mut head = [0; 2];
-                    client.read_exact(&mut head).unwrap();
-                    let mut methods = vec![0; usize::from(head[1])];
-                    client.read_exact(&mut methods).unwrap();
-                    client.write_all(&[5, 0]).unwrap();
-                    let mut request = [0; 4];
-                    client.read_exact(&mut request).unwrap();
-                    let ip = match request[3] {
-                        1 => {
-                            let mut v4 = [0; 4];
-                            client.read_exact(&mut v4).unwrap();
-                            std::net::IpAddr::from(v4)
-                        }
-                        4 => {
-                            let mut v6 = [0; 16];
-                            client.read_exact(&mut v6).unwrap();
-                            std::net::IpAddr::from(v6)
-                        }
-                        atyp => panic!("测试的代理不解析主机名（地址类型 {atyp}）"),
-                    };
-                    let mut port = [0; 2];
-                    client.read_exact(&mut port).unwrap();
-                    let target = std::net::SocketAddr::new(ip, u16::from_be_bytes(port));
-                    if request[1] != 1 {
-                        // 只做 CONNECT
-                        let _closed = client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
-                        return;
-                    }
-                    let Ok(upstream) = std::net::TcpStream::connect(target) else {
+        use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+        type Seen = Arc<Mutex<Vec<SocketAddr>>>;
+
+        fn read_address(client: &mut TcpStream, kind: u8) -> SocketAddr {
+            let ip = match kind {
+                1 => {
+                    let mut v4 = [0; 4];
+                    client.read_exact(&mut v4).unwrap();
+                    IpAddr::from(v4)
+                }
+                4 => {
+                    let mut v6 = [0; 16];
+                    client.read_exact(&mut v6).unwrap();
+                    IpAddr::from(v6)
+                }
+                other => panic!("测试的代理不解析主机名（地址类型 {other}）"),
+            };
+            let mut port = [0; 2];
+            client.read_exact(&mut port).unwrap();
+            SocketAddr::new(ip, u16::from_be_bytes(port))
+        }
+
+        /// 转发 UDP：客户端发来的去掉 SOCKS 头转给目的地址，目的地址回的加上头转回客户端；`waker` 发来任何包即停。
+        fn relay(socket: UdpSocket, waker: SocketAddr, relayed: Seen) {
+            let mut client = None;
+            let mut buffer = [0; 65536];
+            loop {
+                let (len, from) = socket.recv_from(&mut buffer).unwrap();
+                if from == waker {
+                    return;
+                }
+                let datagram = &buffer[..len];
+                if client.is_none_or(|client| client == from)
+                    && datagram.len() > 10
+                    && datagram[3] == 1
+                {
+                    client = Some(from);
+                    let ip = IpAddr::from([datagram[4], datagram[5], datagram[6], datagram[7]]);
+                    let target =
+                        SocketAddr::new(ip, u16::from_be_bytes([datagram[8], datagram[9]]));
+                    relayed.lock().unwrap().push(target);
+                    let _sent = socket.send_to(&datagram[10..], target);
+                } else if let (Some(client), SocketAddr::V4(back)) = (client, from) {
+                    let mut wrapped = vec![0, 0, 0, 1];
+                    wrapped.extend_from_slice(&back.ip().octets());
+                    wrapped.extend_from_slice(&back.port().to_be_bytes());
+                    wrapped.extend_from_slice(datagram);
+                    let _sent = socket.send_to(&wrapped, client);
+                }
+            }
+        }
+
+        fn serve(mut client: TcpStream, udp: bool, connected: Seen, relayed: Seen) {
+            let mut head = [0; 2];
+            client.read_exact(&mut head).unwrap();
+            let mut methods = vec![0; usize::from(head[1])];
+            client.read_exact(&mut methods).unwrap();
+            client.write_all(&[5, 0]).unwrap();
+            let mut request = [0; 4];
+            client.read_exact(&mut request).unwrap();
+            let target = read_address(&mut client, request[3]);
+            match request[1] {
+                1 => {
+                    let Ok(upstream) = TcpStream::connect(target) else {
                         let _closed = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
                         return;
                     };
-                    seen.lock().unwrap().push(target);
+                    connected.lock().unwrap().push(target);
                     client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
                     let (mut up_read, mut client_write) =
                         (upstream.try_clone().unwrap(), client.try_clone().unwrap());
                     let (mut up_write, mut client_read) = (upstream, client);
-                    std::thread::spawn(move || std::io::copy(&mut up_read, &mut client_write));
+                    // 一头断了就关上另一头，免得对方以为连接还在
+                    std::thread::spawn(move || {
+                        let _done = std::io::copy(&mut up_read, &mut client_write);
+                        let _closed = client_write.shutdown(std::net::Shutdown::Both);
+                    });
                     let _done = std::io::copy(&mut client_read, &mut up_write);
-                });
+                    let _closed = up_write.shutdown(std::net::Shutdown::Both);
+                }
+                3 if udp => {
+                    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    let waker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    let at = socket.local_addr().unwrap();
+                    let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+                    reply.extend_from_slice(&at.port().to_be_bytes());
+                    client.write_all(&reply).unwrap();
+                    let wake_from = waker.local_addr().unwrap();
+                    let relaying = std::thread::spawn(move || relay(socket, wake_from, relayed));
+                    // 控制连接断开即结束这次转发
+                    let _closed = std::io::copy(&mut client, &mut std::io::sink());
+                    waker.send_to(b"stop", at).unwrap();
+                    relaying.join().unwrap();
+                }
+                _ => {
+                    let _closed = client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected, relayed): (Seen, Seen) = Default::default();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, sent, stopped) = (connected.clone(), relayed.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(client) = client else { continue };
+                let (seen, sent) = (seen.clone(), sent.clone());
+                std::thread::spawn(move || serve(client, udp, seen, sent));
             }
         });
-        Socks { port, connected }
+        Socks {
+            port,
+            connected,
+            relayed,
+            stop,
+        }
+    }
+
+    fn url(&self) -> Url {
+        Url::parse(&format!("socks5://127.0.0.1:{}", self.port)).unwrap()
     }
 }
 
-/// BT 经 SOCKS5 代理：磁力链接连做种的一方经代理转发，取到种子信息；HTTP 代理不收。
+/// 取 `uri` 的种子信息，等到报出 BT 代理的问题（最多 20 秒）；取到种子信息或超时还没报时为 None。
+fn proxy_problem(rt: &Runtime, service: &Service, uri: &str) -> Option<String> {
+    let fetch = service.fetch_metadata(uri.to_owned()).unwrap();
+    let mut progress = fetch.progress;
+    let _resume = fetch.resume;
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(problem) = progress.borrow_and_update().proxy_problem.clone() {
+                    return Some(problem);
+                }
+                if progress.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    })
+}
+
+/// BT 经 SOCKS5 代理：磁力链接连做种的一方经代理转发（TCP 与 uTP 都经它），取到种子信息；HTTP 代理不收。代理连不上、
+/// 不转发 UDP 时，取种子信息的进度里报出原因。
 #[test]
 fn torrents_connect_through_the_socks_proxy() {
     let dir = test_dir("socks-proxy");
     let (seeder, id) = seed(&dir.join("seed"), false, false);
-    let socks = Socks::start();
+    let seeder_at = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, seeder.listen_port()));
     let rt = runtime();
     let (service, _events) = service(&dir.join("tasks.sqlite"));
     assert!(matches!(
         service.set_torrent_proxy(Some(Url::parse("http://127.0.0.1:1").unwrap())),
         Err(Error::InvalidInput(_))
     ));
-    let proxy = Url::parse(&format!("socks5://127.0.0.1:{}", socks.port)).unwrap();
-    service.set_torrent_proxy(Some(proxy.clone())).unwrap();
-    assert_eq!(service.settings().unwrap().torrent_proxy, Some(proxy));
+
+    let socks = Socks::start(true);
+    service.set_torrent_proxy(Some(socks.url())).unwrap();
+    assert_eq!(service.settings().unwrap().torrent_proxy, Some(socks.url()));
     let resume = fetch(&rt, &service, &magnet(&id, &seeder));
     assert_eq!(TorrentInfo::of(&resume).unwrap().info_hash, id.as_str());
-    let seeder_at = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, seeder.listen_port()));
+    let through =
+        |seen: &Mutex<Vec<std::net::SocketAddr>>| seen.lock().unwrap().contains(&seeder_at);
     assert!(
-        socks.connected.lock().unwrap().contains(&seeder_at),
-        "没经代理连做种的一方：{:?}",
-        socks.connected.lock().unwrap()
+        through(&socks.connected) || through(&socks.relayed),
+        "没经代理连做种的一方"
     );
+    // 会话刚建起时 UDP 转发还没谈好，第一次连节点的 uTP 发不出去、改走 TCP；再取一次时 uTP 经代理的 UDP 转发
+    fetch(&rt, &service, &magnet(&id, &seeder));
+    assert!(
+        through(&socks.relayed),
+        "uTP 没经代理转发：{:?}",
+        socks.relayed.lock().unwrap()
+    );
+
+    // 不转发 UDP 的代理
+    let tcp_only = Socks::start(false);
+    service.set_torrent_proxy(Some(tcp_only.url())).unwrap();
+    let problem =
+        proxy_problem(&rt, &service, &magnet(&id, &seeder)).expect("没报出代理不转发 UDP");
+    assert!(problem.contains("不转发 UDP"), "{problem}");
+
+    // 连不上的代理：端口上没人
+    let closed = tcp_only.url();
+    drop(tcp_only);
+    service.set_torrent_proxy(Some(closed)).unwrap();
+    let problem = proxy_problem(&rt, &service, &magnet(&id, &seeder)).expect("没报出代理连不上");
+    assert!(problem.contains("连不上代理"), "{problem}");
     drop(service);
     drop(seeder);
 }

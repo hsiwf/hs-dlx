@@ -352,6 +352,7 @@ NetworkStatus Session::network() const {
 	out.natpmp_error = text_of(m_network.natpmp_error);
 	out.dht_nodes = m_network.dht_nodes;
 	out.incoming = m_network.incoming;
+	out.proxy_error = text_of(m_network.proxy_error);
 	return out;
 }
 
@@ -445,6 +446,8 @@ void Session::set_proxy(SocksProxy const& proxy) const {
 	lt::settings_pack pack;
 	set_proxy_of(pack, proxy);
 	m_session.apply_settings(std::move(pack));
+	std::lock_guard<std::mutex> net(m_network_mutex);
+	m_network.proxy_error.clear();
 }
 
 void Session::set_upload_limit(std::int32_t bytes_per_second) const {
@@ -517,6 +520,10 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
+		} else if (lt::alert_cast<lt::socks5_alert>(a)) {
+			// 经代理的 UDP（DHT、uTP、UDP 的 tracker）连代理或握手失败；libtorrent 随后自己重试
+			std::lock_guard<std::mutex> net(m_network_mutex);
+			m_network.proxy_error = a->message();
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {
 			{
 				std::lock_guard<std::mutex> net(m_network_mutex);

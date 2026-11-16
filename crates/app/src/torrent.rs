@@ -15,14 +15,15 @@ use std::thread::JoinHandle as ThreadHandle;
 use std::time::Duration;
 
 use hs_dlx_torrent::{
-    AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, SocksProxy, State, TorrentId,
+    AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, State, TorrentId,
 };
 use hs_m3u8_core::Url;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::diagnosis::{Check, Facts, Public, Tracker, checks};
+use crate::diagnosis::{Check, Facts, ProxyFact, Public, Tracker, checks};
 use crate::public_trackers::{PublicTrackers, SOURCES};
+use crate::socks::{ProxyCheck, libtorrent_proxy};
 use crate::{Error, Failure, FailureKind, Seeding};
 
 /// 取事件时最多等多久（毫秒）：关闭时取事件的线程最晚这么久后发现要退出。
@@ -162,6 +163,8 @@ pub struct MetadataProgress {
     pub tracker_error: Option<String>,
     /// 磁力链接没带 tracker、要补公共 tracker，而列表这次没取到时为原因（隔一阵再取）；别的时候为 None
     pub public_trackers_error: Option<String>,
+    /// BT 代理的问题（探出用不了，或经它的 UDP 最近出错）；直连或没问题时为 None
+    pub proxy_problem: Option<String>,
 }
 
 /// 运行中的 BT 任务在做什么。
@@ -204,6 +207,8 @@ pub struct TorrentProgress {
     /// 这次运行里最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None。私有种子只经
     /// tracker 找节点，它报错时多半一直连不上节点
     pub tracker_error: Option<String>,
+    /// BT 代理的问题（同 [`MetadataProgress::proxy_problem`]）
+    pub proxy_problem: Option<String>,
 }
 
 impl TorrentProgress {
@@ -234,6 +239,7 @@ impl TorrentProgress {
             reachable: count(status.reachable_pieces),
             scarce: false,
             tracker_error: None,
+            proxy_problem: None,
         }
     }
 }
@@ -266,6 +272,19 @@ pub(crate) struct Engine {
     stop: AtomicBool,
     /// 公共 tracker 列表的状况（[`Bt::set_public`] 改）
     public: watch::Receiver<PublicTrackers>,
+    /// BT 代理探到的情况（[`Bt::set_proxy_check`] 改）
+    proxy_check: watch::Receiver<ProxyCheck>,
+}
+
+impl Engine {
+    /// BT 代理的问题：探出用不了的原因，或 libtorrent 经它的 UDP 最近一次出的错；直连或没问题时为 None。
+    fn proxy_problem(&self) -> Option<String> {
+        if let ProxyCheck::Unusable(why) = &*self.proxy_check.borrow() {
+            return Some(why.clone());
+        }
+        let error = self.session.network().proxy_error;
+        (!error.is_empty()).then(|| format!("代理出错：{error}"))
+    }
 }
 
 impl Engine {
@@ -506,6 +525,8 @@ pub(crate) struct Bt {
     upload_limit: Mutex<Option<NonZeroU32>>,
     /// 经的 SOCKS5 代理（None 为直连），同上
     proxy: Mutex<Option<Url>>,
+    /// 代理探到的情况；改代理时随之重置
+    proxy_check: watch::Sender<ProxyCheck>,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     /// 公共 tracker 列表的来源（空时不补）与状况
@@ -521,7 +542,7 @@ struct Running {
 
 /// 关闭时要存下的会话状态。
 pub(crate) struct SessionState {
-    /// 监听的端口；还没监听成功时为 None
+    /// 监听的端口；还没监听成功、或经代理（不接受连入，libtorrent 报 0）时为 None
     pub port: Option<u16>,
     /// DHT 的状态（路由表里的节点）
     pub dht: Vec<u8>,
@@ -543,6 +564,11 @@ impl Bt {
         Bt {
             network,
             upload_limit: Mutex::new(upload_limit),
+            proxy_check: watch::Sender::new(if proxy.is_some() {
+                ProxyCheck::Unchecked
+            } else {
+                ProxyCheck::Direct
+            }),
             proxy: Mutex::new(proxy),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
@@ -576,7 +602,7 @@ impl Bt {
     pub fn engine(&self, saved: SessionState) -> Result<Arc<Engine>, Error> {
         let mut running = lock(&self.running);
         let upload_limit = *lock(&self.upload_limit);
-        let proxy = socks_of(lock(&self.proxy).as_ref());
+        let proxy = libtorrent_proxy(lock(&self.proxy).as_ref());
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -611,6 +637,7 @@ impl Bt {
             stats: Notify::new(),
             stop: AtomicBool::new(false),
             public: self.public.subscribe(),
+            proxy_check: self.proxy_check.subscribe(),
         });
         let pumped = engine.clone();
         let pump = std::thread::Builder::new()
@@ -665,19 +692,52 @@ impl Bt {
         }
     }
 
-    /// 改经的代理（None 为直连；调用方已校验，见 [`check_proxy`]）：已建的会话随即照它，之后建的也照它。
+    /// 改经的代理（None 为直连；调用方已校验，见 [`crate::socks::check`]）：已建的会话随即照它，之后建的也照它。
     pub fn set_proxy(&self, proxy: Option<Url>) {
         let running = lock(&self.running);
-        let socks = socks_of(proxy.as_ref());
+        let socks = libtorrent_proxy(proxy.as_ref());
+        self.proxy_check.send_replace(if proxy.is_some() {
+            ProxyCheck::Unchecked
+        } else {
+            ProxyCheck::Direct
+        });
         *lock(&self.proxy) = proxy;
         if let Some(running) = &*running {
             running.engine.session.set_proxy(&socks);
         }
     }
 
-    /// 经的代理（去掉凭据的写法）；直连时为 None。
-    pub fn proxy(&self) -> Option<String> {
-        lock(&self.proxy).as_ref().map(hs_m3u8_core::bare_url)
+    /// 经的代理（去掉凭据的写法）与探到的情况；直连时为 None。
+    pub fn proxy(&self) -> Option<(String, ProxyCheck)> {
+        lock(&self.proxy).as_ref().map(|url| {
+            (
+                hs_m3u8_core::bare_url(url),
+                self.proxy_check.borrow().clone(),
+            )
+        })
+    }
+
+    /// 代理设了而还没探时记为在探，返回要探的地址（由调用方去探，结果交给 [`Bt::set_proxy_check`]）；直连、已在探或
+    /// 探过时为 None。
+    pub fn begin_proxy_probe(&self) -> Option<Url> {
+        let proxy = lock(&self.proxy);
+        let url = proxy.as_ref()?;
+        self.proxy_check
+            .send_if_modified(|check| {
+                let unchecked = *check == ProxyCheck::Unchecked;
+                if unchecked {
+                    *check = ProxyCheck::Checking;
+                }
+                unchecked
+            })
+            .then(|| url.clone())
+    }
+
+    /// 记下探 `url` 的结果；代理已改成别的时不记。
+    pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
+        if lock(&self.proxy).as_ref() == Some(url) {
+            self.proxy_check.send_replace(check);
+        }
     }
 
     /// 已建的引擎；还没建会话时为 None。
@@ -689,45 +749,6 @@ impl Bt {
 
     pub fn probe_dir(&self) -> &Path {
         &self.probe_dir
-    }
-}
-
-/// BT 经的代理（[`crate::Settings::torrent_proxy`]）能不能用：`socks5://` 或 `socks5h://` 开头（两者一样，主机名都交给
-/// 代理解析），有主机与端口，没有路径以外的部分；不能用时为原因。
-pub(crate) fn check_proxy(url: &Url) -> Result<(), String> {
-    if !matches!(url.scheme(), "socks5" | "socks5h") {
-        return Err(
-            "BT 的代理要是 SOCKS5（socks5:// 开头）：HTTP 代理转发不了 DHT 与 UDP".to_owned(),
-        );
-    }
-    if url.host_str().is_none_or(str::is_empty) || url.port().is_none() {
-        return Err("BT 的代理要写明主机与端口，如 socks5://127.0.0.1:1080".to_owned());
-    }
-    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
-        return Err("BT 的代理地址只写主机与端口（可带用户名与密码）".to_owned());
-    }
-    Ok(())
-}
-
-/// 代理在 libtorrent 里的写法；None 为直连。用户名与密码按地址里的百分号编码解开（不是 UTF-8 的字节换成替换字符）。
-fn socks_of(proxy: Option<&Url>) -> SocksProxy {
-    let decoded = |text: &str| {
-        percent_encoding::percent_decode_str(text)
-            .decode_utf8_lossy()
-            .into_owned()
-    };
-    match proxy {
-        None => SocksProxy::default(),
-        Some(url) => SocksProxy {
-            host: url
-                .host_str()
-                .expect("存下的代理都过了 check_proxy，有主机")
-                .trim_matches(['[', ']'])
-                .to_owned(),
-            port: url.port().expect("存下的代理都过了 check_proxy，有端口"),
-            username: decoded(url.username()),
-            password: url.password().map(decoded).unwrap_or_default(),
-        },
     }
 }
 
@@ -792,6 +813,7 @@ pub(crate) async fn fetch_metadata(
             peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
             tracker_error: tracker_error.clone(),
             public_trackers_error: public.failure(),
+            proxy_problem: owner.engine.proxy_problem(),
         });
         // 取到种子信息的事件丢了也不要紧：每次都看状态
         tokio::select! {
@@ -1081,6 +1103,7 @@ pub(crate) async fn seed(
                 }
                 let mut progress = TorrentProgress::of(&status);
                 progress.tracker_error.clone_from(&tracker_error);
+                progress.proxy_problem = owner.engine.proxy_problem();
                 if matches!(progress.phase, TorrentPhase::Checking { .. }) {
                     each(progress);
                     continue;
@@ -1167,6 +1190,7 @@ async fn drive(
                     short = if shortfall { short + 1 } else { 0 };
                     progress.scarce = short >= SCARCE_TICKS;
                     progress.tracker_error.clone_from(&tracker_error);
+                    progress.proxy_problem = owner.engine.proxy_problem();
                     each(progress);
                 }
                 Err(error) => {
@@ -1379,14 +1403,14 @@ fn sweep(path: &Path) -> Vec<PathBuf> {
 }
 
 /// 诊断在下或做种（`seeding`）的种子 `info_hash`：要一次会话的统计、等它到，再查网络状况、种子的状态与 tracker；上传
-/// 限速为 `upload_limit`，经的代理为 `proxy`（去掉凭据的写法，直连为 None）。种子不在会话里（刚开始、还没加进去）、统计 [`STEP_TIMEOUT`] 内没到时报 [`Error::Torrent`]；
+/// 限速为 `upload_limit`，经的代理为 `proxy`（去掉凭据的写法与探到的情况，直连为 None）。种子不在会话里（刚开始、还没加进去）、统计 [`STEP_TIMEOUT`] 内没到时报 [`Error::Torrent`]；
 /// 等的期间 BT 会话关闭时报 [`Error::Closed`]。
 pub(crate) async fn diagnose(
     engine: &Engine,
     info_hash: &str,
     seeding: bool,
     upload_limit: Option<NonZeroU32>,
-    proxy: Option<String>,
+    proxy: Option<(String, ProxyCheck)>,
 ) -> Result<Vec<Check>, Error> {
     let id = TorrentId::parse(info_hash)
         .map_err(|error| Error::Corrupt(format!("种子的编号：{error}")))?;
@@ -1430,7 +1454,11 @@ pub(crate) async fn diagnose(
     let most =
         |of_status: i32, of_trackers: Option<i32>| count(of_status.max(of_trackers.unwrap_or(-1)));
     let facts = Facts {
-        proxy,
+        proxy: proxy.map(|(address, check)| ProxyFact {
+            address,
+            check,
+            error: network.proxy_error.clone(),
+        }),
         listen_port: network.listen_port,
         listen_error: network.listen_error,
         upnp_port: network.upnp_port,
@@ -1470,34 +1498,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proxies_must_be_socks5_with_a_port() {
-        let url = |text: &str| Url::parse(text).unwrap();
-        assert!(check_proxy(&url("socks5://127.0.0.1:7897")).is_ok());
-        let socks = socks_of(Some(&url("socks5h://me:p%40ss@[::1]:1080")));
-        assert_eq!(
-            (
-                socks.host.as_str(),
-                socks.port,
-                socks.username.as_str(),
-                socks.password.as_str()
-            ),
-            ("::1", 1080, "me", "p@ss")
-        );
-        assert!(
-            check_proxy(&url("http://127.0.0.1:7897"))
-                .unwrap_err()
-                .contains("SOCKS5")
-        );
-        assert!(
-            check_proxy(&url("socks5://127.0.0.1"))
-                .unwrap_err()
-                .contains("端口")
-        );
-        assert!(check_proxy(&url("socks5://127.0.0.1:1080/x")).is_err());
-        assert_eq!(socks_of(None).host, "");
-    }
 
     #[test]
     fn fingerprints_take_one_digit_per_part() {

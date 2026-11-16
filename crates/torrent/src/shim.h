@@ -118,6 +118,7 @@ private:
 		std::string natpmp_error;
 		std::int64_t dht_nodes = -1;
 		bool incoming = false;
+		std::string proxy_error;
 	};
 	mutable Network m_network;
 	// 守着 m_network

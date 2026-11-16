@@ -10,6 +10,7 @@ mod preference;
 mod public_trackers;
 mod service;
 mod settings;
+mod socks;
 pub mod special_link;
 mod store;
 mod task;
@@ -33,6 +34,7 @@ pub use torrent::{
     TorrentPhase, TorrentProgress, torrent_from_file,
 };
 pub use update::{
-    Package, Release, Restart, UpdateFeed, Version, record_failure as record_update_failure,
-    sweep as sweep_update, take_failure as take_update_failure,
+    INSTALLS_ON_EXIT, Package, Release, Restart, UpdateFeed, Version,
+    record_failure as record_update_failure, sweep as sweep_update,
+    take_failure as take_update_failure,
 };

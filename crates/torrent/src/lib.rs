@@ -140,6 +140,9 @@ mod ffi {
         dht_nodes: i64,
         /// 有过节点从外面连进来（统计过才知道）
         incoming: bool,
+        /// 经代理的 UDP（DHT、uTP、UDP 的 tracker）最近一次连代理或握手失败的说明（英文）；没失败过或改过代理之后为空。
+        /// 代理拒绝转发 UDP、回了 IPv6 地址时 libtorrent 不报这个，UDP 就此不通
+        proxy_error: String,
     }
 
     /// 种子的一个 tracker 此刻的状况。
@@ -161,8 +164,9 @@ mod ffi {
         added: bool,
     }
 
-    /// SOCKS5 代理（RFC 1928）：要转发 UDP（UDP ASSOCIATE），DHT、uTP 与 UDP 的 tracker 才经得了它。经它时不接受
-    /// 外部连入、不映射端口、不做本地发现（libtorrent 只开一个连代理用的接口），主机名交给代理解析。
+    /// SOCKS5 代理（RFC 1928）：要转发 UDP（UDP ASSOCIATE）且回 IPv4 的转发地址，DHT、uTP 与 UDP 的 tracker 才经得了
+    /// 它（libtorrent 经代理时只开一个 IPv4 的接口）。经它时不接受外部连入、不映射端口、不做本地发现；节点与 tracker
+    /// 的主机名交给代理解析，DHT 引导节点（dht.libtorrent.org）的除外，照样在本机解析。
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
     struct SocksProxy {
         /// 代理的主机名或 IP；空为不经代理
@@ -465,7 +469,8 @@ impl Session {
         self.inner().set_upload_limit(bytes_per_second);
     }
 
-    /// 改经的代理（见 [`SocksProxy`]；`host` 为空时改回直连）：libtorrent 随即重开监听，之后的连接照它，已连着的不断。
+    /// 改经的代理（见 [`SocksProxy`]；`host` 为空时改回直连）：libtorrent 随即重开监听，之后的连接照它，已连着的不断；
+    /// 清掉记着的代理出错（[`NetworkStatus::proxy_error`]）。
     pub fn set_proxy(&self, proxy: &SocksProxy) {
         self.inner().set_proxy(proxy);
     }

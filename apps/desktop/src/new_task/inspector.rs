@@ -251,6 +251,9 @@ impl NewTask {
                     .into_any_element(),
                 );
             }
+            if let Some(problem) = &progress.proxy_problem {
+                body.push(ui::note(format!("BT 代理：{problem}"), true).into_any_element());
+            }
         }
         ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
     }

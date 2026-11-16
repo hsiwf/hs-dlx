@@ -166,6 +166,11 @@ pub fn between_torrent(
     {
         found.push((Level::Warn, format!("tracker 报错：{error}")));
     }
+    if let Some(problem) = &now.proxy_problem
+        && before.is_none_or(|b| b.proxy_problem.as_ref() != Some(problem))
+    {
+        found.push((Level::Warn, format!("BT 代理：{problem}")));
+    }
     found
 }
 

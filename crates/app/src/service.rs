@@ -26,6 +26,7 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
+use crate::socks::ProxyCheck;
 use crate::store::{self, Store};
 use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
 use crate::update::{self, Release, Restart, UpdateFeed, Version};
@@ -225,6 +226,8 @@ struct Shared {
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
     public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 探 BT 代理的任务（BT 会话建起时、改了代理时开始）；再探或关闭时取消
+    proxy_probe: Mutex<Option<AbortOnDropHandle<()>>>,
     /// 代理设置改了（[`Service::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
     proxy_changed: Arc<Notify>,
     /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
@@ -296,6 +299,7 @@ impl Service {
                 settings.torrent_proxy.clone(),
             ),
             public_fetch: Mutex::new(None),
+            proxy_probe: Mutex::new(None),
             proxy_changed: Arc::new(Notify::new()),
             runtime: runtime.handle().clone(),
             seeding: watch::Sender::new(settings.seeding),
@@ -364,8 +368,9 @@ impl Service {
                 seeder.cancel.cancel();
             }
         }
-        // 取公共 tracker 列表的不改存储，不用等
+        // 取公共 tracker 列表、探 BT 代理的不改存储，不用等
         drop(lock(&self.shared.public_fetch).take());
+        drop(lock(&self.shared.proxy_probe).take());
         let tracker = &self.shared.tracker;
         tracker.close();
         let _timed_out = self
@@ -488,11 +493,15 @@ impl Service {
     /// 主机或端口时报 [`Error::InvalidInput`]。
     pub fn set_torrent_proxy(&self, proxy: Option<Url>) -> Result<(), Error> {
         if let Some(url) = &proxy {
-            torrent::check_proxy(url).map_err(Error::InvalidInput)?;
+            crate::socks::check(url).map_err(Error::InvalidInput)?;
         }
         self.shared
             .write(|tx| store::set_torrent_proxy(tx, proxy.as_ref()))?;
         self.shared.bt.set_proxy(proxy);
+        // BT 会话已建时随即探；还没建时等建起时探
+        if self.shared.bt.existing().is_some() {
+            self.shared.probe_torrent_proxy();
+        }
         Ok(())
     }
 
@@ -1117,7 +1126,26 @@ impl Shared {
             ));
             *lock(&self.public_fetch) = Some(AbortOnDropHandle::new(fetching));
         }
+        self.probe_torrent_proxy();
         Ok(engine)
+    }
+
+    /// 设了 BT 代理而还没探时探它（见 [`crate::socks::probe`]），结果交给 BT 引擎；之前在探的随之取消。
+    fn probe_torrent_proxy(self: &Arc<Self>) {
+        let Some(url) = self.bt.begin_proxy_probe() else {
+            return;
+        };
+        let shared = Arc::downgrade(self);
+        let probing = self.runtime.spawn(async move {
+            let check = match crate::socks::probe(&url).await {
+                Ok(()) => ProxyCheck::Usable,
+                Err(why) => ProxyCheck::Unusable(why),
+            };
+            if let Some(shared) = shared.upgrade() {
+                shared.bt.set_proxy_check(&url, check);
+            }
+        });
+        *lock(&self.proxy_probe) = Some(AbortOnDropHandle::new(probing));
     }
 
     /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；

@@ -3,6 +3,8 @@
 
 use std::num::NonZeroU32;
 
+use crate::socks::ProxyCheck;
+
 /// 诊断的一项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckItem {
@@ -42,8 +44,8 @@ pub struct Check {
 /// 诊断时查到的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Facts {
-    /// 经的 SOCKS5 代理（去掉凭据的写法）；直连时为 None。经代理时不接受外部连入、不映射端口
-    pub proxy: Option<String>,
+    /// 经的 SOCKS5 代理；直连时为 None。经代理时不接受外部连入、不映射端口
+    pub proxy: Option<ProxyFact>,
     /// 在监听的端口；0 为没在监听
     pub listen_port: u16,
     pub listen_error: String,
@@ -68,6 +70,16 @@ pub(crate) struct Facts {
     pub public: Public,
     /// 上传限速，字节每秒；None 为不限
     pub upload_limit: Option<NonZeroU32>,
+}
+
+/// BT 代理的状况。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyFact {
+    /// 去掉凭据的地址
+    pub address: String,
+    pub check: ProxyCheck,
+    /// libtorrent 经它的 UDP 最近一次出的错；没有时为空
+    pub error: String,
 }
 
 /// 公共 tracker 的状况。
@@ -128,13 +140,31 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     let check = |item, level, text: String| Check { item, level, text };
     let mut checks = Vec::new();
     if let Some(proxy) = &facts.proxy {
-        checks.push(check(
-            CheckItem::Listen,
-            CheckLevel::Ok,
-            format!(
-                "经 SOCKS5 代理 {proxy} 连节点、tracker 与 DHT：外面连不进来，只能主动去连别人"
+        let address = &proxy.address;
+        checks.push(match &proxy.check {
+            ProxyCheck::Unusable(why) => check(
+                CheckItem::Listen,
+                CheckLevel::Bad,
+                format!("BT 代理用不了：{why}"),
             ),
-        ));
+            _ if !proxy.error.is_empty() => check(
+                CheckItem::Listen,
+                CheckLevel::Warn,
+                format!("BT 代理 {address} 最近出错：{}", proxy.error),
+            ),
+            ProxyCheck::Usable => check(
+                CheckItem::Listen,
+                CheckLevel::Ok,
+                format!(
+                    "经 SOCKS5 代理 {address} 连节点、tracker 与 DHT：外面连不进来，只能主动去连别人"
+                ),
+            ),
+            ProxyCheck::Direct | ProxyCheck::Unchecked | ProxyCheck::Checking => check(
+                CheckItem::Listen,
+                CheckLevel::Warn,
+                format!("在探 BT 代理 {address}"),
+            ),
+        });
         checks.push(check(
             CheckItem::PortMapping,
             CheckLevel::Ok,
@@ -235,6 +265,12 @@ fn checks_after_connectivity(facts: &Facts, mut checks: Vec<Check>) -> Vec<Check
             CheckLevel::Ok,
             "私有种子不用 DHT".to_owned(),
         ),
+        (false, Some(0)) if facts.proxy.is_some() => check(
+            CheckItem::Dht,
+            CheckLevel::Warn,
+            "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有多半是 BT 代理连不上或不转发 UDP（见第一项）"
+                .to_owned(),
+        ),
         (false, Some(0)) => check(
             CheckItem::Dht,
             CheckLevel::Warn,
@@ -317,7 +353,7 @@ fn checks_after_connectivity(facts: &Facts, mut checks: Vec<Check>) -> Vec<Check
             CheckItem::PublicTrackers,
             CheckLevel::Warn,
             format!(
-                "公共 tracker 列表没取到（{why}）：隔一阵再取；取到之前只靠种子里的 tracker 与 DHT 找节点，可检查代理设置"
+                "公共 tracker 列表没取到（{why}）：隔一阵再取；取到之前只靠种子里的 tracker 与 DHT 找节点，可检查设置里的「代理」"
             ),
         ),
         Public::Covered => check(
@@ -529,9 +565,13 @@ mod tests {
         assert!(text(&facts, CheckItem::Trackers).contains("其余的还没回应"));
         facts.trackers = vec![tracker(false)];
         assert!(text(&facts, CheckItem::Trackers).contains("还没回应"));
-        // 经代理：不接受连入、不映射端口不算问题
+        // 经代理：不接受连入、不映射端口不算问题；代理用不了、出过错时报在第一项
         let mut facts = healthy();
-        facts.proxy = Some("socks5://127.0.0.1:1080".into());
+        facts.proxy = Some(ProxyFact {
+            address: "socks5://127.0.0.1:1080".into(),
+            check: ProxyCheck::Usable,
+            error: String::new(),
+        });
         facts.listen_port = 0;
         facts.upnp_port = 0;
         facts.incoming = false;
@@ -542,6 +582,14 @@ mod tests {
         );
         assert!(text(&facts, CheckItem::Listen).contains("socks5://127.0.0.1:1080"));
         assert_eq!(checks(&facts).len(), checks(&healthy()).len());
+        let proxy = facts.proxy.as_mut().unwrap();
+        proxy.error = "connection refused".into();
+        assert_eq!(level(&facts, CheckItem::Listen), CheckLevel::Warn);
+        facts.proxy.as_mut().unwrap().check = ProxyCheck::Unusable("代理不转发 UDP".into());
+        assert_eq!(level(&facts, CheckItem::Listen), CheckLevel::Bad);
+        assert!(text(&facts, CheckItem::Listen).contains("不转发 UDP"));
+        facts.dht_nodes = Some(0);
+        assert!(text(&facts, CheckItem::Dht).contains("BT 代理"));
         // 公共 tracker：没取到时带上原因；私有种子不补
         let mut facts = healthy();
         facts.public = Public::Failed("connection refused".into());

@@ -48,6 +48,12 @@ impl Tasks {
         self.quit
     }
 
+    /// 撤回过几次退出（[`Tasks::stay`]）：比较前后两次的值即知其间有没有撤回。问完接着再问
+    /// （[`Tasks::stay_unanswered`]）不算撤回。
+    pub fn stays(&self) -> u64 {
+        self.stays
+    }
+
     /// 有任务在运行、继续、放弃或新建：退出要等它们。
     pub fn busy(&self) -> usize {
         self.creating
@@ -157,6 +163,7 @@ impl Tasks {
     /// 不退出：在等答复的系统退出请求随之取消（注销、关机不再进行）。
     pub fn stay(&mut self) {
         self.quit = Quit::Staying;
+        self.stays += 1;
         #[cfg(target_os = "macos")]
         hs_dlx_macos::reply_to_terminate(false);
     }
