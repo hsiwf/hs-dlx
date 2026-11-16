@@ -24,7 +24,9 @@ pub use failure::{Failure, FailureKind, not_a_playlist};
 pub use naming::{file_name, task_title, title_of};
 pub use netcheck::{NetCheck, NetItem, NetworkReport};
 pub use preference::StoredPreference;
-pub use service::{Downloaded, Event, Events, MetadataFetch, Service, UpdateDownload};
+pub use service::{
+    Downloaded, Event, Events, MetadataFetch, MetadataHandle, Service, UpdateDownload,
+};
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{

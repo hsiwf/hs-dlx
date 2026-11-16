@@ -356,8 +356,9 @@ impl SettingsView {
                 Ok(()) => {
                     self.torrent_proxy = None;
                     self.torrent_proxy_picked = false;
-                    // 检测结果是按旧的设置量的
+                    // 检测结果（与在做的检测）是按旧的设置量的
                     self.network_report = None;
+                    self.network_check = None;
                 }
                 Err(error) => self.torrent_proxy_error = Some(error.to_string()),
             }
@@ -382,8 +383,9 @@ impl SettingsView {
             Ok(url) => {
                 self.torrent_proxy = Some(url);
                 self.torrent_proxy_error = None;
-                // 检测结果是按旧的设置量的
+                // 检测结果（与在做的检测）是按旧的设置量的
                 self.network_report = None;
+                self.network_check = None;
             }
             Err(reason) => self.torrent_proxy_error = Some(reason),
         }

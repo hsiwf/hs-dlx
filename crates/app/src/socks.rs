@@ -97,12 +97,6 @@ pub(crate) fn libtorrent_proxy(url: Option<&Url>) -> SocksProxy {
     }
 }
 
-/// 照 libtorrent 经代理时的步骤探 `url`（已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有用户名选认证
-/// 方式、申请转发 UDP，看它回的转发地址是不是 IPv4。用不了时为原因；[`PROBE_TIMEOUT`] 内没做完也算用不了。
-pub(crate) async fn probe(url: &Url) -> Result<(), String> {
-    associate(url).await.map(drop)
-}
-
 /// 经代理转发 UDP 的通道：控制连接断开即失效。
 pub(crate) struct UdpRelay {
     /// 控制连接：持有期间转发有效
@@ -111,7 +105,9 @@ pub(crate) struct UdpRelay {
     pub address: SocketAddr,
 }
 
-/// 照 [`probe`] 的步骤谈好 UDP 转发并留着控制连接；用不了时为原因。
+/// 照 libtorrent 经代理时的步骤谈 UDP 转发（`url` 已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有
+/// 用户名选认证方式、申请转发 UDP，看它回的转发地址 libtorrent 用不用得了；谈好时留着控制连接。用不了时为原因，
+/// [`PROBE_TIMEOUT`] 内没做完也算用不了。
 pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, String> {
     let proxy = libtorrent_proxy(Some(url));
     tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy))
@@ -175,9 +171,12 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
             stream.read_exact(&mut bound).await.map_err(io)?;
             let ip = Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]);
             let port = u16::from_be_bytes([bound[4], bound[5]]);
-            // libtorrent 照原样发往 0.0.0.0：在 macOS 与 Linux 上即本机，只有代理在本机时才到得了它；Windows 上发不出
+            // libtorrent 照原样发往 0.0.0.0：在 macOS 与 Linux 上即本机，只有代理在本机（回环或本机网卡的地址，后者绑得
+            // 上）时才到得了它；Windows 上发不出
             if ip.is_unspecified() {
-                if !address.ip().is_loopback() || cfg!(target_os = "windows") {
+                let local = address.ip().is_loopback()
+                    || std::net::UdpSocket::bind((address.ip(), 0)).is_ok();
+                if !local || cfg!(target_os = "windows") {
                     return Err(format!(
                         "代理 {at} 回的 UDP 转发地址是 0.0.0.0：libtorrent 发不到代理那里，DHT、uTP 与 UDP 的 tracker 经不了它"
                     ));

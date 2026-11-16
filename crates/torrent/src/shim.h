@@ -49,7 +49,7 @@ public:
 	std::uint16_t listen_port() const;
 	void set_upload_limit(std::int32_t bytes_per_second) const;
 	void set_proxy(SocksProxy const& proxy) const;
-	void clear_proxy_error() const;
+	void reconnect_proxy(SocksProxy const& proxy) const;
 	NetworkStatus network() const;
 	void request_stats() const;
 	rust::Vec<TrackerState> trackers(rust::Str id) const;

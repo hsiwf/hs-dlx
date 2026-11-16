@@ -115,8 +115,8 @@ pub(crate) struct Proxied {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Measured {
     pub dht: Dht,
-    /// UDP 的 tracker 握手；公共 tracker 列表没取到时为 None
-    pub trackers: Option<Ratio>,
+    /// UDP 的 tracker 握手；没测时为原因（公共 tracker 列表还没取到等）
+    pub trackers: Result<Ratio, String>,
     /// IPv6：没有公网地址时为 None；有时为 IPv6 的 DHT 引导节点（解析不出的不算），开不了套接字时为原因
     pub ipv6: Option<Result<Ratio, String>>,
     /// 设了 BT 代理时
@@ -149,14 +149,65 @@ pub struct NetworkReport {
     pub verdict: String,
 }
 
-/// 设了 BT 代理而经它的引导节点一个都没回、直连的却有回的：代理接了 UDP 转发却没转发出去（节点不支持 UDP 等）。
+/// 设了 BT 代理而经它的引导节点一个都没回、直连的却有回的：代理接了 UDP 转发却没转发出去（节点不支持 UDP 等）。引导
+/// 节点解析成了 TUN 代理的假地址时（见 [`Dht::tun`]）不下这个结论：假地址经别的代理本来就到不了。
 pub(crate) fn drops_udp(direct: &Dht, proxied: &Dht) -> bool {
-    direct.bootstrap.replied > 0 && proxied.bootstrap.asked > 0 && proxied.bootstrap.replied == 0
+    !proxied.tun
+        && direct.bootstrap.replied > 0
+        && proxied.bootstrap.asked > 0
+        && proxied.bootstrap.replied == 0
 }
 
 /// 代理接了 UDP 转发却没转发出去时的说明。
 pub(crate) const DROPS_UDP: &str =
     "代理接了 UDP 转发，但没转发出去：代理的节点可能不支持 UDP，换节点或在代理里打开 UDP";
+
+/// 探 BT 代理的结论：握手或申请转发 UDP 没成（`through` 为原因）、或没转发出去（见 [`drops_udp`]）时为用不了。
+pub(crate) fn judge_proxy(direct: &Dht, through: &Result<Dht, String>) -> ProxyCheck {
+    match through {
+        Err(why) => ProxyCheck::Unusable(why.clone()),
+        Ok(through) if drops_udp(direct, through) => ProxyCheck::Unusable(DROPS_UDP.to_owned()),
+        Ok(_) => ProxyCheck::Usable,
+    }
+}
+
+/// 经 BT 代理 `url` 探 DHT：握手、申请转发 UDP，再经它向引导节点 `hosts` 要节点（`hosts` 为空时只握手）。握手或申请
+/// 没成时内层为原因；开不了本机的 UDP 套接字时为外层的错。
+pub(crate) async fn through_proxy(
+    url: &Url,
+    hosts: &[(&'static str, u16)],
+) -> std::io::Result<Result<Dht, String>> {
+    let relay = match crate::socks::associate(url).await {
+        Ok(relay) => relay,
+        Err(why) => return Ok(Err(why)),
+    };
+    let udp = Udp::via(relay).await?;
+    let (found, unresolved) = bootstrap(hosts, false).await;
+    Ok(Ok(dht(&udp, &found, unresolved).await))
+}
+
+/// 探 BT 代理 `url` 能不能用（同网络检测的判据，见 [`judge_proxy`]）：经它的引导节点一个都没回时，再从本机直连问一次
+/// 作比较。开不了本机的 UDP 套接字时也算用不了，原因写明。
+pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> ProxyCheck {
+    let socket =
+        |error: std::io::Error| ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}"));
+    let through = match through_proxy(url, hosts).await {
+        Ok(through) => through,
+        Err(error) => return socket(error),
+    };
+    let direct = match &through {
+        Ok(through) if through.bootstrap.asked > 0 && through.bootstrap.replied == 0 => {
+            let udp = match Udp::direct(false).await {
+                Ok(udp) => udp,
+                Err(error) => return socket(error),
+            };
+            let (found, unresolved) = bootstrap(hosts, false).await;
+            dht(&udp, &found, unresolved).await
+        }
+        _ => Dht::default(),
+    };
+    judge_proxy(&direct, &through)
+}
 
 /// 照量到的下结论。
 pub(crate) fn report(measured: &Measured) -> NetworkReport {
@@ -199,13 +250,18 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
             ),
         ),
     }];
-    checks.push(match measured.trackers {
-        None => check(
+    checks.push(match &measured.trackers {
+        Err(why) => check(
             NetItem::UdpTrackers,
             CheckLevel::Warn,
-            "公共 tracker 列表还没取到（BT 用过之后才取），没测 UDP 的 tracker".to_owned(),
+            format!("没测 UDP 的 tracker：{why}"),
         ),
-        Some(ratio) if ratio.replied > 0 => check(
+        Ok(ratio) if ratio.asked == 0 => check(
+            NetItem::UdpTrackers,
+            CheckLevel::Warn,
+            "公共 tracker 列表里没有写成 IP 地址的 UDP tracker，没测".to_owned(),
+        ),
+        Ok(ratio) if ratio.replied > 0 => check(
             NetItem::UdpTrackers,
             CheckLevel::Ok,
             format!(
@@ -213,7 +269,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
                 ratio.asked, ratio.replied
             ),
         ),
-        Some(ratio) => check(
+        Ok(ratio) => check(
             NetItem::UdpTrackers,
             CheckLevel::Bad,
             format!("UDP 的 tracker {} 个都没回", ratio.asked),
@@ -288,7 +344,7 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
     // 出口 IP 与路由器的外网 IPv4 一比即知是不是运营商级 NAT；经 TUN 代理时量到的是代理的出口，不比
     let nat_hint = match dht.external {
         Some(ip) if !dht.tun => format!(
-            "；DHT 节点看到的出口 IP 为 {ip}，路由器管理页里的外网 IPv4 与它不同即是运营商级 NAT，映射也没用"
+            "；DHT 节点看到的出口 IP 为 {ip}：没开 VPN 或全局代理时，路由器管理页里的外网 IPv4 与它不同即是运营商级 NAT，映射也没用"
         ),
         _ => String::new(),
     };
@@ -751,7 +807,7 @@ mod tests {
     fn healthy() -> Measured {
         Measured {
             dht: dht_of(ratio(4, 3), ratio(32, 14)),
-            trackers: Some(ratio(17, 12)),
+            trackers: Ok(ratio(17, 12)),
             ipv6: None,
             proxy: None,
             session: Some(Session {
@@ -767,7 +823,7 @@ mod tests {
         let mut measured = healthy();
         measured.dht = dht_of(ratio(4, 1), ratio(32, 1));
         measured.dht.external = Some(Ipv4Addr::new(120, 229, 78, 85).into());
-        measured.trackers = Some(ratio(17, 4));
+        measured.trackers = Ok(ratio(17, 4));
         measured.ipv6 = Some(Ok(ratio(2, 0)));
         measured.session = Some(Session {
             listen_error: None,
@@ -890,6 +946,14 @@ mod tests {
         let tun = report(&tun);
         assert!(text(&tun, NetItem::Dht).contains("TUN"));
         assert!(!text(&tun, NetItem::Incoming).contains("运营商级 NAT"));
+        // 公共 tracker 列表没取到：写明原因，不说「BT 用过之后才取」
+        let mut failed = healthy();
+        failed.trackers = Err("公共 tracker 列表没取到（连不上）".into());
+        assert!(text(&report(&failed), NetItem::UdpTrackers).contains("连不上"));
+        // 经 TUN 的假地址经别的代理到不了：不说代理没转发
+        let mut proxied_tun = dht_of(ratio(4, 0), ratio(0, 0));
+        proxied_tun.tun = true;
+        assert!(!drops_udp(&healthy().dht, &proxied_tun));
         // BT 没用过、监听失败
         let mut fresh = healthy();
         fresh.session = None;

@@ -454,9 +454,13 @@ void Session::set_proxy(SocksProxy const& proxy) const {
 	m_network.proxy_error.clear();
 }
 
-void Session::clear_proxy_error() const {
-	std::lock_guard<std::mutex> net(m_network_mutex);
-	m_network.proxy_error.clear();
+void Session::reconnect_proxy(SocksProxy const& proxy) const {
+	// 只有代理的设置变了 libtorrent 才重连（设成同样的值不重连），而握手、认证被拒后它不再自己重试：先换成另一个端口
+	// 再换回。代理类型不变，其间不会直连
+	lt::settings_pack detour;
+	detour.set_int(lt::settings_pack::proxy_port, proxy.port == 1 ? 2 : 1);
+	m_session.apply_settings(std::move(detour));
+	set_proxy(proxy);
 }
 
 void Session::set_upload_limit(std::int32_t bytes_per_second) const {

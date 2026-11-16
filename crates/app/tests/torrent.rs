@@ -408,6 +408,30 @@ fn torrent_drafts_are_checked() {
     drop(seeder);
 }
 
+/// 取种子信息时取消（释放句柄）后马上再取同一个磁力链接：加得进，不报「正在取」或「还在移除中」。
+#[test]
+fn a_cancelled_fetch_can_be_retried_at_once() {
+    let dir = test_dir("refetch");
+    let rt = runtime();
+    let (service, _events) = service(&dir.join("tasks.sqlite"));
+    // 没有节点、不补 tracker：一直取不到
+    let uri = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+    for round in 0..10 {
+        let mut fetch = service.fetch_metadata(uri.clone()).unwrap();
+        // 第一次报进度时已加进会话
+        let added = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), fetch.progress.changed()).await
+        });
+        assert!(matches!(added, Ok(Ok(()))), "第 {round} 次没加进会话");
+        // 句柄在这里释放，下一轮随即再取
+        let ended = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), fetch.resume).await
+        });
+        assert!(ended.is_err(), "第 {round} 次没取到也结束了：{ended:?}");
+    }
+    drop(service);
+}
+
 /// 等到 `pick` 认的一个事件（期间的别的丢掉），返回它认出的；60 秒内没等到即失败。
 async fn event<T>(
     events: &mut mpsc::UnboundedReceiver<Event>,

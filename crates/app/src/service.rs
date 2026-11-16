@@ -46,7 +46,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
 /// 网络检测最多做多久：解析各 3 秒、两轮各等 2 秒、经代理的握手最多 10 秒，并行做完约 10 秒。
 const NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
-/// 设了 BT 代理时多久看一眼它（见 `Shared::probe_torrent_proxy`）。
+/// 设了 BT 代理时多久看一眼它（见 `Shared::watch_torrent_proxy`）。
 const PROXY_RECHECK: Duration = Duration::from_secs(30);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -119,7 +119,30 @@ pub type Events = mpsc::UnboundedReceiver<Event>;
 pub struct MetadataFetch {
     pub progress: watch::Receiver<MetadataProgress>,
     /// 结果为种子的续传数据；释放即停止取
-    pub resume: AbortOnDropHandle<Result<Vec<u8>, Error>>,
+    pub resume: MetadataHandle,
+}
+
+/// 取种子信息的句柄：可等待，结果同 [`tokio::task::JoinHandle`]。释放即停止取，加进 BT 会话的种子当场移除。
+pub struct MetadataHandle {
+    task: AbortOnDropHandle<Result<Vec<u8>, Error>>,
+    slot: torrent::FetchSlot,
+}
+
+impl Future for MetadataHandle {
+    type Output = Result<Result<Vec<u8>, Error>, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx)
+    }
+}
+
+impl Drop for MetadataHandle {
+    fn drop(&mut self) {
+        self.slot.close();
+    }
 }
 
 /// 一个正在运行的任务。
@@ -230,8 +253,9 @@ struct Shared {
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
     public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
-    /// 探 BT 代理的任务（BT 会话建起时、改了代理时开始）；再探或关闭时取消
-    proxy_probe: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 看着 BT 代理的任务与它看着的地址（BT 会话已建、设了代理时有，见 `Shared::watch_torrent_proxy`）；改了代理或
+    /// 关闭时取消
+    proxy_probe: Mutex<Option<(Url, AbortOnDropHandle<()>)>>,
     /// 代理设置改了（[`Service::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
     proxy_changed: Arc<Notify>,
     /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
@@ -518,9 +542,10 @@ impl Service {
         self.shared
             .write(|tx| store::set_torrent_proxy(tx, proxy.as_ref()))?;
         self.shared.bt.set_proxy(proxy);
-        // BT 会话已建时随即探；还没建时等建起时探
+        // 重新开始看着（存的与之前相同时也随即再探）：BT 会话已建时随即开始；还没建时等建起时
+        drop(lock(&self.shared.proxy_probe).take());
         if self.shared.bt.existing().is_some() {
-            self.shared.probe_torrent_proxy();
+            self.shared.watch_torrent_proxy();
         }
         Ok(())
     }
@@ -680,12 +705,20 @@ impl Service {
         let engine = self.shared.bt_engine()?;
         let (progress, receiver) = watch::channel(MetadataProgress::default());
         let probe_dir = self.shared.bt.probe_dir().to_path_buf();
-        let handle = self
-            .runtime()
-            .spawn(torrent::fetch_metadata(engine, uri, probe_dir, progress));
+        let slot = torrent::FetchSlot::default();
+        let handle = self.runtime().spawn(torrent::fetch_metadata(
+            engine,
+            uri,
+            probe_dir,
+            progress,
+            slot.clone(),
+        ));
         Ok(MetadataFetch {
             progress: receiver,
-            resume: AbortOnDropHandle::new(handle),
+            resume: MetadataHandle {
+                task: AbortOnDropHandle::new(handle),
+                slot,
+            },
         })
     }
 
@@ -1146,7 +1179,7 @@ impl Shared {
             ));
             *lock(&self.public_fetch) = Some(AbortOnDropHandle::new(fetching));
         }
-        self.probe_torrent_proxy();
+        self.watch_torrent_proxy();
         Ok(engine)
     }
 
@@ -1182,51 +1215,38 @@ impl Shared {
             })
         };
         let udp_trackers = async {
-            match self.bt.public_list(Duration::ZERO).await {
-                Some(list) => Some(netcheck::udp_trackers(&trackers, &list).await),
-                None => None,
+            match self.bt.public() {
+                PublicTrackers::Ready(list) => Ok(netcheck::udp_trackers(&trackers, &list).await),
+                PublicTrackers::Off => Err("不补公共 tracker".to_owned()),
+                PublicTrackers::Idle => Err("公共 tracker 列表在 BT 用过之后才取".to_owned()),
+                PublicTrackers::Fetching => Err("公共 tracker 列表还在取".to_owned()),
+                PublicTrackers::Failed(why) => Err(format!("公共 tracker 列表没取到（{why}）")),
             }
         };
         let proxy_url = self.bt.proxy_url();
         let proxied = async {
             let url = proxy_url.as_ref()?;
-            let address = hs_m3u8_core::bare_url(url);
-            Some(match crate::socks::associate(url).await {
-                Ok(relay) => match Udp::via(relay).await {
-                    Ok(udp) => {
-                        let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
-                        let dht = netcheck::dht(&udp, &found, unresolved).await;
-                        Ok((url, address, Some(dht), None))
-                    }
-                    Err(error) => Err(socket(error)),
-                },
-                Err(why) => Ok((url, address, None, Some(why))),
-            })
+            Some(netcheck::through_proxy(url, &DHT_BOOTSTRAP).await)
         };
         let (dht, ipv6, trackers, proxied) = tokio::join!(direct, ipv6, udp_trackers, proxied);
-        let proxy = match proxied.transpose()? {
-            None => None,
-            Some((url, address, through, why)) => {
+        let proxy = match (proxy_url, proxied) {
+            (Some(url), Some(through)) => {
+                let through = through.map_err(socket)?;
                 // 记进 BT 引擎：取种子信息的界面与诊断随之更新
-                let check = match (&why, &through) {
-                    (Some(why), _) => ProxyCheck::Unusable(why.clone()),
-                    (None, Some(through)) if netcheck::drops_udp(&dht, through) => {
-                        ProxyCheck::Unusable(netcheck::DROPS_UDP.to_owned())
-                    }
-                    (None, _) => ProxyCheck::Usable,
+                self.bt
+                    .set_proxy_check(&url, netcheck::judge_proxy(&dht, &through));
+                let (check, dht) = match through {
+                    // 报告里「没转发出去」另有说明，握手本身算通
+                    Ok(through) => (ProxyCheck::Usable, Some(through)),
+                    Err(why) => (ProxyCheck::Unusable(why), None),
                 };
-                self.bt.set_proxy_check(url, check.clone());
                 Some(netcheck::Proxied {
-                    address,
-                    // 报告里「没转发出去」另有说明，探测本身算通
-                    check: if why.is_some() {
-                        check
-                    } else {
-                        ProxyCheck::Usable
-                    },
-                    dht: through,
+                    address: hs_m3u8_core::bare_url(&url),
+                    check,
+                    dht,
                 })
             }
+            _ => None,
         };
         Ok(netcheck::report(&netcheck::Measured {
             dht,
@@ -1237,37 +1257,42 @@ impl Shared {
         }))
     }
 
-    /// 设了 BT 代理而还没探时开始看着它（之前看着的随之取消）：先探一次，之后每 [`PROXY_RECHECK`] 看一眼，探出用不了
-    /// 或 libtorrent 经它的 UDP 报过错时再探；探到能用即清掉 libtorrent 记着的出错。代理改了或服务释放即止。
-    fn probe_torrent_proxy(self: &Arc<Self>) {
-        let Some(url) = self.bt.begin_proxy_probe() else {
+    /// 照现在的 BT 代理看着它：已在看着同一个地址时不动；改了或改成直连时停下看着旧的，设了时开始看着新的。看着时每
+    /// [`PROXY_RECHECK`] 看一眼，还没探、探出用不了，或 libtorrent 经它报过错时探一次（见
+    /// [`crate::netcheck::probe_proxy`]），记下结果；探到能用即清掉 libtorrent 记着的出错。服务释放即止。
+    fn watch_torrent_proxy(self: &Arc<Self>) {
+        let url = self.bt.proxy_url();
+        let mut watching = lock(&self.proxy_probe);
+        if let (Some((watched, _)), Some(url)) = (&*watching, &url)
+            && watched == url
+        {
+            return;
+        }
+        *watching = None;
+        let Some(url) = url else {
             return;
         };
         let shared = Arc::downgrade(self);
+        let hosts = self.bt.dht_bootstrap();
+        let watched = url.clone();
         let probing = self.runtime.spawn(async move {
             let mut ticks = tokio::time::interval(PROXY_RECHECK);
             loop {
                 ticks.tick().await;
-                let due = match shared.upgrade() {
-                    Some(shared) if shared.bt.proxy_url().as_ref() == Some(&url) => {
-                        shared.bt.proxy_needs_probe()
-                    }
-                    _ => return,
-                };
-                if !due {
-                    continue;
+                match shared.upgrade().map(|shared| shared.bt.proxy_due(&url)) {
+                    Some(Some(true)) => {}
+                    Some(Some(false)) => continue,
+                    // 代理改了或服务已释放
+                    Some(None) | None => return,
                 }
-                let check = match crate::socks::probe(&url).await {
-                    Ok(()) => ProxyCheck::Usable,
-                    Err(why) => ProxyCheck::Unusable(why),
-                };
+                let check = crate::netcheck::probe_proxy(&url, hosts).await;
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
                 shared.bt.set_proxy_check(&url, check);
             }
         });
-        *lock(&self.proxy_probe) = Some(AbortOnDropHandle::new(probing));
+        *watching = Some((watched, AbortOnDropHandle::new(probing)));
     }
 
     /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；

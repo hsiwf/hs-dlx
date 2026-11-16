@@ -278,7 +278,7 @@ mod ffi {
         fn listen_port(self: &Session) -> u16;
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
         fn set_proxy(self: &Session, proxy: &SocksProxy);
-        fn clear_proxy_error(self: &Session);
+        fn reconnect_proxy(self: &Session, proxy: &SocksProxy);
         fn network(self: &Session) -> NetworkStatus;
         fn request_stats(self: &Session);
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
@@ -477,9 +477,11 @@ impl Session {
         self.inner().set_proxy(proxy);
     }
 
-    /// 清掉记着的代理出错（[`NetworkStatus::proxy_error`]）：已确认代理现在能用时（libtorrent 自己重连上不报事件）。
-    pub fn clear_proxy_error(&self) {
-        self.inner().clear_proxy_error();
+    /// 让 libtorrent 重新连一次 SOCKS5 代理 `proxy`（与现在设的相同），并清掉记着的代理出错
+    /// （[`NetworkStatus::proxy_error`]）。libtorrent 在代理握手、认证或转发 UDP 被拒后不再自己重试，代理修好之后要这样
+    /// 才用得上；其间不会直连。
+    pub fn reconnect_proxy(&self, proxy: &SocksProxy) {
+        self.inner().reconnect_proxy(proxy);
     }
 
     /// 网络状况（监听与端口映射随事件更新，DHT 与连入要 [`Session::request_stats`] 之后才新）。

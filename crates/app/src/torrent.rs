@@ -759,70 +759,68 @@ impl Bt {
         })
     }
 
-    /// 代理设了而还没探时记为在探，返回要探的地址（由调用方去探，结果交给 [`Bt::set_proxy_check`]）；直连、已在探或
-    /// 探过时为 None。
-    pub fn begin_proxy_probe(&self) -> Option<Url> {
-        let proxy = lock(&self.proxy);
-        let url = proxy.as_ref()?;
-        self.proxy_check
-            .send_if_modified(|check| {
-                let unchecked = *check == ProxyCheck::Unchecked;
-                if unchecked {
-                    *check = ProxyCheck::Checking;
-                }
-                unchecked
-            })
-            .then(|| url.clone())
-    }
-
     /// 经的代理的地址；直连时为 None。
     pub fn proxy_url(&self) -> Option<Url> {
         lock(&self.proxy).clone()
     }
 
-    /// 公共 tracker 列表：正在取时最多等 `wait`；取到时为它，没取到、等不到或不补时为 None。
-    pub async fn public_list(&self, wait: Duration) -> Option<Arc<[String]>> {
-        let mut public = self.public.subscribe();
-        let settled = tokio::time::timeout(
-            wait,
-            public.wait_for(|public| {
-                !matches!(public, PublicTrackers::Idle | PublicTrackers::Fetching)
-            }),
-        )
-        .await;
-        match settled {
-            Ok(Ok(public)) => match &*public {
-                PublicTrackers::Ready(list) => Some(list.clone()),
-                _ => None,
-            },
-            _ => None,
+    /// 公共 tracker 列表现在的状况。
+    pub(crate) fn public(&self) -> PublicTrackers {
+        self.public.borrow().clone()
+    }
+
+    /// 探 BT 代理时问的 DHT 引导节点：只连本机时（测试）为空，只握手。
+    pub(crate) fn dht_bootstrap(&self) -> &'static [(&'static str, u16)] {
+        match self.network {
+            TorrentNetwork::Internet => &crate::netcheck::DHT_BOOTSTRAP,
+            TorrentNetwork::Loopback { .. } => &[],
         }
     }
 
-    /// 记下探 `url` 的结果；代理已改成别的时不记。探到能用时清掉 libtorrent 记着的经它的出错（那是之前的，它自己已重连）。
+    /// 记下探 `url` 的结果；代理已改成别的时不记。之前探出用不了、或 libtorrent 经它报过错，而这次探到能用时，让
+    /// libtorrent 重连代理（它在握手、认证或转发 UDP 被拒后不再自己重试）并清掉那条出错。
     pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
         let running = lock(&self.running);
         if lock(&self.proxy).as_ref() != Some(url) {
             return;
         }
+        let previous = self.proxy_check.send_replace(check.clone());
         if check == ProxyCheck::Usable
             && let Some(running) = &*running
         {
-            running.engine.session.clear_proxy_error();
+            let session = &running.engine.session;
+            if matches!(previous, ProxyCheck::Unusable(_))
+                || !session.network().proxy_error.is_empty()
+            {
+                session.reconnect_proxy(&libtorrent_proxy(Some(url)));
+            }
         }
-        self.proxy_check.send_replace(check);
     }
 
-    /// 设了代理，而还在探、探出用不了，或 libtorrent 经它的 UDP 报过错：该再探一次。
-    pub fn proxy_needs_probe(&self) -> bool {
-        let errored = lock(&self.running)
+    /// 经的代理还是 `url` 时，该不该再探：还没探（随即记为在探）、在探、探出用不了，或 libtorrent 经它报过错时该；
+    /// 代理已改成别的或直连时为 None。
+    pub fn proxy_due(&self, url: &Url) -> Option<bool> {
+        let running = lock(&self.running);
+        if lock(&self.proxy).as_ref() != Some(url) {
+            return None;
+        }
+        let errored = running
             .as_ref()
             .is_some_and(|running| !running.engine.session.network().proxy_error.is_empty());
-        errored
-            || matches!(
-                *self.proxy_check.borrow(),
-                ProxyCheck::Checking | ProxyCheck::Unusable(_)
-            )
+        let mut due = errored;
+        self.proxy_check.send_if_modified(|check| match check {
+            ProxyCheck::Unchecked => {
+                *check = ProxyCheck::Checking;
+                due = true;
+                true
+            }
+            ProxyCheck::Checking | ProxyCheck::Unusable(_) => {
+                due = true;
+                false
+            }
+            ProxyCheck::Direct | ProxyCheck::Usable => false,
+        });
+        Some(due)
     }
 
     /// 已建的引擎；还没建会话时为 None。
@@ -865,6 +863,7 @@ pub(crate) async fn fetch_metadata(
     uri: String,
     probe_dir: PathBuf,
     progress: watch::Sender<MetadataProgress>,
+    slot: FetchSlot,
 ) -> Result<Vec<u8>, Error> {
     let save_path = utf8(&probe_dir)?;
     let not_added =
@@ -872,14 +871,12 @@ pub(crate) async fn fetch_metadata(
     // 同一个磁力链接刚取消或取完、还在移除时，等它移除完再加
     let pending = hs_dlx_torrent::magnet_id(&uri).map_err(not_added)?;
     engine.settled(&pending).await?;
-    let id = engine
-        .session
-        .add_magnet(&uri, save_path)
-        .map_err(not_added)?;
-    let probe = Probe {
-        engine: engine.clone(),
-        id: id.clone(),
-    };
+    let id = slot.add(&engine, || {
+        engine
+            .session
+            .add_magnet(&uri, save_path)
+            .map_err(not_added)
+    })?;
     // 加进去之后才登记：同一个种子已在会话里时上面就报错了，不会抢别人的事件
     let mut owner = engine.own(&id)?;
     // 还不知道私不私有：链接没带 tracker 时才补（带了的可能是私有种子的 tracker，不让信息哈希经公共 tracker 传出去）
@@ -941,7 +938,7 @@ pub(crate) async fn fetch_metadata(
             alert.message
         )));
     }
-    drop(probe);
+    slot.finish();
     drop(owner);
     Ok(alert.data)
 }
@@ -956,6 +953,56 @@ impl Drop for Probe {
     fn drop(&mut self) {
         // 移除不了只在它已不在会话里时：那正是要的结果
         let _absent = self.engine.session.remove(&self.id, Removal::Keep);
+    }
+}
+
+/// 取种子信息加进会话的那个种子，由取的任务与取的句柄共有：句柄释放时当场移除（不等任务被运行时丢弃），之后马上再取
+/// 同一个磁力链接也加得进。
+#[derive(Clone, Default)]
+pub(crate) struct FetchSlot(Arc<Mutex<Slot>>);
+
+#[derive(Default)]
+enum Slot {
+    /// 还没加进会话
+    #[default]
+    Empty,
+    /// 加进去了：释放时移除
+    Added { _probe: Probe },
+    /// 句柄已释放：不再加，加了的已移除
+    Closed,
+}
+
+impl FetchSlot {
+    /// 在锁内加入（`add` 返回种子编号）并记下：句柄已释放时不加，报 [`Error::Torrent`]。加入与释放互斥，释放之后不会
+    /// 再有加进去的。
+    fn add(
+        &self,
+        engine: &Arc<Engine>,
+        add: impl FnOnce() -> Result<TorrentId, Error>,
+    ) -> Result<TorrentId, Error> {
+        let mut slot = lock(&self.0);
+        if matches!(*slot, Slot::Closed) {
+            return Err(Error::Torrent("取种子信息已取消".to_owned()));
+        }
+        let id = add()?;
+        *slot = Slot::Added {
+            _probe: Probe {
+                engine: engine.clone(),
+                id: id.clone(),
+            },
+        };
+        Ok(id)
+    }
+
+    /// 取完：移除加进去的种子。
+    fn finish(&self) {
+        drop(std::mem::take(&mut *lock(&self.0)));
+    }
+
+    /// 句柄释放：移除加进去的种子，之后不再加。
+    pub(crate) fn close(&self) {
+        let added = std::mem::replace(&mut *lock(&self.0), Slot::Closed);
+        drop(added);
     }
 }
 
