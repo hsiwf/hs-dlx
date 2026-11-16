@@ -161,6 +161,8 @@ pub struct CloudFile {
     pub fetched: bool,
     /// 已校验过；为 true 时 `fetched` 一定为 true
     pub done: bool,
+    /// 定下根之后用户在网盘上删了它（或删进回收站），不取回、不算进总量；为 true 时 `fetched` 一定为 false
+    pub skipped: bool,
 }
 
 /// 新建前认出地址是文件时服务器报的（响应头原样）。总字节数、ETag、Last-Modified、Content-Type 都没有时第一次下载

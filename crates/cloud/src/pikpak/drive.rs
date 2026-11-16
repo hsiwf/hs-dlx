@@ -79,14 +79,17 @@ impl Client {
         Job::of(task)
     }
 
-    /// 离线任务 `id`；网盘上已没有（被用户删了）时为 None。
+    /// 离线任务 `id`；网盘上已没有（被用户删了）时为 None。按编号筛出的列表里有别的任务即没按编号筛，查不出有没有，
+    /// 报 [`Error::Unrecognized`]。
     pub async fn job(&self, id: &str) -> Result<Option<Job>, Error> {
         let filters = serde_json::json!({ "id": { "in": id } }).to_string();
         let mut found = self.jobs(&filters).await?;
-        match found.iter().position(|job| job.id == id) {
-            Some(index) => Ok(Some(found.swap_remove(index))),
-            None => Ok(None),
+        if found.iter().any(|job| job.id != id) {
+            return Err(Error::Unrecognized(
+                "按编号查离线任务时列出了别的任务".to_owned(),
+            ));
         }
+        Ok(found.pop())
     }
 
     /// 最近的离线任务里提交的是 `link` 的那些的编号：提交前记下，提交得到结果之前就断了时用来排除旧的。

@@ -295,7 +295,9 @@ impl FileAmount {
                 bytes: done + checked,
                 total: Some(*total),
             }),
-            CloudProgress::Remote { .. } | CloudProgress::Listing => None,
+            CloudProgress::Remote { .. }
+            | CloudProgress::Listing
+            | CloudProgress::Skipped { .. } => None,
         };
         if row.task.status == Status::Running {
             return row.cloud_progress.as_ref().and_then(from_progress);

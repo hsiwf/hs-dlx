@@ -65,6 +65,20 @@ struct Fake {
     b_trashed: bool,
     /// 离线任务列表是空的（任务被删了，或刚提交的还没列出来）
     jobs_hidden: bool,
+    /// 离线任务列表里的任务都是失败的
+    jobs_failed: bool,
+    /// 子文件夹 Sub 在回收站里
+    sub_trashed: bool,
+    /// b.bin 被彻底删了：取它回 404，Sub 里也列不出它
+    b_gone: bool,
+    /// b.bin 的直链每次最多给 64 KiB（带 ETag）
+    b_chunked: bool,
+    /// 只挂着 `held` 从中间开始的请求（第一个请求照常回，任务目录里已有记录）
+    hold_tail: bool,
+    /// 直链不随取的次数变（同一个签名地址）
+    stable_links: bool,
+    /// b.bin 的 ETag 后缀：换了即同一直链给出了另一个验证器（落到了另一个 CDN 节点）
+    b_etag: &'static str,
 }
 
 #[derive(Default)]
@@ -126,9 +140,14 @@ fn authorized(headers: &HeaderMap) -> bool {
     headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer a1")
 }
 
-fn task_body(id: &str) -> Value {
+fn task_body(id: &str, failed: bool) -> Value {
+    let (phase, message) = if failed {
+        ("PHASE_TYPE_ERROR", "没有可用的连接")
+    } else {
+        ("PHASE_TYPE_COMPLETE", "")
+    };
     json!({
-        "kind": "drive#task", "id": id, "name": "Show", "phase": "PHASE_TYPE_COMPLETE",
+        "kind": "drive#task", "id": id, "name": "Show", "phase": phase, "message": message,
         "progress": 100, "file_id": "VShow", "file_size": "0", "params": { "url": MAGNET },
     })
 }
@@ -148,22 +167,37 @@ async fn submit(
         // 声明的长度比发出的长：发完这几个字节连接即断，客户端收到了响应头、没读完响应体
         return ([(header::CONTENT_LENGTH, "1000")], "{\"task\"").into_response();
     }
-    Json(json!({ "task": task_body(&id) })).into_response()
+    Json(json!({ "task": task_body(&id, false) })).into_response()
 }
 
-async fn tasks(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+/// 离线任务列表，最近的在前；`filters` 只认按编号筛（`{"id":{"in":"<编号>"}}`），`{}` 为不筛。
+async fn tasks(
+    State(fake): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     assert!(authorized(&headers));
+    let filters: Value = serde_json::from_str(&query["filters"]).unwrap();
+    let only = filters["id"]["in"].as_str();
     let fake = fake.lock().unwrap();
     let tasks: Vec<Value> = if fake.jobs_hidden {
         Vec::new()
     } else {
-        fake.jobs.iter().map(|id| task_body(id)).collect()
+        fake.jobs
+            .iter()
+            .filter(|id| only.is_none_or(|only| only == id.as_str()))
+            .map(|id| task_body(id, fake.jobs_failed))
+            .collect()
     };
     Json(json!({ "tasks": tasks })).into_response()
 }
 
 fn file_json(fake: &Fake, remote: &Remote, base: &str) -> Value {
-    let count = fake.links.get(remote.id).copied().unwrap_or(0);
+    let count = if fake.stable_links {
+        0
+    } else {
+        fake.links.get(remote.id).copied().unwrap_or(0)
+    };
     let incomplete = remote.id == "VB" && fake.b_incomplete;
     let (phase, hash) = if incomplete {
         ("PHASE_TYPE_RUNNING", String::new())
@@ -204,8 +238,9 @@ async fn children(
     let files = match query["parent_id"].as_str() {
         "VShow" => vec![
             file_json(&fake, &fake.files[0], &base),
-            json!({ "kind": "drive#folder", "id": "VSub", "name": "Sub" }),
+            json!({ "kind": "drive#folder", "id": "VSub", "name": "Sub", "trashed": fake.sub_trashed }),
         ],
+        "VSub" if fake.b_gone => Vec::new(),
         "VSub" => vec![file_json(&fake, &fake.files[1], &base)],
         other => panic!("没有这个文件夹：{other}"),
     };
@@ -221,6 +256,13 @@ async fn entry(
     let mut fake = fake.lock().unwrap();
     if id == "VShow" {
         return Json(json!({ "kind": "drive#folder", "id": "VShow", "name": "Show" }))
+            .into_response();
+    }
+    if id == "VB" && fake.b_gone {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "file_not_found", "error_code": 5, "error_description": "" })),
+        )
             .into_response();
     }
     *fake.links.entry(id.clone()).or_default() += 1;
@@ -242,7 +284,7 @@ async fn download(
         .and_then(|value| value.strip_prefix("bytes="))
         .and_then(|value| value.split_once('-'))
         .map_or(0, |(start, _)| start.parse::<u64>().unwrap());
-    let (data, hold, unverifiable) = {
+    let (data, hold, unverifiable, chunked) = {
         let mut fake = fake.lock().unwrap();
         if query["n"] == "1" && fake.expire_once.contains(&id.as_str()) {
             return StatusCode::FORBIDDEN.into_response();
@@ -255,20 +297,26 @@ async fn download(
             return StatusCode::FORBIDDEN.into_response();
         }
         let remote = fake.files.iter().find(|remote| remote.id == id).unwrap();
-        if id == fake.held {
+        let held = id == fake.held && (!fake.hold_tail || range_start > 0);
+        if held {
             fake.b_requested.notify_one();
         }
         (
             remote.body.clone(),
-            (id == fake.held).then(|| fake.hold_b.clone()),
+            held.then(|| fake.hold_b.clone()),
             unverifiable,
+            id == "VB" && fake.b_chunked,
         )
     };
     if let Some(gate) = hold {
         gate.pass().await;
     }
     let len = data.len() as u64;
-    let etag = format!("\"{id}\"");
+    let etag = if id == "VB" {
+        format!("\"{id}{}\"", fake.lock().unwrap().b_etag)
+    } else {
+        format!("\"{id}\"")
+    };
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
@@ -282,7 +330,7 @@ async fn download(
                 end.parse::<u64>().unwrap().min(len - 1)
             };
             // 每次最多给 64 KiB：客户端从给到的地方接着请求
-            let end = if unverifiable {
+            let end = if unverifiable || chunked {
                 end.min(start + 65_535)
             } else {
                 end
@@ -326,6 +374,13 @@ async fn start(files: Vec<Remote>) -> (Url, Shared) {
         b_incomplete: false,
         b_trashed: false,
         jobs_hidden: false,
+        jobs_failed: false,
+        sub_trashed: false,
+        b_gone: false,
+        b_chunked: false,
+        hold_tail: false,
+        stable_links: false,
+        b_etag: "",
         held: "VB",
     }));
     fake.lock().unwrap().hold_b.open();
@@ -830,5 +885,155 @@ fn logging_in_again_as_the_same_user_keeps_running_tasks() {
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
+    );
+}
+
+/// 用户把子文件夹删进了回收站：里面的一概不要，只取回其余的。
+#[test]
+fn folders_in_the_recycle_bin_are_skipped() {
+    let dir = test_dir("trashed-folder");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().sub_trashed = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(folder.clone()), 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert!(folder.join("Show").join("a.bin").exists());
+    assert!(!folder.join("Show").join("Sub").exists());
+}
+
+/// 列出文件之后用户在网盘上删了 b.bin（删进回收站，或彻底删了）：取到它时跳过，其余的照常下完。
+#[test]
+fn a_file_deleted_after_listing_is_skipped() {
+    for (name, gone) in [("deleted-trashed", false), ("deleted-gone", true)] {
+        let dir = test_dir(name);
+        let folder = dir.join("out");
+        let rt = runtime();
+        let (base, fake) = rt.block_on(start(remotes(None)));
+        let gate = Arc::new(Gate::default());
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.hold_b = gate.clone();
+            fake.held = "VA";
+        }
+        let (service, mut events) = service(&dir, &base);
+        log_in(&rt, &service);
+        let task = rt
+            .block_on(service.create(draft(folder.clone()), 1))
+            .unwrap()
+            .unwrap();
+        let requested = fake.lock().unwrap().b_requested.clone();
+        rt.block_on(requested.notified());
+        {
+            let mut fake = fake.lock().unwrap();
+            if gone {
+                fake.b_gone = true;
+            } else {
+                fake.b_trashed = true;
+            }
+        }
+        gate.open();
+        let mut skipped = Vec::new();
+        let status = rt.block_on(ended(&mut events, task.id, |progress| {
+            if let CloudProgress::Skipped { output, .. } = progress {
+                skipped.push(output.clone());
+            }
+        }));
+        assert_eq!(status, Status::Done, "{name}");
+        assert_eq!(skipped, [folder.join("Show").join("Sub").join("b.bin")]);
+        assert!(folder.join("Show").join("a.bin").exists());
+        let files = service.cloud_files(task.id).unwrap();
+        assert!(files[0].done && !files[1].fetched && files[1].skipped);
+    }
+}
+
+/// 网盘上的离线下载失败了：清掉编号，继续即重新提交。
+#[test]
+fn a_failed_cloud_job_is_submitted_again_on_resume() {
+    let dir = test_dir("job-failed");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().jobs_failed = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    match rt.block_on(ended(&mut events, task.id, |_| {})) {
+        Status::Failed(failure) => {
+            assert_eq!(failure.kind, FailureKind::CloudFailed);
+            assert!(
+                failure.message.contains("没有可用的连接"),
+                "{}",
+                failure.message
+            );
+        }
+        other => panic!("应以云端失败停下：{other:?}"),
+    }
+    assert_eq!(
+        service.task(task.id).unwrap().spec.cloud().unwrap().job,
+        None
+    );
+    fake.lock().unwrap().jobs_failed = false;
+    service.resume(task.id).unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert_eq!(fake.lock().unwrap().submits, 2);
+}
+
+/// 文件的任务目录续不了（同一个直链续传时给出了另一个 ETag，多为落到了另一个 CDN 节点）：删掉它从头下这个文件，
+/// 照样下完、校验通过。
+#[test]
+fn an_unresumable_file_work_dir_is_started_over() {
+    let dir = test_dir("unresumable");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    let gate = Arc::new(Gate::default());
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.hold_b = gate.clone();
+        fake.b_chunked = true;
+        fake.hold_tail = true;
+        fake.stable_links = true;
+    }
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(folder.clone()), 1))
+        .unwrap()
+        .unwrap();
+    let requested = fake.lock().unwrap().b_requested.clone();
+    rt.block_on(requested.notified());
+    service.pause(task.id);
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Paused
+    );
+    assert!(
+        folder.join("Show.hsdl").join("1").join("job.json").exists(),
+        "第一个请求之后任务目录里应已有记录"
+    );
+    fake.lock().unwrap().b_etag = "-v2";
+    gate.open();
+    service.resume(task.id).unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert_eq!(
+        std::fs::read(folder.join("Show").join("Sub").join("b.bin")).unwrap(),
+        remotes(None)[1].body
     );
 }

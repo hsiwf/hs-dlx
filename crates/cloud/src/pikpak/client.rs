@@ -65,10 +65,12 @@ impl Session {
         }
     }
 
-    /// 等在途的换令牌做完（每次最多一次接口请求的时限）：退出前调，免得旧的 refresh_token 已作废、新的还没存下。
+    /// 等在途的换令牌做完，最多等一次接口请求的时限（[`Timeouts::request`]）：退出前调，免得旧的 refresh_token 已作废、
+    /// 新的还没存下。连不上网盘时换令牌的请求会反复重试，那时请求没发出、旧的 refresh_token 还能用，等满时限就不再等。
     pub async fn settle(&self) {
         self.refreshing.close();
-        self.refreshing.wait().await;
+        // 等满时限仍没做完的随运行时关闭丢弃
+        let _unsettled = tokio::time::timeout(TIMEOUTS.request, self.refreshing.wait()).await;
         self.refreshing.reopen();
     }
 

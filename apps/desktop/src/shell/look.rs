@@ -346,6 +346,9 @@ fn running_cloud(row: &Row) -> Look {
             look(state, color, share, percent(share), line.to_owned())
         }
         (Some(CloudProgress::Listing), _) => preparing("PikPak 下完了，列出文件"),
+        (Some(CloudProgress::Skipped { output, .. }), _) => {
+            preparing(&format!("网盘上删了 {}，跳过", output.display()))
+        }
         (
             Some(CloudProgress::Fetching {
                 index, count, file, ..

@@ -710,7 +710,12 @@ impl Service {
                     match login.poll(&shared.engine, &http, &endpoints).await? {
                         pikpak::login::Poll::Pending => {}
                         pikpak::login::Poll::Done(account) => {
-                            let current = lock(&shared.pikpak).clone();
+                            // 照存储里的账号取（还没建时建出），与同时开始的任务用的是同一个
+                            let current = match shared.pikpak_session() {
+                                Ok(session) => Some(session),
+                                Err(Error::NotLoggedIn) => None,
+                                Err(error) => return Err(error),
+                            };
                             match current {
                                 // 同一账号重新登录：在用的登录状态换上新令牌，在跑的任务不受影响
                                 Some(session) if session.user_id() == account.user_id => {
@@ -2126,7 +2131,7 @@ impl Shared {
         let guard = self.register(id, Control::Cloud(run.cancel.clone()));
         let shared = self.clone();
         self.tracker.spawn(async move {
-            let outcome = run
+            let (outcome, leftovers) = run
                 .done
                 .await
                 .expect("云离线任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
@@ -2138,7 +2143,7 @@ impl Shared {
                 resume: None,
                 seeding: None,
             };
-            shared.conclude(id, ending, Vec::new(), guard);
+            shared.conclude(id, ending, leftovers, guard);
         });
     }
 }

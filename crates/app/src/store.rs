@@ -617,7 +617,9 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
             gcid TEXT NOT NULL CHECK (length(gcid) = 40 AND gcid NOT GLOB '*[^0-9a-f]*'),
             fetched INTEGER NOT NULL DEFAULT 0 CHECK (fetched IN (0, 1)),
             done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1)),
+            skipped INTEGER NOT NULL DEFAULT 0 CHECK (skipped IN (0, 1)),
             CHECK (done = 0 OR fetched = 1),
+            CHECK (skipped = 0 OR fetched = 0),
             PRIMARY KEY (task_id, seq),
             UNIQUE (task_id, path)
         ) STRICT;
@@ -1187,7 +1189,8 @@ pub fn set_cloud_root(
 /// 反斜杠、冒号）报 [`Error::Corrupt`]：本应用写入的都合要求，拼出的路径不会越出内容的根。
 pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, Error> {
     let mut statement = tx.prepare(
-        "SELECT file_id, path, size, gcid, fetched, done FROM cloud_file WHERE task_id = ?1 ORDER BY seq",
+        "SELECT file_id, path, size, gcid, fetched, done, skipped FROM cloud_file WHERE task_id = ?1
+         ORDER BY seq",
     )?;
     let rows = statement.query_map([id.0], |row| {
         Ok((
@@ -1197,10 +1200,11 @@ pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, E
             row.get::<_, String>(3)?,
             row.get::<_, bool>(4)?,
             row.get::<_, bool>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
     rows.map(|row| {
-        let (file_id, path, size, gcid, fetched, done) = row?;
+        let (file_id, path, size, gcid, fetched, done, skipped) = row?;
         // 反斜杠与冒号在 Windows 上会换掉路径的根（`C:x`、`\\x`）
         let safe = path.is_empty()
             || path
@@ -1216,6 +1220,7 @@ pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, E
             gcid,
             fetched,
             done,
+            skipped,
         })
     })
     .collect()
@@ -1249,6 +1254,17 @@ pub fn set_cloud_before(tx: &Transaction<'_>, id: TaskId, before: &[String]) -> 
         return Err(Error::NotFound(id));
     }
     Ok(())
+}
+
+/// 除 `id` 外各云离线任务记着的离线任务编号：查回结果不明的提交时排除它们，不认领别的任务的。
+pub fn cloud_jobs_except(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<String>, Error> {
+    let mut statement = tx.prepare(
+        "SELECT cloud_job FROM task WHERE kind = 'cloud' AND cloud_job IS NOT NULL AND id != ?1",
+    )?;
+    let jobs = statement
+        .query_map([id.0], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(jobs)
 }
 
 /// 网盘上的离线任务不在了（用户在网页或 App 里删了）：清掉记着的编号，继续时重新提交。只用于还没列出文件的；没有
@@ -1296,6 +1312,20 @@ pub fn set_cloud_file_done(
     if tx.execute(
         "UPDATE cloud_file SET done = ?3 WHERE task_id = ?1 AND seq = ?2",
         params![id.0, seq, done],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 记下云离线任务第 `seq` 个文件跳过（定下根之后用户在网盘上删了它）；没有这个文件时报 [`Error::NotFound`]，已取回
+/// 的记为跳过违反表的约束。
+pub fn set_cloud_file_skipped(tx: &Transaction<'_>, id: TaskId, seq: usize) -> Result<(), Error> {
+    let seq = i64::try_from(seq).expect("文件数远小于 i64 的上限");
+    if tx.execute(
+        "UPDATE cloud_file SET skipped = 1 WHERE task_id = ?1 AND seq = ?2",
+        params![id.0, seq],
     )? == 0
     {
         return Err(Error::NotFound(id));
@@ -2412,11 +2442,12 @@ mod tests {
             gcid: "6805ed701e6ea96597858628f8999a955d441d9d".into(),
             fetched: false,
             done: false,
+            skipped: false,
         }
     }
 
     /// 云离线任务新建时还没提交、没有根与任务目录；提交了记下编号（只记一次），列出文件时根与任务目录一起定下（标题
-    /// 换成根名）、占用路径；各文件先记取回再记下完，记为没取回时一并没下完；删任务连同文件。
+    /// 换成根名）、占用路径；各文件先记取回再记下完，记为没取回时一并没下完，跳过与取回互斥；删任务连同文件。
     #[test]
     fn cloud_tasks_round_trip() {
         let mut store = Store::in_memory().unwrap();
@@ -2500,8 +2531,20 @@ mod tests {
                 ..files[1].clone()
             }
         );
+        // 取回了的不能记为跳过
+        assert!(set_cloud_file_skipped(&tx, id, 1).is_err());
         set_cloud_file_fetched(&tx, id, 1, false).unwrap();
         assert_eq!(cloud_files(&tx, id).unwrap()[1], files[1]);
+        // 跳过了的不能再记为取回
+        set_cloud_file_skipped(&tx, id, 1).unwrap();
+        assert!(set_cloud_file_fetched(&tx, id, 1, true).is_err());
+        assert_eq!(
+            cloud_files(&tx, id).unwrap()[1],
+            CloudFile {
+                skipped: true,
+                ..files[1].clone()
+            }
+        );
         assert!(matches!(
             set_cloud_file_fetched(&tx, id, 2, true),
             Err(Error::NotFound(_))

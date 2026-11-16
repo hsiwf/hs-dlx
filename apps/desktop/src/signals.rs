@@ -182,6 +182,15 @@ pub fn between_cloud(before: Option<&CloudProgress>, now: &CloudProgress) -> Vec
             }
             found.extend(between_file(same, file));
         }
+        CloudProgress::Skipped { output, .. } => {
+            found.push((
+                Level::Warn,
+                format!(
+                    "{} 在网盘上被删了（或删进了回收站），跳过它",
+                    output.display()
+                ),
+            ));
+        }
         CloudProgress::Verifying { index, count, .. } => {
             let again =
                 matches!(before, Some(CloudProgress::Verifying { index: at, .. }) if at == index);
