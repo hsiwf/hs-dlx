@@ -456,7 +456,7 @@ void Session::set_proxy(SocksProxy const& proxy) const {
 
 void Session::reconnect_proxy(SocksProxy const& proxy) const {
 	// 只有代理的设置变了 libtorrent 才重连（设成同样的值不重连），而握手、认证被拒后它不再自己重试：先换成另一个端口
-	// 再换回。代理类型不变，其间不会直连
+	// 再换回。代理类型不变，其间不会直连；两次之间发起的节点连接与 HTTP tracker 请求连到那个端口，失败后照常重试
 	lt::settings_pack detour;
 	detour.set_int(lt::settings_pack::proxy_port, proxy.port == 1 ? 2 : 1);
 	m_session.apply_settings(std::move(detour));
@@ -534,7 +534,8 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 		} else if (lt::alert_cast<lt::listen_succeeded_alert>(a)) {
 			out.push_back(alert_of(AlertKind::ListenSucceeded, *a, std::string()));
 		} else if (lt::alert_cast<lt::socks5_alert>(a)) {
-			// 经代理的 UDP（DHT、uTP、UDP 的 tracker）连代理或握手失败；libtorrent 随后自己重试
+			// 经代理的 UDP（DHT、uTP、UDP 的 tracker）连代理或握手失败：连不上、读写出错时 libtorrent 按退避自己重试，
+			// 握手被拒（版本不对、要认证、认证方式不支持）后不再重试
 			std::lock_guard<std::mutex> net(m_network_mutex);
 			m_network.proxy_error = a->message();
 		} else if (lt::alert_cast<lt::listen_failed_alert>(a)) {

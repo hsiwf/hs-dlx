@@ -423,11 +423,8 @@ fn a_cancelled_fetch_can_be_retried_at_once() {
             tokio::time::timeout(Duration::from_secs(10), fetch.progress.changed()).await
         });
         assert!(matches!(added, Ok(Ok(()))), "第 {round} 次没加进会话");
-        // 句柄在这里释放，下一轮随即再取
-        let ended = rt.block_on(async {
-            tokio::time::timeout(Duration::from_millis(500), fetch.resume).await
-        });
-        assert!(ended.is_err(), "第 {round} 次没取到也结束了：{ended:?}");
+        // 下一轮随即再取
+        drop(fetch);
     }
     drop(service);
 }

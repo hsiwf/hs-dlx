@@ -186,27 +186,44 @@ pub(crate) async fn through_proxy(
     Ok(Ok(dht(&udp, &found, unresolved).await))
 }
 
-/// 探 BT 代理 `url` 能不能用（同网络检测的判据，见 [`judge_proxy`]）：经它的引导节点一个都没回时，再从本机直连问一次
-/// 作比较。开不了本机的 UDP 套接字时也算用不了，原因写明。
-pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> ProxyCheck {
-    let socket =
-        |error: std::io::Error| ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}"));
-    let through = match through_proxy(url, hosts).await {
-        Ok(through) => through,
-        Err(error) => return socket(error),
+/// 经代理问 DHT 引导节点一个都没回时的说明（只经代理问，分不清是代理还是网络的问题）。
+pub(crate) const PROXY_SILENT: &str = "经代理问 DHT 引导节点一个都没回：代理可能没转发 UDP（换节点或在代理里打开 UDP），也可能网络不通";
+
+/// 后台看着 BT 代理时探它（只经代理发包，不从本机直连发）：握手、申请转发 UDP，再经它向引导节点 `hosts` 各发一个
+/// find_node。握手或申请没成、引导节点一个都没回时为用不了；`hosts` 为空时只握手。判断不了时为 None：引导节点都解析
+/// 不出，或解析成了 TUN 代理的假地址（见 [`Dht::tun`]）。开不了本机的 UDP 套接字时也算用不了，原因写明。
+pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> Option<ProxyCheck> {
+    let relay = match crate::socks::associate(url).await {
+        Ok(relay) => relay,
+        Err(why) => return Some(ProxyCheck::Unusable(why)),
     };
-    let direct = match &through {
-        Ok(through) if through.bootstrap.asked > 0 && through.bootstrap.replied == 0 => {
-            let udp = match Udp::direct(false).await {
-                Ok(udp) => udp,
-                Err(error) => return socket(error),
-            };
-            let (found, unresolved) = bootstrap(hosts, false).await;
-            dht(&udp, &found, unresolved).await
+    if hosts.is_empty() {
+        return Some(ProxyCheck::Usable);
+    }
+    let udp = match Udp::via(relay).await {
+        Ok(udp) => udp,
+        Err(error) => {
+            return Some(ProxyCheck::Unusable(format!("开不了 UDP 套接字：{error}")));
         }
-        _ => Dht::default(),
     };
-    judge_proxy(&direct, &through)
+    let (found, _unresolved) = bootstrap(hosts, false).await;
+    if found.is_empty() || found.iter().any(fake_ip) {
+        return None;
+    }
+    let requests: Vec<_> = found.iter().map(|to| (*to, krpc("find_node"))).collect();
+    Some(if udp.exchange(&requests, is_krpc_reply).await.is_empty() {
+        ProxyCheck::Unusable(PROXY_SILENT.to_owned())
+    } else {
+        ProxyCheck::Usable
+    })
+}
+
+/// 198.18.0.0/15 里的地址：TUN 代理（fake-ip）给域名的假地址。
+fn fake_ip(address: &SocketAddr) -> bool {
+    match address.ip() {
+        IpAddr::V4(ip) => ip.octets()[0] == 198 && (ip.octets()[1] & 0xfe) == 18,
+        IpAddr::V6(_) => false,
+    }
 }
 
 /// 照量到的下结论。
@@ -630,10 +647,6 @@ pub(crate) async fn dht(udp: &Udp, bootstrap: &[SocketAddr], unresolved: usize) 
         .filter(|(_, count)| *count >= 2)
         .max_by_key(|(_, count)| *count)
         .map(|(ip, _)| ip);
-    let fake_ip = |address: &SocketAddr| match address.ip() {
-        IpAddr::V4(ip) => ip.octets()[0] == 198 && (ip.octets()[1] & 0xfe) == 18,
-        IpAddr::V6(_) => false,
-    };
     Dht {
         bootstrap: Ratio {
             asked: bootstrap.len(),
@@ -1103,5 +1116,32 @@ mod tests {
             let measured = dht(&udp, &[router], 0).await;
             assert_eq!(measured.nodes, ratio(4, 2), "转发地址 {bound}");
         }
+    }
+
+    /// 后台探 BT 代理只经代理：引导节点经它有回应为能用，一个都不回为用不了，连不上代理写明原因。
+    #[tokio::test]
+    async fn the_background_probe_asks_bootstraps_through_the_proxy() {
+        let answering = fake_network().await;
+        let silent = fake_node(Vec::new(), true).await;
+        let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
+        assert_eq!(
+            probe_proxy(&proxy, &[("127.0.0.1", answering.port())]).await,
+            Some(ProxyCheck::Usable)
+        );
+        let proxy = fake_socks(Ipv4Addr::LOCALHOST).await;
+        assert_eq!(
+            probe_proxy(&proxy, &[("127.0.0.1", silent.port())]).await,
+            Some(ProxyCheck::Unusable(PROXY_SILENT.to_owned()))
+        );
+        let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let unreachable = Url::parse(&format!(
+            "socks5://127.0.0.1:{}",
+            closed.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        assert!(matches!(
+            probe_proxy(&unreachable, &[("127.0.0.1", answering.port())]).await,
+            Some(ProxyCheck::Unusable(why)) if why.contains("连不上代理")
+        ));
     }
 }

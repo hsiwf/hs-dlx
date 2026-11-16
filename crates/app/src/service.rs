@@ -48,6 +48,8 @@ const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
 /// 设了 BT 代理时多久看一眼它（见 `Shared::watch_torrent_proxy`）。
 const PROXY_RECHECK: Duration = Duration::from_secs(30);
+/// BT 代理能用时多久复查一次：经代理问 4 个引导节点。代理切到不转发 UDP 的节点时 libtorrent 不报错，只能靠复查发现。
+const PROXY_RECHECK_USABLE: Duration = Duration::from_secs(10 * 60);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1257,12 +1259,15 @@ impl Shared {
         }))
     }
 
-    /// 照现在的 BT 代理看着它：已在看着同一个地址时不动；改了或改成直连时停下看着旧的，设了时开始看着新的。看着时每
-    /// [`PROXY_RECHECK`] 看一眼，还没探、探出用不了，或 libtorrent 经它报过错时探一次（见
-    /// [`crate::netcheck::probe_proxy`]），记下结果；探到能用即清掉 libtorrent 记着的出错。服务释放即止。
+    /// 照现在的 BT 代理看着它：已在看着同一个地址时不动；改了或改成直连时停下看着旧的，设了时开始看着新的。开始时探
+    /// 一次（之前记下的结果可能是 BT 会话建起前量的）；之后每 [`PROXY_RECHECK`] 看一眼，还没探、探出用不了，或
+    /// libtorrent 经它报过错时再探，能用时每 [`PROXY_RECHECK_USABLE`] 复查一次。探只经代理发包（见
+    /// [`crate::netcheck::probe_proxy`]），判断不了时不改记下的结果；探到的记下（见 [`Bt::set_proxy_check`]）。服务
+    /// 释放即止。
     fn watch_torrent_proxy(self: &Arc<Self>) {
-        let url = self.bt.proxy_url();
         let mut watching = lock(&self.proxy_probe);
+        // 在锁内读：与同时改代理的不会把新地址的看护换成旧地址的
+        let url = self.bt.proxy_url();
         if let (Some((watched, _)), Some(url)) = (&*watching, &url)
             && watched == url
         {
@@ -1277,19 +1282,24 @@ impl Shared {
         let watched = url.clone();
         let probing = self.runtime.spawn(async move {
             let mut ticks = tokio::time::interval(PROXY_RECHECK);
+            let mut last_probe: Option<tokio::time::Instant> = None;
             loop {
                 ticks.tick().await;
+                let stale = last_probe.is_none_or(|at| at.elapsed() >= PROXY_RECHECK_USABLE);
                 match shared.upgrade().map(|shared| shared.bt.proxy_due(&url)) {
-                    Some(Some(true)) => {}
-                    Some(Some(false)) => continue,
+                    Some(Some(due)) if due || stale => {}
+                    Some(Some(_)) => continue,
                     // 代理改了或服务已释放
                     Some(None) | None => return,
                 }
+                last_probe = Some(tokio::time::Instant::now());
                 let check = crate::netcheck::probe_proxy(&url, hosts).await;
                 let Some(shared) = shared.upgrade() else {
                     return;
                 };
-                shared.bt.set_proxy_check(&url, check);
+                if let Some(check) = check {
+                    shared.bt.set_proxy_check(&url, check);
+                }
             }
         });
         *watching = Some((watched, AbortOnDropHandle::new(probing)));

@@ -388,12 +388,24 @@ impl Engine {
                 "种子 {id} 正在别处使用（取种子信息或下载）"
             )));
         }
-        routes.insert(id.clone(), sender);
+        routes.insert(id.clone(), sender.clone());
         Ok(Owner {
             engine: self.clone(),
             id: id.clone(),
             alerts,
+            route: sender,
         })
+    }
+
+    /// 撤掉种子 `id` 转给 `route` 的登记；已换成别的登记（同一个种子之后的）时不动。
+    fn release(&self, id: &TorrentId, route: &mpsc::UnboundedSender<Routed>) {
+        let mut routes = lock(&self.routes);
+        if routes
+            .get(id)
+            .is_some_and(|sender| sender.same_channel(route))
+        {
+            routes.remove(id);
+        }
     }
 
     /// 等种子 `id` 移除完（之前移除的还没完时再加入会报错）；[`STEP_TIMEOUT`] 内没完报 [`Error::Torrent`]。
@@ -416,16 +428,18 @@ impl Engine {
     }
 }
 
-/// 管一个种子的异步任务手里的：它的事件；释放时不再接收。
+/// 管一个种子的异步任务手里的：它的事件；释放时撤掉登记（见 [`Engine::release`]），不再接收。
 struct Owner {
     engine: Arc<Engine>,
     id: TorrentId,
     alerts: mpsc::UnboundedReceiver<Routed>,
+    /// 登记的发送端，撤登记时认是不是自己的
+    route: mpsc::UnboundedSender<Routed>,
 }
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        lock(&self.engine.routes).remove(&self.id);
+        self.engine.release(&self.id, &self.route);
     }
 }
 
@@ -777,8 +791,9 @@ impl Bt {
         }
     }
 
-    /// 记下探 `url` 的结果；代理已改成别的时不记。之前探出用不了、或 libtorrent 经它报过错，而这次探到能用时，让
-    /// libtorrent 重连代理（它在握手、认证或转发 UDP 被拒后不再自己重试）并清掉那条出错。
+    /// 记下探 `url` 的结果；代理已改成别的时不记。之前不是能用（还没探、在探、用不了）或 libtorrent 经它报过错，而这次
+    /// 探到能用时，让 libtorrent 重连代理并清掉那条出错：它在握手、认证或转发 UDP 被拒后不再自己重试，有的还不报错，
+    /// 重新保存同样的设置也不会让它重连。
     pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
         let running = lock(&self.running);
         if lock(&self.proxy).as_ref() != Some(url) {
@@ -789,9 +804,7 @@ impl Bt {
             && let Some(running) = &*running
         {
             let session = &running.engine.session;
-            if matches!(previous, ProxyCheck::Unusable(_))
-                || !session.network().proxy_error.is_empty()
-            {
+            if previous != ProxyCheck::Usable || !session.network().proxy_error.is_empty() {
                 session.reconnect_proxy(&libtorrent_proxy(Some(url)));
             }
         }
@@ -871,14 +884,13 @@ pub(crate) async fn fetch_metadata(
     // 同一个磁力链接刚取消或取完、还在移除时，等它移除完再加
     let pending = hs_dlx_torrent::magnet_id(&uri).map_err(not_added)?;
     engine.settled(&pending).await?;
-    let id = slot.add(&engine, || {
+    let mut owner = slot.add(&engine, || {
         engine
             .session
             .add_magnet(&uri, save_path)
             .map_err(not_added)
     })?;
-    // 加进去之后才登记：同一个种子已在会话里时上面就报错了，不会抢别人的事件
-    let mut owner = engine.own(&id)?;
+    let id = owner.id.clone();
     // 还不知道私不私有：链接没带 tracker 时才补（带了的可能是私有种子的 tracker，不让信息哈希经公共 tracker 传出去）
     let bare = owner
         .session()
@@ -956,8 +968,8 @@ impl Drop for Probe {
     }
 }
 
-/// 取种子信息加进会话的那个种子，由取的任务与取的句柄共有：句柄释放时当场移除（不等任务被运行时丢弃），之后马上再取
-/// 同一个磁力链接也加得进。
+/// 取种子信息加进会话的那个种子与它事件的登记，由取的任务与取的句柄共有：句柄释放时当场撤登记、移除种子（不等任务
+/// 被运行时丢弃），之后马上再取同一个磁力链接也加得进、登记得上。
 #[derive(Clone, Default)]
 pub(crate) struct FetchSlot(Arc<Mutex<Slot>>);
 
@@ -966,43 +978,57 @@ enum Slot {
     /// 还没加进会话
     #[default]
     Empty,
-    /// 加进去了：释放时移除
-    Added { _probe: Probe },
+    /// 加进去了、登记了：释放时撤登记（只撤自己的）、移除种子
+    Added {
+        probe: Probe,
+        route: mpsc::UnboundedSender<Routed>,
+    },
     /// 句柄已释放：不再加，加了的已移除
     Closed,
 }
 
 impl FetchSlot {
-    /// 在锁内加入（`add` 返回种子编号）并记下：句柄已释放时不加，报 [`Error::Torrent`]。加入与释放互斥，释放之后不会
-    /// 再有加进去的。
+    /// 在锁内加入（`add` 返回种子编号）、接手它的事件（见 [`Engine::own`]）并记下：句柄已释放时不加，报
+    /// [`Error::Torrent`]；接手不了时移除刚加的再报错。加入与释放互斥，释放之后不会再有加进去的。
     fn add(
         &self,
         engine: &Arc<Engine>,
         add: impl FnOnce() -> Result<TorrentId, Error>,
-    ) -> Result<TorrentId, Error> {
+    ) -> Result<Owner, Error> {
         let mut slot = lock(&self.0);
         if matches!(*slot, Slot::Closed) {
             return Err(Error::Torrent("取种子信息已取消".to_owned()));
         }
         let id = add()?;
-        *slot = Slot::Added {
-            _probe: Probe {
-                engine: engine.clone(),
-                id: id.clone(),
-            },
+        let probe = Probe {
+            engine: engine.clone(),
+            id: id.clone(),
         };
-        Ok(id)
+        let owner = engine.own(&id)?;
+        *slot = Slot::Added {
+            probe,
+            route: owner.route.clone(),
+        };
+        Ok(owner)
     }
 
-    /// 取完：移除加进去的种子。
+    /// 取完或句柄释放（`closed` 时之后不再加）：撤登记、移除加进去的种子。
+    fn release(&self, closed: bool) {
+        let next = if closed { Slot::Closed } else { Slot::Empty };
+        if let Slot::Added { probe, route } = std::mem::replace(&mut *lock(&self.0), next) {
+            probe.engine.release(&probe.id, &route);
+            drop(probe);
+        }
+    }
+
+    /// 取完：撤登记、移除加进去的种子。
     fn finish(&self) {
-        drop(std::mem::take(&mut *lock(&self.0)));
+        self.release(false);
     }
 
-    /// 句柄释放：移除加进去的种子，之后不再加。
+    /// 句柄释放：撤登记、移除加进去的种子，之后不再加。
     pub(crate) fn close(&self) {
-        let added = std::mem::replace(&mut *lock(&self.0), Slot::Closed);
-        drop(added);
+        self.release(true);
     }
 }
 
