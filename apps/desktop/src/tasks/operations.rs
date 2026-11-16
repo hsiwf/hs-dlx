@@ -59,7 +59,7 @@ impl Tasks {
                 if result.is_err() && this.quitting() {
                     this.cancel_quit("有新建没成，没有退出".to_owned());
                 }
-                // 没有在途的新建了，留着的结束事件都不属于将要加进来的行（是已移除的行的）
+                // 没有在途的新建了，留着的事件都不属于将要加进来的行（是已移除的行的）
                 if this.creating == 0 {
                     this.early.clear();
                 }
@@ -73,7 +73,7 @@ impl Tasks {
         Ok(created)
     }
 
-    /// 新建的任务建成了：加进列表，处理新建期间先到的结束事件；选了退出的随即暂停。
+    /// 新建的任务建成了：加进列表，按先后处理新建期间先到的结束与改名事件；选了退出的随即暂停。
     fn started(&mut self, task: hs_dlx_app::Task, cx: &mut Context<Self>) -> TaskId {
         let id = task.id;
         let mut row = Row::new(task, Instant::now());
@@ -81,7 +81,9 @@ impl Tasks {
         self.rows.push(row);
         let (early, rest) = std::mem::take(&mut self.early)
             .into_iter()
-            .partition(|event| matches!(event, Event::Ended { id: at, .. } if *at == id));
+            .partition(|event| {
+                matches!(event, Event::Ended { id: at, .. } | Event::Renamed { id: at } if *at == id)
+            });
         self.early = rest;
         for event in early {
             self.apply(event, cx);

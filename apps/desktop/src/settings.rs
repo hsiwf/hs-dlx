@@ -599,7 +599,7 @@ impl SettingsView {
         };
         row(
             "PikPak",
-            Some("云离线用你自己的账号：网盘替你下完磁力链接，再取回本机"),
+            None,
             div()
                 .flex()
                 .flex_col()

@@ -81,7 +81,8 @@ pub struct Tasks {
     stays: u64,
     /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
     creating: usize,
-    /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
+    /// 新建期间收到的、列表里还没有的任务的结束与改名事件：新建的结果与任务的事件走两条路，它们可能先到；加进那一行
+    /// 时按收到的先后再处理
     early: Vec<Event>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
@@ -221,7 +222,7 @@ impl Tasks {
     }
 
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
-        if let Event::Ended { id, .. } = &event
+        if let Event::Ended { id, .. } | Event::Renamed { id } = &event
             && self.creating > 0
             && self.row(*id).is_none()
         {

@@ -1,5 +1,6 @@
 //! PikPak 客户端对着本地的模拟接口：登录轮询、令牌过期换新、captcha 失效重申、离线任务、分页列目录、200 带错误体。
-//! 模拟接口照 docs 里记下的 PikPak 行为：refresh_token 用过即作废，captcha token 只认最近申请的那个。
+//! 模拟接口照 docs 里记下的 PikPak 行为：refresh_token 用过即作废；captcha token 按动作发，每个动作只认最近为它申请
+//! 的那个。
 
 use std::sync::{Arc, Mutex};
 
@@ -20,14 +21,16 @@ struct Fake {
     polls: u32,
     /// 现在有效的令牌；换一次加一
     generation: u32,
-    /// 现在有效的 captcha token；为空时还没申请过
-    captcha: String,
+    /// 各动作现在有效的 captcha token
+    captcha: std::collections::HashMap<String, String>,
     /// 申请过几次 captcha token
     captcha_inits: u32,
     /// 下一个 drive 请求不论令牌都回 401（模拟服务端提前作废）
     revoke_once: bool,
     /// 提交离线时回 200 带错误体
     quota_exhausted: bool,
+    /// 查离线任务时先回几次 503（网关出错）
+    tasks_unavailable: u32,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -88,12 +91,15 @@ async fn captcha_init(State(fake): State<Shared>, Json(body): Json<Value>) -> Re
     assert_eq!(body["meta"]["user_id"], "user-1");
     let mut fake = fake.lock().unwrap();
     fake.captcha_inits += 1;
-    fake.captcha = format!("c{}", fake.captcha_inits);
-    Json(json!({ "captcha_token": fake.captcha, "expires_in": 300 })).into_response()
+    let token = format!("c{}", fake.captcha_inits);
+    let action = body["action"].as_str().unwrap().to_owned();
+    fake.captcha.insert(action, token.clone());
+    Json(json!({ "captcha_token": token, "expires_in": 300 })).into_response()
 }
 
-/// drive 接口的鉴权：令牌不是现在有效的回 401，captcha token 不是最近申请的回 400；通过时为 None。
-fn rejected(fake: &mut Fake, headers: &HeaderMap) -> Option<Response> {
+/// drive 接口（动作 `action`）的鉴权：令牌不是现在有效的回 401，captcha token 不是最近为这个动作申请的回 400；通过时
+/// 为 None。
+fn rejected(fake: &mut Fake, headers: &HeaderMap, action: &str) -> Option<Response> {
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -106,7 +112,11 @@ fn rejected(fake: &mut Fake, headers: &HeaderMap) -> Option<Response> {
         .get("x-captcha-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if fake.captcha.is_empty() || captcha != fake.captcha {
+    if fake
+        .captcha
+        .get(action)
+        .is_none_or(|token| token != captcha)
+    {
         return Some(rejection(StatusCode::BAD_REQUEST, "captcha_invalid", 9));
     }
     None
@@ -126,7 +136,7 @@ async fn files_post(
     Json(body): Json<Value>,
 ) -> Response {
     let mut fake = fake.lock().unwrap();
-    if let Some(response) = rejected(&mut fake, &headers) {
+    if let Some(response) = rejected(&mut fake, &headers, "POST:/drive/v1/files") {
         return response;
     }
     assert_eq!(body["upload_type"], "UPLOAD_TYPE_URL");
@@ -142,8 +152,12 @@ async fn files_post(
 
 async fn tasks(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     let mut fake = fake.lock().unwrap();
-    if let Some(response) = rejected(&mut fake, &headers) {
+    if let Some(response) = rejected(&mut fake, &headers, "GET:/drive/v1/tasks") {
         return response;
+    }
+    if fake.tasks_unavailable > 0 {
+        fake.tasks_unavailable -= 1;
+        return (StatusCode::SERVICE_UNAVAILABLE, "<html>bad gateway</html>").into_response();
     }
     Json(json!({ "tasks": [task("PHASE_TYPE_COMPLETE", 100)], "next_page_token": "" }))
         .into_response()
@@ -152,7 +166,7 @@ async fn tasks(State(fake): State<Shared>, headers: HeaderMap) -> Response {
 fn file(id: &str, name: &str, size: &str) -> Value {
     json!({
         "kind": "drive#file", "id": id, "name": name, "size": size,
-        "hash": "6805ED701E6EA96597858628F8999A955D441D9D",
+        "hash": "6805ED701E6EA96597858628F8999A955D441D9D", "phase": "PHASE_TYPE_COMPLETE",
     })
 }
 
@@ -162,7 +176,7 @@ async fn files_get(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let mut fake = fake.lock().unwrap();
-    if let Some(response) = rejected(&mut fake, &headers) {
+    if let Some(response) = rejected(&mut fake, &headers, "GET:/drive/v1/files") {
         return response;
     }
     assert_eq!(query["parent_id"], "VFolder1");
@@ -184,7 +198,7 @@ async fn file_get(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let mut fake = fake.lock().unwrap();
-    if let Some(response) = rejected(&mut fake, &headers) {
+    if let Some(response) = rejected(&mut fake, &headers, "GET:/drive/v1/files") {
         return response;
     }
     assert_eq!(query["usage"], "FETCH");
@@ -277,11 +291,23 @@ async fn submits_and_follows_an_offline_download() {
     assert_eq!(job.file.as_deref(), Some("VFolder1"));
     assert_eq!(
         client
-            .find_job("magnet:?xt=urn:btih:abc")
+            .find_job("magnet:?xt=urn:btih:abc", &[])
             .await
             .unwrap()
             .map(|job| job.id),
         Some("VTask1".to_owned())
+    );
+    // 提交前已有的不算
+    assert_eq!(
+        client.job_ids_for("magnet:?xt=urn:btih:abc").await.unwrap(),
+        ["VTask1"]
+    );
+    assert_eq!(
+        client
+            .find_job("magnet:?xt=urn:btih:abc", &["VTask1".to_owned()])
+            .await
+            .unwrap(),
+        None
     );
     // 两页合起来；GCID 改成小写
     let children = client.children("VFolder1").await.unwrap();
@@ -298,9 +324,9 @@ async fn submits_and_follows_an_offline_download() {
         entry.link.unwrap().as_str(),
         "https://dl.example/a.mkv?expire=1794819746&sign=x"
     );
-    // 一路没换过令牌，captcha token 一直沿用
+    // 一路没换过令牌；captcha token 每个动作申请一次（提交、查任务、列文件与取直链同为 GET /drive/v1/files），之后沿用
     assert!(saved.lock().unwrap().is_empty());
-    assert_eq!(fake.lock().unwrap().captcha_inits, 1);
+    assert_eq!(fake.lock().unwrap().captcha_inits, 3);
 }
 
 #[tokio::test]
@@ -373,4 +399,18 @@ async fn clients_of_one_session_share_refreshed_tokens() {
     let saved = saved.lock().unwrap();
     assert_eq!(saved.len(), 2);
     assert_eq!(saved[1].refresh_token, "r3");
+}
+
+/// 查询被网关暂时拒绝（503）时退避后再试，不当成失败；作废的登录状态不再发请求。
+#[tokio::test]
+async fn queries_ride_out_a_gateway_error_and_a_retired_session_stops() {
+    let (endpoints, fake) = start().await;
+    let account = logged_in(&endpoints).await;
+    let (client, _) = client(&endpoints, account);
+    client.submit("magnet:?xt=urn:btih:abc").await.unwrap();
+    fake.lock().unwrap().tasks_unavailable = 1;
+    assert!(client.job("VTask1").await.unwrap().is_some());
+    assert_eq!(fake.lock().unwrap().tasks_unavailable, 0);
+    client.session().retire();
+    assert!(matches!(client.job("VTask1").await, Err(Error::LoggedOut)));
 }

@@ -30,6 +30,11 @@ pub enum Reason {
 }
 
 impl Rejection {
+    /// 暂时的拒绝：网盘或途中的网关出错（5xx），或请求太频繁；过一阵再试可能就好。
+    pub fn transient(&self) -> bool {
+        self.status >= 500 || self.reason() == Reason::RateLimited
+    }
+
     pub fn reason(&self) -> Reason {
         let name = self.name.as_str();
         // 9 也是「文件在回收站里」等错误的码，captcha 的错误名都以 captcha 开头

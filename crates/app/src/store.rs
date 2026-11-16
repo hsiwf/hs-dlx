@@ -514,11 +514,13 @@ fn add_torrent_proxy(tx: &Transaction<'_>) -> Result<(), Error> {
 }
 
 /// 第 11 版：
-/// - 重建任务表，加云离线任务（种类 `cloud`，见 [`crate::CloudSpec`]）：网盘（`cloud_provider`）、网盘上离线任务的编号
-///   （`cloud_job`）与保存目录（`cloud_folder`）必有，内容的根（`cloud_root`）与任务目录一起在列出文件时定下，没有请求头；
-///   失败的种类加 `cloud-login`、`cloud-quota`、`cloud-failed`、`cloud-api`、`integrity`。其余约束不变。
-/// - 云离线任务的文件（`cloud_file`，见 [`crate::CloudFile`]）：按任务与序号（列出时的次序，从 0 起）。不用外键：迁移在
-///   事务里跑，关不了外键检查，之后重建任务表时 DROP TABLE 会连带删掉这里的行；删任务时由 [`delete`] 一起删。
+/// - 重建任务表，加云离线任务（种类 `cloud`，见 [`crate::CloudSpec`]）：网盘（`cloud_provider`）、建任务的账号
+///   （`cloud_user`）与保存目录（`cloud_folder`）必有；网盘上离线任务的编号（`cloud_job`）提交成了才有；内容的根
+///   （`cloud_root`）与任务目录一起在列出文件时定下，那时一定已提交；没有请求头。失败的种类加 `cloud-login`、
+///   `cloud-quota`、`cloud-failed`、`cloud-api`、`integrity`。其余约束不变。
+/// - 云离线任务的文件（`cloud_file`，见 [`crate::CloudFile`]）：按任务与序号（列出时的次序，从 0 起），路径不重复；
+///   下完（`done`）的一定已取回到输出位置（`fetched`）。不用外键：迁移在事务里跑，关不了外键检查，之后重建任务表时
+///   DROP TABLE 会连带删掉这里的行；删任务时由 [`delete`] 一起删。
 /// - 网盘账号（`cloud_account`，见 [`hs_dlx_cloud::pikpak::Account`]）：每个网盘至多一个。
 fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
     let counter = task_counter(tx)?;
@@ -548,6 +550,7 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
             torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
             torrent_seeding INTEGER CHECK (torrent_seeding IN (0, 1)),
             cloud_provider TEXT CHECK (cloud_provider IN ('pikpak')),
+            cloud_user TEXT CHECK (cloud_user != ''),
             cloud_job TEXT CHECK (cloud_job != ''),
             cloud_folder TEXT,
             cloud_root TEXT,
@@ -584,11 +587,12 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
                                         AND torrent_trusted IS NULL AND torrent_seeding IS NULL)),
             CHECK (torrent_seeding IS NOT 1 OR status = 'done'),
             CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]')),
-            CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_job IS NOT NULL
+            CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_user IS NOT NULL
                                        AND cloud_folder IS NOT NULL)),
-            CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_job IS NULL AND cloud_folder IS NULL
-                                      AND cloud_root IS NULL)),
-            CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)))
+            CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_user IS NULL AND cloud_job IS NULL
+                                      AND cloud_folder IS NULL AND cloud_root IS NULL)),
+            CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)
+                                       AND (cloud_root IS NULL OR cloud_job IS NOT NULL)))
         ) STRICT;
         INSERT INTO task_v11 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
                               file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
@@ -609,7 +613,9 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
             path TEXT NOT NULL,
             size INTEGER NOT NULL CHECK (size >= 0),
             gcid TEXT NOT NULL CHECK (length(gcid) = 40 AND gcid NOT GLOB '*[^0-9a-f]*'),
+            fetched INTEGER NOT NULL DEFAULT 0 CHECK (fetched IN (0, 1)),
             done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1)),
+            CHECK (done = 0 OR fetched = 1),
             PRIMARY KEY (task_id, seq),
             UNIQUE (task_id, path)
         ) STRICT;
@@ -728,7 +734,7 @@ const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, m
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
                        file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding, cloud_provider, \
-                       cloud_job, cloud_folder, cloud_root";
+                       cloud_job, cloud_folder, cloud_root, cloud_user";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
@@ -811,8 +817,8 @@ pub fn insert(
             )
         }
     };
-    let (provider, job, folder, cloud_root) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None),
+    let (provider, user, job, folder, cloud_root) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None),
         Kind::Cloud(cloud) => {
             if !cloud.folder.is_absolute() {
                 return Err(Error::InvalidInput(format!(
@@ -822,7 +828,8 @@ pub fn insert(
             }
             (
                 Some(provider_code(cloud.provider)),
-                Some(cloud.job.as_str()),
+                Some(cloud.user.as_str()),
+                cloud.job.as_deref(),
                 Some(utf8(&cloud.folder)?),
                 cloud.root.as_deref().map(named_utf8).transpose()?,
             )
@@ -841,9 +848,10 @@ pub fn insert(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
-                           torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root)
+                           torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root,
+                           cloud_user)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -872,6 +880,7 @@ pub fn insert(
             job,
             folder,
             cloud_root,
+            user,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -1141,7 +1150,8 @@ pub fn set_cloud_root(
             Error::InvalidInput(format!("网盘报的文件大小 {} 字节超出范围", file.size))
         })?;
         let inserted = tx.execute(
-            "INSERT INTO cloud_file (task_id, seq, file_id, path, size, gcid, done) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO cloud_file (task_id, seq, file_id, path, size, gcid, fetched, done)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id.0,
                 i64::try_from(seq).expect("文件数远小于 i64 的上限"),
@@ -1149,6 +1159,7 @@ pub fn set_cloud_root(
                 file.path,
                 size,
                 file.gcid,
+                file.fetched,
                 file.done
             ],
         );
@@ -1158,7 +1169,7 @@ pub fn set_cloud_root(
                 if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
                 return Err(Error::InvalidInput(format!(
-                    "{id}的文件不合要求（路径重复或 GCID 不对）：{}",
+                    "{id}的文件不合要求（路径重复、GCID 不对或没取回就记为下完）：{}",
                     file.path
                 )));
             }
@@ -1168,10 +1179,11 @@ pub fn set_cloud_root(
     Ok(())
 }
 
-/// 云离线任务的文件，按序号；还没定下根的为空。
+/// 云离线任务的文件，按序号；还没定下根的为空。路径不是相对内容的根、以 `/` 分隔的文件名时（有空段、`.`、`..`、
+/// 反斜杠）报 [`Error::Corrupt`]：本应用写入的都合要求，拼出的路径不会越出内容的根。
 pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, Error> {
     let mut statement = tx.prepare(
-        "SELECT file_id, path, size, gcid, done FROM cloud_file WHERE task_id = ?1 ORDER BY seq",
+        "SELECT file_id, path, size, gcid, fetched, done FROM cloud_file WHERE task_id = ?1 ORDER BY seq",
     )?;
     let rows = statement.query_map([id.0], |row| {
         Ok((
@@ -1180,22 +1192,67 @@ pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, E
             row.get::<_, i64>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, bool>(4)?,
+            row.get::<_, bool>(5)?,
         ))
     })?;
     rows.map(|row| {
-        let (file_id, path, size, gcid, done) = row?;
+        let (file_id, path, size, gcid, fetched, done) = row?;
+        let safe = path.is_empty()
+            || path
+                .split('/')
+                .all(|part| !matches!(part, "" | "." | "..") && !part.contains('\\'));
+        if !safe {
+            return Err(Error::Corrupt(format!("{id}的文件路径 {path:?}")));
+        }
         Ok(CloudFile {
             id: file_id,
             path,
             size: u64::try_from(size).map_err(|_| Error::Corrupt(format!("{id}的文件大小")))?,
             gcid,
+            fetched,
             done,
         })
     })
     .collect()
 }
 
-/// 记下云离线任务第 `seq` 个文件下完没有；没有这个文件时报 [`Error::NotFound`]。
+/// 记下云离线任务提交到网盘后网盘给的离线任务编号 `job`（不能为空）；没有这个还没提交过的云离线任务时报
+/// [`Error::NotFound`]。
+pub fn set_cloud_job(tx: &Transaction<'_>, id: TaskId, job: &str) -> Result<(), Error> {
+    if job.is_empty() {
+        return Err(Error::InvalidInput("网盘给的离线任务编号是空的".to_owned()));
+    }
+    if tx.execute(
+        "UPDATE task SET cloud_job = ?2 WHERE id = ?1 AND kind = 'cloud' AND cloud_job IS NULL",
+        params![id.0, job],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 记下云离线任务第 `seq` 个文件取回到输出位置没有（核心装上了输出、还没校验）；没有这个文件时报
+/// [`Error::NotFound`]。记为没取回时一并记为没下完。
+pub fn set_cloud_file_fetched(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    seq: usize,
+    fetched: bool,
+) -> Result<(), Error> {
+    let seq = i64::try_from(seq).expect("文件数远小于 i64 的上限");
+    if tx.execute(
+        "UPDATE cloud_file SET fetched = ?3, done = done AND ?3 WHERE task_id = ?1 AND seq = ?2",
+        params![id.0, seq, fetched],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 记下云离线任务第 `seq` 个文件下完（校验过）没有；没有这个文件时报 [`Error::NotFound`]，还没取回的记为下完违反
+/// 表的约束。
 pub fn set_cloud_file_done(
     tx: &Transaction<'_>,
     id: TaskId,
@@ -1290,6 +1347,7 @@ struct Row {
     cloud_job: Option<String>,
     cloud_folder: Option<String>,
     cloud_root: Option<String>,
+    cloud_user: Option<String>,
 }
 
 impl Row {
@@ -1330,6 +1388,7 @@ impl Row {
             cloud_job: row.get(32)?,
             cloud_folder: row.get(33)?,
             cloud_root: row.get(34)?,
+            cloud_user: row.get(35)?,
         })
     }
 
@@ -1341,12 +1400,15 @@ impl Row {
             serde_json::from_str(&self.headers).map_err(|_| corrupt("请求头"))?;
         let cloud = match (
             self.cloud_provider,
+            self.cloud_user,
             self.cloud_job,
             self.cloud_folder,
             self.cloud_root,
         ) {
-            (None, None, None, None) => None,
-            (Some(provider), Some(job), Some(folder), root) => {
+            (None, None, None, None, None) => None,
+            (Some(provider), Some(user), job, Some(folder), root)
+                if job.is_some() || root.is_none() =>
+            {
                 let folder = PathBuf::from(folder);
                 let root = root.map(PathBuf::from);
                 if !folder.is_absolute()
@@ -1356,6 +1418,7 @@ impl Row {
                 }
                 Some(CloudSpec {
                     provider: parse_provider(&provider).ok_or_else(|| corrupt("网盘"))?,
+                    user,
                     job,
                     folder,
                     root,
@@ -2284,14 +2347,15 @@ mod tests {
         }
     }
 
-    fn cloud_spec(root: Option<PathBuf>) -> TaskSpec {
+    fn cloud_spec(job: Option<&str>, root: Option<PathBuf>) -> TaskSpec {
         TaskSpec {
             title: "Show".into(),
             url: "magnet:?xt=urn:btih:x".parse().unwrap(),
             headers: Vec::new(),
             kind: Kind::Cloud(CloudSpec {
                 provider: CloudProvider::PikPak,
-                job: "VTask1".into(),
+                user: "user-1".into(),
+                job: job.map(str::to_owned),
                 folder: m(""),
                 root,
             }),
@@ -2304,22 +2368,33 @@ mod tests {
             path: path.into(),
             size: 7,
             gcid: "6805ed701e6ea96597858628f8999a955d441d9d".into(),
+            fetched: false,
             done: false,
         }
     }
 
-    /// 云离线任务新建时没有根与任务目录；列出文件时一起定下（标题换成根名）、占用路径，各文件按次序记下与改完成；删任务
-    /// 连同文件。
+    /// 云离线任务新建时还没提交、没有根与任务目录；提交了记下编号（只记一次），列出文件时根与任务目录一起定下（标题
+    /// 换成根名）、占用路径；各文件先记取回再记下完，记为没取回时一并没下完；删任务连同文件。
     #[test]
     fn cloud_tasks_round_trip() {
         let mut store = Store::in_memory().unwrap();
         let tx = store.transaction().unwrap();
-        let id = insert(&tx, &cloud_spec(None), None, None, 1).unwrap();
+        let id = insert(&tx, &cloud_spec(None, None), None, None, 1).unwrap();
         let task = get(&tx, id).unwrap().unwrap();
-        assert_eq!((task.spec.clone(), task.work_dir), (cloud_spec(None), None));
+        assert_eq!(
+            (task.spec.clone(), task.work_dir),
+            (cloud_spec(None, None), None)
+        );
         assert!(cloud_files(&tx, id).unwrap().is_empty());
         let files = [cloud_file("VA", "a.bin"), cloud_file("VB", "Sub/b.bin")];
-        // 没有文件、同一路径两次都不收
+        // 没提交就定不了根
+        assert!(set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files).is_err());
+        set_cloud_job(&tx, id, "VTask1").unwrap();
+        assert!(matches!(
+            set_cloud_job(&tx, id, "VTask2"),
+            Err(Error::NotFound(_))
+        ));
+        // 没有文件、路径被占都不收
         assert!(matches!(
             set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &[]),
             Err(Error::InvalidInput(_))
@@ -2332,12 +2407,11 @@ mod tests {
         delete(&tx, other).unwrap();
         set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files).unwrap();
         let task = get(&tx, id).unwrap().unwrap();
-        assert_eq!(task.spec.title, "节目");
         assert_eq!(
             task.spec,
             TaskSpec {
                 title: "节目".into(),
-                ..cloud_spec(Some(m("节目")))
+                ..cloud_spec(Some("VTask1"), Some(m("节目")))
             }
         );
         assert_eq!(task.work_dir, Some(m("节目.hsdl")));
@@ -2351,18 +2425,24 @@ mod tests {
             set_cloud_root(&tx, id, &m("别处"), &m("别处.hsdl"), &files),
             Err(Error::NotFound(_))
         ));
+        // 没取回的不能记为下完
+        assert!(set_cloud_file_done(&tx, id, 1, true).is_err());
+        set_cloud_file_fetched(&tx, id, 1, true).unwrap();
         set_cloud_file_done(&tx, id, 1, true).unwrap();
         let stored = cloud_files(&tx, id).unwrap();
         assert_eq!(stored[0], files[0]);
         assert_eq!(
             stored[1],
             CloudFile {
+                fetched: true,
                 done: true,
                 ..files[1].clone()
             }
         );
+        set_cloud_file_fetched(&tx, id, 1, false).unwrap();
+        assert_eq!(cloud_files(&tx, id).unwrap()[1], files[1]);
         assert!(matches!(
-            set_cloud_file_done(&tx, id, 2, true),
+            set_cloud_file_fetched(&tx, id, 2, true),
             Err(Error::NotFound(_))
         ));
         delete(&tx, id).unwrap();
@@ -2377,7 +2457,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let id = {
             let tx = store.transaction().unwrap();
-            let id = insert(&tx, &cloud_spec(None), None, None, 1).unwrap();
+            let id = insert(&tx, &cloud_spec(Some("VTask1"), None), None, None, 1).unwrap();
             tx.commit().unwrap();
             id
         };
@@ -2398,7 +2478,31 @@ mod tests {
         }
     }
 
-    /// 云离线的三列必有且只用于它，根与任务目录一起有，没有请求头。
+    /// 存储里的文件路径被改坏（越出内容的根、空段）时读不回来。
+    #[test]
+    fn cloud_file_paths_that_escape_the_root_are_refused() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let id = insert(&tx, &cloud_spec(Some("VTask1"), None), None, None, 1).unwrap();
+        set_cloud_root(
+            &tx,
+            id,
+            &m("节目"),
+            &m("节目.hsdl"),
+            &[cloud_file("VA", "a/b")],
+        )
+        .unwrap();
+        for bad in ["../x", "a//b", "/x", "a/..", ".", "a\\b"] {
+            tx.execute("UPDATE cloud_file SET path = ?1", [bad])
+                .unwrap();
+            assert!(
+                matches!(cloud_files(&tx, id), Err(Error::Corrupt(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    /// 云离线的网盘、账号与保存目录必有且只用于它；离线任务编号可空，有根时必有；根与任务目录一起有；没有请求头。
     #[test]
     fn cloud_columns_must_agree() {
         let mut store = Store::in_memory().unwrap();
@@ -2412,37 +2516,48 @@ mod tests {
                 [],
             )
         };
-        let all = ", cloud_provider, cloud_job, cloud_folder";
-        insert("cloud", all, ", 'pikpak', 'VTask1', '/m'").unwrap();
+        let all = ", cloud_provider, cloud_user, cloud_folder";
+        insert("cloud", all, ", 'pikpak', 'u', '/m'").unwrap();
         insert(
             "cloud",
-            &format!("{all}, cloud_root, work_dir"),
-            ", 'pikpak', 'VTask2', '/m', '/m/a', '/m/a.hsdl'",
+            &format!("{all}, cloud_job, cloud_root, work_dir"),
+            ", 'pikpak', 'u', '/m', 'VTask2', '/m/a', '/m/a.hsdl'",
         )
         .unwrap();
         tx.execute("DELETE FROM task", []).unwrap();
         for (kind, columns, values) in [
             (
                 "cloud",
-                ", cloud_provider, cloud_job",
-                ", 'pikpak', 'VTask1'".to_owned(),
+                ", cloud_provider, cloud_folder",
+                ", 'pikpak', '/m'".to_owned(),
             ),
-            ("cloud", all, ", 'baidu', 'VTask1', '/m'".to_owned()),
+            ("cloud", all, ", 'baidu', 'u', '/m'".to_owned()),
             ("cloud", all, ", 'pikpak', '', '/m'".to_owned()),
             (
                 "cloud",
-                &format!("{all}, cloud_root"),
-                ", 'pikpak', 'VTask1', '/m', '/m/a'".to_owned(),
+                &format!("{all}, cloud_job"),
+                ", 'pikpak', 'u', '/m', ''".to_owned(),
+            ),
+            // 有根却没提交
+            (
+                "cloud",
+                &format!("{all}, cloud_root, work_dir"),
+                ", 'pikpak', 'u', '/m', '/m/a', '/m/a.hsdl'".to_owned(),
+            ),
+            (
+                "cloud",
+                &format!("{all}, cloud_job, cloud_root"),
+                ", 'pikpak', 'u', '/m', 'V', '/m/a'".to_owned(),
             ),
             (
                 "cloud",
                 &format!("{all}, work_dir"),
-                ", 'pikpak', 'VTask1', '/m', '/m/a.hsdl'".to_owned(),
+                ", 'pikpak', 'u', '/m', '/m/a.hsdl'".to_owned(),
             ),
             (
                 "hls",
-                ", preference, output_kind, live, cloud_job",
-                ", '{}', 'mp4', 0, 'VTask1'".to_owned(),
+                ", preference, output_kind, live, cloud_user",
+                ", '{}', 'mp4', 0, 'u'".to_owned(),
             ),
         ] {
             assert!(
@@ -2451,8 +2566,8 @@ mod tests {
             );
         }
         let headers = tx.execute(
-            "INSERT INTO task (kind, title, url, headers, status, created_at, cloud_provider, cloud_job, cloud_folder)
-             VALUES ('cloud', 'x', 'magnet:?', '[[\"a\",\"b\"]]', 'paused', 1, 'pikpak', 'V', '/m')",
+            "INSERT INTO task (kind, title, url, headers, status, created_at, cloud_provider, cloud_user, cloud_folder)
+             VALUES ('cloud', 'x', 'magnet:?', '[[\"a\",\"b\"]]', 'paused', 1, 'pikpak', 'u', '/m')",
             [],
         );
         assert!(headers.is_err());
@@ -2502,7 +2617,7 @@ mod tests {
         );
         assert_eq!(pikpak_account(&tx).unwrap(), None);
         // 删掉的任务的编号不再用
-        let id = insert(&tx, &cloud_spec(None), None, None, 5).unwrap();
+        let id = insert(&tx, &cloud_spec(None, None), None, None, 5).unwrap();
         assert_eq!(id, TaskId(3));
         drop(tx);
         drop(store);

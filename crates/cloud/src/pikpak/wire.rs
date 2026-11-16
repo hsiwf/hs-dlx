@@ -132,4 +132,10 @@ pub(crate) struct File {
     /// 原文件的直链（带签名、有时效）；只在取单个文件且带 `usage=FETCH` 时有
     #[serde(default)]
     pub web_content_link: String,
+    /// `PHASE_TYPE_COMPLETE` 为已完整；离线下载中单个文件失败或还在处理时为别的
+    #[serde(default)]
+    pub phase: String,
+    /// 在回收站里
+    #[serde(default)]
+    pub trashed: bool,
 }

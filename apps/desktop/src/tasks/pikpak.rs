@@ -103,7 +103,7 @@ impl Tasks {
     }
 }
 
-/// 登录有了结果：成了即重读账号，没成写下原因。
+/// 登录有了结果：成了即重读账号、把应用带回前台，没成写下原因。
 fn finish(
     this: &gpui_kit::WeakEntity<Tasks>,
     cx: &mut gpui_kit::AsyncApp,
@@ -114,7 +114,11 @@ fn finish(
         // 跑着这段的任务留在 `_login` 里，下次登录时换掉
         this.pikpak.login = None;
         match result {
-            Ok(()) => this.reload_pikpak(),
+            Ok(()) => {
+                this.reload_pikpak();
+                // 在浏览器里点了确认：回到应用，设置页上写着已登录
+                cx.activate(true);
+            }
             Err(reason) => this.pikpak.error = Some(reason),
         }
         cx.notify();

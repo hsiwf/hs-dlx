@@ -8,7 +8,7 @@ use std::time::Duration;
 use hs_dlx_cloud::pikpak::{self, Client, Entry, Phase, Reason, Session, gcid::Gcid};
 use hs_m3u8_core::{
     CancellationToken, FileOutputOptions, FileProgress, FileRequest, HttpErrorKind, HttpOptions,
-    Proxy, Source,
+    Proxy, Source, WorkDirProblem,
 };
 use tokio::task::JoinHandle;
 
@@ -19,8 +19,10 @@ use crate::{CloudFile, CloudSpec, Error, Failure, FailureKind, Status, Task, Tas
 
 /// 网盘还在下时多久问一次进度。
 const POLL: Duration = Duration::from_secs(5);
-/// 直链被拒（过期、换了出口）时最多重取几次。
+/// 一个文件的直链被拒、或换了直链后核心认不出是不是同一个文件时，最多重取几次直链。
 const RELINKS: u32 = 3;
+/// 等网盘下完时，接口连着暂时失败（网络、5xx、请求太频繁）多久才算失败：几小时的离线下载里偶尔一次不算。
+const POLL_TOLERANCE: Duration = Duration::from_secs(5 * 60);
 /// 校验时每次读多少字节。
 const VERIFY_CHUNK: usize = 1 << 20;
 /// 网盘文件夹最多套几层：防网盘回的目录结构打转。
@@ -78,12 +80,15 @@ pub(super) fn failure(error: &pikpak::Error) -> Failure {
             }
             Reason::Quota => FailureKind::CloudQuota,
             Reason::RateLimited => FailureKind::Status(429),
+            // 网盘或途中的网关出错，不是离线下载本身失败
+            Reason::Other if rejection.status >= 500 => FailureKind::Status(rejection.status),
             Reason::Other => FailureKind::CloudFailed,
         },
         pikpak::Error::Unrecognized(_) => FailureKind::CloudApi,
         pikpak::Error::Verification(_)
         | pikpak::Error::LoginExpired
-        | pikpak::Error::LoginDenied => FailureKind::CloudLogin,
+        | pikpak::Error::LoginDenied
+        | pikpak::Error::LoggedOut => FailureKind::CloudLogin,
         pikpak::Error::Save(_) => FailureKind::Disk,
         pikpak::Error::NoRandom(_) => FailureKind::Other,
     };
@@ -97,58 +102,81 @@ pub(super) fn failure(error: &pikpak::Error) -> Failure {
 }
 
 impl Shared {
-    /// PikPak 的登录状态：还没有时照存储里的账号建；没登录时报 [`Error::NotLoggedIn`]。
+    /// PikPak 的登录状态：还没有时照存储里的账号建；没登录时报 [`Error::NotLoggedIn`]。调用方不能持着 `store` 锁
+    /// （持着时用 [`Shared::pikpak_session_in`]）。
     pub(super) fn pikpak_session(self: &Arc<Self>) -> Result<Arc<Session>, Error> {
-        let mut session = lock(&self.pikpak);
-        if let Some(session) = &*session {
+        let mut store = lock(&self.store);
+        let tx = store.transaction()?;
+        self.pikpak_session_in(&tx)
+    }
+
+    /// 同 [`Shared::pikpak_session`]，账号从调用方持着 `store` 锁开的事务 `tx` 读（锁的顺序：先 `store` 再 `pikpak`）。
+    pub(super) fn pikpak_session_in(
+        self: &Arc<Self>,
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<Arc<Session>, Error> {
+        let mut slot = lock(&self.pikpak);
+        if let Some(session) = &*slot {
             return Ok(session.clone());
         }
-        let account = {
-            let mut store = lock(&self.store);
-            let tx = store.transaction()?;
-            store::pikpak_account(&tx)?
-        }
-        .ok_or(Error::NotLoggedIn)?;
-        let created = Arc::new(self.new_pikpak_session(account));
-        *session = Some(created.clone());
+        let account = store::pikpak_account(tx)?.ok_or(Error::NotLoggedIn)?;
+        let created = self.new_pikpak_session(account);
+        *slot = Some(created.clone());
         Ok(created)
     }
 
-    /// 以 `account` 建 PikPak 的登录状态：换了的令牌写进存储。
-    pub(super) fn new_pikpak_session(self: &Arc<Self>, account: pikpak::Account) -> Session {
+    /// 以 `account` 建 PikPak 的登录状态：换了的令牌写进存储；它已作废（退出登录、换了账号）时不写，那次换令牌失败。
+    /// 是否作废在 `store` 锁内判，与作废它的 [`Shared::replace_pikpak`] 不会交错。
+    pub(super) fn new_pikpak_session(self: &Arc<Self>, account: pikpak::Account) -> Arc<Session> {
         let shared = Arc::downgrade(self);
-        Session::new(
-            self.pikpak_endpoints.clone(),
-            account,
-            Box::new(move |account| {
-                let shared = shared.upgrade().ok_or("应用正在退出")?;
-                shared
-                    .write(|tx| store::set_pikpak_account(tx, Some(account)))
-                    .map_err(|error| error.to_string())
-            }),
-        )
+        let endpoints = self.pikpak_endpoints.clone();
+        Arc::new_cyclic(|this: &std::sync::Weak<Session>| {
+            let this = this.clone();
+            Session::new(
+                endpoints,
+                account,
+                Box::new(move |account| {
+                    let shared = shared.upgrade().ok_or("应用正在退出")?;
+                    shared
+                        .write(|tx| {
+                            if this.upgrade().is_none_or(|session| session.is_retired()) {
+                                return Err(Error::NotLoggedIn);
+                            }
+                            store::set_pikpak_account(tx, Some(account))
+                        })
+                        .map_err(|error| error.to_string())
+                }),
+            )
+        })
     }
 
-    /// 经代理 `proxy` 调 PikPak 接口的客户端。
-    pub(super) fn pikpak_client(self: &Arc<Self>, proxy: Proxy) -> Result<Client, Error> {
+    /// 换掉 PikPak 的登录状态（登录了新的为 Some，退出登录为 None），旧的作废、不再发请求与写存储。调用方持着 `store`
+    /// 锁，已提交了存储里的账号（见 [`Shared::set_pikpak`]）。
+    pub(super) fn replace_pikpak(&self, session: Option<Arc<Session>>) {
+        let old = std::mem::replace(&mut *lock(&self.pikpak), session);
+        if let Some(old) = old {
+            old.retire();
+        }
+    }
+
+    /// 经代理 `proxy` 调 PikPak 接口的客户端；`session` 为登录状态。
+    pub(super) fn pikpak_client(&self, session: Arc<Session>, proxy: Proxy) -> Client {
         let http = HttpOptions {
             proxy,
             ..HttpOptions::default()
         };
-        Ok(Client::new(
-            self.engine.clone(),
-            http,
-            self.pikpak_session()?,
-        ))
+        Client::new(self.engine.clone(), http, session)
     }
 
-    /// 开始云离线任务 `task`（经代理 `proxy`，取直链与下载走同一出口）；调用方须在运行时里。
+    /// 开始云离线任务 `task`（经代理 `proxy`，取直链与下载走同一出口），登录状态从调用方持着 `store` 锁开的事务 `tx`
+    /// 读；没登录时报 [`Error::NotLoggedIn`]。调用方须在运行时里。
     pub(super) fn launch_cloud(
         self: &Arc<Self>,
+        tx: &rusqlite::Transaction<'_>,
         task: &Task,
         proxy: Proxy,
     ) -> Result<CloudRun, Error> {
-        let client = self.pikpak_client(proxy.clone())?;
+        let client = self.pikpak_client(self.pikpak_session_in(tx)?, proxy.clone());
         let cancel = CancellationToken::new();
         let shared = self.clone();
         let (task, token) = (task.clone(), cancel.clone());
@@ -169,7 +197,21 @@ impl Shared {
 
     async fn run_cloud(self: &Arc<Self>, task: &Task, ctx: Ctx<'_>) -> Result<u64, Stop> {
         let id = task.id;
-        let spec = task.spec.cloud().expect("只为云离线任务开始").clone();
+        let mut spec = task.spec.cloud().expect("只为云离线任务开始").clone();
+        let user = ctx.client.session().user_id();
+        if user != spec.user {
+            return Err(Stop::failed(
+                FailureKind::CloudLogin,
+                format!(
+                    "这个任务是用另一个 PikPak 账号（用户 {}）建的，现在登录的是用户 {user}：登录回那个账号再继续",
+                    spec.user
+                ),
+            ));
+        }
+        if spec.job.is_none() {
+            let job = self.submit_cloud(id, &task.spec.url, ctx).await?;
+            spec.job = Some(job);
+        }
         let (root, work_dir, files) = match (&spec.root, &task.work_dir) {
             (Some(root), Some(work_dir)) => {
                 let files = self
@@ -201,11 +243,26 @@ impl Shared {
                 total,
                 received,
             };
-            if !exists(&output).await.map_err(Stop::Failed)? {
-                let file_dir = work_dir.join(index.to_string());
-                received += self
-                    .fetch_cloud_file(at, file, &output, &file_dir, ctx)
-                    .await?;
+            match (exists(&output).await.map_err(Stop::Failed)?, file.fetched) {
+                // 上次取回、装上了输出，还没校验就停了
+                (true, true) => {}
+                (true, false) => {
+                    return Err(Stop::failed(
+                        FailureKind::OutputTaken,
+                        format!(
+                            "保存位置上已有 {}，不是这个任务取回的：挪走后再继续",
+                            output.display()
+                        ),
+                    ));
+                }
+                (false, _) => {
+                    let file_dir = work_dir.join(index.to_string());
+                    received += self
+                        .fetch_cloud_file(at, file, &output, &file_dir, ctx)
+                        .await?;
+                    self.write(|tx| store::set_cloud_file_fetched(tx, id, index, true))
+                        .map_err(Stop::store)?;
+                }
             }
             self.verify_cloud_file(at, file, &output, ctx.cancel)
                 .await?;
@@ -235,10 +292,25 @@ impl Shared {
         ctx: Ctx<'_>,
     ) -> Result<(PathBuf, PathBuf, Vec<CloudFile>), Stop> {
         let (client, cancel) = (ctx.client, ctx.cancel);
+        let job_id = spec.job.as_deref().expect("列文件之前已提交");
+        // 接口连着暂时失败的起点；成功一次即清掉
+        let mut failing: Option<tokio::time::Instant> = None;
         let job = loop {
-            let job = until(cancel, client.job(&spec.job))
-                .await?
-                .map_err(Stop::cloud)?;
+            let job = match until(cancel, client.job(job_id)).await? {
+                Ok(job) => {
+                    failing = None;
+                    job
+                }
+                Err(error) if transient(&error) => {
+                    let since = *failing.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= POLL_TOLERANCE {
+                        return Err(Stop::cloud(error));
+                    }
+                    until(cancel, tokio::time::sleep(POLL)).await?;
+                    continue;
+                }
+                Err(error) => return Err(Stop::cloud(error)),
+            };
             let Some(job) = job else {
                 return Err(Stop::failed(
                     FailureKind::CloudFailed,
@@ -294,6 +366,21 @@ impl Shared {
                 "网盘上下到的文件夹是空的".to_owned(),
             ));
         }
+        let missing: Vec<&str> = found
+            .iter()
+            .filter(|(_, entry)| !entry.ready)
+            .map(|(_, entry)| entry.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(Stop::failed(
+                FailureKind::CloudFailed,
+                format!(
+                    "网盘上有 {} 个文件不完整或在回收站里：{}",
+                    missing.len(),
+                    missing.join("、")
+                ),
+            ));
+        }
         let places: Vec<CloudPlace> = found
             .iter()
             .map(|(folders, entry)| CloudPlace {
@@ -314,6 +401,7 @@ impl Shared {
                 path,
                 size: entry.size,
                 gcid: entry.gcid.expect("文件都有 GCID（读出时已核对）"),
+                fetched: false,
                 done: false,
             })
             .collect();
@@ -325,7 +413,7 @@ impl Shared {
                 spec.folder.clone(),
                 top.name.clone(),
                 !top.folder,
-                spec.job.clone(),
+                job_id.to_owned(),
             );
             let (_, root) = super::named(&spec.folder, move || {
                 naming::cloud_root_for(&folder, &name, single, &fallback, &taken)
@@ -346,8 +434,9 @@ impl Shared {
         }
     }
 
-    /// 取直链、交给核心下载第 `at.index` 个文件到 `output`（任务目录 `file_dir`）；直链被拒时重取，最多 [`RELINKS`] 次。
-    /// 返回从网络读到的字节数（各次合计）。
+    /// 取直链、交给核心下载第 `at.index` 个文件到 `output`（任务目录 `file_dir`），返回从网络读到的字节数（各次合计）。
+    /// 直链被拒时重取；换了直链后核心认不出是不是同一个文件（直链不带验证器、或带的变了）时删掉这个文件的任务目录、
+    /// 从头下，最后有 GCID 校验。两种合计最多 [`RELINKS`] 次，用完以云端失败报出（可再继续）。
     async fn fetch_cloud_file(
         self: &Arc<Self>,
         at: Position,
@@ -416,11 +505,43 @@ impl Shared {
                 .await
                 .expect("转发进度的任务不会 panic，运行时关闭时本任务也一起丢弃");
             received += control.progress().borrow().received;
-            match result {
+            let error = match result {
                 Ok(_) => return Ok(received),
                 Err(hs_m3u8_core::Error::Cancelled) => return Err(Stop::Paused),
-                Err(error) if link_rejected(&error) && relinked < RELINKS => relinked += 1,
-                Err(error) => return Err(Stop::core(error)),
+                Err(error) => error,
+            };
+            let stale = matches!(
+                error,
+                hs_m3u8_core::Error::WorkDir {
+                    problem: WorkDirProblem::SourceUnverified | WorkDirProblem::FileChanged,
+                    ..
+                }
+            );
+            if !(stale || link_rejected(&error)) {
+                return Err(Stop::core(error));
+            }
+            if relinked == RELINKS {
+                return Err(Stop::failed(
+                    FailureKind::CloudFailed,
+                    format!(
+                        "{} 的直链重取了 {RELINKS} 次仍下不了：{error}",
+                        output.display()
+                    ),
+                ));
+            }
+            relinked += 1;
+            if stale {
+                let leftovers = self
+                    .engine
+                    .discard(file_dir, hs_m3u8_core::Unsettled::Fail, cancel)
+                    .await
+                    .map_err(Stop::core)?;
+                if let Some(leftover) = leftovers.first() {
+                    return Err(Stop::failed(
+                        FailureKind::Disk,
+                        format!("重下 {} 前删不掉它的任务目录：{leftover}", output.display()),
+                    ));
+                }
             }
         }
     }
@@ -435,7 +556,7 @@ impl Shared {
     ) -> Result<(), Stop> {
         let (path, size, cancelled) = (output.to_path_buf(), file.size, cancel.clone());
         let events = self.events.clone();
-        let checked = tokio::task::spawn_blocking(move || {
+        let checked: Result<String, u64> = tokio::task::spawn_blocking(move || {
             gcid_of(&path, size, &cancelled, |checked| {
                 // 接收端随界面关闭而丢弃时没有谁要
                 let _closed = events.send(Event::CloudProgress {
@@ -452,22 +573,53 @@ impl Shared {
         })
         .await
         .expect("校验不会 panic，运行时关闭时本任务也一起丢弃")?;
-        if checked == file.gcid {
-            return Ok(());
-        }
+        let what = match checked {
+            Ok(gcid) if gcid == file.gcid => return Ok(()),
+            Ok(gcid) => format!("与网盘给的 GCID 不符（网盘 {}，下到的 {gcid}）", file.gcid),
+            Err(read) => format!("有 {read} 字节，网盘上是 {} 字节", file.size),
+        };
         let removed = tokio::fs::remove_file(output).await;
         let note = match removed {
-            Ok(()) => "已删掉，继续时重下这个文件".to_owned(),
+            Ok(()) => {
+                self.write(|tx| store::set_cloud_file_fetched(tx, at.id, at.index, false))
+                    .map_err(Stop::store)?;
+                "已删掉，继续时重下这个文件".to_owned()
+            }
             Err(error) => format!("删不掉（{error}），先手动删掉它再继续"),
         };
         Err(Stop::failed(
             FailureKind::Integrity,
-            format!(
-                "{} 与网盘给的 GCID 不符（网盘 {}，下到的 {checked}），{note}",
-                output.display(),
-                file.gcid
-            ),
+            format!("{} {what}，{note}", output.display()),
         ))
+    }
+
+    /// 把磁力链接 `link` 提交给网盘，记下网盘给的离线任务编号并返回。提交前先记下网盘上已有的同一链接的任务：请求
+    /// 可能已生效而没收到结果（发出后断开、没读完响应）时，按链接找这之后新建的那个，找到即用它，不重发。
+    async fn submit_cloud(
+        self: &Arc<Self>,
+        id: TaskId,
+        link: &hs_m3u8_core::Url,
+        ctx: Ctx<'_>,
+    ) -> Result<String, Stop> {
+        let (client, cancel) = (ctx.client, ctx.cancel);
+        let link = link.as_str();
+        let before = until(cancel, client.job_ids_for(link))
+            .await?
+            .map_err(Stop::cloud)?;
+        // 提交发出后不随暂停取消：发出去就要等到结果，记下编号
+        let job = match client.submit(link).await {
+            Ok(job) => job,
+            Err(pikpak::Error::Transport(error)) if super::may_have_taken_effect(&error) => {
+                match client.find_job(link, &before).await.map_err(Stop::cloud)? {
+                    Some(job) => job,
+                    None => return Err(Stop::cloud(pikpak::Error::Transport(error))),
+                }
+            }
+            Err(error) => return Err(Stop::cloud(error)),
+        };
+        self.write(|tx| store::set_cloud_job(tx, id, &job.id))
+            .map_err(Stop::store)?;
+        Ok(job.id)
     }
 
     fn cloud_progress(&self, id: TaskId, progress: CloudProgress) {
@@ -508,7 +660,8 @@ impl Shared {
                 return Err(left(leftover.to_string()));
             }
         }
-        for file in &files {
+        // 只删这个任务取回的；没取回的位置上即使有东西也不是它的
+        for file in files.iter().filter(|file| file.fetched) {
             let output = output_of(root, &file.path);
             match tokio::fs::remove_file(&output).await {
                 Ok(()) => {}
@@ -653,14 +806,14 @@ fn link_rejected(error: &hs_m3u8_core::Error) -> bool {
     }
 }
 
-/// 读 `path` 算 GCID（总长 `size` 字节），每读一块调 `checked`（已读字节数）；`cancel` 取消时为 [`Stop::Paused`]，文件
-/// 长度不是 `size` 时以 [`FailureKind::Integrity`] 失败。
+/// 读 `path` 算 GCID（总长 `size` 字节），每读一块调 `checked`（已读字节数）：长度是 `size` 时为 Ok(GCID)，不是时为
+/// Err(实际字节数)。`cancel` 取消时为 [`Stop::Paused`]，读不了时以磁盘一类的失败报出。
 fn gcid_of(
     path: &Path,
     size: u64,
     cancel: &CancellationToken,
     mut checked: impl FnMut(u64),
-) -> Result<String, Stop> {
+) -> Result<Result<String, u64>, Stop> {
     use std::io::Read as _;
     let disk = |error: std::io::Error| {
         Stop::failed(
@@ -685,21 +838,32 @@ fn gcid_of(
         checked(read);
     }
     if read != size {
-        return Err(Stop::failed(
-            FailureKind::Integrity,
-            format!("{} 有 {read} 字节，网盘上是 {size} 字节", path.display()),
-        ));
+        return Ok(Err(read));
     }
-    Ok(gcid.finish())
+    Ok(Ok(gcid.finish()))
 }
 
-/// 新建云离线任务时的规格：标题取网盘给的名字（整理成文件主名），什么都不剩时为「磁力链接」。
-pub(super) fn draft_spec(spec: CloudSpec, name: &str, url: hs_m3u8_core::Url) -> TaskSpec {
-    let title = naming::clean_title(name);
-    let title = if title.is_empty() {
+/// 暂时的失败：网络（核心判为可重试的）、网盘或网关出错（5xx）、请求太频繁；过一阵再试可能就好。
+fn transient(error: &pikpak::Error) -> bool {
+    match error {
+        pikpak::Error::Transport(error) => error.retryable(),
+        pikpak::Error::Rejected(rejection) => rejection.transient(),
+        _ => false,
+    }
+}
+
+/// 新建云离线任务时的规格：标题取磁力链接的显示名（`dn`，整理成文件主名），没有或什么都不剩时为「磁力链接」；列出
+/// 文件、定下根后换成根名。
+pub(super) fn draft_spec(spec: CloudSpec, url: hs_m3u8_core::Url) -> TaskSpec {
+    let name = url
+        .query_pairs()
+        .find(|(key, _)| key == "dn")
+        .map(|(_, name)| naming::clean_title(&name))
+        .unwrap_or_default();
+    let title = if name.is_empty() {
         "磁力链接".to_owned()
     } else {
-        title
+        name
     };
     TaskSpec {
         title,

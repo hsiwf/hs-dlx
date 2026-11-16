@@ -1,7 +1,6 @@
 //! 设备授权登录（RFC 8628）：向 PikPak 要一个登录码，用户在系统浏览器里打开官网的确认页登录并点确认（邮箱、手机号、
 //! Google 都在官网上处理，不经手密码），这边按间隔轮询，确认了即拿到令牌。Google 不让在应用内嵌的网页里登录，所以
-//! 确认页要在系统浏览器里打开。确认页用网页版的 `/drive/qr-login`：要登录码时接口给的 `verification_uri_complete`
-//! （user.mypikpak.com/__/auth/device/）打开是 404。
+//! 确认页要在系统浏览器里打开，用网页版的 `/drive/qr-login`。
 
 use std::time::Duration;
 

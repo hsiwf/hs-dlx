@@ -126,8 +126,10 @@ pub struct TorrentSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudSpec {
     pub provider: CloudProvider,
-    /// 网盘上离线任务的编号，提交时网盘给的
-    pub job: String,
+    /// 建任务时登录的账号的用户编号：网盘上的离线任务与文件只在这个账号下，换了账号要换回来才能继续
+    pub user: String,
+    /// 网盘上离线任务的编号；提交成了才有（新建时在本机先记下任务，开始运行后才提交）
+    pub job: Option<String>,
     /// 保存目录（绝对路径），内容的根放在这里
     pub folder: PathBuf,
     /// 内容的根：保存目录下的文件（网盘下到的是单个文件）或目录（文件夹），以文件名结尾的绝对路径。网盘下完、列出
@@ -152,7 +154,9 @@ pub struct CloudFile {
     pub size: u64,
     /// 网盘给的 GCID（见 [`hs_dlx_cloud::pikpak::gcid`]），40 位小写十六进制
     pub gcid: String,
-    /// 已下完、校验过并放到了输出位置
+    /// 已取回、核心装到了输出位置（还没校验）：输出位置上的东西是这个任务的，可以校验、不符时删
+    pub fetched: bool,
+    /// 已校验过；为 true 时 `fetched` 一定为 true
     pub done: bool,
 }
 

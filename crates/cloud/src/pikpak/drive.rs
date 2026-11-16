@@ -49,6 +49,8 @@ pub struct Entry {
     pub gcid: Option<String>,
     /// 原文件的直链（带签名、有时效；取链与下载要走同一出口）：只有 [`Client::entry`] 取的文件有
     pub link: Option<Url>,
+    /// 内容完整、不在回收站里：离线下载里失败或还在处理的文件、被移进回收站的文件为 false
+    pub ready: bool,
 }
 
 /// 每页列多少项。
@@ -85,13 +87,25 @@ impl Client {
         }
     }
 
-    /// 最近的离线任务里提交的是 `link` 的那个（提交得到结果之前就断了时，查它到底建没建）；没有时为 None。
-    pub async fn find_job(&self, link: &str) -> Result<Option<Job>, Error> {
+    /// 最近的离线任务里提交的是 `link` 的那些的编号：提交前记下，提交得到结果之前就断了时用来排除旧的。
+    pub async fn job_ids_for(&self, link: &str) -> Result<Vec<String>, Error> {
         Ok(self
             .jobs("{}")
             .await?
             .into_iter()
-            .find(|job| job.url == link))
+            .filter(|job| job.url == link)
+            .map(|job| job.id)
+            .collect())
+    }
+
+    /// 最近的离线任务里提交的是 `link`、编号不在 `before`（提交前已有的，见 [`Client::job_ids_for`]）里的那个：提交
+    /// 得到结果之前就断了时，查它到底建没建；没有时为 None。
+    pub async fn find_job(&self, link: &str, before: &[String]) -> Result<Option<Job>, Error> {
+        Ok(self
+            .jobs("{}")
+            .await?
+            .into_iter()
+            .find(|job| job.url == link && !before.contains(&job.id)))
     }
 
     /// 离线任务的第一页（最近的在前），按 `filters`（JSON）筛。
@@ -107,14 +121,9 @@ impl Client {
         list.tasks.into_iter().map(Job::of).collect()
     }
 
-    /// 文件夹 `folder` 里的文件与文件夹（不含回收站里的与没传完的），按网盘给的次序。
+    /// 文件夹 `folder` 里的文件与文件夹，按网盘给的次序；不完整的、在回收站里的也列出（[`Entry::ready`] 为 false）。
     pub async fn children(&self, folder: &str) -> Result<Vec<Entry>, Error> {
         checked_id(folder)?;
-        let filters = serde_json::json!({
-            "phase": { "eq": "PHASE_TYPE_COMPLETE" },
-            "trashed": { "eq": false },
-        })
-        .to_string();
         let mut entries = Vec::new();
         let mut page_token = String::new();
         loop {
@@ -122,7 +131,6 @@ impl Client {
             url.query_pairs_mut()
                 .append_pair("parent_id", folder)
                 .append_pair("limit", &PAGE.to_string())
-                .append_pair("filters", &filters)
                 .append_pair("page_token", &page_token);
             let page: wire::FileList = self
                 .api(Method::Get, url, None, "GET:/drive/v1/files")
@@ -231,7 +239,9 @@ impl Entry {
                     .map_err(|error| Error::Unrecognized(format!("{} 的直链：{error}", file.name)))
             })
             .transpose()?;
+        let ready = !file.trashed && (folder || file.phase == "PHASE_TYPE_COMPLETE");
         Ok(Entry {
+            ready,
             id: checked_id(&file.id)?.to_owned(),
             size: if folder {
                 0

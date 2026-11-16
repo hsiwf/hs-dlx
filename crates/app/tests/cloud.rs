@@ -1,5 +1,5 @@
 //! 云离线任务的端到端测试：真实的 SQLite 文件、服务与核心的分段下载，对着测试内的本地模拟 PikPak（设备授权登录、离线
-//! 任务、文件夹、带签名的直链；直链支持范围请求、带 ETag）。服务自带 tokio 运行时，在测试自己的运行时外面建、外面
+//! 任务、文件夹、带签名的直链；直链支持范围请求，一般带 ETag）。服务自带 tokio 运行时，在测试自己的运行时外面建、外面
 //! 丢弃；等事件与本地服务在测试的运行时里。
 
 use std::collections::HashMap;
@@ -49,6 +49,14 @@ struct Fake {
     submits: u32,
     /// 提交时照常建任务，但响应体发到一半断开
     break_submit: bool,
+    /// 离线任务列表里的任务编号，新的在前；提交一次加一个 `VTask<次数>`
+    jobs: Vec<String>,
+    /// 登录得到的用户编号
+    user: &'static str,
+    /// b.bin 的直链不带 ETag、每次最多给 64 KiB，第一个直链的第二个请求回 403
+    b_unverifiable: bool,
+    /// b.bin 在网盘上还没处理完
+    b_incomplete: bool,
 }
 
 #[derive(Default)]
@@ -93,10 +101,11 @@ async fn device_code() -> Response {
         .into_response()
 }
 
-async fn auth_token(Json(body): Json<Value>) -> Response {
+async fn auth_token(State(fake): State<Shared>, Json(body): Json<Value>) -> Response {
     assert_ne!(body["grant_type"], "refresh_token", "测试里令牌不会过期");
+    let user = fake.lock().unwrap().user;
     Json(json!({
-        "access_token": "a1", "refresh_token": "r1", "expires_in": 7200, "sub": "user-1",
+        "access_token": "a1", "refresh_token": "r1", "expires_in": 7200, "sub": user,
     }))
     .into_response()
 }
@@ -109,9 +118,9 @@ fn authorized(headers: &HeaderMap) -> bool {
     headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer a1")
 }
 
-fn task_body() -> Value {
+fn task_body(id: &str) -> Value {
     json!({
-        "kind": "drive#task", "id": "VTask1", "name": "Show", "phase": "PHASE_TYPE_COMPLETE",
+        "kind": "drive#task", "id": id, "name": "Show", "phase": "PHASE_TYPE_COMPLETE",
         "progress": 100, "file_id": "VShow", "file_size": "0", "params": { "url": MAGNET },
     })
 }
@@ -125,22 +134,31 @@ async fn submit(
     assert_eq!(body["url"]["url"], MAGNET);
     let mut fake = fake.lock().unwrap();
     fake.submits += 1;
+    let id = format!("VTask{}", fake.submits);
+    fake.jobs.insert(0, id.clone());
     if fake.break_submit {
         // 声明的长度比发出的长：发完这几个字节连接即断，客户端收到了响应头、没读完响应体
         return ([(header::CONTENT_LENGTH, "1000")], "{\"task\"").into_response();
     }
-    Json(json!({ "task": task_body() })).into_response()
+    Json(json!({ "task": task_body(&id) })).into_response()
 }
 
-async fn tasks(headers: HeaderMap) -> Response {
+async fn tasks(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     assert!(authorized(&headers));
-    Json(json!({ "tasks": [task_body()] })).into_response()
+    let fake = fake.lock().unwrap();
+    let tasks: Vec<Value> = fake.jobs.iter().map(|id| task_body(id)).collect();
+    Json(json!({ "tasks": tasks })).into_response()
 }
 
 fn file_json(fake: &Fake, remote: &Remote, base: &str) -> Value {
     let count = fake.links.get(remote.id).copied().unwrap_or(0);
+    let phase = if remote.id == "VB" && fake.b_incomplete {
+        "PHASE_TYPE_RUNNING"
+    } else {
+        "PHASE_TYPE_COMPLETE"
+    };
     json!({
-        "kind": "drive#file", "id": remote.id, "name": remote.name,
+        "kind": "drive#file", "id": remote.id, "name": remote.name, "phase": phase,
         "size": remote.body.len().to_string(),
         "hash": remote.gcid.map(str::to_owned).unwrap_or_else(|| gcid(&remote.body)).to_uppercase(),
         "web_content_link": format!("{base}dl/{}?n={count}", remote.id),
@@ -189,16 +207,27 @@ async fn entry(
     Json(file_json(&fake, remote, &base(&headers))).into_response()
 }
 
-/// 直链：支持 `Range: bytes=a-` 与 `bytes=a-b`，带强 ETag；`expire_once` 里的第一个链接回 403。
+/// 直链：支持 `Range: bytes=a-` 与 `bytes=a-b`，带强 ETag；`expire_once` 里的第一个链接回 403；`b_unverifiable` 时
+/// b.bin 见 [`Fake::b_unverifiable`]。
 async fn download(
     State(fake): State<Shared>,
     headers: HeaderMap,
     UrlPath(id): UrlPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let (data, hold) = {
+    let range_start = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes="))
+        .and_then(|value| value.split_once('-'))
+        .map_or(0, |(start, _)| start.parse::<u64>().unwrap());
+    let (data, hold, unverifiable) = {
         let fake = fake.lock().unwrap();
         if query["n"] == "1" && fake.expire_once.contains(&id.as_str()) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let unverifiable = id == "VB" && fake.b_unverifiable;
+        if unverifiable && query["n"] == "1" && range_start > 0 {
             return StatusCode::FORBIDDEN.into_response();
         }
         let remote = fake.files.iter().find(|remote| remote.id == id).unwrap();
@@ -208,6 +237,7 @@ async fn download(
         (
             remote.body.clone(),
             (id == "VB").then(|| fake.hold_b.clone()),
+            unverifiable,
         )
     };
     if let Some(gate) = hold {
@@ -227,21 +257,32 @@ async fn download(
             } else {
                 end.parse::<u64>().unwrap().min(len - 1)
             };
+            // 每次最多给 64 KiB：客户端从给到的地方接着请求
+            let end = if unverifiable {
+                end.min(start + 65_535)
+            } else {
+                end
+            };
             (start, end)
         });
-    match range {
+    let mut response = match range {
         Some((start, end)) => (
             StatusCode::PARTIAL_CONTENT,
             [
                 (header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}")),
-                (header::ETAG, etag),
                 (header::ACCEPT_RANGES, "bytes".to_owned()),
             ],
             data[start as usize..=end as usize].to_vec(),
         )
             .into_response(),
-        None => ([(header::ETAG, etag)], data).into_response(),
+        None => data.into_response(),
+    };
+    if !unverifiable {
+        response
+            .headers_mut()
+            .insert(header::ETAG, etag.parse().unwrap());
     }
+    response
 }
 
 /// 起模拟接口，返回它的地址与状态。
@@ -254,6 +295,10 @@ async fn start(files: Vec<Remote>) -> (Url, Shared) {
         b_requested: Arc::new(Notify::new()),
         submits: 0,
         break_submit: false,
+        jobs: Vec::new(),
+        user: "user-1",
+        b_unverifiable: false,
+        b_incomplete: false,
     }));
     fake.lock().unwrap().hold_b.open();
     let app = axum::Router::new()
@@ -474,26 +519,153 @@ fn creating_a_cloud_task_needs_a_login() {
     assert!(service.tasks().unwrap().is_empty());
 }
 
-/// 提交时收到了响应头、没读完响应体（网盘已建了任务）：按链接在最近的离线任务里找回它，不重发，网盘上只建了一个。
+/// 提交时收到了响应头、没读完响应体（网盘已建了任务）：在提交前没有的任务里按链接找回它，不重发、也不认领之前提交过
+/// 同一链接的旧任务；网盘上只新建了一个。
 #[test]
 fn a_submit_cut_off_after_the_server_answered_is_found_not_resent() {
     let dir = test_dir("cut-off");
     let rt = runtime();
     let (base, fake) = rt.block_on(start(remotes(None)));
-    fake.lock().unwrap().break_submit = true;
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.break_submit = true;
+        fake.jobs = vec!["VTask0".to_owned()];
+    }
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
     let task = rt
         .block_on(service.create(draft(dir.join("out")), 1))
         .unwrap()
         .unwrap();
-    let Kind::Cloud(spec) = &task.spec.kind else {
-        panic!("是云离线任务");
-    };
-    assert_eq!(spec.job, "VTask1");
-    assert_eq!(fake.lock().unwrap().submits, 1);
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
     );
+    let task = service.task(task.id).unwrap();
+    let Kind::Cloud(spec) = &task.spec.kind else {
+        panic!("是云离线任务");
+    };
+    assert_eq!(spec.job.as_deref(), Some("VTask1"));
+    assert_eq!(fake.lock().unwrap().submits, 1);
+}
+
+/// 重开应用后（登录状态还没建）继续暂停了的云离线任务：照常接着下完。
+#[test]
+fn a_paused_cloud_task_resumes_after_reopening() {
+    let dir = test_dir("reopen");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    let gate = Arc::new(Gate::default());
+    fake.lock().unwrap().hold_b = gate.clone();
+    let id = {
+        let (service, mut events) = service(&dir, &base);
+        log_in(&rt, &service);
+        let task = rt
+            .block_on(service.create(draft(folder.clone()), 1))
+            .unwrap()
+            .unwrap();
+        let requested = fake.lock().unwrap().b_requested.clone();
+        rt.block_on(requested.notified());
+        service.pause(task.id);
+        assert_eq!(
+            rt.block_on(ended(&mut events, task.id, |_| {})),
+            Status::Paused
+        );
+        task.id
+    };
+    gate.open();
+    let (service, mut events) = service(&dir, &base);
+    service.resume(id).unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Done);
+    assert_eq!(
+        std::fs::read(folder.join("Show").join("Sub").join("b.bin")).unwrap(),
+        remotes(None)[1].body
+    );
+}
+
+/// 直链不带 ETag：取回到一半直链被拒，换了直链后核心认不出是不是同一个文件，删掉这个文件的任务目录从头下，照样下完、
+/// 校验通过。
+#[test]
+fn a_link_that_cannot_be_verified_is_fetched_again_from_scratch() {
+    let dir = test_dir("unverifiable");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().b_unverifiable = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(folder.clone()), 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert_eq!(
+        std::fs::read(folder.join("Show").join("Sub").join("b.bin")).unwrap(),
+        remotes(None)[1].body
+    );
+    // 第一个被拒、第二个认不出、第三个从头下完
+    assert_eq!(fake.lock().unwrap().links["VB"], 3);
+}
+
+/// 网盘上有文件还没处理完：不取回缺了的内容当作完成，以云端失败报出。
+#[test]
+fn an_incomplete_cloud_file_fails_the_task() {
+    let dir = test_dir("incomplete");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().b_incomplete = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    match rt.block_on(ended(&mut events, task.id, |_| {})) {
+        Status::Failed(failure) => {
+            assert_eq!(failure.kind, FailureKind::CloudFailed);
+            assert!(failure.message.contains("b.bin"), "{}", failure.message);
+        }
+        other => panic!("应以云端失败停下：{other:?}"),
+    }
+}
+
+/// 换了账号再继续：以登录失效停下、写明要登录哪个账号，不当成网盘上没有这个任务。
+#[test]
+fn resuming_under_another_account_asks_for_the_right_one() {
+    let dir = test_dir("other-account");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    let gate = Arc::new(Gate::default());
+    fake.lock().unwrap().hold_b = gate.clone();
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    let requested = fake.lock().unwrap().b_requested.clone();
+    rt.block_on(requested.notified());
+    service.pause(task.id);
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Paused
+    );
+    gate.open();
+    service.logout_pikpak().unwrap();
+    assert!(matches!(service.resume(task.id), Err(Error::NotLoggedIn)));
+    fake.lock().unwrap().user = "user-2";
+    let login = rt.block_on(service.login_pikpak()).unwrap().unwrap();
+    rt.block_on(login.done).unwrap().unwrap();
+    service.resume(task.id).unwrap();
+    match rt.block_on(ended(&mut events, task.id, |_| {})) {
+        Status::Failed(failure) => {
+            assert_eq!(failure.kind, FailureKind::CloudLogin);
+            assert!(failure.message.contains("user-1"), "{}", failure.message);
+        }
+        other => panic!("应以登录失效停下：{other:?}"),
+    }
 }

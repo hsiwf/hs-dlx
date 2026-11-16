@@ -41,6 +41,9 @@ pub enum Error {
     /// 用户在浏览器里拒绝了登录
     #[error("在浏览器里拒绝了登录")]
     LoginDenied,
+    /// 已退出登录或换了账号（[`Session::retire`]），这个账号的请求不再发
+    #[error("已退出 PikPak 登录或换了账号")]
+    LoggedOut,
     /// 本机取不到随机数，生成不了设备号
     #[error("本机取不到随机数：{0}")]
     NoRandom(String),

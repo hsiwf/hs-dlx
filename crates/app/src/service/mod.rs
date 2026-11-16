@@ -705,9 +705,8 @@ impl Service {
                     match login.poll(&shared.engine, &http, &endpoints).await? {
                         pikpak::login::Poll::Pending => {}
                         pikpak::login::Poll::Done(account) => {
-                            shared.write(|tx| store::set_pikpak_account(tx, Some(&account)))?;
-                            let session = Arc::new(shared.new_pikpak_session(account));
-                            *lock(&shared.pikpak) = Some(session);
+                            let session = shared.new_pikpak_session(account.clone());
+                            shared.set_pikpak(Some(&account), Some(session))?;
                             return Ok(());
                         }
                     }
@@ -722,12 +721,9 @@ impl Service {
         }))
     }
 
-    /// 退出 PikPak：从存储里删掉账号；之后开始的云离线任务要重新登录，在运行的照用已有的令牌跑完这一次。
+    /// 退出 PikPak：从存储里删掉账号，登录状态作废：在运行的云离线任务下一次调网盘时以登录失效停下，之后的要重新登录。
     pub fn logout_pikpak(&self) -> Result<(), Error> {
-        self.shared
-            .write(|tx| store::set_pikpak_account(tx, None))?;
-        *lock(&self.shared.pikpak) = None;
-        Ok(())
+        self.shared.set_pikpak(None, None)
     }
 
     /// 云离线任务的文件与各自下完没有（列出文件之前为空），任务不在运行时显示已下多少；没有这个任务时报
@@ -1219,6 +1215,22 @@ impl Drop for RunningGuard {
 }
 
 impl Shared {
+    /// 把 PikPak 账号记成 `account`（None 为退出登录），提交了才换上登录状态 `session`、作废旧的；提交与换在 `store` 锁内
+    /// 做，与旧登录状态换了令牌要写存储的（见 [`Shared::new_pikpak_session`]）不会交错。写不进时什么也不换。
+    fn set_pikpak(
+        &self,
+        account: Option<&pikpak::Account>,
+        session: Option<Arc<Session>>,
+    ) -> Result<(), Error> {
+        let mut store = lock(&self.store);
+        let tx = store.transaction()?;
+        let applied = self.apply_unsaved(&tx)?;
+        store::set_pikpak_account(&tx, account)?;
+        self.commit(tx, applied)?;
+        self.replace_pikpak(session);
+        Ok(())
+    }
+
     /// 在一个事务里先补写没写进去的结束状态，再做 `f`，然后提交（见 [`Shared::commit`]）。
     fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T, Error>) -> Result<T, Error> {
         let mut store = lock(&self.store);
@@ -1677,10 +1689,9 @@ impl Shared {
         }
     }
 
-    /// 新建云离线任务：把磁力链接 `url` 提交给网盘 `provider`，记下网盘给的离线任务并开始等它下完；内容的根到列出文件
-    /// 时才在保存目录 `folder` 里定下。带了请求头（`has_headers`）、不是磁力链接时报 [`Error::InvalidInput`]，没登录时报
-    /// [`Error::NotLoggedIn`]，网盘拒绝或连不上时报 [`Error::PikPak`]。提交发出后没等到结果就断了的，按链接在网盘最近的
-    /// 离线任务里找，找到即用它，找不到照原样报错。
+    /// 新建云离线任务：在本机记下要把磁力链接 `url` 交给网盘 `provider`（属于现在登录的账号）并开始；提交、等网盘下完
+    /// 都在任务的运行里做，失败的以任务失败报出。内容的根到列出文件时才在保存目录 `folder` 里定下。带了请求头
+    /// （`has_headers`）、不是磁力链接时报 [`Error::InvalidInput`]，没登录时报 [`Error::NotLoggedIn`]。
     async fn create_cloud(
         self: &Arc<Self>,
         url: Url,
@@ -1696,25 +1707,15 @@ impl Shared {
             return Err(Error::InvalidInput("云离线只收磁力链接".to_owned()));
         }
         let crate::CloudProvider::PikPak = provider;
-        let proxy = self.settings()?.proxy;
-        let client = self.pikpak_client(proxy)?;
-        let job = match client.submit(url.as_str()).await {
-            Ok(job) => job,
-            Err(pikpak::Error::Transport(error)) if may_have_taken_effect(&error) => {
-                match client.find_job(url.as_str()).await? {
-                    Some(job) => job,
-                    None => return Err(pikpak::Error::Transport(error).into()),
-                }
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let session = self.pikpak_session()?;
         let spec = CloudSpec {
             provider,
-            job: job.id,
+            user: session.user_id().to_owned(),
+            job: None,
             folder,
             root: None,
         };
-        let spec = cloud::draft_spec(spec, &job.name, url);
+        let spec = cloud::draft_spec(spec, url);
         self.insert_and_start(&spec, None, None, created_at)
     }
 
@@ -1773,7 +1774,7 @@ impl Shared {
             Kind::Torrent(spec) => Launched::Torrent(self.launch_torrent(tx, task.id, spec)?),
             Kind::Cloud(_) => {
                 let proxy = store::settings(tx)?.proxy;
-                Launched::Cloud(self.launch_cloud(task, proxy)?)
+                Launched::Cloud(self.launch_cloud(tx, task, proxy)?)
             }
         })
     }
