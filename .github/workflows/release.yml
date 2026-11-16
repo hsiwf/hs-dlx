@@ -4,10 +4,11 @@ name: release
 # v<版本> 标签：有就跳过，没有就发版。所以「合并一个 PR」与「发一个版本」是同一条路径，发版只需改版本号并在
 # CHANGELOG.md 写好这个版本的一节。
 #
-# 顺序：先核对版本号与更新日志，再由 desktop.yml 打三个平台的安装包，全部成功后建 GitHub Release：先建草稿、安装包
-# 与 SHA256SUMS 传齐后才公开，公开时 GitHub 在这个提交上打 v<版本> 标签。任一步失败时没有公开的 Release、也没有
-# 标签：在 Actions 里重跑失败的作业（读的是同一个提交，上一次留下的同名草稿先删掉），或在 dev 上修好再合并一次
-# （新的推送照常发这个版本）。
+# 顺序：先核对版本号与更新日志，再由 desktop.yml 打三个平台的安装包，全部成功后建 GitHub Release：先建草稿，安装包、
+# 各自的 minisign 签名（.minisig，应用更新时验）与 SHA256SUMS 传齐后才公开，公开时 GitHub 在这个提交上打 v<版本>
+# 标签。任一步失败时没有公开的 Release、也没有标签：在 Actions 里重跑失败的作业（读的是同一个提交，上一次留下的同名
+# 草稿先删掉），或在 dev 上修好再合并一次（新的推送照常发这个版本）。签名用仓库的 Secret MINISIGN_SECRET_KEY（私钥
+# 文件的全文），公钥在 apps/desktop/update.pub。
 on:
   push:
     branches: [main]
@@ -140,6 +141,27 @@ jobs:
           if [ "$count" -ne 3 ]; then echo "::error::安装包应为 3 个，实有 $count 个"; ls -la; exit 1; fi
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+
+      # 给每个安装包签名（minisign，可信注释为「hs-dlx <版本> <文件名>」，应用更新时逐字核对，见
+      # crates/app/src/update.rs），再用编进应用的公钥验一遍：Secret 里的私钥与公钥对不上时在这里失败，不发出应用验
+      # 不过的包
+      - name: 签名
+        if: steps.gate.outputs.go == 'true'
+        working-directory: dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then echo "::error::仓库没有 MINISIGN_SECRET_KEY 这个 Secret"; exit 1; fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          while read -r _ file; do
+            minisign -S -s "$key" -m "$file" -c "hs-dlx $VERSION" -t "hs-dlx $VERSION $file"
+            minisign -V -p "$GITHUB_WORKSPACE/apps/desktop/update.pub" -m "$file"
+          done < SHA256SUMS
+          rm -f "$key"
+          ls -la
 
       - name: 发布说明
         if: steps.gate.outputs.go == 'true'

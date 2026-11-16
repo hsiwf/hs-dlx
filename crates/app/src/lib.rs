@@ -14,13 +14,14 @@ pub mod special_link;
 mod store;
 mod task;
 mod torrent;
+mod update;
 
 pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
 pub use failure::{Failure, FailureKind, not_a_playlist};
 pub use naming::{file_name, task_title, title_of};
 pub use preference::StoredPreference;
-pub use service::{Event, Events, MetadataFetch, Service};
+pub use service::{Downloaded, Event, Events, MetadataFetch, Service, UpdateDownload};
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{
@@ -31,3 +32,4 @@ pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,
     TorrentPhase, TorrentProgress, torrent_from_file,
 };
+pub use update::{Package, Release, Restart, UpdateFeed, Version, sweep as sweep_update};

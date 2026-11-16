@@ -40,6 +40,7 @@ use crate::sniff::SniffView;
 use crate::tasks::{Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
+use crate::updates::Updates;
 
 /// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图。
 pub const MIN_WIDTH: f32 =
@@ -73,6 +74,8 @@ enum Page {
 /// 主窗口的视图：任务状态在 [`Tasks`] 里，这里是这个窗口自己的（选中哪个任务、显示哪一页、粘贴栏、嗅探页）。
 pub struct Shell {
     tasks: Entity<Tasks>,
+    /// 更新：顶栏有新版本时提示，设置页里装
+    updates: Entity<Updates>,
     /// 选中的任务：打开窗口时与选中的被移除时为最新的一个；没有任务时为 None
     selected: Option<TaskId>,
     /// 主体显示的页，只经 [`Shell::show`] 换
@@ -109,10 +112,12 @@ impl Shell {
     /// `link` 为启动参数里给的链接：有就填进粘贴栏并探测。
     pub fn new(
         tasks: Entity<Tasks>,
+        updates: Entity<Updates>,
         link: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let updated = cx.observe(&updates, |_, _, cx| cx.notify());
         let dock = cx.new(|cx| Dock::new(window, cx));
         dock.update(cx, |dock, cx| dock.focus(window, cx));
         let typed = cx.subscribe_in(
@@ -165,6 +170,7 @@ impl Shell {
         });
         let mut shell = Shell {
             tasks,
+            updates,
             selected,
             page: Page::Task,
             sniff: None,
@@ -179,7 +185,7 @@ impl Shell {
             confirm_discard: None,
             editing_headers: None,
             diagnosis: None,
-            _subscriptions: vec![typed, activated, changed],
+            _subscriptions: vec![typed, activated, changed, updated],
         };
         shell.refresh_clipboard(cx);
         shell.sync_standby(cx);
@@ -317,10 +323,18 @@ impl Shell {
         }));
     }
 
-    /// 打开设置页；已开着时关上。读不出设置时提示原因。
+    /// 打开设置页；已开着时关上。
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.page, Page::Settings { .. }) {
             self.show(Page::Task, cx);
+        } else {
+            self.open_settings(window, cx);
+        }
+    }
+
+    /// 打开设置页；已开着时什么也不做。读不出设置时提示原因。
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.page, Page::Settings { .. }) {
             return;
         }
         let settings = match self.tasks.read(cx).service().settings() {
@@ -331,8 +345,8 @@ impl Shell {
             }
         };
         let home = self.home.clone();
-        let tasks = self.tasks.clone();
-        let view = cx.new(|cx| SettingsView::new(tasks, home, settings, window, cx));
+        let (tasks, updates) = (self.tasks.clone(), self.updates.clone());
+        let view = cx.new(|cx| SettingsView::new(tasks, updates, home, settings, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
                 SettingsEvent::Dismissed => this.show(Page::Task, cx),

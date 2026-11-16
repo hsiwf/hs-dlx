@@ -17,6 +17,8 @@ pub struct Settings {
     pub seeding: Seeding,
     /// 整个 BT 会话的上传限速，字节每秒；None 为不限
     pub upload_limit: Option<NonZeroU32>,
+    /// 启动时与之后每天查一次有没有新版本
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             theme: Theme::Eclipse,
             seeding: Seeding::default(),
             upload_limit: None,
+            check_updates: true,
         }
     }
 }

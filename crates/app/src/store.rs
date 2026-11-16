@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -31,6 +31,7 @@ const MIGRATIONS: [Migration; 8] = [
     rebuild_with_ranges,
     rebuild_with_torrents,
     rebuild_with_seeding,
+    add_check_updates,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -491,6 +492,14 @@ fn rebuild_with_seeding(tx: &Transaction<'_>) -> Result<(), Error> {
         ALTER TABLE settings ADD COLUMN upload_limit INTEGER CHECK (upload_limit > 0);",
     )?;
     keep_task_counter(tx, counter)
+}
+
+/// 第 9 版：设置加「自动检查更新」（1 为启动时与之后每天查一次有没有新版本），没设过为查。
+fn add_check_updates(tx: &Transaction<'_>) -> Result<(), Error> {
+    tx.execute_batch(
+        "ALTER TABLE settings ADD COLUMN check_updates INTEGER NOT NULL DEFAULT 1 CHECK (check_updates IN (0, 1));",
+    )?;
+    Ok(())
 }
 
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
@@ -1200,9 +1209,11 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<u32>,
         Option<u32>,
         Option<u32>,
+        bool,
     );
-    let (folder, proxy, theme, seed, ratio, minutes, upload): Columns = tx.query_row(
-        "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit FROM settings WHERE id = 1",
+    let (folder, proxy, theme, seed, ratio, minutes, upload, check_updates): Columns = tx.query_row(
+        "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates
+         FROM settings WHERE id = 1",
         [],
         |row| {
             Ok((
@@ -1213,6 +1224,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         },
     )?;
@@ -1247,7 +1259,17 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         theme: parse_theme(&theme)?,
         seeding,
         upload_limit,
+        check_updates,
     })
+}
+
+/// 记下要不要自动检查更新。
+pub fn set_check_updates(tx: &Transaction<'_>, check: bool) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET check_updates = ?1 WHERE id = 1",
+        params![check],
+    )?;
+    Ok(())
 }
 
 /// 记下做种的设置。

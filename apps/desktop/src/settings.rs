@@ -1,10 +1,11 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种与上传限速、外观、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种与上传限速、外观、更新、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _,
@@ -18,6 +19,7 @@ use crate::tasks::Tasks;
 use crate::theme::{self, Theme};
 use crate::tray::Tray;
 use crate::ui::{self, Tone};
+use crate::updates::{UpdateState, Updates};
 use crate::web_route::WebRoute;
 
 /// 设置各行的最大宽度。
@@ -77,8 +79,12 @@ pub struct SettingsView {
     seeding_error: Option<String>,
     /// 第三方声明打不开的原因
     notices_error: Option<String>,
+    updates: Entity<Updates>,
+    /// 「自动检查更新」最近一次没存进去的原因
+    updates_error: Option<String>,
     _system: Task<()>,
     _typed: Subscription,
+    _updates: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -87,11 +93,13 @@ impl SettingsView {
     /// `settings` 为存着的设置。
     pub fn new(
         tasks: Entity<Tasks>,
+        updates: Entity<Updates>,
         home: Option<PathBuf>,
         settings: Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let watched = cx.observe(&updates, |_, _, cx| cx.notify());
         let proxy = settings.proxy;
         let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
         if let Proxy::Url(url) = &proxy {
@@ -134,8 +142,11 @@ impl SettingsView {
             upload_limit: settings.upload_limit,
             seeding_error: None,
             notices_error: None,
+            updates,
+            updates_error: None,
             _system: system,
             _typed: typed,
+            _updates: watched,
         }
     }
 
@@ -292,6 +303,151 @@ impl SettingsView {
                 div().flex().flex_wrap().gap(px(8.)).children(upload),
             ),
         ]
+    }
+
+    /// 换「自动检查更新」：存进了才选中。
+    fn pick_auto_update(&mut self, auto: bool, cx: &mut Context<Self>) {
+        self.updates_error = self
+            .updates
+            .update(cx, |updates, cx| updates.set_auto(auto, cx))
+            .err();
+        cx.notify();
+    }
+
+    /// 更新一行：自动检查的开关，与查到的新版本、下载与安装到了哪一步。
+    fn render_updates(&self, cx: &mut Context<Self>) -> Div {
+        let (auto, state) = {
+            let updates = self.updates.read(cx);
+            (updates.auto(), updates.state().clone())
+        };
+        let chips = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .child(ui::chip(
+                "update-auto",
+                "启动时与每天检查",
+                auto,
+                cx.listener(|this, _, _, cx| this.pick_auto_update(true, cx)),
+            ))
+            .child(ui::chip(
+                "update-manual",
+                "不自动检查",
+                !auto,
+                cx.listener(|this, _, _, cx| this.pick_auto_update(false, cx)),
+            ));
+        let check = |cx: &mut Context<Self>| {
+            ui::button(
+                "update-check",
+                "检查更新",
+                Tone::Plain,
+                cx.listener(|this, _, _, cx| {
+                    this.updates.update(cx, |updates, cx| updates.check(cx));
+                }),
+            )
+            .into_any_element()
+        };
+        let install = |label: &'static str, cx: &mut Context<Self>| {
+            ui::button(
+                "update-install",
+                label,
+                Tone::Glow,
+                cx.listener(|this, _, _, cx| {
+                    this.updates.update(cx, |updates, cx| updates.install(cx));
+                }),
+            )
+            .into_any_element()
+        };
+        let page = |url: &hs_m3u8_core::Url, label: &'static str, cx: &mut Context<Self>| {
+            let url = url.to_string();
+            ui::button(
+                "update-page",
+                label,
+                Tone::Plain,
+                cx.listener(move |_, _, _, cx| cx.open_url(&url)),
+            )
+            .into_any_element()
+        };
+        let mut lines: Vec<gpui_kit::AnyElement> = Vec::new();
+        let mut buttons: Vec<gpui_kit::AnyElement> = Vec::new();
+        match &state {
+            UpdateState::Idle => buttons.push(check(cx)),
+            UpdateState::Checking => lines.push(ui::caption("正在查…").into_any_element()),
+            UpdateState::Latest => {
+                lines.push(ui::caption("已是最新").into_any_element());
+                buttons.push(check(cx));
+            }
+            UpdateState::Available(release) => {
+                lines.push(
+                    ui::reads(
+                        Vec::new(),
+                        Some(("新版本".into(), release.version.to_string().into())),
+                    )
+                    .into_any_element(),
+                );
+                match &release.package {
+                    Some(package) => {
+                        lines.push(
+                            ui::caption(format!(
+                                "下载 {}，验过签名后装上；运行中的任务先暂停，应用重开后在列表里继续",
+                                crate::format::bytes(package.size)
+                            ))
+                            .into_any_element(),
+                        );
+                        buttons.push(install("更新并重启", cx));
+                    }
+                    None => lines.push(
+                        ui::caption("这个平台不能自动更新，到下载页下载新版本").into_any_element(),
+                    ),
+                }
+                buttons.push(page(&release.page, "更新内容", cx));
+            }
+            UpdateState::Downloading { release, received } => {
+                let total = release.package.as_ref().map_or(0, |package| package.size);
+                lines.push(
+                    ui::caption(format!(
+                        "下载 {}：{} / {}",
+                        release.version,
+                        crate::format::bytes(*received),
+                        crate::format::bytes(total)
+                    ))
+                    .into_any_element(),
+                );
+            }
+            UpdateState::Installing(version) => {
+                lines.push(ui::caption(format!("正在装 {version}")).into_any_element());
+            }
+            UpdateState::Restarting(version) => lines.push(
+                ui::caption(format!("{version} 已装好：等任务停下后退出并打开新版本"))
+                    .into_any_element(),
+            ),
+            UpdateState::Failed { release, reason } => {
+                lines.push(ui::error_text(reason.clone()).into_any_element());
+                match release {
+                    Some(release) => {
+                        if release.package.is_some() {
+                            buttons.push(install("再试一次", cx));
+                        }
+                        buttons.push(page(&release.page, "到下载页下载", cx));
+                    }
+                    None => buttons.push(check(cx)),
+                }
+            }
+        }
+        row(
+            "更新",
+            Some("经上面的代理查 GitHub 上的新版本；安装包验过签名才装"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(chips)
+                .children(lines)
+                .children(self.updates_error.clone().map(ui::error_text))
+                .when(!buttons.is_empty(), |content| {
+                    content.child(div().flex().flex_wrap().gap(px(8.)).children(buttons))
+                }),
+        )
     }
 
     /// 在访达（资源管理器、文件管理器）里打开随安装包附上的第三方声明目录；不是从安装包运行时写明原因。
@@ -527,6 +683,11 @@ impl Render for SettingsView {
                             )
                             .child(
                                 self.render_theme(cx)
+                                    .border_b_1()
+                                    .border_color(theme::hairline()),
+                            )
+                            .child(
+                                self.render_updates(cx)
                                     .border_b_1()
                                     .border_color(theme::hairline()),
                             )

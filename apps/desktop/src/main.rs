@@ -23,6 +23,7 @@ mod tasks;
 mod theme;
 mod tray;
 mod ui;
+mod updates;
 mod wait;
 mod web_route;
 
@@ -41,6 +42,7 @@ use hs_dlx_instance::HandOverError;
 use crate::tasks::Tasks;
 use crate::tray::Tray;
 use crate::ui::{PAD, TITLE_HEIGHT};
+use crate::updates::Updates;
 
 /// 全部任务合计同时最多多少个请求（见 `Engine::new`）。
 const MAX_REQUESTS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
@@ -147,16 +149,22 @@ fn main() {
                         .folder
                         .or_else(default_folder)
                         .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
-                    Ok(Some((service, events, folder, handoffs)))
+                    Ok(Some((service, events, folder, handoffs, settings.check_updates)))
                 });
             match started {
                 Ok(None) => cx.quit(),
-                Ok(Some((service, events, folder, handoffs))) => {
+                Ok(Some((service, events, folder, handoffs, check_updates))) => {
                     // 最后一个窗口关掉不自动退出：在后台继续时窗口关着、应用照跑；退出由 main_window 发出
                     cx.set_quit_mode(QuitMode::Explicit);
                     let tasks = cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
-                    main_window::install(tasks.clone(), cx);
+                    let updates = cx.new(|cx| {
+                        Updates::new(tasks.clone(), updates::feed(), check_updates, cx)
+                    });
+                    main_window::install(tasks.clone(), updates, cx);
                     let mut problems = Vec::new();
+                    if let Err(left) = hs_dlx_app::sweep_update() {
+                        problems.push(left);
+                    }
                     #[cfg(target_os = "macos")]
                     if let Err(error) = main_window::ask_before_terminate(cx) {
                         problems.push(format!("从程序坞退出、注销时不会先问：{error}"));

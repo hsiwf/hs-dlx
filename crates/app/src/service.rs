@@ -28,6 +28,7 @@ use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
 use crate::store::{self, Store};
 use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
+use crate::update::{self, Release, Restart, UpdateFeed, Version};
 use crate::{
     Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind, MetadataProgress,
     OutputSpec, SavedTorrent, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
@@ -44,6 +45,20 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 正在下载的更新（[`Service::download_update`]）。
+pub struct UpdateDownload {
+    /// 已下的字节数
+    pub received: watch::Receiver<u64>,
+    pub done: AbortOnDropHandle<Result<Downloaded, Error>>,
+}
+
+/// 下完并验过签名的安装包。
+#[derive(Debug)]
+pub struct Downloaded {
+    pub version: Version,
+    path: PathBuf,
+}
 
 /// 交给界面的事件。
 #[derive(Debug)]
@@ -461,6 +476,98 @@ impl Service {
         by_user.store(true, Ordering::Relaxed);
         cancel.cancel();
         Ok(())
+    }
+
+    /// 记下要不要自动检查更新。
+    pub fn set_check_updates(&self, check: bool) -> Result<(), Error> {
+        self.shared.write(|tx| store::set_check_updates(tx, check))
+    }
+
+    /// 查 `feed` 上有没有比本应用新的版本，经设置里的代理；没有时为 None。返回的句柄在任何执行器上都可等待，释放它即
+    /// 取消。查不到等见 [`Error::Update`]；读不出设置时直接报错。
+    pub fn check_update(
+        &self,
+        feed: &UpdateFeed,
+    ) -> Result<AbortOnDropHandle<Result<Option<Release>, Error>>, Error> {
+        let proxy = self.settings()?.proxy;
+        let (engine, feed) = (self.shared.engine.clone(), feed.clone());
+        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
+            update::check(&engine, &feed, &proxy, Version::current()).await
+        })))
+    }
+
+    /// 下载 `release` 里本平台的安装包（经设置里的代理，放在系统的临时目录，没下完的再下时接着下），先取签名、核对它是
+    /// 这个版本这个文件的，下完验内容。返回已下的字节数与句柄：句柄的结果为验过的安装包，交给
+    /// [`Service::install_update`]；释放它即取消。`release` 没有本平台的安装包时报 [`Error::Update`]，读不出设置时直接
+    /// 报错；其余失败（取不到、签名不符等）经句柄报 [`Error::Update`]，签名不符的文件删掉。
+    pub fn download_update(
+        &self,
+        feed: &UpdateFeed,
+        release: &Release,
+    ) -> Result<UpdateDownload, Error> {
+        let package = release
+            .package
+            .clone()
+            .ok_or_else(|| Error::Update("这个平台不能自动更新，到下载页下载新版本".to_owned()))?;
+        let proxy = self.settings()?.proxy;
+        let (engine, key, release) = (
+            self.shared.engine.clone(),
+            feed.public_key.clone(),
+            release.clone(),
+        );
+        let (progress, received) = watch::channel(0);
+        let handle = self.runtime().spawn(async move {
+            let (key, signature) =
+                update::signature(&engine, &proxy, &key, &release, &package).await?;
+            let path = update::download_dir().join(&package.name);
+            let mut output = FileOutputOptions::new(path.clone());
+            output.overwrite = true;
+            let mut source = Source::new(package.url.clone());
+            source.http.proxy = proxy;
+            let failed = |error: hs_m3u8_core::Error| {
+                Error::Update(format!("下载不了 {}：{error}", package.name))
+            };
+            let job = engine
+                .start_file(FileRequest::new(source, output))
+                .map_err(failed)?;
+            let mut bytes = job.control().progress();
+            let waiting = job.wait();
+            tokio::pin!(waiting);
+            let downloaded = loop {
+                tokio::select! {
+                    result = &mut waiting => break result.map_err(failed)?,
+                    Ok(()) = bytes.changed() => {
+                        progress.send_replace(bytes.borrow_and_update().bytes);
+                    }
+                }
+            };
+            let checked = downloaded.path.clone();
+            tokio::task::spawn_blocking(move || {
+                let verified = update::verify(&checked, &key, &signature);
+                if verified.is_err() {
+                    // 不是发布的那个文件：留着下次也只会接着用它
+                    let _gone = std::fs::remove_file(&checked);
+                }
+                verified
+            })
+            .await
+            .expect("验签名不会 panic，运行时关闭时本任务也一起丢弃")?;
+            Ok(Downloaded {
+                version: release.version,
+                path: downloaded.path,
+            })
+        });
+        Ok(UpdateDownload {
+            received,
+            done: AbortOnDropHandle::new(handle),
+        })
+    }
+
+    /// 装上验过签名的安装包（见 [`crate::Restart`]）：返回之后怎么重开，调用方起它之后正常退出应用。装不上时报
+    /// [`Error::Update`]，已装的版本不受影响。返回的句柄在任何执行器上都可等待。
+    pub fn install_update(&self, downloaded: Downloaded) -> JoinHandle<Result<Restart, Error>> {
+        self.runtime()
+            .spawn_blocking(move || update::install(&downloaded.path))
     }
 
     /// 记下外观主题。
