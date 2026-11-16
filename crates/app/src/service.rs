@@ -459,6 +459,15 @@ impl Service {
         })
     }
 
+    /// 检测 BT 用的网络（见 [`crate::NetworkReport`]）：BT 会话还没建时先建（端口映射随之开始），再并行探直连与 IPv6 的
+    /// DHT、UDP 的 tracker（公共 tracker 列表取到了时）、经 BT 代理的 DHT（设了时，探到的结果同时记进 BT 引擎），最后读
+    /// 会话报的端口映射与连入；约 10 秒。BT 会话建不出、开不了 UDP 套接字时报错。返回的句柄在任何执行器上都可等待。
+    pub fn check_network(&self) -> JoinHandle<Result<crate::NetworkReport, Error>> {
+        let shared = self.shared.clone();
+        self.runtime()
+            .spawn(async move { shared.check_network().await })
+    }
+
     /// 让下完的 BT 任务做种（照做种的设置，到了停的条件即停）：记下在做种，加入 BT 会话、校验已下的文件后只上传；文件
     /// 不全时停下（[`SeedEnd::Incomplete`]），不补下。开始与停下照常以 [`Event::SeedingStarted`] 与
     /// [`Event::SeedingEnded`] 报来。不是下完的 BT 任务时报 [`Error::InvalidInput`]，已在做种时报 [`Error::Seeding`]，
@@ -1128,6 +1137,79 @@ impl Shared {
         }
         self.probe_torrent_proxy();
         Ok(engine)
+    }
+
+    async fn check_network(self: &Arc<Self>) -> Result<crate::NetworkReport, Error> {
+        use crate::netcheck::{self, DHT_BOOTSTRAP, Udp};
+        let engine = self.bt_engine()?;
+        engine.request_stats();
+        let socket = |error: std::io::Error| Error::Io {
+            action: "打开",
+            path: "检测网络用的 UDP 套接字".into(),
+            cause: error,
+        };
+        let (v4, v6, trackers) = (
+            Udp::direct(false).await.map_err(socket)?,
+            Udp::direct(true).await.ok(),
+            Udp::direct(false).await.map_err(socket)?,
+        );
+        let direct = async {
+            let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
+            netcheck::dht(&v4, asked, &found).await
+        };
+        let ipv6 = async {
+            let address = netcheck::public_ipv6().await;
+            let dht = match (&address, &v6) {
+                (Some(_), Some(udp)) => {
+                    let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, true).await;
+                    netcheck::dht(udp, asked, &found).await.bootstrap
+                }
+                _ => netcheck::Ratio::default(),
+            };
+            (address, dht)
+        };
+        // 刚建起 BT 会话时列表还在取：最多等 5 秒
+        let udp_trackers = async {
+            match self.bt.public_list(Duration::from_secs(5)).await {
+                Some(list) => Some(netcheck::udp_trackers(&trackers, &list).await),
+                None => None,
+            }
+        };
+        let proxy_url = self.bt.proxy_url();
+        let proxied = async {
+            let url = proxy_url.as_ref()?;
+            let address = hs_m3u8_core::bare_url(url);
+            Some(match crate::socks::associate(url).await {
+                Ok(relay) => {
+                    self.bt.set_proxy_check(url, ProxyCheck::Usable);
+                    let dht = match Udp::via(relay).await {
+                        Ok(udp) => {
+                            let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
+                            Some(netcheck::dht(&udp, asked, &found).await)
+                        }
+                        Err(_) => None,
+                    };
+                    (address, ProxyCheck::Usable, dht)
+                }
+                Err(why) => {
+                    self.bt
+                        .set_proxy_check(url, ProxyCheck::Unusable(why.clone()));
+                    (address, ProxyCheck::Unusable(why), None)
+                }
+            })
+        };
+        let (dht, (ipv6, ipv6_dht), trackers, proxy) =
+            tokio::join!(direct, ipv6, udp_trackers, proxied);
+        let (mapped, incoming) = engine.connectivity();
+        Ok(netcheck::report(&netcheck::Measured {
+            dht,
+            trackers,
+            ipv6,
+            ipv6_dht,
+            proxy,
+            mapped,
+            incoming,
+        }))
     }
 
     /// 设了 BT 代理而还没探时探它（见 [`crate::socks::probe`]），结果交给 BT 引擎；之前在探的随之取消。

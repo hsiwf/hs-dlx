@@ -94,6 +94,9 @@ pub struct SettingsView {
     torrent_address: Entity<InputState>,
     /// BT 代理最近一次没存进去的原因
     torrent_proxy_error: Option<String>,
+    /// 网络检测：在做时有（释放即取消），做完的结果或没做成的原因
+    network_check: Option<Task<()>>,
+    network_report: Option<Result<hs_dlx_app::NetworkReport, String>>,
     _torrent_typed: Subscription,
 }
 
@@ -179,6 +182,8 @@ impl SettingsView {
             torrent_proxy: settings.torrent_proxy,
             torrent_address,
             torrent_proxy_error: None,
+            network_check: None,
+            network_report: None,
             _torrent_typed: torrent_typed,
         }
     }
@@ -379,6 +384,67 @@ impl SettingsView {
             Err(reason) => self.torrent_proxy_error = Some(reason),
         }
         cx.notify();
+    }
+
+    /// 开始网络检测；在做时什么也不做。
+    fn check_network(&mut self, cx: &mut Context<Self>) {
+        if self.network_check.is_some() {
+            return;
+        }
+        let handle = self.tasks.read(cx).service().check_network();
+        self.network_check = Some(cx.spawn(async move |this, cx| {
+            let result = match handle.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("检测的任务没做完：{error}")),
+            };
+            // 关了时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                this.network_report = Some(result);
+                this.network_check = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// 网络检测一行。
+    fn render_network_check(&self, cx: &mut Context<Self>) -> Div {
+        let running = self.network_check.is_some();
+        let mut content = div().flex().flex_col().gap(px(12.)).child(
+            div().flex().items_center().gap(px(12.)).child(ui::button(
+                "check-network",
+                if running {
+                    "在检测…"
+                } else {
+                    "检测网络"
+                },
+                Tone::Plain,
+                cx.listener(|this, _, _, cx| this.check_network(cx)),
+            )),
+        );
+        match &self.network_report {
+            Some(Ok(report)) => {
+                content = content
+                    .children(
+                        report
+                            .checks
+                            .iter()
+                            .map(|check| ui::check_line(check.level, &check.text)),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(report.verdict.clone()),
+                    );
+            }
+            Some(Err(reason)) => content = content.child(ui::error_text(reason.clone())),
+            None => {}
+        }
+        row(
+            "网络检测",
+            Some("DHT、UDP 的 tracker、IPv6、BT 代理与外部连入通不通；约 10 秒"),
+            content,
+        )
     }
 
     /// BT 代理一行。
@@ -857,6 +923,11 @@ impl Render for SettingsView {
                             )
                             .child(
                                 self.render_torrent_proxy(cx)
+                                    .border_b_1()
+                                    .border_color(theme::hairline()),
+                            )
+                            .child(
+                                self.render_network_check(cx)
                                     .border_b_1()
                                     .border_color(theme::hairline()),
                             )

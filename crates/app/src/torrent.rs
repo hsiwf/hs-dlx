@@ -277,6 +277,20 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    /// 要一次会话的统计（DHT 的节点数、有没有节点连进来），到了之后 [`Engine::connectivity`] 里是新的。
+    pub(crate) fn request_stats(&self) {
+        self.session.request_stats();
+    }
+
+    /// 端口映射到的外部端口（UPnP 或 NAT-PMP，都没映射成时为 None）与有没有节点从外面连进来过。
+    pub(crate) fn connectivity(&self) -> (Option<u16>, bool) {
+        let network = self.session.network();
+        let mapped = [network.upnp_port, network.natpmp_port]
+            .into_iter()
+            .find(|&port| port != 0);
+        (mapped, network.incoming)
+    }
+
     /// BT 代理的问题：探出用不了的原因，或 libtorrent 经它的 UDP 最近一次出的错；直连或没问题时为 None。
     fn proxy_problem(&self) -> Option<String> {
         if let ProxyCheck::Unusable(why) = &*self.proxy_check.borrow() {
@@ -731,6 +745,30 @@ impl Bt {
                 unchecked
             })
             .then(|| url.clone())
+    }
+
+    /// 经的代理的地址；直连时为 None。
+    pub fn proxy_url(&self) -> Option<Url> {
+        lock(&self.proxy).clone()
+    }
+
+    /// 公共 tracker 列表：正在取时最多等 `wait`；取到时为它，没取到、等不到或不补时为 None。
+    pub async fn public_list(&self, wait: Duration) -> Option<Arc<[String]>> {
+        let mut public = self.public.subscribe();
+        let settled = tokio::time::timeout(
+            wait,
+            public.wait_for(|public| {
+                !matches!(public, PublicTrackers::Idle | PublicTrackers::Fetching)
+            }),
+        )
+        .await;
+        match settled {
+            Ok(Ok(public)) => match &*public {
+                PublicTrackers::Ready(list) => Some(list.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// 记下探 `url` 的结果；代理已改成别的时不记。

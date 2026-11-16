@@ -741,3 +741,25 @@ pub fn rings(size: f32, width: f32, inset: f32) -> Div {
         .child(ring(size, width, theme::accent()))
         .child(ring(size - inset, 2., theme::accent_dim()))
 }
+
+/// 检测或诊断的一项：按结论着色的圆点与说明。
+pub fn check_line(level: hs_dlx_app::CheckLevel, text: &str) -> Div {
+    let color = match level {
+        hs_dlx_app::CheckLevel::Ok => theme::accent(),
+        hs_dlx_app::CheckLevel::Warn => theme::alpha(theme::warn(), 0.55),
+        hs_dlx_app::CheckLevel::Bad => theme::warn(),
+    };
+    div()
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .child(div().pt(px(6.)).child(dot(color, 7.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(13.))
+                .line_height(px(TEXT_LINE))
+                .child(text.to_owned()),
+        )
+}

@@ -8,7 +8,7 @@ use gpui_kit::{
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
     linear_color_stop, linear_gradient, px,
 };
-use hs_dlx_app::{Check, CheckLevel, TaskId};
+use hs_dlx_app::{Check, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
@@ -222,7 +222,11 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .children(checks.iter().map(check_line))
+                .children(
+                    checks
+                        .iter()
+                        .map(|check| ui::check_line(check.level, &check.text).into_any_element()),
+                )
                 .child(button("再诊断一次"))
                 .into_any_element(),
         };
@@ -689,29 +693,6 @@ fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cell("大小", format::bytes(wanted)),
         ],
     }
-}
-
-/// 诊断的一项：按结论着色的圆点与说明。
-fn check_line(check: &Check) -> AnyElement {
-    let color = match check.level {
-        CheckLevel::Ok => theme::accent(),
-        CheckLevel::Warn => theme::alpha(theme::warn(), 0.55),
-        CheckLevel::Bad => theme::warn(),
-    };
-    div()
-        .flex()
-        .items_start()
-        .gap(px(10.))
-        .child(div().pt(px(6.)).child(ui::dot(color, 7.)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(13.))
-                .line_height(px(ui::TEXT_LINE))
-                .child(check.text.clone()),
-        )
-        .into_any_element()
 }
 
 /// 输出所在的目录：占着输出路径的东西就在里面。

@@ -100,13 +100,26 @@ pub(crate) fn libtorrent_proxy(url: Option<&Url>) -> SocksProxy {
 /// 照 libtorrent 经代理时的步骤探 `url`（已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有用户名选认证
 /// 方式、申请转发 UDP，看它回的转发地址是不是 IPv4。用不了时为原因；[`PROBE_TIMEOUT`] 内没做完也算用不了。
 pub(crate) async fn probe(url: &Url) -> Result<(), String> {
+    associate(url).await.map(drop)
+}
+
+/// 经代理转发 UDP 的通道：控制连接断开即失效。
+pub(crate) struct UdpRelay {
+    /// 控制连接：持有期间转发有效
+    _control: TcpStream,
+    /// 发往这里的包带上 SOCKS5 的 UDP 头（RFC 1928 第 7 节）由代理转发
+    pub address: SocketAddr,
+}
+
+/// 照 [`probe`] 的步骤谈好 UDP 转发并留着控制连接；用不了时为原因。
+pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, String> {
     let proxy = libtorrent_proxy(Some(url));
     tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy))
         .await
         .map_err(|_| format!("代理 {} 10 秒内没回应", hs_m3u8_core::bare_url(url)))?
 }
 
-async fn handshake(proxy: &SocksProxy) -> Result<(), String> {
+async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
     let at = format!("{}:{}", proxy.host, proxy.port);
     let address = tokio::net::lookup_host(&at)
         .await
@@ -157,7 +170,22 @@ async fn handshake(proxy: &SocksProxy) -> Result<(), String> {
         ));
     }
     match head[3] {
-        1 => Ok(()),
+        1 => {
+            let mut bound = [0; 6];
+            stream.read_exact(&mut bound).await.map_err(io)?;
+            let ip = Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]);
+            let port = u16::from_be_bytes([bound[4], bound[5]]);
+            // 回 0.0.0.0 即与代理同一个地址
+            let ip = if ip.is_unspecified() {
+                address.ip()
+            } else {
+                ip.into()
+            };
+            Ok(UdpRelay {
+                _control: stream,
+                address: SocketAddr::new(ip, port),
+            })
+        }
         4 => Err(format!(
             "代理 {at} 转发 UDP 用的是 IPv6 地址，经代理时只能用 IPv4：DHT、uTP 与 UDP 的 tracker 经不了它"
         )),

@@ -11,6 +11,9 @@ use hs_dlx_app::{Failure, MetadataProgress, OutputKind};
 use hs_m3u8_core::{FileInfo, Probe};
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, TorrentChoice, duration_of};
+
+/// 磁力链接取种子信息多久还没有节点时提示去检测网络。
+const NO_PEERS_HINT: std::time::Duration = std::time::Duration::from_secs(60);
 use crate::format;
 use crate::theme;
 use crate::ui::{self, Solid, Step, Tone};
@@ -253,6 +256,15 @@ impl NewTask {
             }
             if let Some(problem) = &progress.proxy_problem {
                 body.push(ui::note(format!("BT 代理：{problem}"), true).into_any_element());
+            }
+            if progress.peers == 0 && self.since.elapsed() >= NO_PEERS_HINT {
+                body.push(
+                    ui::note(
+                        "一直找不到节点时，可到设置里「检测网络」看是哪里不通",
+                        false,
+                    )
+                    .into_any_element(),
+                );
             }
         }
         ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
