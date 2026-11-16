@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, linear_color_stop,
-    linear_gradient, px,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
+    linear_color_stop, linear_gradient, px,
 };
-use hs_dlx_app::Status;
+use hs_dlx_app::{Check, TaskId};
+use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
@@ -35,6 +36,16 @@ const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
 pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA, 0.);
+
+/// 一个 BT 任务的诊断：在诊断中，或诊断的结果（诊断不了时为原因）。只对诊断时那一次运行（任务停过、开始或停止了做种
+/// 之后不再显示）。
+pub(super) struct Diagnosis {
+    id: TaskId,
+    /// 诊断时任务的运行：停下的次数（[`Row::reading`]）与在不在做种
+    run: (u64, bool),
+    result: Option<Result<Vec<Check>, String>>,
+    _running: Task<()>,
+}
 
 /// 检查面板底栏里的操作：最该按的一个与其余的。
 struct Foot {
@@ -118,7 +129,7 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> Div {
-        let host = row.task.spec.url.host_str().unwrap_or_default().to_owned();
+        let host = crate::links::source(&row.task.spec.url);
         let mut body: Vec<AnyElement> = Vec::new();
         if let Some(card) = self.headers_card(row, cx) {
             body.push(card.into_any_element());
@@ -154,6 +165,9 @@ impl Shell {
         if live {
             body.push(live_view::legend(row).into_any_element());
         }
+        if let Some(section) = self.diagnosis_section(row, cx) {
+            body.push(section.into_any_element());
+        }
         body.push(signals(&row.signals).into_any_element());
         let Foot { primary, rest } = self.foot(row, cx);
         let mut foot: Vec<AnyElement> = Vec::new();
@@ -172,6 +186,84 @@ impl Shell {
             );
         }
         ui::inspector(row.task.spec.title.clone(), host, body, foot)
+    }
+
+    /// 在下或做种的 BT 任务的诊断一节：没诊断过时是「诊断」按钮，诊断中写在诊断，诊断过的逐项列出结论（可再诊断）。
+    fn diagnosis_section(&self, row: &Row, cx: &Context<Self>) -> Option<Div> {
+        let active = row.task.status == Status::Running || row.task.seeding;
+        if row.task.spec.torrent().is_none() || !active {
+            return None;
+        }
+        let id = row.task.id;
+        let run = (row.reading, row.task.seeding);
+        let shown = self
+            .diagnosis
+            .as_ref()
+            .filter(|diagnosis| diagnosis.id == id && diagnosis.run == run);
+        let button = |label: &'static str| {
+            ui::button(
+                "diagnose",
+                label,
+                Tone::Plain,
+                cx.listener(move |this, _, _, cx| this.diagnose(id, run, cx)),
+            )
+        };
+        let body: AnyElement = match shown.map(|diagnosis| &diagnosis.result) {
+            None => button("诊断网络与节点").into_any_element(),
+            Some(None) => ui::note("在诊断…", false).into_any_element(),
+            Some(Some(Err(reason))) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(ui::error_text(reason.clone()))
+                .child(button("再诊断一次"))
+                .into_any_element(),
+            Some(Some(Ok(checks))) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .children(
+                    checks
+                        .iter()
+                        .map(|check| ui::check_line(check.level, &check.text).into_any_element()),
+                )
+                .child(button("再诊断一次"))
+                .into_any_element(),
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(ui::caption("诊断"))
+                .child(body),
+        )
+    }
+
+    /// 诊断 BT 任务 `id`（这时的运行为 `run`），结果写进诊断一节；之前的结果作废。
+    fn diagnose(&mut self, id: TaskId, run: (u64, bool), cx: &mut Context<Self>) {
+        let handle = self.tasks.read(cx).service().diagnose(id);
+        let running = cx.spawn(async move |this, cx| {
+            let result = match handle.await {
+                Ok(Ok(checks)) => Ok(checks),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(join) => Err(format!("诊断中途出错：{join}")),
+            };
+            // 诊断期间窗口关掉时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                if let Some(diagnosis) = this.diagnosis.as_mut().filter(|d| d.id == id) {
+                    diagnosis.result = Some(result);
+                    cx.notify();
+                }
+            });
+        });
+        self.diagnosis = Some(Diagnosis {
+            id,
+            run,
+            result: None,
+            _running: running,
+        });
+        cx.notify();
     }
 
     /// 正在改这个任务的请求头时，检查面板最上面的编辑卡片。
@@ -235,7 +327,14 @@ impl Shell {
             .editing_headers
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
-        stopped_plan(failure, row.recording(), row.task.write_only, editing)
+        let headers = row.task.spec.torrent().is_none();
+        stopped_plan(
+            failure,
+            row.recording(),
+            row.task.write_only,
+            headers,
+            editing,
+        )
     }
 
     /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
@@ -366,11 +465,16 @@ impl Shell {
                 primary: None,
                 rest: vec![pause(cx), discard(cx)],
             },
-            // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录
-            Status::Paused | Status::Failed(_) if row.task.work_dir.is_none() => Foot {
-                primary: None,
-                rest: vec![forget(Tone::Plain, cx).flex_1()],
-            },
+            // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录。BT 任务本就
+            // 没有任务目录
+            Status::Paused | Status::Failed(_)
+                if row.task.work_dir.is_none() && row.task.spec.torrent().is_none() =>
+            {
+                Foot {
+                    primary: None,
+                    rest: vec![forget(Tone::Plain, cx).flex_1()],
+                }
+            }
             Status::Paused | Status::Failed(_) => self.stopped_foot(row, discard(cx), cx),
             Status::Done => {
                 // 输出在不在是完成时与打开应用时在后台查的；还没查完时先不给这两个按钮
@@ -397,6 +501,30 @@ impl Shell {
                         .flex_1(),
                     );
                 }
+                // BT：做种时只能停止做种（停了才能从列表移除），没在做种时可以再做
+                if row.task.spec.torrent().is_some() {
+                    if row.task.seeding {
+                        rest.push(ui::button(
+                            "stop-seeding",
+                            "停止做种",
+                            Tone::Ghost,
+                            cx.listener(move |this, _, _, cx| {
+                                this.tasks
+                                    .update(cx, |tasks, cx| tasks.stop_seeding(id, cx));
+                                cx.notify();
+                            }),
+                        ));
+                        return Foot { primary, rest };
+                    }
+                    rest.push(ui::button(
+                        "seed",
+                        "做种",
+                        Tone::Ghost,
+                        cx.listener(move |this, _, _, cx| {
+                            this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
+                        }),
+                    ));
+                }
                 rest.push(forget(Tone::Ghost, cx));
                 Foot { primary, rest }
             }
@@ -412,6 +540,23 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         let Some(result) = row.task.result.as_ref() else {
             return Vec::new();
         };
+        if row.task.seeding
+            && let Some(progress) = row
+                .torrent_progress
+                .as_ref()
+                .filter(|progress| progress.phase == TorrentPhase::Seeding)
+        {
+            return vec![
+                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+                cell("已上传", format::bytes(progress.uploaded)),
+                cell("分享率", format::ratio(progress.uploaded, progress.wanted)),
+                cell(
+                    "节点",
+                    // 两边都下完了的节点互相断开（libtorrent 的 close_redundant_connections），做种时连着的都是在下的
+                    progress.peers.to_string(),
+                ),
+            ];
+        }
         let mut cells = Vec::new();
         if row.task.spec.hls().is_some() {
             cells.push(cell(
@@ -427,6 +572,9 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         }
         cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
         return cells;
+    }
+    if row.task.spec.torrent().is_some() {
+        return torrent_reads(row, now);
     }
     if row.task.spec.hls().is_none() {
         return file_reads(row, now);
@@ -504,6 +652,45 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         _ => vec![
             cell("已下", format::bytes(amount.bytes)),
             cell("大小", size),
+        ],
+    }
+}
+
+/// BT 任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下、要下的大小、节点数（其中做种的）与上传速度，停着的
+/// 为已下与要下的大小；还没有内容时为空。
+fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let Some(amount) = FileAmount::of(row) else {
+        return Vec::new();
+    };
+    let wanted = amount.total.unwrap_or(0);
+    match (&row.task.status, &row.torrent_progress) {
+        (Status::Running, Some(progress)) => {
+            let speed = row.rate.bytes_per_second(now);
+            // 按最近几秒的速度估：剩下的字节除以速度
+            let left = if speed > 0.0 {
+                let left = wanted.saturating_sub(amount.bytes);
+                format::duration(Duration::from_secs_f64(left as f64 / speed))
+            } else {
+                "—".to_owned()
+            };
+            vec![
+                cell("速度", format!("{}/s", format::bytes(speed as u64))),
+                cell("剩余", left),
+                cell("已下", format::bytes(amount.bytes)),
+                cell("大小", format::bytes(wanted)),
+                cell(
+                    "节点",
+                    format!("{}（做种 {}）", progress.peers, progress.seeds),
+                ),
+                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+            ]
+        }
+        (Status::Running, None) => Vec::new(),
+        _ if amount.bytes == 0 => Vec::new(),
+        _ => vec![
+            cell("已下", format::bytes(amount.bytes)),
+            cell("大小", format::bytes(wanted)),
         ],
     }
 }

@@ -1,5 +1,5 @@
-//! 新建页舞台中间的图形：探测中与失败时是表盘，认出播放列表后是各档清晰度的同心环（几何、点击判定与画法），认出文件
-//! 后是写着大小的表盘。
+//! 新建页舞台中间的图形：探测中（与取种子信息时）与失败时是表盘，认出播放列表后是各档清晰度的同心环（几何、点击判定
+//! 与画法），认出文件后是写着大小的表盘，取到种子信息后是写着所选大小的表盘。
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -10,7 +10,7 @@ use gpui_kit::{
 use hs_dlx_app::Failure;
 use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
-use super::{NewTask, PageCheck, Probing, duration_of};
+use super::{NewTask, PageCheck, Probing, TorrentChoice, duration_of};
 use crate::backdrop::{self, Disc};
 use crate::ring::{self, Ticks};
 use crate::{dial, format, theme, ui};
@@ -147,22 +147,40 @@ impl NewTask {
         hit(&rings(&master.variants), (dx * dx + dy * dy).sqrt())
     }
 
-    /// 舞台中间的图形：探测中（与取到的不是播放列表、正在网页里看时）是转着彗尾的表盘，失败时是警告色的表盘，认出播放
-    /// 列表后是同心环，认出文件后是写着大小的表盘。
+    /// 舞台中间的图形：探测中（与取到的不是播放列表、正在网页里看时，取种子信息时）是转着彗尾的表盘，失败时是警告色的
+    /// 表盘，认出播放列表后是同心环，认出文件后是写着大小的表盘，取到种子信息后是写着所选大小的表盘。
     pub(super) fn render_figure(&self, cx: &mut Context<Self>) -> AnyElement {
         match &self.probing {
             Probing::Ready(probe) => self.rings_figure(probe, cx).into_any_element(),
             Probing::File(info) => file_dial(info).into_any_element(),
+            Probing::Torrent(choice) => torrent_dial(choice).into_any_element(),
             Probing::Failed(failure) if self.page_check != PageCheck::Opening => {
                 failed_dial(failure).into_any_element()
             }
-            Probing::Running | Probing::Failed(_) => self.probing_dial(cx).into_any_element(),
+            Probing::Metadata(progress) => {
+                let doing = match (self.url.scheme(), progress.peers) {
+                    ("magnet", 0) => "找有这个种子的节点".to_owned(),
+                    ("magnet", peers) => format!("连着 {peers} 个节点"),
+                    _ => "读种子文件".to_owned(),
+                };
+                self.probing_dial("取种子信息", doing, cx)
+                    .into_any_element()
+            }
+            Probing::Running | Probing::Failed(_) => {
+                let doing = if self.page_check == PageCheck::Opening {
+                    "在网页里打开看看"
+                } else {
+                    "读取播放列表"
+                };
+                self.probing_dial("探测中", doing.to_owned(), cx)
+                    .into_any_element()
+            }
         }
     }
 
-    /// 探测中的表盘：彗尾按探测了多久转，圆盘里写探测了多久（逐帧重画见 [`NewTask::animate`]）。系统要求减少动态效果
-    /// 时彗尾停在 12 点、不写时长。
-    fn probing_dial(&self, cx: &Context<Self>) -> Div {
+    /// 探测中的表盘：彗尾按探测了多久转，圆盘里写探测了多久（逐帧重画见 [`NewTask::animate`]），上面写 `state`、下面
+    /// 写在做的 `doing`。系统要求减少动态效果时彗尾停在 12 点、不写时长。
+    fn probing_dial(&self, state: &'static str, doing: String, cx: &Context<Self>) -> Div {
         let animate = !cx.reduce_motion();
         let elapsed = self.since.elapsed();
         let head = if animate {
@@ -170,18 +188,13 @@ impl NewTask {
         } else {
             0.
         };
-        let doing = if self.page_check == PageCheck::Opening {
-            "在网页里打开看看"
-        } else {
-            "读取播放列表"
-        };
         dial::dial(
             theme::accent(),
             dial::figure(move |bounds, window, _| {
                 ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
             }),
             dial::readout(
-                "探测中",
+                state,
                 theme::accent(),
                 dial::Big::Figure(if animate {
                     format::clock(elapsed)
@@ -291,8 +304,10 @@ impl NewTask {
     pub(super) fn keys_hint(&self) -> Option<AnyElement> {
         let probe = match &self.probing {
             Probing::Ready(probe) => probe,
-            Probing::File(_) => return Some(ui::caption("回车开始").into_any_element()),
-            Probing::Running | Probing::Failed(_) => return None,
+            Probing::File(_) | Probing::Torrent(_) => {
+                return Some(ui::caption("回车开始").into_any_element());
+            }
+            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return None,
         };
         let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
             "↑ ↓ 换一档 · 回车开始"
@@ -427,6 +442,29 @@ fn file_dial(info: &FileInfo) -> Div {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
         dial::readout("文件", theme::accent(), dial::Big::Phrase(big), line),
+    )
+}
+
+/// 取到种子信息后的表盘：圆盘里写选了的文件的大小与几个文件。
+fn torrent_dial(choice: &TorrentChoice) -> Div {
+    let ticks = Ticks::full(
+        ring::COMET_TICKS,
+        theme::alpha(theme::accent(), 0.45),
+        false,
+    );
+    let (count, bytes) = choice.selected();
+    let line = format!("{count} / {} 个文件", choice.info.files.len());
+    dial::dial(
+        theme::accent(),
+        dial::figure(move |bounds, window, _| {
+            ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
+        }),
+        dial::readout(
+            "BT",
+            theme::accent(),
+            dial::Big::Phrase(format::bytes(bytes)),
+            line,
+        ),
     )
 }
 

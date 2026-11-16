@@ -68,6 +68,24 @@ pub enum Error {
     /// 核心库报的错误
     #[error(transparent)]
     Core(#[from] hs_m3u8_core::Error),
+    /// BT 引擎（libtorrent）报的错误，或等它一步的结果超时；说明里 libtorrent 的部分为英文
+    #[error("BT：{0}")]
+    Torrent(String),
+    /// 应用更新没成（查不到、下载不了、签名不符、装不上）：说明里写明哪一步与原因；已装的版本不受影响
+    #[error("更新：{0}")]
+    Update(String),
+    /// 应用更新换到一半，新旧两份都没在原来的位置：说明里写明各在哪、怎么处理；不能再试
+    #[error("更新没换完：{0}")]
+    UpdateStranded(String),
+    /// BT 任务在做种：要先停止做种（[`crate::Service::stop_seeding`]）
+    #[error("{0}正在做种，先停止做种")]
+    Seeding(TaskId),
+    /// 新建的 BT 任务的种子已在这个任务里：两个任务会写同一批文件
+    #[error("这个种子已在{0}里")]
+    TorrentTaken(TaskId),
+    /// 放弃 BT 任务时下了的文件没删干净（里面有不是这个种子的文件，或删除出错）：任务留在存储里，处理后可再放弃
+    #[error("{id}下了的文件没删干净，任务留在列表里：{cause}")]
+    ContentLeft { id: TaskId, cause: Box<Error> },
     /// 文件系统或系统资源的操作失败：建存储所在的目录、设权限、给存储加锁、取名时检查路径是否已存在、启动 tokio
     /// 运行时；照原样报出
     #[error("{action} {path} 失败：{cause}")]

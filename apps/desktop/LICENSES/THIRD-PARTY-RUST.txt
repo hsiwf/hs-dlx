@@ -99,6 +99,7 @@ crossbeam-utils 0.8.23  MIT OR Apache-2.0  https://github.com/crossbeam-rs/cross
 crypto-common 0.1.7  MIT OR Apache-2.0  https://github.com/RustCrypto/traits
 crypto-common 0.2.2  MIT OR Apache-2.0  https://github.com/RustCrypto/traits
 ctor 1.0.13  Apache-2.0 OR MIT  https://github.com/mmastrac/linktime
+cxx 1.0.205  MIT OR Apache-2.0  https://github.com/dtolnay/cxx
 data-url 0.3.2  MIT OR Apache-2.0  https://github.com/servo/rust-url
 deranged 0.5.8  MIT OR Apache-2.0  https://github.com/jhpratt/deranged
 derive_more 2.1.1  MIT  https://github.com/JelteF/derive_more
@@ -277,6 +278,7 @@ libloading 0.8.9  ISC  https://github.com/nagisa/rust_libloading/
 libm 0.2.16  MIT  https://github.com/rust-lang/compiler-builtins
 libsqlite3-sys 0.39.1  MIT  https://github.com/rusqlite/rusqlite
 linebender_resource_handle 0.1.1  Apache-2.0 OR MIT  https://github.com/linebender/raw_resource_handle
+link-cplusplus 1.0.12  MIT OR Apache-2.0  https://github.com/dtolnay/link-cplusplus
 link-section 0.19.3  Apache-2.0 OR MIT  https://github.com/mmastrac/linktime
 linux-raw-sys 0.12.1  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT  https://github.com/sunfishcode/linux-raw-sys
 litemap 0.8.3  Unicode-3.0  https://github.com/unicode-org/icu4x
@@ -298,6 +300,7 @@ memchr 2.8.3  Unlicense OR MIT  https://github.com/BurntSushi/memchr
 memmap2 0.9.12  MIT OR Apache-2.0  https://github.com/RazrFalcon/memmap2-rs
 memoffset 0.9.1  MIT  https://github.com/Gilnaa/memoffset
 mime 0.3.17  MIT OR Apache-2.0  https://github.com/hyperium/mime
+minisign-verify 0.3.0  MIT  https://github.com/jedisct1/rust-minisign-verify
 miniz_oxide 0.8.9  MIT OR Zlib OR Apache-2.0  https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 miniz_oxide 0.9.1  MIT OR Zlib OR Apache-2.0  https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 mio 1.2.4  MIT  https://github.com/tokio-rs/mio
@@ -623,10 +626,12 @@ accesskit_unix 0.22.1：LICENSE-APACHE（本项目补的，出处见源码的 th
 accesskit_windows 0.34.0：LICENSE-APACHE（本项目补的，出处见源码的 third_party/crate-licenses/README.md）
 allocator-api2 0.2.21：LICENSE-APACHE
 anyhow 1.0.104：LICENSE-APACHE
+cxx 1.0.205：LICENSE-APACHE
 dyn-clone 1.0.20：LICENSE-APACHE
 inventory 0.3.25：LICENSE-APACHE
 itoa 1.0.18：LICENSE-APACHE
 libc 0.2.190：LICENSE-APACHE
+link-cplusplus 1.0.12：LICENSE-APACHE
 mac 0.1.1：LICENSE-APACHE（本项目补的，出处见源码的 third_party/crate-licenses/README.md）
 mach2 0.6.0：LICENSE-APACHE
 proc-macro2 1.0.107：LICENSE-APACHE
@@ -846,6 +851,7 @@ async-task 4.7.1：LICENSE-MIT
 atomic-waker 1.1.2：LICENSE-MIT
 blocking 1.7.0：LICENSE-MIT
 concurrent-queue 2.5.0：LICENSE-MIT
+cxx 1.0.205：LICENSE-MIT
 dyn-clone 1.0.20：LICENSE-MIT
 endi 1.1.1：LICENSE-MIT
 event-listener 5.4.2：LICENSE-MIT
@@ -858,6 +864,7 @@ inventory 0.3.25：LICENSE-MIT
 itoa 1.0.18：LICENSE-MIT
 khronos-egl 6.0.0：LICENSE-MIT
 lazy_static 1.5.1：LICENSE-MIT
+link-cplusplus 1.0.12：LICENSE-MIT
 linux-raw-sys 0.12.1：LICENSE-MIT
 once_cell 1.21.4：LICENSE-MIT
 ordered-stream 0.2.0：LICENSE-MIT
@@ -14028,6 +14035,70 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+minisign-verify 0.3.0：LICENSE
+--------------------------------------------------------------------------------
+
+Copyright (c) 2019-2025 Frank Denis
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--
+
+Code in the src/crypto folder is derived from the rust-crypto project:
+https://github.com/DaGenix/rust-crypto
+
+Original ISC license follows:
+
+Copyright (c) 2006-2009 Graydon Hoare
+Copyright (c) 2009-2013 Mozilla Foundation
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 miniz_oxide 0.8.9：LICENSE

@@ -1,0 +1,331 @@
+//! BT 用的 SOCKS5 代理（RFC 1928、RFC 1929）：写入时的校验、交给 libtorrent 的写法，与开始用之前的探测。libtorrent
+//! 经代理时只开一个 IPv4 的接口，代理拒绝转发 UDP、或回 IPv6 的转发地址时它不报错，DHT、uTP 与 UDP 的 tracker 就此
+//! 不通；探测照它的步骤走一遍，把这类问题报出来。
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use hs_dlx_torrent::SocksProxy;
+use hs_m3u8_core::Url;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+
+/// 探测最多等多久：解析、连接与三次往返都在本机或近处，过了即算代理没回应。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// RFC 1929 的用户名与密码最长多少字节。
+const CREDENTIAL_LIMIT: usize = 255;
+
+/// BT 代理探到的情况。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProxyCheck {
+    /// 直连，不经代理
+    Direct,
+    /// 设了代理，还没探（BT 会话建起时探）
+    Unchecked,
+    Checking,
+    /// 连得上、认证过了、接了 UDP 转发；问得了 DHT 引导节点时经它问通了
+    Usable,
+    /// 解析不出、连不上、超时或连接断开，为原因；libtorrent 遇到这些按退避自己重试
+    Unreachable(String),
+    /// 代理在协议上拒绝了（不是 SOCKS5、认证方式不接受、认证被拒、拒绝转发 UDP、回的转发地址 BT 用不了），为原因；
+    /// libtorrent 遇到这些不再自己重试，恢复后要让它重连
+    Refused(String),
+    /// 接了 UDP 转发，但经它问 DHT 引导节点一个都没回、或发不到转发地址，为原因；libtorrent 那边的转发照旧
+    Silent(String),
+}
+
+impl ProxyCheck {
+    /// 用不了时的原因。
+    pub(crate) fn problem(&self) -> Option<&str> {
+        match self {
+            ProxyCheck::Unreachable(why) | ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => {
+                Some(why)
+            }
+            ProxyCheck::Direct
+            | ProxyCheck::Unchecked
+            | ProxyCheck::Checking
+            | ProxyCheck::Usable => None,
+        }
+    }
+}
+
+/// 地址里的用户名或密码解开百分号编码；不是 UTF-8 时为 None。
+fn decoded(text: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(text)
+        .decode_utf8()
+        .ok()
+        .map(|text| text.into_owned())
+}
+
+/// BT 代理的地址能不能用：`socks5://` 或 `socks5h://` 开头（两者一样，主机名交给代理解析），主机为 IPv4 地址或主机名
+/// （不收 IPv6 地址：libtorrent 经代理时只开 IPv4 的接口），写明端口，只写主机与端口；用户名与密码可选，有密码就要有
+/// 用户名，解开后为 UTF-8、各不超过 255 字节。不能用时为原因。
+pub(crate) fn check(url: &Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "socks5" | "socks5h") {
+        return Err(
+            "BT 的代理要是 SOCKS5（socks5:// 开头）：HTTP 代理转发不了 DHT 与 UDP".to_owned(),
+        );
+    }
+    match url.host_str() {
+        // IPv6 地址写在方括号里
+        Some(host) if host.starts_with('[') => {
+            return Err("BT 的代理不能用 IPv6 地址，改用 IPv4 地址或主机名".to_owned());
+        }
+        Some(host) if !host.is_empty() && url.port().is_some() => {}
+        _ => return Err("BT 的代理要写明主机与端口，如 socks5://127.0.0.1:1080".to_owned()),
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("BT 的代理地址只写主机与端口（可带用户名与密码）".to_owned());
+    }
+    let username = decoded(url.username()).ok_or("BT 代理的用户名不是 UTF-8")?;
+    let password = url
+        .password()
+        .map(decoded)
+        .unwrap_or(Some(String::new()))
+        .ok_or("BT 代理的密码不是 UTF-8")?;
+    if username.is_empty() && !password.is_empty() {
+        return Err("BT 代理有密码就要有用户名".to_owned());
+    }
+    if username.len() > CREDENTIAL_LIMIT || password.len() > CREDENTIAL_LIMIT {
+        return Err(format!(
+            "BT 代理的用户名与密码各不能超过 {CREDENTIAL_LIMIT} 字节"
+        ));
+    }
+    Ok(())
+}
+
+/// 交给 libtorrent 的写法；None 为直连。`url` 已过 [`check`]；主机 `localhost` 换成 127.0.0.1（解析它常先得到
+/// IPv6 的 ::1）。
+pub(crate) fn libtorrent_proxy(url: Option<&Url>) -> SocksProxy {
+    let Some(url) = url else {
+        return SocksProxy::default();
+    };
+    let host = url.host_str().expect("存下的代理都过了 check，有主机");
+    let host = if host.eq_ignore_ascii_case("localhost") {
+        Ipv4Addr::LOCALHOST.to_string()
+    } else {
+        host.to_owned()
+    };
+    SocksProxy {
+        host,
+        port: url.port().expect("存下的代理都过了 check，有端口"),
+        username: decoded(url.username()).expect("存下的代理都过了 check，用户名是 UTF-8"),
+        password: url
+            .password()
+            .map(|password| decoded(password).expect("存下的代理都过了 check，密码是 UTF-8"))
+            .unwrap_or_default(),
+    }
+}
+
+/// 经代理转发 UDP 的通道：控制连接断开即失效。
+pub(crate) struct UdpRelay {
+    /// 控制连接：持有期间转发有效
+    _control: TcpStream,
+    /// 发往这里的包带上 SOCKS5 的 UDP 头（RFC 1928 第 7 节）由代理转发
+    pub address: SocketAddr,
+}
+
+/// 照 libtorrent 经代理时的步骤谈 UDP 转发（`url` 已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有
+/// 用户名选认证方式、申请转发 UDP，看它回的转发地址 libtorrent 用不用得了；谈好时留着控制连接。用不了时为
+/// [`ProxyCheck::Unreachable`] 或 [`ProxyCheck::Refused`]（带原因）。解析与连接、连上之后的握手各最多
+/// [`PROBE_TIMEOUT`]：前者超时为 Unreachable（libtorrent 连代理有超时、会重试），后者为 Refused（libtorrent 等握手的
+/// 回应没有超时，会一直卡着）。
+pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, ProxyCheck> {
+    let proxy = libtorrent_proxy(Some(url));
+    let at = format!("{}:{}", proxy.host, proxy.port);
+    let (address, stream) = tokio::time::timeout(PROBE_TIMEOUT, connect(&at))
+        .await
+        .map_err(|_| ProxyCheck::Unreachable(format!("代理 {at} 10 秒内没连上")))??;
+    tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy, &at, address, stream))
+        .await
+        .map_err(|_| {
+            ProxyCheck::Refused(format!(
+                "代理 {at} 连上了，但 10 秒内没回应 SOCKS5 握手：这个端口可能不是 SOCKS5（如 HTTP 代理的端口），改成代理的 SOCKS5 端口"
+            ))
+        })?
+}
+
+/// 解析代理的主机、取 IPv4 地址连上去。
+async fn connect(at: &str) -> Result<(SocketAddr, TcpStream), ProxyCheck> {
+    let address = tokio::net::lookup_host(at)
+        .await
+        .map_err(|error| ProxyCheck::Unreachable(format!("解析不出代理 {at}：{error}")))?
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| ProxyCheck::Unreachable(format!("代理 {at} 没有 IPv4 地址")))?;
+    let stream = TcpStream::connect(address)
+        .await
+        .map_err(|error| ProxyCheck::Unreachable(format!("连不上代理 {at}：{error}")))?;
+    Ok((address, stream))
+}
+
+async fn handshake(
+    proxy: &SocksProxy,
+    at: &str,
+    address: SocketAddr,
+    mut stream: TcpStream,
+) -> Result<UdpRelay, ProxyCheck> {
+    let refused = |why: String| ProxyCheck::Refused(why);
+    let io = |error: std::io::Error| ProxyCheck::Unreachable(format!("代理 {at} 断开了：{error}"));
+    let login = !proxy.username.is_empty();
+    // 提供的认证方式同 libtorrent：有用户名时免认证与用户名密码都提供，由代理选
+    let offered: &[u8] = if login { &[5, 2, 0, 2] } else { &[5, 1, 0] };
+    stream.write_all(offered).await.map_err(io)?;
+    let mut reply = [0; 2];
+    stream.read_exact(&mut reply).await.map_err(io)?;
+    if reply[0] != 5 {
+        return Err(refused(format!("{at} 不是 SOCKS5 代理")));
+    }
+    match reply[1] {
+        0 => {}
+        2 if login => {}
+        _ if login => return Err(refused(format!("代理 {at} 不接受这两种认证方式"))),
+        _ => {
+            return Err(refused(format!(
+                "代理 {at} 要认证：在地址里写上用户名与密码"
+            )));
+        }
+    }
+    if reply[1] == 2 {
+        let mut request = vec![1, len(&proxy.username)];
+        request.extend_from_slice(proxy.username.as_bytes());
+        request.push(len(&proxy.password));
+        request.extend_from_slice(proxy.password.as_bytes());
+        stream.write_all(&request).await.map_err(io)?;
+        stream.read_exact(&mut reply).await.map_err(io)?;
+        // libtorrent 要求子协商的版本为 1，不是时不再往下
+        if reply[0] != 1 {
+            return Err(refused(format!(
+                "代理 {at} 回的认证应答版本不对（{}）",
+                reply[0]
+            )));
+        }
+        if reply[1] != 0 {
+            return Err(refused(format!("代理 {at} 的用户名或密码不对")));
+        }
+    }
+    // UDP ASSOCIATE，客户端地址不定（0.0.0.0:0），同 libtorrent
+    stream
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(io)?;
+    let mut head = [0; 4];
+    stream.read_exact(&mut head).await.map_err(io)?;
+    if head[0] != 5 {
+        return Err(refused(format!(
+            "代理 {at} 回的转发应答版本不对（{}）",
+            head[0]
+        )));
+    }
+    if head[1] != 0 {
+        return Err(refused(format!(
+            "代理 {at} 不转发 UDP（{}）：DHT、uTP 与 UDP 的 tracker 经不了它",
+            refusal(head[1])
+        )));
+    }
+    let relay = match head[3] {
+        1 => {
+            let mut bound = [0; 6];
+            stream.read_exact(&mut bound).await.map_err(io)?;
+            let ip = Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]);
+            let port = u16::from_be_bytes([bound[4], bound[5]]);
+            // libtorrent 照原样记下转发地址，只收从它来的包：0.0.0.0 时回包的来源（代理的真实地址）对不上，全被丢掉
+            if ip.is_unspecified() {
+                return Err(refused(format!(
+                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它。在代理里把 UDP 的绑定地址设成本机连得到的具体 IP（代理在本机时如 127.0.0.1）"
+                )));
+            }
+            // 代理不在本机（不是回环地址、也不是本机网卡的地址：绑不上）而回了回环地址：BT 会发到自己这台电脑上
+            let local =
+                address.ip().is_loopback() || std::net::UdpSocket::bind((address.ip(), 0)).is_ok();
+            if ip.is_loopback() && !local {
+                return Err(refused(format!(
+                    "代理 {at} 不在本机，却回了回环地址 {ip} 作 UDP 转发地址：BT 发不到它。在代理里把 UDP 的绑定地址设成本机连得到的代理 IP"
+                )));
+            }
+            SocketAddr::new(ip.into(), port)
+        }
+        // 域名：libtorrent 不解析它，改发往代理的地址
+        3 => {
+            let mut len = [0; 1];
+            stream.read_exact(&mut len).await.map_err(io)?;
+            let mut rest = vec![0; usize::from(len[0]) + 2];
+            stream.read_exact(&mut rest).await.map_err(io)?;
+            let port = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
+            SocketAddr::new(address.ip(), port)
+        }
+        4 => {
+            return Err(refused(format!(
+                "代理 {at} 转发 UDP 用的是 IPv6 地址，经代理时只能用 IPv4：DHT、uTP 与 UDP 的 tracker 经不了它"
+            )));
+        }
+        other => {
+            return Err(refused(format!(
+                "代理 {at} 回的 UDP 转发地址认不出（地址类型 {other}）"
+            )));
+        }
+    };
+    Ok(UdpRelay {
+        _control: stream,
+        address: relay,
+    })
+}
+
+/// 用户名或密码的长度（已过 [`check`]，不超过 255）。
+fn len(text: &str) -> u8 {
+    u8::try_from(text.len()).expect("check 已限定不超过 255 字节")
+}
+
+/// SOCKS5 回的失败码的说法（RFC 1928 第 6 节）。
+fn refusal(code: u8) -> String {
+    let what = match code {
+        1 => "代理出错",
+        2 => "规则不允许",
+        3 => "网络不可达",
+        4 => "主机不可达",
+        5 => "连接被拒",
+        6 => "超时",
+        7 => "不支持这个命令",
+        8 => "不支持这种地址",
+        _ => "未知的失败",
+    };
+    format!("回 {code}，{what}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
+
+    #[test]
+    fn addresses_are_checked_where_they_are_written() {
+        assert!(check(&url("socks5://127.0.0.1:7897")).is_ok());
+        assert!(check(&url("socks5h://me:p%40ss@proxy.example:1080")).is_ok());
+        let why = |text| check(&url(text)).unwrap_err();
+        assert!(why("http://127.0.0.1:7897").contains("SOCKS5"));
+        assert!(why("socks5://127.0.0.1").contains("端口"));
+        assert!(why("socks5://[::1]:1080").contains("IPv6"));
+        assert!(why("socks5://127.0.0.1:1080/x").contains("只写主机与端口"));
+        assert!(why("socks5://:secret@127.0.0.1:1080").contains("用户名"));
+        assert!(why("socks5://%FF@127.0.0.1:1080").contains("UTF-8"));
+        let long = "a".repeat(256);
+        assert!(why(&format!("socks5://{long}@127.0.0.1:1080")).contains("255"));
+    }
+
+    #[test]
+    fn libtorrent_gets_decoded_credentials_and_ipv4_for_localhost() {
+        let proxy = libtorrent_proxy(Some(&url("socks5h://me:p%40ss@LOCALHOST:1080")));
+        assert_eq!(
+            (
+                proxy.host.as_str(),
+                proxy.port,
+                proxy.username.as_str(),
+                proxy.password.as_str()
+            ),
+            ("127.0.0.1", 1080, "me", "p@ss")
+        );
+        assert_eq!(libtorrent_proxy(None), SocksProxy::default());
+    }
+}

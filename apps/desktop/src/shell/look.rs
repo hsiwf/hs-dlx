@@ -1,7 +1,7 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_dlx_app::{Failure, Status};
+use hs_dlx_app::{Failure, Status, TorrentPhase};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -36,19 +36,32 @@ enum Stopped<'a> {
 }
 
 pub fn look(row: &Row) -> Look {
+    let torrent = row.task.spec.torrent().is_some();
     if row.discarding {
-        return discarding(row, "放弃中", "停下并删除任务目录");
+        let line = if torrent {
+            "停下并删除已下的文件"
+        } else {
+            "停下并删除任务目录"
+        };
+        return discarding(row, "放弃中", line);
     }
     match &row.task.status {
+        Status::DiscardUnfinished if torrent => discarding(
+            row,
+            "放弃没做完",
+            "已下的文件没删干净：处理提示里留下的，再放弃一次",
+        ),
         Status::DiscardUnfinished => discarding(
             row,
             "放弃没做完",
             "任务目录可能已删了一部分，再放弃一次即可",
         ),
+        Status::Running if torrent => running_torrent(row),
         Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
+        Status::Done if row.task.seeding => seeding_look(row),
         Status::Done => done_look(row),
     }
 }
@@ -138,6 +151,9 @@ const FILE_TICKS: usize = 120;
 
 /// 停着的任务的 [`Kept`]；`paused` 时说明里写明继续时接着下。
 fn kept(row: &Row, paused: bool) -> Kept {
+    if row.task.spec.torrent().is_some() {
+        return kept_torrent(row, paused);
+    }
     if row.task.spec.hls().is_none() {
         return kept_file(row, paused);
     }
@@ -191,6 +207,127 @@ fn kept_file(row: &Row, paused: bool) -> Kept {
         fraction: fraction.unwrap_or(0.0),
         big: fraction.map_or_else(|| "‖".to_owned(), percent),
         line,
+    }
+}
+
+/// 按已下的比例点亮的刻度份数（共 [`FILE_TICKS`] 份）。
+fn lit(fraction: Option<f32>) -> usize {
+    fraction.map_or(0, |f| (f * FILE_TICKS as f32) as usize)
+}
+
+/// 停着的 BT 任务的 [`Kept`]：按存着的续传数据里已有的字节数；上次没正常退出的，已有的要等继续时校验才知道。
+fn kept_torrent(row: &Row, paused: bool) -> Kept {
+    let amount = FileAmount::of(row);
+    let fraction = amount.as_ref().and_then(FileAmount::fraction);
+    let then = if paused { " · 继续时接着下" } else { "" };
+    let line = match (&amount, &row.disk) {
+        (_, Disk::Unreadable(reason)) => format!("读不出存着的进度：{reason}"),
+        (_, Disk::Torrent(saved)) if !saved.trusted => "已下的要等继续时重新校验".to_owned(),
+        (Some(a), _) if a.bytes > 0 => format!(
+            "已下 {} / {}{then}",
+            format::bytes(a.bytes),
+            format::bytes(a.total.unwrap_or(0))
+        ),
+        (_, Disk::Unread) => "正在读取进度".to_owned(),
+        _ => "还没有下载内容".to_owned(),
+    };
+    Kept {
+        done: lit(fraction),
+        total: FILE_TICKS,
+        known: fraction.is_some(),
+        fraction: fraction.unwrap_or(0.0),
+        big: fraction.map_or_else(|| "‖".to_owned(), percent),
+        line,
+    }
+}
+
+/// 在下的 BT 任务：校验时按校验了的比例；下载时刻度按已下的字节比例，连着节点而凑不齐全部内容时标「资源不足」；下完
+/// 了正在存进度、从会话里移除。
+fn running_torrent(row: &Row) -> Look {
+    let look = |state: &str, color: Hsla, fraction: f32, big: String, line: String| Look {
+        state: state.to_owned(),
+        color,
+        ticks: Ticks::of(FILE_TICKS, lit(Some(fraction)), true),
+        short: percent(fraction),
+        big,
+        line,
+        hint: None,
+        fraction,
+        orb: color,
+    };
+    let Some(progress) = row.torrent_progress.as_ref() else {
+        return Look {
+            state: "准备中".to_owned(),
+            color: theme::accent(),
+            ticks: Ticks::of(0, 0, true),
+            big: "—".to_owned(),
+            line: String::new(),
+            hint: None,
+            fraction: 0.0,
+            orb: theme::accent(),
+            short: "…".to_owned(),
+        };
+    };
+    match progress.phase {
+        TorrentPhase::Checking { progress: share } => look(
+            "校验中",
+            theme::accent(),
+            share,
+            percent(share),
+            "校验磁盘上已有的文件".to_owned(),
+        ),
+        // 做种的进度只在任务完成之后（见 seeding_look）
+        TorrentPhase::Finishing | TorrentPhase::Seeding => look(
+            "收尾",
+            theme::accent(),
+            1.0,
+            "100%".to_owned(),
+            String::new(),
+        ),
+        TorrentPhase::Downloading => {
+            let fraction = if progress.wanted > 0 {
+                (progress.done as f64 / progress.wanted as f64).min(1.0) as f32
+            } else {
+                0.0
+            };
+            let amount = format!(
+                "{} / {}",
+                format::bytes(progress.done),
+                format::bytes(progress.wanted)
+            );
+            if progress.peers == 0 {
+                // 私有种子只经 tracker 找节点：它报错时多半一直连不上，原因在信号里
+                let why = if progress.tracker_error.is_some() {
+                    "tracker 报错"
+                } else {
+                    "还没连上节点"
+                };
+                return look(
+                    "找节点",
+                    theme::accent(),
+                    fraction,
+                    percent(fraction),
+                    format!("{amount} · {why}"),
+                );
+            }
+            if progress.scarce {
+                let share = progress.reachable as f32 / progress.pieces as f32;
+                return look(
+                    "资源不足",
+                    theme::warn(),
+                    fraction,
+                    percent(fraction),
+                    format!("{amount} · 在线的节点只凑得齐 {}", percent(share)),
+                );
+            }
+            look(
+                "下载中",
+                theme::accent(),
+                fraction,
+                percent(fraction),
+                format!("{amount} · {} 个节点", progress.peers),
+            )
+        }
     }
 }
 
@@ -290,6 +427,41 @@ fn kept_text(
 }
 
 /// 已完成的任务：整圈点亮（刻度数按存储里的总片数，与下载时一致），大字为时长，下面写输出的种类、视频的宽高与大小。
+/// 在做种的 BT 任务：刻度全亮；大字为分享率，说明为已上传、上传速度与节点数。开始做种时先校验已下的文件，写校验到
+/// 哪；还没报来进度时只写在做种。
+fn seeding_look(row: &Row) -> Look {
+    let ticks = Ticks::of(FILE_TICKS, FILE_TICKS, true);
+    let (big, line) = match row.torrent_progress.as_ref() {
+        Some(progress) if progress.phase == TorrentPhase::Seeding => (
+            format::ratio(progress.uploaded, progress.wanted),
+            format!(
+                "已上传 {} · {}/s · {} 个节点",
+                format::bytes(progress.uploaded),
+                format::bytes(progress.upload_rate),
+                progress.peers
+            ),
+        ),
+        Some(progress) => match progress.phase {
+            TorrentPhase::Checking { progress: share } => {
+                (percent(share), "校验已下的文件".to_owned())
+            }
+            _ => ("↑".to_owned(), String::new()),
+        },
+        None => ("↑".to_owned(), String::new()),
+    };
+    Look {
+        state: "做种中".to_owned(),
+        color: theme::accent(),
+        ticks,
+        big,
+        line,
+        hint: None,
+        fraction: 1.0,
+        orb: theme::accent(),
+        short: "↑".to_owned(),
+    }
+}
+
 fn done_look(row: &Row) -> Look {
     let total = row.task.total.unwrap_or(0);
     let ticks = Ticks::of(total, total, false);

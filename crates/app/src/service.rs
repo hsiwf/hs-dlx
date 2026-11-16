@@ -5,10 +5,10 @@
 //! 任务下次打开时按暂停处理。
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use hs_m3u8_core::hls::Preference;
@@ -16,19 +16,23 @@ use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, FileOutput, FileOutputOptions, FileProgress, FileRequest, Job,
     JobControl, JobRequest, Leftover, LeftoverKind, Output, OutputOptions, Probe, Progress, Proxy,
-    Resource, Saved, Source, Stage, Unsettled, check_option_header,
+    Resource, Saved, Source, Stage, Unsettled, Url, check_option_header,
 };
 use rusqlite::Transaction;
-use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, watch};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::preference::StoredPreference;
+use crate::public_trackers::{self, PublicTrackers};
 use crate::store::{self, Store};
+use crate::torrent::{self, Bt, Outcome, Resume, SeedEnd, Seeder};
+use crate::update::{self, Release, Restart, UpdateFeed, Version};
 use crate::{
-    Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind, OutputSpec, Settings,
-    Status, Task, TaskId, TaskSpec, Theme, naming,
+    Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind, MetadataProgress,
+    OutputSpec, SavedTorrent, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
+    TorrentInfo, TorrentNetwork, TorrentProgress, TorrentSpec, naming,
 };
 
 /// 同一任务两次进度事件之间至少隔多久：界面每秒最多重画十次进度。
@@ -39,8 +43,31 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 新建时检查保存目录里的名字最多等多久：网络盘没有响应时不让新建一直挂着。
 const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
+/// 网络检测最多做多久：解析各 3 秒、两轮各等 2 秒、经代理的握手最多 10 秒，并行做完约 10 秒。
+const NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
+/// 设了 BT 代理时多久看一眼它（见 `Shared::watch_torrent_proxy`）。
+const PROXY_RECHECK: Duration = Duration::from_secs(30);
+/// BT 代理能用时多久复查一次：经代理问各 DHT 引导节点一次。代理切到不转发 UDP 的节点时 libtorrent 不报错，只能靠复查
+/// 发现。
+const PROXY_RECHECK_USABLE: Duration = Duration::from_secs(10 * 60);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 正在下载的更新（[`Service::download_update`]）。
+pub struct UpdateDownload {
+    /// 已下的字节数
+    pub received: watch::Receiver<u64>,
+    pub done: AbortOnDropHandle<Result<Downloaded, Error>>,
+}
+
+/// 下完并验过签名的安装包。
+#[derive(Debug)]
+pub struct Downloaded {
+    pub version: Version,
+    path: PathBuf,
+    /// 下载目录（[`UpdateFeed::dir`]）
+    dir: PathBuf,
+}
 
 /// 交给界面的事件。
 #[derive(Debug)]
@@ -51,6 +78,22 @@ pub enum Event {
     FileProgress {
         id: TaskId,
         progress: Box<FileProgress>,
+    },
+    /// 运行中或在做种的 BT 任务的进度快照，约每半秒一次
+    TorrentProgress {
+        id: TaskId,
+        progress: Box<TorrentProgress>,
+    },
+    /// 已完成的 BT 任务开始做种（下完接着做、[`Service::seed`]，或打开应用时接着上次的）
+    SeedingStarted { id: TaskId },
+    /// 做种时定时存进度没存成（`reason` 为原因）：照常做种，下一次再存；这期间的上传与做种时长要等存成了才记下
+    SeedingNotSaved { id: TaskId, reason: String },
+    /// 做种停了：`end` 为原因。`unsaved` 为 Some 时停下时的进度与「不再做种」没能写进存储，下次打开时照存储里的（可能
+    /// 接着做种）
+    SeedingEnded {
+        id: TaskId,
+        end: SeedEnd,
+        unsaved: Option<Error>,
     },
     /// 任务停下。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
     /// 没删掉的东西（被替换的旧输出、没删干净的任务目录等，输出不受影响）。`unsaved` 为 Some 时状态没能写进存储：服务
@@ -74,6 +117,36 @@ pub enum Event {
 /// 事件的接收端，在任何执行器上都可等待。
 pub type Events = mpsc::UnboundedReceiver<Event>;
 
+/// 磁力链接取种子信息（[`Service::fetch_metadata`]）。
+pub struct MetadataFetch {
+    pub progress: watch::Receiver<MetadataProgress>,
+    /// 结果为种子的续传数据；释放即停止取
+    pub resume: MetadataHandle,
+}
+
+/// 取种子信息的句柄：可等待，结果同 [`tokio::task::JoinHandle`]。释放即停止取，加进 BT 会话的种子当场移除。
+pub struct MetadataHandle {
+    task: AbortOnDropHandle<Result<Vec<u8>, Error>>,
+    slot: torrent::FetchSlot,
+}
+
+impl Future for MetadataHandle {
+    type Output = Result<Result<Vec<u8>, Error>, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx)
+    }
+}
+
+impl Drop for MetadataHandle {
+    fn drop(&mut self) {
+        self.slot.close();
+    }
+}
+
 /// 一个正在运行的任务。
 struct Running {
     control: Control,
@@ -81,11 +154,13 @@ struct Running {
     stopped: watch::Receiver<bool>,
 }
 
-/// 运行中任务的控制：两种任务的进度不同。
+/// 运行中任务的控制：各种任务的进度不同。
 #[derive(Clone)]
 enum Control {
     Hls(JobControl),
     File(JobControl<FileProgress>),
+    /// 取消即暂停
+    Torrent(CancellationToken),
 }
 
 impl Control {
@@ -93,22 +168,34 @@ impl Control {
         match self {
             Control::Hls(control) => control.cancel(),
             Control::File(control) => control.cancel(),
+            Control::Torrent(cancel) => cancel.cancel(),
         }
     }
 
-    /// 停止录制；文件任务没有录制，什么也不做。
+    /// 停止录制；文件与 BT 任务没有录制，什么也不做。
     fn stop(&self) {
         match self {
             Control::Hls(control) => control.stop(),
-            Control::File(_) => {}
+            Control::File(_) | Control::Torrent(_) => {}
         }
     }
 }
 
-/// 开始了的任务：两种任务的结果与进度不同。
+/// 开始了的任务：各种任务的结果与进度不同。
 enum Launched {
     Hls(Job),
     File(Job<FileOutput, FileProgress>),
+    Torrent(TorrentRun),
+}
+
+/// 开始了的 BT 任务。
+struct TorrentRun {
+    cancel: CancellationToken,
+    done: JoinHandle<torrent::Ended>,
+    /// 种子的编号、加入时的续传数据与内容的根：新建没记进存储时删它下了的文件
+    info_hash: String,
+    resume: Vec<u8>,
+    root: PathBuf,
 }
 
 impl Launched {
@@ -116,6 +203,7 @@ impl Launched {
         match self {
             Launched::Hls(job) => job.control().cancel(),
             Launched::File(job) => job.control().cancel(),
+            Launched::Torrent(run) => run.cancel.cancel(),
         }
     }
 }
@@ -127,6 +215,10 @@ struct Ending {
     result: Option<Finished>,
     /// 点播的总片数；None 时不改存储里的
     total: Option<usize>,
+    /// BT 任务停下时要到的续传数据；None 时不改存储里的
+    resume: Option<Resume>,
+    /// BT 任务下完时接着做不做种；None 时不改存储里的
+    seeding: Option<bool>,
 }
 
 impl Ending {
@@ -136,6 +228,9 @@ impl Ending {
         task.result.clone_from(&self.result);
         if self.total.is_some() {
             task.total = self.total;
+        }
+        if let Some(seeding) = self.seeding {
+            task.seeding = seeding;
         }
     }
 }
@@ -156,6 +251,28 @@ struct Shared {
     /// 服务在运行时里起的、会改状态的任务（运行中任务的收尾、放弃、存储写不进时不要了的任务的收尾）；关闭时等它们
     tracker: TaskTracker,
     events: mpsc::UnboundedSender<Event>,
+    /// BT 引擎，第一次用到时建会话
+    bt: Bt,
+    /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
+    public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 看着 BT 代理的任务与它看着的地址（BT 会话已建、设了代理时有，见 `Shared::watch_torrent_proxy`）；改了代理或
+    /// 关闭时取消
+    proxy_probe: Mutex<Option<(Url, AbortOnDropHandle<()>)>>,
+    /// 代理设置改了（[`Service::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
+    proxy_changed: Arc<Notify>,
+    /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
+    runtime: Handle,
+    /// 做种的设置，随 [`Service::set_seeding`] 改；在做种的随时照它判停不停
+    seeding: watch::Sender<Seeding>,
+    /// 在做种的（含正在加入会话、还没开始的）：停止做种经它找到，登记与查询都在 `store` 锁内
+    seeders: Mutex<HashMap<TaskId, SeedControl>>,
+}
+
+/// 一个在做种的任务的控制。
+struct SeedControl {
+    cancel: CancellationToken,
+    /// 用户停止了做种（[`Service::stop_seeding`]）：停下后不再做种，即使停的期间应用正在退出
+    by_user: Arc<AtomicBool>,
 }
 
 /// 任务服务。不能在 tokio 运行时里释放：释放时要在自己的运行时上等任务停下（见 [`Service::close`]）。
@@ -166,11 +283,22 @@ pub struct Service {
 }
 
 impl Service {
-    /// 用 `store` 建服务，同时最多 `max_requests` 个请求（见 [`Engine::new`]）；返回服务与事件的接收端。上次异常退出时
-    /// 还标着运行中的任务改为暂停。
-    pub fn new(mut store: Store, max_requests: NonZeroUsize) -> Result<(Service, Events), Error> {
+    /// 用 `store` 建服务，HTTP 同时最多 `max_requests` 个请求（见 [`hs_m3u8_core::Engine::new`]），BT 会话连
+    /// `network`；返回服务与事件的接收端。上次异常退出时还标着运行中的任务改为暂停；其中 BT 任务存的续传数据改为不可信
+    /// （可能比磁盘上的多），下次继续时先整体校验已下的文件。
+    pub fn new(
+        mut store: Store,
+        max_requests: NonZeroUsize,
+        network: TorrentNetwork,
+    ) -> Result<(Service, Events), Error> {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
+        let settings = store::settings(&tx)?;
+        let seeding: Vec<TaskId> = store::list(&tx)?
+            .into_iter()
+            .filter(|task| task.seeding)
+            .map(|task| task.id)
+            .collect();
         tx.commit()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -195,11 +323,39 @@ impl Service {
             unsaved: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             events,
+            bt: Bt::new(
+                network,
+                settings.upload_limit,
+                settings.torrent_proxy.clone(),
+            ),
+            public_fetch: Mutex::new(None),
+            proxy_probe: Mutex::new(None),
+            proxy_changed: Arc::new(Notify::new()),
+            runtime: runtime.handle().clone(),
+            seeding: watch::Sender::new(settings.seeding),
+            seeders: Mutex::new(HashMap::new()),
         });
         let service = Service {
             shared,
             runtime: Some(runtime),
         };
+        // 上次退出时还在做种的接着做；开始不了的与做种中途开始不了的一样，以做种停了报出、记为不再做种（可再点做种）
+        {
+            let _entered = service.runtime().enter();
+            for id in seeding {
+                if let Err(error) = service.shared.start_seeding(id) {
+                    // 接收端就在返回值里，这时不会已丢弃
+                    let _closed = service.shared.events.send(Event::SeedingEnded {
+                        id,
+                        end: SeedEnd::Failed(error.to_string()),
+                        unsaved: service
+                            .shared
+                            .write(|tx| store::set_seeding_task(tx, id, false))
+                            .err(),
+                    });
+                }
+            }
+        }
         Ok((service, receiver))
     }
 
@@ -227,7 +383,8 @@ impl Service {
     }
 
     /// 退出前停下所有任务：不再开始任务（新建与继续报 [`Error::Closed`]），取消运行中的，最多等 2 秒让它们与放弃等
-    /// 收尾任务做完、写进结束状态，再补写没写进去的，返回补写的结果。没来得及停下的与补写不进的，存储里还是运行中，
+    /// 收尾任务做完、写进结束状态，再补写没写进去的；建过 BT 会话时记下它的监听端口与 DHT 状态，会话随之关闭（向
+    /// tracker 报告停止最多再等 2 秒）。返回补写与记下会话状态的结果。没来得及停下的与补写不进的，存储里还是运行中，
     /// 下次打开时按暂停处理。不能在 tokio 运行时里调用。
     pub fn close(&self) -> Result<(), Error> {
         {
@@ -236,13 +393,28 @@ impl Service {
             for running in lock(&self.shared.running).values() {
                 running.control.cancel();
             }
+            // 停下做种；存储里照旧记着在做种，下次打开接着做
+            for seeder in lock(&self.shared.seeders).values() {
+                seeder.cancel.cancel();
+            }
         }
+        // 取公共 tracker 列表、探 BT 代理的不改存储，不用等
+        drop(lock(&self.shared.public_fetch).take());
+        drop(lock(&self.shared.proxy_probe).take());
         let tracker = &self.shared.tracker;
         tracker.close();
         let _timed_out = self
             .runtime()
             .block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tracker.wait()).await });
-        self.flush()
+        let flushed = self.flush();
+        let saved = match self.shared.bt.close() {
+            Ok(Some(state)) => self
+                .shared
+                .write(|tx| store::set_torrent_session(tx, &state)),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        flushed.and(saved)
     }
 
     /// 设置。
@@ -267,6 +439,216 @@ impl Service {
         Ok(())
     }
 
+    /// 记下做种的设置；在做种的随即照它判停不停。
+    pub fn set_seeding(&self, seeding: Seeding) -> Result<(), Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_seeding(&tx, seeding)?;
+        tx.commit()?;
+        self.shared.seeding.send_replace(seeding);
+        Ok(())
+    }
+
+    /// 记下 BT 的上传限速（字节每秒；None 为不限），BT 会话已建时随即照它限。
+    pub fn set_upload_limit(&self, limit: Option<NonZeroU32>) -> Result<(), Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        store::set_upload_limit(&tx, limit)?;
+        tx.commit()?;
+        self.shared.bt.set_upload_limit(limit);
+        Ok(())
+    }
+
+    /// 诊断在下或做种的 BT 任务（见 [`crate::Check`]）：要一次 BT 会话的统计并查种子与 tracker 的状况。不是在下或做种
+    /// 的 BT 任务时报 [`Error::InvalidInput`]（BT 会话还没建也是），统计 10 秒内没到时报 [`Error::Torrent`]。返回的
+    /// 句柄在任何执行器上都可等待。
+    pub fn diagnose(&self, id: TaskId) -> JoinHandle<Result<Vec<crate::Check>, Error>> {
+        let shared = self.shared.clone();
+        self.runtime().spawn(async move {
+            let (spec, limit) = {
+                let mut store = lock(&shared.store);
+                let tx = store.transaction()?;
+                let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+                (
+                    task.spec.torrent().cloned(),
+                    store::settings(&tx)?.upload_limit,
+                )
+            };
+            let not_running = || Error::InvalidInput("只有在下或做种的 BT 任务能诊断".to_owned());
+            let spec = spec.ok_or_else(not_running)?;
+            let seeding = if lock(&shared.running).contains_key(&id) {
+                false
+            } else if lock(&shared.seeders).contains_key(&id) {
+                true
+            } else {
+                return Err(not_running());
+            };
+            // 在下或做种的已建过会话；关闭之后没有了
+            let engine = shared.bt.existing().ok_or(Error::Closed)?;
+            torrent::diagnose(&engine, &spec.info_hash, seeding, limit, shared.bt.proxy()).await
+        })
+    }
+
+    /// 检测 BT 用的网络（见 [`crate::NetworkReport`]）：并行探直连与 IPv6 的 DHT、UDP 的 tracker（公共 tracker 列表
+    /// 取到了时）、经 BT 代理的 DHT（设了时；探到的结果同时记进 BT 引擎），再读 BT 会话报的监听、端口映射与连入（还没
+    /// 建会话时不建，这几项不测）。设了 BT 代理时也从本机直连测一次。约 10 秒，最多 25 秒，过了报
+    /// [`Error::TimedOut`]；开不了 UDP 套接字时报 [`Error::Io`]。返回的句柄在任何执行器上都可等待，释放它即取消。
+    pub fn check_network(&self) -> AbortOnDropHandle<Result<crate::NetworkReport, Error>> {
+        let shared = self.shared.clone();
+        AbortOnDropHandle::new(self.runtime().spawn(async move {
+            tokio::time::timeout(NETWORK_CHECK_TIMEOUT, shared.check_network())
+                .await
+                .map_err(|_| Error::TimedOut {
+                    action: "检测网络".to_owned(),
+                    after: NETWORK_CHECK_TIMEOUT,
+                })?
+        }))
+    }
+
+    /// 让下完的 BT 任务做种（照做种的设置，到了停的条件即停）：记下在做种，加入 BT 会话、校验已下的文件后只上传；文件
+    /// 不全时停下（[`SeedEnd::Incomplete`]），不补下。开始与停下照常以 [`Event::SeedingStarted`] 与
+    /// [`Event::SeedingEnded`] 报来。不是下完的 BT 任务时报 [`Error::InvalidInput`]，已在做种时报 [`Error::Seeding`]，
+    /// 正在退出时报 [`Error::Closed`]。
+    pub fn seed(&self, id: TaskId) -> Result<(), Error> {
+        let _entered = self.runtime().enter();
+        self.shared.start_seeding(id)
+    }
+
+    /// 停止做种：随即记为不再做种（之后应用退出或崩溃也不再接着做），再存下进度、从 BT 会话里移除；停下后发
+    /// [`Event::SeedingEnded`]。没在做种时什么也不做；记不进存储时报错，做种照旧。
+    pub fn stop_seeding(&self, id: TaskId) -> Result<(), Error> {
+        let shared = &self.shared;
+        let mut store = lock(&shared.store);
+        let tx = store.transaction()?;
+        let applied = shared.apply_unsaved(&tx)?;
+        let Some((cancel, by_user)) = lock(&shared.seeders)
+            .get(&id)
+            .map(|seeder| (seeder.cancel.clone(), seeder.by_user.clone()))
+        else {
+            return Ok(());
+        };
+        store::set_seeding_task(&tx, id, false)?;
+        shared.commit(tx, applied)?;
+        // 提交了才停（提交失败时做种照旧，与报的错一致），仍在 `store` 锁内：与关闭的先后分明
+        by_user.store(true, Ordering::Relaxed);
+        cancel.cancel();
+        Ok(())
+    }
+
+    /// 记下 BT 经的 SOCKS5 代理（None 为直连），BT 会话已建时随即照它连。不是 `socks5://` 或 `socks5h://` 开头、没写
+    /// 主机或端口时报 [`Error::InvalidInput`]。
+    pub fn set_torrent_proxy(&self, proxy: Option<Url>) -> Result<(), Error> {
+        if let Some(url) = &proxy {
+            crate::socks::check(url).map_err(Error::InvalidInput)?;
+        }
+        self.shared
+            .write(|tx| store::set_torrent_proxy(tx, proxy.as_ref()))?;
+        self.shared.bt.set_proxy(proxy);
+        // 重新开始看着（存的与之前相同时也随即再探）：BT 会话已建时随即开始；还没建时等建起时
+        drop(lock(&self.shared.proxy_probe).take());
+        if self.shared.bt.existing().is_some() {
+            self.shared.watch_torrent_proxy();
+        }
+        Ok(())
+    }
+
+    /// 记下要不要自动检查更新。
+    pub fn set_check_updates(&self, check: bool) -> Result<(), Error> {
+        self.shared.write(|tx| store::set_check_updates(tx, check))
+    }
+
+    /// 查 `feed` 上有没有比本应用新的版本，经设置里的代理；没有时为 None。返回的句柄在任何执行器上都可等待，释放它即
+    /// 取消。查不到等见 [`Error::Update`]；读不出设置时直接报错。
+    pub fn check_update(
+        &self,
+        feed: &UpdateFeed,
+    ) -> Result<AbortOnDropHandle<Result<Option<Release>, Error>>, Error> {
+        let proxy = self.settings()?.proxy;
+        let (engine, feed) = (self.shared.engine.clone(), feed.clone());
+        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
+            update::check(&engine, &feed, &proxy, Version::current()).await
+        })))
+    }
+
+    /// 下载 `release` 里本平台的安装包（经设置里的代理，放在 `feed.dir`，没下完的再下时接着下），先取签名、核对它是
+    /// 这个版本这个文件的，下完验内容。返回已下的字节数与句柄：句柄的结果为验过的安装包，交给
+    /// [`Service::install_update`]；释放它即取消。`release` 没有本平台的安装包时报 [`Error::Update`]，读不出设置时直接
+    /// 报错；其余失败（取不到、签名不符等）经句柄报 [`Error::Update`]，签名不符的文件删掉。
+    pub fn download_update(
+        &self,
+        feed: &UpdateFeed,
+        release: &Release,
+    ) -> Result<UpdateDownload, Error> {
+        let package = release
+            .package
+            .clone()
+            .ok_or_else(|| Error::Update("这个平台不能自动更新，到下载页下载新版本".to_owned()))?;
+        let proxy = self.settings()?.proxy;
+        let (engine, key, dir, release) = (
+            self.shared.engine.clone(),
+            feed.public_key.clone(),
+            feed.dir.clone(),
+            release.clone(),
+        );
+        let (progress, received) = watch::channel(0);
+        let handle = self.runtime().spawn(async move {
+            let (key, signature) =
+                update::signature(&engine, &proxy, &key, &release, &package).await?;
+            let path = dir.join(&package.name);
+            let mut output = FileOutputOptions::new(path.clone());
+            output.overwrite = true;
+            let mut source = Source::new(package.url.clone());
+            source.http.proxy = proxy;
+            let failed = |error: hs_m3u8_core::Error| {
+                Error::Update(format!("下载不了 {}：{error}", package.name))
+            };
+            let job = engine
+                .start_file(FileRequest::new(source, output))
+                .map_err(failed)?;
+            let mut bytes = job.control().progress();
+            let waiting = job.wait();
+            tokio::pin!(waiting);
+            let downloaded = loop {
+                tokio::select! {
+                    result = &mut waiting => break result.map_err(failed)?,
+                    Ok(()) = bytes.changed() => {
+                        progress.send_replace(bytes.borrow_and_update().bytes);
+                    }
+                }
+            };
+            // 下完与最后一次进度同时到时上面可能先选了下完
+            progress.send_replace(downloaded.bytes);
+            let checked = downloaded.path.clone();
+            tokio::task::spawn_blocking(move || {
+                let verified = update::verify(&checked, &key, &signature);
+                if verified.is_err() {
+                    // 不是发布的那个文件：留着下次也只会接着用它
+                    let _gone = std::fs::remove_file(&checked);
+                }
+                verified
+            })
+            .await
+            .expect("验签名不会 panic，运行时关闭时本任务也一起丢弃")?;
+            Ok(Downloaded {
+                version: release.version,
+                path: downloaded.path,
+                dir,
+            })
+        });
+        Ok(UpdateDownload {
+            received,
+            done: AbortOnDropHandle::new(handle),
+        })
+    }
+
+    /// 装上验过签名的安装包，返回退出之后怎么接着做（见 [`crate::Restart`]：退出已不可撤回时起它）。没装上时报
+    /// [`Error::Update`]（已装的版本不受影响，可再试），换到一半时报 [`Error::UpdateStranded`]。返回的句柄在任何执行器
+    /// 上都可等待。
+    pub fn install_update(&self, downloaded: Downloaded) -> JoinHandle<Result<Restart, Error>> {
+        self.runtime()
+            .spawn_blocking(move || update::install(&downloaded.path, &downloaded.dir))
+    }
+
     /// 记下外观主题。
     pub fn set_theme(&self, theme: Theme) -> Result<(), Error> {
         let mut store = lock(&self.shared.store);
@@ -286,6 +668,7 @@ impl Service {
         let tx = store.transaction()?;
         store::set_proxy(&tx, proxy)?;
         tx.commit()?;
+        self.shared.proxy_changed.notify_one();
         Ok(())
     }
 
@@ -315,6 +698,57 @@ impl Service {
             self.runtime()
                 .spawn(async move { engine.identify(&source).await }),
         ))
+    }
+
+    /// 磁力链接 `uri` 取种子信息（连 DHT 与链接里的 tracker、节点找有它的节点），返回取的进度与句柄：句柄的结果为种子的
+    /// 续传数据，供新建任务（[`DraftKind::Torrent`]）；句柄在任何执行器上都可等待，释放它即停止取。不是磁力链接、或这个
+    /// 种子正在下载或取种子信息时报 [`Error::Torrent`]；BT 会话建不出时直接报错。取不到时一直等，由调用方决定何时放弃。
+    pub fn fetch_metadata(&self, uri: String) -> Result<MetadataFetch, Error> {
+        let engine = self.shared.bt_engine()?;
+        let (progress, receiver) = watch::channel(MetadataProgress::default());
+        let probe_dir = self.shared.bt.probe_dir().to_path_buf();
+        let slot = torrent::FetchSlot::default();
+        let handle = self.runtime().spawn(torrent::fetch_metadata(
+            engine,
+            uri,
+            probe_dir,
+            progress,
+            slot.clone(),
+        ));
+        Ok(MetadataFetch {
+            progress: receiver,
+            resume: MetadataHandle {
+                task: AbortOnDropHandle::new(handle),
+                slot,
+            },
+        })
+    }
+
+    /// BT 任务存着的续传数据里的种子信息：任务不在运行时显示要下多少、已下多少。没有这个 BT 任务时报
+    /// [`Error::NotFound`]；返回的句柄在任何执行器上都可等待。
+    pub fn inspect_torrent(&self, id: TaskId) -> JoinHandle<Result<SavedTorrent, Error>> {
+        let shared = self.shared.clone();
+        self.runtime().spawn(async move {
+            let resume = {
+                let mut store = lock(&shared.store);
+                let tx = store.transaction()?;
+                let stored = store::torrent_resume(&tx, id)?;
+                // 停下时要到的还没写进存储的（待补写）比存储里的新
+                lock(&shared.unsaved)
+                    .get(&id)
+                    .and_then(|ending| ending.resume.clone())
+                    .unwrap_or(stored)
+            };
+            // 读种子信息要解析整个续传数据（大种子有几 MB），在阻塞线程上做；存储里的读不出即被改动过
+            let info = tokio::task::spawn_blocking(move || TorrentInfo::of(&resume.data))
+                .await
+                .expect("读种子信息不会 panic，运行时关闭时本任务也一起丢弃")
+                .map_err(|error| Error::Corrupt(format!("{id}的续传数据：{error}")))?;
+            Ok(SavedTorrent {
+                info,
+                trusted: resume.trusted,
+            })
+        })
     }
 
     /// 按 `draft` 新建任务并开始，返回存进存储的任务；`created_at` 为新建时间（Unix 秒）。输出放在 `draft.folder` 里：
@@ -400,30 +834,78 @@ impl Service {
         })
     }
 
-    /// 只从存储里删掉任务，不碰磁盘：用于已完成的（任务目录已在完成时删掉，输出归用户）与没有自己的任务目录的。别的报
-    /// [`Error::NotFinished`]：它们的任务目录要用 [`Service::discard`] 一起删。
+    /// 从存储里删掉任务，输出不动：用于已完成的（任务目录已在完成时删掉，输出归用户；BT 另删保存目录里它的 `.parts`
+    /// 文件）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们的任务目录（BT 为下了的文件）要用
+    /// [`Service::discard`] 一起删。在做种的报 [`Error::Seeding`]；`.parts` 删不掉时报 [`Error::Io`]，记录留着。
     pub fn forget(&self, id: TaskId) -> Result<(), Error> {
-        self.shared.write(|tx| {
+        let part = self.shared.write(|tx| {
             if lock(&self.shared.discarding).contains(&id) {
                 return Err(Error::Discarding(id));
             }
+            if lock(&self.shared.seeders).contains_key(&id) {
+                return Err(Error::Seeding(id));
+            }
             let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
-            if task.status != Status::Done && task.work_dir.is_some() {
+            let unfinished = task.work_dir.is_some() || task.spec.torrent().is_some();
+            if task.status != Status::Done && unfinished {
                 return Err(Error::NotFinished(id));
             }
-            store::delete(tx, id)
-        })
+            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户；记录删了之后在
+            // 后台删
+            let part = match task.spec.torrent() {
+                Some(spec) => Some((torrent_folder(spec), store::torrent_resume(tx, id)?.data)),
+                None => None,
+            };
+            store::delete(tx, id)?;
+            Ok(part)
+        })?;
+        if let Some((folder, resume)) = part {
+            self.forget_part_file(folder, resume);
+        }
+        Ok(())
     }
 
-    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）的报
-    /// [`Error::InvalidInput`]；任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、放弃没做完
+    /// 在运行时的阻塞线程上删掉移除了的 BT 任务在保存目录 `folder` 里的 `.parts`（名字由续传数据 `resume` 得出）；删不掉
+    /// 或读不出名字时发 [`Event::Orphaned`]。
+    fn forget_part_file(&self, folder: PathBuf, resume: Vec<u8>) {
+        let events = self.shared.events.clone();
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let removed = tokio::task::spawn_blocking(move || {
+                let name = TorrentInfo::of(&resume)
+                    .map_err(|error| (folder.clone(), format!("读不出 .parts 的名字：{error}")))?
+                    .part_file;
+                let part = folder.join(name);
+                match std::fs::remove_file(&part) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err((part, format!("删不掉：{error}"))),
+                }
+            })
+            .await
+            .expect("删文件不会 panic，运行时关闭时本任务也一起丢弃");
+            if let Err((path, reason)) = removed {
+                // 接收端随界面关闭而丢弃时没有谁能处理
+                let _closed = events.send(Event::Orphaned {
+                    paths: vec![path],
+                    reason,
+                });
+            }
+        });
+    }
+
+    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）、或任务是 BT
+    /// 任务（没有请求头）的报 [`Error::InvalidInput`]；任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、放弃没做完
     /// 的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
     pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
         for (name, value) in &headers {
             check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
         self.shared.write(|tx| {
-            self.shared.stopped(tx, id)?;
+            let task = self.shared.stopped(tx, id)?;
+            if task.spec.torrent().is_some() {
+                return Err(Error::InvalidInput(format!("{id}是 BT 任务，没有请求头")));
+            }
             store::set_headers(tx, id, &headers)
         })
     }
@@ -442,9 +924,10 @@ impl Service {
         }
     }
 
-    /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::DiscardUnfinished`]，再删掉任务目录（见 [`Engine::discard`]）
-    /// 与存储里的记录；返回留下的东西。
-    /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
+    /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::DiscardUnfinished`]，再删掉任务目录（见 [`Engine::discard`]；
+    /// BT 任务为 libtorrent 建的文件、空了的目录与存部分块的 `.parts` 文件）与存储里的记录；返回留下的东西（BT 任务
+    /// 没有）。
+    /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]（BT 任务的文件没删干净时报 [`Error::ContentLeft`]）；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
     /// 30 秒内做不完报 [`Error::TimedOut`]（之后再放弃从做到的地方接着做）。做完之前任务记为正在放弃，继续与移除都报
     /// [`Error::Discarding`]，再放弃一次同样报这个错误。返回的句柄在任何执行器上都可等待。
     pub fn discard(&self, id: TaskId) -> JoinHandle<Result<Vec<Leftover>, Error>> {
@@ -505,10 +988,54 @@ impl Drop for DiscardGuard {
     }
 }
 
+/// 从 `sources` 取公共 tracker 列表，经设置里的代理（每次取时读），结果交给 BT 引擎（[`Bt::set_public`]）；没取到隔一阵
+/// 再取（[`public_trackers::FIRST_RETRY`] 起每次翻倍），其间代理设置改了即刻再取、间隔从头算；取到或服务已释放即止。
+async fn fetch_public_trackers(shared: Weak<Shared>, engine: Engine, sources: Vec<Url>) {
+    let mut wait = public_trackers::FIRST_RETRY;
+    loop {
+        let proxy = match shared.upgrade() {
+            Some(shared) => {
+                let mut store = lock(&shared.store);
+                store
+                    .transaction()
+                    .and_then(|tx| store::settings(&tx))
+                    .map(|settings| settings.proxy)
+            }
+            None => return,
+        };
+        let fetched = match proxy {
+            Ok(proxy) => public_trackers::fetch(&engine, &sources, &proxy).await,
+            Err(error) => Err(format!("读不出代理设置：{error}")),
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        match fetched {
+            Ok(trackers) => {
+                shared.bt.set_public(PublicTrackers::Ready(trackers.into()));
+                return;
+            }
+            Err(why) => shared.bt.set_public(PublicTrackers::Failed(why)),
+        }
+        // 等的时候不持有服务
+        let proxy_changed = shared.proxy_changed.clone();
+        drop(shared);
+        let changed = tokio::select! {
+            () = proxy_changed.notified() => true,
+            () = tokio::time::sleep(wait) => false,
+        };
+        wait = if changed {
+            public_trackers::FIRST_RETRY
+        } else {
+            (wait * 2).min(public_trackers::LAST_RETRY)
+        };
+    }
+}
+
 /// [`Service::discard`] 的步骤：等任务停下、删任务目录、删存储里的记录。
 async fn run_discard(
     id: TaskId,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     stopped: Option<watch::Receiver<bool>>,
 ) -> Result<Vec<Leftover>, Error> {
     if let Some(mut stopped) = stopped {
@@ -517,7 +1044,30 @@ async fn run_discard(
     }
     // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
     shared.write(|tx| store::set_status(tx, id, &Status::DiscardUnfinished))?;
-    let leftovers = match shared.get(id)?.work_dir {
+    let task = shared.get(id)?;
+    if let Some(spec) = task.spec.torrent() {
+        let resume = {
+            let mut store = lock(&shared.store);
+            let tx = store.transaction()?;
+            store::torrent_resume(&tx, id)?
+        };
+        let engine = shared.bt_engine()?;
+        torrent::delete(engine, &spec.info_hash, &resume.data, &spec.root)
+            .await
+            .map_err(|cause| Error::ContentLeft {
+                id,
+                cause: Box::new(cause),
+            })?;
+        return shared
+            .write(|tx| store::delete(tx, id))
+            .map(|()| Vec::new())
+            .map_err(|cause| Error::RecordNotDeleted {
+                id,
+                leftovers: Vec::new(),
+                cause: Box::new(cause),
+            });
+    }
+    let leftovers = match task.work_dir {
         // 放弃超时时这个 future 被丢弃，核心在步与步之间停下，再放弃时从做到的地方接着做
         Some(work_dir) => {
             shared
@@ -607,6 +1157,276 @@ impl Shared {
         store::get(&tx, id)?.ok_or(Error::NotFound(id))
     }
 
+    /// BT 引擎；还没有时照存储里上次关闭时的端口与 DHT 状态建会话（见 [`Shared::torrent_engine`]）。不持 `store` 锁调用。
+    fn bt_engine(self: &Arc<Self>) -> Result<Arc<torrent::Engine>, Error> {
+        let saved = {
+            let mut store = lock(&self.store);
+            let tx = store.transaction()?;
+            store::torrent_session(&tx)?
+        };
+        self.torrent_engine(saved)
+    }
+
+    /// BT 引擎；还没有时照 `saved` 建会话（见 [`Bt::engine`]），第一次建时开始取公共 tracker 列表。
+    fn torrent_engine(
+        self: &Arc<Self>,
+        saved: torrent::SessionState,
+    ) -> Result<Arc<torrent::Engine>, Error> {
+        let engine = self.bt.engine(saved)?;
+        if let Some(sources) = self.bt.begin_public() {
+            let fetching = self.runtime.spawn(fetch_public_trackers(
+                Arc::downgrade(self),
+                self.engine.clone(),
+                sources,
+            ));
+            *lock(&self.public_fetch) = Some(AbortOnDropHandle::new(fetching));
+        }
+        self.watch_torrent_proxy();
+        Ok(engine)
+    }
+
+    async fn check_network(self: &Arc<Self>) -> Result<crate::NetworkReport, Error> {
+        use crate::netcheck::{self, DHT_BOOTSTRAP, Udp};
+        let socket = |error: std::io::Error| Error::Io {
+            action: "打开",
+            path: "检测网络用的 UDP 套接字".into(),
+            cause: error,
+        };
+        let engine = self.bt.existing();
+        if let Some(engine) = &engine {
+            engine.request_stats();
+        }
+        let (v4, trackers) = (
+            Udp::direct(false).await.map_err(socket)?,
+            Udp::direct(false).await.map_err(socket)?,
+        );
+        let direct = async {
+            let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
+            netcheck::dht(&v4, &found, unresolved).await
+        };
+        let ipv6 = async {
+            if !netcheck::has_public_ipv6().await {
+                return None;
+            }
+            Some(match Udp::direct(true).await {
+                Ok(udp) => {
+                    let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, true).await;
+                    let measured = netcheck::dht(&udp, &found, unresolved).await;
+                    match measured.failure {
+                        Some(why) => Err(why),
+                        None => Ok(measured.bootstrap),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            })
+        };
+        let udp_trackers = async {
+            match self.bt.public() {
+                PublicTrackers::Ready(list) => netcheck::udp_trackers(&trackers, &list).await,
+                PublicTrackers::Off => Err("不补公共 tracker".to_owned()),
+                PublicTrackers::Idle => Err("公共 tracker 列表在 BT 用过之后才取".to_owned()),
+                PublicTrackers::Fetching => Err("公共 tracker 列表还在取".to_owned()),
+                PublicTrackers::Failed(why) => Err(format!("公共 tracker 列表没取到（{why}）")),
+            }
+        };
+        let proxy_url = self.bt.proxy_url();
+        let proxied = async {
+            let url = proxy_url.as_ref()?;
+            Some(netcheck::through_proxy(url, &DHT_BOOTSTRAP).await)
+        };
+        let (dht, ipv6, trackers, proxied) = tokio::join!(direct, ipv6, udp_trackers, proxied);
+        let proxy = match (proxy_url, proxied) {
+            (Some(url), Some(through)) => {
+                let through = through.map_err(socket)?;
+                // 记进 BT 引擎（取种子信息的界面与诊断随之更新），报告照记下的出
+                let check = self.bt.record_proxy_check(
+                    &url,
+                    netcheck::judge_proxy(&through),
+                    netcheck::resolved(&through),
+                );
+                Some(netcheck::Proxied {
+                    address: hs_m3u8_core::bare_url(&url),
+                    check,
+                    dht: through.ok(),
+                })
+            }
+            _ => None,
+        };
+        Ok(netcheck::report(&netcheck::Measured {
+            dht,
+            trackers,
+            ipv6,
+            proxy,
+            session: engine.map(|engine| engine.session_facts()),
+        }))
+    }
+
+    /// 照现在的 BT 代理看着它：已在看着同一个地址时不动；改了或改成直连时停下看着旧的，设了时开始看着新的。开始时探
+    /// 一次（之前记下的结果可能是 BT 会话建起前量的）；之后每 [`PROXY_RECHECK`] 看一眼，还没探、探出用不了，或
+    /// libtorrent 经它报过错时再探，能用时每 [`PROXY_RECHECK_USABLE`] 复查一次。探只经代理发包（见
+    /// [`crate::netcheck::probe_proxy`]），探到的记下（见 [`Bt::set_proxy_check`]）。服务释放即止。
+    fn watch_torrent_proxy(self: &Arc<Self>) {
+        let mut watching = lock(&self.proxy_probe);
+        // 在锁内读：与同时改代理的不会把新地址的看护换成旧地址的
+        let url = self.bt.proxy_url();
+        if let (Some((watched, _)), Some(url)) = (&*watching, &url)
+            && watched == url
+        {
+            return;
+        }
+        *watching = None;
+        let Some(url) = url else {
+            return;
+        };
+        let shared = Arc::downgrade(self);
+        let hosts = self.bt.dht_bootstrap();
+        let watched = url.clone();
+        let probing = self.runtime.spawn(async move {
+            let mut ticks = tokio::time::interval(PROXY_RECHECK);
+            let mut last_probe: Option<tokio::time::Instant> = None;
+            loop {
+                ticks.tick().await;
+                let stale = last_probe.is_none_or(|at| at.elapsed() >= PROXY_RECHECK_USABLE);
+                match shared.upgrade().map(|shared| shared.bt.proxy_due(&url)) {
+                    Some(Some(due)) if due || stale => {}
+                    Some(Some(_)) => continue,
+                    // 代理改了或服务已释放
+                    Some(None) | None => return,
+                }
+                last_probe = Some(tokio::time::Instant::now());
+                let (check, fake) = crate::netcheck::probe_proxy(&url, hosts).await;
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                shared.bt.set_proxy_check(&url, check, fake);
+            }
+        });
+        *watching = Some((watched, AbortOnDropHandle::new(probing)));
+    }
+
+    /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；
+    /// 调用方须在运行时里。
+    fn start_seeding(self: &Arc<Self>, id: TaskId) -> Result<(), Error> {
+        let (engine, info_hash, resume, root) = {
+            let mut store = lock(&self.store);
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(Error::Closed);
+            }
+            if lock(&self.seeders).contains_key(&id) {
+                return Err(Error::Seeding(id));
+            }
+            let tx = store.transaction()?;
+            let applied = self.apply_unsaved(&tx)?;
+            let task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+            let spec = match (&task.status, task.spec.torrent()) {
+                (Status::Done, Some(spec)) => spec.clone(),
+                _ => {
+                    return Err(Error::InvalidInput(format!(
+                        "{id}不是下完的 BT 任务，不能做种"
+                    )));
+                }
+            };
+            let engine = self.torrent_engine(store::torrent_session(&tx)?)?;
+            let resume = store::torrent_resume(&tx, id)?;
+            store::set_seeding_task(&tx, id, true)?;
+            self.commit(tx, applied)?;
+            (engine, spec.info_hash, resume, spec.root)
+        };
+        let started = async move {
+            let folder = root
+                .parent()
+                .expect("内容的根是以文件名结尾的绝对路径")
+                .to_path_buf();
+            torrent::start_seeding(engine, &info_hash, &resume, &folder).await
+        };
+        self.track_seeding(id, started);
+        Ok(())
+    }
+
+    /// 登记任务 `id` 在做种，等 `started` 给出加进会话的种子后做种（期间每 5 分钟存一次进度），直到停下；停下时存下进度，
+    /// 发出 [`Event::SeedingEnded`]。应用退出时停下的（用户没先停止做种，也不是到了条件或文件不全）记着在做种，下次打开
+    /// 接着做，别的记为不再做种。调用方须在运行时里。
+    fn track_seeding(
+        self: &Arc<Self>,
+        id: TaskId,
+        started: impl Future<Output = Result<Seeder, Error>> + Send + 'static,
+    ) {
+        let cancel = CancellationToken::new();
+        let by_user = Arc::new(AtomicBool::new(false));
+        {
+            let _store = lock(&self.store);
+            lock(&self.seeders).insert(
+                id,
+                SeedControl {
+                    cancel: cancel.clone(),
+                    by_user: by_user.clone(),
+                },
+            );
+            // 关闭之后才登记的（下完时正赶上退出）随即停下
+            if self.closed.load(Ordering::Relaxed) {
+                cancel.cancel();
+            }
+        }
+        // 接收端随界面关闭而丢弃时没有谁要这些事件
+        let _closed = self.events.send(Event::SeedingStarted { id });
+        let shared = self.clone();
+        let policy = self.seeding.subscribe();
+        self.tracker.spawn(async move {
+            let events = shared.events.clone();
+            let seeded = match started.await {
+                Ok(seeder) => {
+                    let saving = shared.clone();
+                    torrent::seed(
+                        seeder,
+                        policy,
+                        cancel,
+                        |progress| {
+                            // 同上
+                            let _closed = events.send(Event::TorrentProgress {
+                                id,
+                                progress: Box::new(progress),
+                            });
+                        },
+                        |resume| {
+                            let saved = resume.and_then(|resume| {
+                                saving
+                                    .write(|tx| store::set_torrent_resume(tx, id, &resume))
+                                    .map_err(|error| error.to_string())
+                            });
+                            if let Err(reason) = saved {
+                                // 同上
+                                let _closed =
+                                    saving.events.send(Event::SeedingNotSaved { id, reason });
+                            }
+                        },
+                    )
+                    .await
+                }
+                Err(error) => torrent::Seeded {
+                    end: SeedEnd::Failed(error.to_string()),
+                    resume: None,
+                },
+            };
+            // 应用退出时停下的（停下时出了错也算），下次打开接着做
+            let keep = shared.closed.load(Ordering::Relaxed)
+                && !by_user.load(Ordering::Relaxed)
+                && !matches!(seeded.end, SeedEnd::Reached | SeedEnd::Incomplete);
+            let saved = shared.write(|tx| {
+                if let Some(resume) = &seeded.resume {
+                    store::set_torrent_resume(tx, id, resume)?;
+                }
+                store::set_seeding_task(tx, id, keep)
+            });
+            lock(&shared.seeders).remove(&id);
+            // 同上
+            let _closed = shared.events.send(Event::SeedingEnded {
+                id,
+                end: seeded.end,
+                unsaved: saved.err(),
+            });
+        });
+    }
+
     /// 把待补写的结束状态写进事务 `tx`，返回写了的；任务已不在存储里的不写（它被放弃或移除了）。
     fn apply_unsaved(&self, tx: &Transaction<'_>) -> Result<Vec<(TaskId, Ending)>, Error> {
         let unsaved: Vec<(TaskId, Ending)> = lock(&self.unsaved)
@@ -635,13 +1455,28 @@ impl Shared {
             path: draft.folder.clone(),
             cause,
         })?;
-        let base = match &draft.kind {
-            DraftKind::Hls { title, .. } => naming::task_title(&draft.url, title.as_deref()),
-            DraftKind::File { name, .. } => naming::file_name(&draft.url, name.as_deref()),
+        let info = match &draft.kind {
+            DraftKind::Torrent { resume, wanted } => {
+                // 解析整个续传数据（大种子有几 MB），在阻塞线程上做
+                let (headers, resume, wanted) =
+                    (draft.headers.is_empty(), resume.clone(), wanted.clone());
+                let info =
+                    tokio::task::spawn_blocking(move || torrent_draft(headers, &resume, &wanted))
+                        .await
+                        .expect("读种子信息不会 panic，运行时关闭时本任务也一起丢弃")?;
+                Some(info)
+            }
+            DraftKind::Hls { .. } | DraftKind::File { .. } => None,
+        };
+        let base = match (&draft.kind, &info) {
+            (DraftKind::Hls { title, .. }, _) => naming::task_title(&draft.url, title.as_deref()),
+            (DraftKind::File { name, .. }, _) => naming::file_name(&draft.url, name.as_deref()),
+            (DraftKind::Torrent { .. }, Some(info)) => info.name.clone(),
+            (DraftKind::Torrent { .. }, None) => unreachable!("BT 的草稿上面已读出种子信息"),
         };
         let preference = match &draft.kind {
             DraftKind::Hls { preference, .. } => Some(StoredPreference::try_from(preference)?),
-            DraftKind::File { .. } => None,
+            DraftKind::File { .. } | DraftKind::Torrent { .. } => None,
         };
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
@@ -653,7 +1488,7 @@ impl Shared {
             };
             let seen = taken.clone();
             let (folder, base) = (folder.clone(), base.clone());
-            let (title, work_dir, kind) = match &draft.kind {
+            let (title, work_dir, resume, kind) = match &draft.kind {
                 DraftKind::Hls { output, live, .. } => {
                     let output_kind = *output;
                     let (title, output) = named(&draft.folder, move || {
@@ -667,7 +1502,7 @@ impl Shared {
                         output,
                         live: *live,
                     });
-                    (title, work_dir, kind)
+                    (title, Some(work_dir), None, kind)
                 }
                 DraftKind::File {
                     expected,
@@ -684,7 +1519,25 @@ impl Shared {
                         expected: expected.clone(),
                         chunk_size: *chunk_size,
                     });
-                    (name, work_dir, kind)
+                    (name, Some(work_dir), None, kind)
+                }
+                DraftKind::Torrent { resume, wanted } => {
+                    let info = info.as_ref().expect("BT 的草稿上面已读出种子信息");
+                    let (single, info_hash) = (info.single_file(), info.info_hash.clone());
+                    let fallback = info_hash.clone();
+                    let (root_name, root) = named(&draft.folder, move || {
+                        naming::torrent_root_for(&folder, &base, single, &fallback, &taken)
+                    })
+                    .await?;
+                    let (resume, root_named, wanted) =
+                        (resume.clone(), root_name.clone(), wanted.clone());
+                    let placed = tokio::task::spawn_blocking(move || {
+                        torrent::place(&resume, &root_named, &wanted)
+                    })
+                    .await
+                    .expect("改根名不会 panic，运行时关闭时本任务也一起丢弃")?;
+                    let kind = Kind::Torrent(TorrentSpec { info_hash, root });
+                    (root_name, None, Some(placed), kind)
                 }
             };
             let spec = TaskSpec {
@@ -693,7 +1546,7 @@ impl Shared {
                 headers: draft.headers.clone(),
                 kind,
             };
-            match self.insert_and_start(&spec, work_dir, created_at) {
+            match self.insert_and_start(&spec, work_dir, resume, created_at) {
                 Err(Error::PathTaken(path))
                     if !seen.contains(&naming::path_key(&path.to_string_lossy())) => {}
                 result => return result,
@@ -701,11 +1554,13 @@ impl Shared {
         }
     }
 
-    /// 把任务存进存储并开始；调用方须在运行时里（[`Engine::start`] 的要求）。
+    /// 把任务存进存储并开始，任务目录为 `work_dir`、BT 任务的续传数据为 `resume`（见 [`store::insert`]）；调用方须在
+    /// 运行时里（[`Engine::start`] 的要求）。
     fn insert_and_start(
         self: &Arc<Self>,
         spec: &TaskSpec,
-        work_dir: PathBuf,
+        work_dir: Option<PathBuf>,
+        resume: Option<Vec<u8>>,
         created_at: i64,
     ) -> Result<Task, Error> {
         let mut store = lock(&self.store);
@@ -714,10 +1569,15 @@ impl Shared {
         }
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
-        let id = store::insert(&tx, spec, &work_dir, created_at)?;
+        let id = store::insert(
+            &tx,
+            spec,
+            work_dir.as_deref(),
+            resume.as_deref(),
+            created_at,
+        )?;
         let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
-        let proxy = store::settings(&tx)?.proxy;
-        let job = self.launch(&task, proxy)?;
+        let job = self.launch(&tx, &task)?;
         if let Err(error) = self.commit(tx, applied) {
             drop(store);
             self.abandon(job, work_dir);
@@ -727,13 +1587,63 @@ impl Shared {
         Ok(task)
     }
 
-    /// 照任务 `task` 开始下载或录制，经代理 `proxy`；调用方须在运行时里。
-    fn launch(&self, task: &Task, proxy: Proxy) -> Result<Launched, Error> {
+    /// 照任务 `task` 开始下载或录制，经设置里的代理（BT 不经代理），设置与 BT 任务的续传数据从 `tx` 读；调用方须在
+    /// 运行时里。
+    fn launch(self: &Arc<Self>, tx: &Transaction<'_>, task: &Task) -> Result<Launched, Error> {
         Ok(match &task.spec.kind {
-            Kind::Hls(_) => Launched::Hls(self.engine.start(request(task, proxy)?)?),
+            Kind::Hls(_) => {
+                let proxy = store::settings(tx)?.proxy;
+                Launched::Hls(self.engine.start(request(task, proxy)?)?)
+            }
             Kind::File(file) => {
+                let proxy = store::settings(tx)?.proxy;
                 Launched::File(self.engine.start_file(file_request(task, file, proxy)?)?)
             }
+            Kind::Torrent(spec) => Launched::Torrent(self.launch_torrent(tx, task.id, spec)?),
+        })
+    }
+
+    /// 开始 BT 任务 `id`：BT 会话还没有时照 `tx` 里存的端口与 DHT 状态建，续传数据从 `tx` 读；调用方须在运行时里。
+    fn launch_torrent(
+        self: &Arc<Self>,
+        tx: &Transaction<'_>,
+        id: TaskId,
+        spec: &TorrentSpec,
+    ) -> Result<TorrentRun, Error> {
+        let engine = self.torrent_engine(store::torrent_session(tx)?)?;
+        let resume = store::torrent_resume(tx, id)?;
+        let data = resume.data.clone();
+        let cancel = CancellationToken::new();
+        let events = self.events.clone();
+        let (info_hash, folder) = (spec.info_hash.clone(), torrent_folder(spec));
+        let seeding = self.seeding.subscribe();
+        let done = tokio::spawn({
+            let (info_hash, cancel) = (info_hash.clone(), cancel.clone());
+            async move {
+                torrent::run(
+                    engine,
+                    &info_hash,
+                    resume,
+                    folder,
+                    &seeding,
+                    cancel,
+                    |progress| {
+                        // 接收端随界面关闭而丢弃时没有谁要
+                        let _closed = events.send(Event::TorrentProgress {
+                            id,
+                            progress: Box::new(progress),
+                        });
+                    },
+                )
+                .await
+            }
+        });
+        Ok(TorrentRun {
+            cancel,
+            done,
+            info_hash,
+            resume: data,
+            root: spec.root.clone(),
         })
     }
 
@@ -748,10 +1658,7 @@ impl Shared {
         let applied = self.apply_unsaved(&tx)?;
         let mut task = self.stopped(&tx, id)?;
         let job = match run {
-            Run::Resume => {
-                let proxy = store::settings(&tx)?.proxy;
-                self.launch(&task, proxy)?
-            }
+            Run::Resume => self.launch(&tx, &task)?,
             Run::WriteRecorded => {
                 Launched::Hls(self.engine.merge_recorded(output_options(&task)?)?)
             }
@@ -770,16 +1677,35 @@ impl Shared {
         committed.map(|()| task)
     }
 
-    /// 新建时存储写不进而不要的任务：取消，等它停下，再删掉它建出的任务目录；磁盘上还留下东西时发
-    /// [`Event::Orphaned`]。
-    fn abandon(self: &Arc<Self>, job: Launched, work_dir: PathBuf) {
+    /// 新建时存储写不进而不要的任务：取消，等它停下，再删掉它建出的任务目录（`work_dir`；BT 任务没有，删下了的文件）；
+    /// 磁盘上还留下东西时发 [`Event::Orphaned`]。
+    fn abandon(self: &Arc<Self>, job: Launched, work_dir: Option<PathBuf>) {
         job.cancel();
         let shared = self.clone();
         self.tracker.spawn(async move {
             let written = match job {
                 Launched::Hls(job) => job.wait().await.map(|output| written(&output)),
                 Launched::File(job) => job.wait().await.map(|output| vec![output.path]),
+                Launched::Torrent(run) => {
+                    // 已取消：结果只能是暂停或出错，任务都已不要
+                    let _ended = run.done.await;
+                    let deleted = match shared.bt_engine() {
+                        Ok(engine) => {
+                            torrent::delete(engine, &run.info_hash, &run.resume, &run.root).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = deleted {
+                        // 同下
+                        let _closed = shared.events.send(Event::Orphaned {
+                            paths: vec![run.root],
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
+                }
             };
+            let work_dir = work_dir.expect("HLS 与文件任务有任务目录");
             let (paths, reason) = match written {
                 Ok(paths) => (paths, "新建的任务没能记进存储，取消前已写出输出".to_owned()),
                 // 已取消，错误只能是取消或取消前就出的错，任务都已不要
@@ -810,6 +1736,7 @@ impl Shared {
         match job {
             Launched::Hls(job) => self.track_hls(task, job, run),
             Launched::File(job) => self.track_file(task, job),
+            Launched::Torrent(job) => self.track_torrent(task, job),
         }
     }
 
@@ -840,6 +1767,8 @@ impl Shared {
             status,
             result,
             total,
+            resume: _,
+            seeding: _,
         } = ending;
         // 接收端随界面关闭而丢弃时没有谁要这个事件；状态已写进存储或留着待补写
         let _closed = self.events.send(Event::Ended {
@@ -902,6 +1831,8 @@ impl Shared {
                 status,
                 result,
                 total,
+                resume: None,
+                seeding: None,
             };
             shared.conclude(id, ending, leftovers, guard);
         });
@@ -948,10 +1879,78 @@ impl Shared {
                 status,
                 result,
                 total: None,
+                resume: None,
+                seeding: None,
             };
             shared.conclude(id, ending, leftovers, guard);
         });
     }
+
+    /// BT 任务的 [`Shared::track`]：停下时要到的续传数据随结束状态写进存储。
+    fn track_torrent(self: &Arc<Self>, task: &Task, run: TorrentRun) {
+        let id = task.id;
+        let guard = self.register(id, Control::Torrent(run.cancel.clone()));
+        let shared = self.clone();
+        self.tracker.spawn(async move {
+            let ended = run
+                .done
+                .await
+                .expect("BT 任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
+            let (status, result) = match ended.outcome {
+                Outcome::Finished(bytes) => (
+                    Status::Done,
+                    Some(Finished {
+                        duration: None,
+                        bytes,
+                        resolution: None,
+                    }),
+                ),
+                Outcome::Paused => (Status::Paused, None),
+                Outcome::Failed(failure) => (Status::Failed(failure), None),
+            };
+            let finished = status == Status::Done;
+            let ending = Ending {
+                status,
+                result,
+                total: None,
+                resume: ended.resume,
+                seeding: finished.then_some(ended.seeder.is_some()),
+            };
+            shared.conclude(id, ending, Vec::new(), guard);
+            if let Some(seeder) = ended.seeder {
+                shared.track_seeding(id, async move { Ok(seeder) });
+            }
+        });
+    }
+}
+
+/// 新建 BT 任务的草稿（种类为 [`DraftKind::Torrent`]）里续传数据 `resume` 的种子信息；草稿要没有请求头（`no_headers`）、
+/// `wanted` 至少选了一个文件且都是种子里的，不然报 [`Error::InvalidInput`]。
+fn torrent_draft(no_headers: bool, resume: &[u8], wanted: &[i32]) -> Result<TorrentInfo, Error> {
+    if !no_headers {
+        return Err(Error::InvalidInput("BT 任务没有请求头".to_owned()));
+    }
+    let info = TorrentInfo::of(resume)?;
+    if wanted.is_empty() {
+        return Err(Error::InvalidInput("至少要选一个文件".to_owned()));
+    }
+    if let Some(index) = wanted
+        .iter()
+        .find(|index| !info.files.iter().any(|file| file.index == **index))
+    {
+        return Err(Error::InvalidInput(format!(
+            "种子里没有序号为 {index} 的文件"
+        )));
+    }
+    Ok(info)
+}
+
+/// BT 任务的保存目录：内容的根所在的目录。
+fn torrent_folder(spec: &TorrentSpec) -> PathBuf {
+    spec.root
+        .parent()
+        .expect("内容的根是以文件名结尾的绝对路径")
+        .to_path_buf()
 }
 
 /// 转发进度时看到的。
@@ -1070,6 +2069,12 @@ fn save_ending(tx: &Transaction<'_>, id: TaskId, ending: &Ending) -> Result<(), 
     }
     if let Some(total) = ending.total {
         store::set_total(tx, id, total)?;
+    }
+    if let Some(resume) = &ending.resume {
+        store::set_torrent_resume(tx, id, resume)?;
+    }
+    if let Some(seeding) = ending.seeding {
+        store::set_seeding_task(tx, id, seeding)?;
     }
     Ok(())
 }

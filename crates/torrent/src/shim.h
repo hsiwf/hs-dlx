@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,26 +21,39 @@ struct SessionConfig;
 struct Status;
 struct Alert;
 struct FileEntry;
+struct AddOptions;
+struct Described;
+struct NetworkStatus;
+struct TrackerState;
+struct CreateOptions;
+struct SocksProxy;
+enum class Removal : std::uint8_t;
 
 class Session {
 public:
 	explicit Session(SessionConfig const& config);
 
 	rust::String add_magnet(rust::Str uri, rust::Str save_path) const;
-	rust::String add_torrent(rust::Slice<std::uint8_t const> torrent, rust::Str save_path) const;
-	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path) const;
+	rust::String add_resume(rust::Slice<std::uint8_t const> resume, rust::Str id, rust::Str save_path,
+		AddOptions const& options) const;
+	bool removing(rust::Str id) const;
 	void start(rust::Str id) const;
 	void flush(rust::Str id) const;
-	rust::Vec<FileEntry> files(rust::Str id) const;
-	void select_files(rust::Str id, rust::Slice<std::int32_t const> wanted) const;
 	rust::Vec<std::uint8_t> session_state() const;
 	Status status(rust::Str id) const;
 	void connect_peer(rust::Str id, rust::Str ip, std::uint16_t port) const;
 	void pause(rust::Str id) const;
 	void resume(rust::Str id) const;
-	void remove(rust::Str id, bool delete_files) const;
+	void remove(rust::Str id, Removal removal) const;
 	void save_resume_data(rust::Str id) const;
 	std::uint16_t listen_port() const;
+	void set_upload_limit(std::int32_t bytes_per_second) const;
+	void set_proxy(SocksProxy const& proxy) const;
+	void reconnect_proxy(SocksProxy const& proxy) const;
+	NetworkStatus network() const;
+	void request_stats() const;
+	rust::Vec<TrackerState> trackers(rust::Str id) const;
+	std::uint32_t add_trackers(rust::Str id, rust::Slice<rust::String const> urls) const;
 	rust::Vec<Alert> pop_alerts(std::uint32_t wait_ms) const;
 
 private:
@@ -53,12 +67,28 @@ private:
 
 	// 一个还没移除完的种子：移除的事件来了没有；要删文件时删的结果来了没有（libtorrent 先发删的结果，后发移除的事件）
 	struct Removing {
+		lt::torrent_handle handle;
+		// 登记之后丢过事件：移除的结果可能丢了，要按种子对象还在不在判断
+		bool lost = false;
 		bool deleting = false;
 		bool removed = false;
 		bool files_settled = false;
 	};
+	// 种子 `id` 还在移除中：登记了移除、事件还没都来。登记之后丢过事件的，种子对象已不在了即算移除完（移除与删文件都
+	// 做完时它就不在了，删文件的磁盘任务持有它直到删完）；没丢过的只认事件，libtorrent 发出移除的事件后就放掉种子对象，
+	// 那时事件可能还没取走。调用方持有 m_mutex
+	bool still_removing(std::string const& id) const;
+	// 丢了事件：在移除中的都记下
+	void mark_lost() const;
+	// `url` 是 add_trackers 给种子 `id` 补的
+	bool added_tracker(std::string const& id, std::string const& url) const;
+	// 从种子 `id` 的续传数据里去掉 add_trackers 补的 tracker
+	void drop_added_trackers(std::string const& id, lt::add_torrent_params& params) const;
 	// 事件里的种子的编号；不是经这个会话加入的时抛出（加入失败的事件不来查）
 	std::string id_of(lt::torrent_handle const& handle) const;
+	// `handle` 是编号 `id` 现在登记的那一份（在会话里，或移除中还没移除完）：同一个种子移除后再加入时，旧的那份的事件
+	// 不算
+	bool current(std::string const& id, lt::torrent_handle const& handle) const;
 
 	mutable lt::session m_session;
 	// 编号到句柄：移除即去掉，之后对这个编号的操作报「没有这个种子」
@@ -73,15 +103,42 @@ private:
 	// 调了 flush、还没报来写完的次数，按编号：写完的事件按它转出，其余的（种子下完时 libtorrent 自己发的）不转。下完时
 	// 自发的那条若在请求之后才到，会被当作请求的结果：它写盘时已下的就是全部要下的，与请求的保证相同
 	mutable std::map<std::string, int> m_flush_requests;
-	// 守着上面两张表；加入时整个过程持有，取事件时查编号不会早于登记
+	// add_trackers 给各种子补的 tracker，按编号：写续传数据时去掉，不随种子存下；再加入同一个种子时清空
+	mutable std::map<std::string, std::set<std::string>> m_added_trackers;
+	// 守着上面几张表；加入时整个过程持有，取事件时查编号不会早于登记
 	mutable std::mutex m_mutex;
 	// pop_alerts 拿到的事件在下一次 pop_alerts 之前有效：转成自有的数据之前不让别的线程再取
 	mutable std::mutex m_alerts_mutex;
+
+	// 取事件时记下的网络状况（见 network()）
+	struct Network {
+		std::string listen_error;
+		std::uint16_t upnp_port = 0;
+		std::string upnp_error;
+		std::uint16_t natpmp_port = 0;
+		std::string natpmp_error;
+		std::int64_t dht_nodes = -1;
+		bool incoming = false;
+		std::string proxy_error;
+	};
+	mutable Network m_network;
+	// 守着 m_network
+	mutable std::mutex m_network_mutex;
 };
 
 std::unique_ptr<Session> new_session(SessionConfig const& config);
 
-// 为 `path`（文件或目录）建种子文件，分块大小 `piece_size` 字节（0 为按总大小自动选）；返回 bencode 写出的种子文件。
-rust::Vec<std::uint8_t> create_torrent(rust::Str path, std::int32_t piece_size);
+// 磁力链接对应的种子编号（同 add_magnet 定的）；不是磁力链接时抛出。
+rust::String magnet_id(rust::Str uri);
+// 种子文件（bencode 写的）转成续传数据（还没下过的）。
+rust::Vec<std::uint8_t> resume_from_torrent_file(rust::Slice<std::uint8_t const> torrent);
+// 续传数据里的种子信息；没有种子信息时抛出。
+Described describe(rust::Slice<std::uint8_t const> resume);
+// 新建任务前定下内容放哪、下哪些：把续传数据里的种子根名（单文件的文件名、多文件的顶层目录名）改成 `root`，只下序号在
+// `wanted` 里的文件，去掉只上传、暂停、做种模式的标志；返回改后的续传数据。
+rust::Vec<std::uint8_t> place(rust::Slice<std::uint8_t const> resume, rust::Str root, rust::Slice<std::int32_t const> wanted);
+
+// 照 `options` 为 `path`（文件或目录）建种子文件，返回 bencode 写出的种子文件。
+rust::Vec<std::uint8_t> create_torrent(rust::Str path, CreateOptions const& options);
 
 } // namespace hsdlx

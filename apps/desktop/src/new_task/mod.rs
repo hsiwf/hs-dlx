@@ -1,6 +1,7 @@
 //! 新建任务：带着请求头认出地址是什么（或用嗅探页已探测好的结果）。是播放列表时，舞台上每档清晰度画成一个同心环
 //! （越粗码率越高，引线连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头；是文件时
-//! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。探测被拒时可改请求头重新探测；取到的是网页或不是播放列表时
+//! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。磁力链接先连节点取种子信息（种子文件直接读），之后舞台上是
+//! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；取到的是网页或不是播放列表时
 //! 外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是
 //! 外面给的粘贴栏。
 
@@ -20,8 +21,8 @@ use gpui_kit::{
     Task, Window, div, px,
 };
 use hs_dlx_app::{
-    Draft, DraftKind, Expected, Failure, FailureKind, OutputKind, Service, file_name,
-    not_a_playlist, task_title,
+    Draft, DraftKind, Expected, Failure, FailureKind, MetadataFetch, MetadataProgress, OutputKind,
+    Service, TorrentInfo, file_name, not_a_playlist, task_title, torrent_from_file,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
@@ -103,6 +104,88 @@ enum Probing {
     Ready(Box<Probe>),
     /// 地址上是文件
     File(Box<FileInfo>),
+    /// 磁力链接在取种子信息（种子文件在读）
+    Metadata(MetadataProgress),
+    /// 种子信息到手，在选要下的文件
+    Torrent(Box<TorrentChoice>),
+}
+
+/// 种子的来源。
+enum TorrentSource {
+    Magnet,
+    /// 本机的种子文件
+    File(PathBuf),
+}
+
+impl TorrentSource {
+    /// `url` 是磁力链接或种子文件的 `file:` 地址时为它的来源（见 [`crate::links::torrent_url`]）。
+    fn of(url: &Url) -> Option<TorrentSource> {
+        crate::links::torrent_url(url.as_str())?;
+        match url.scheme() {
+            "magnet" => Some(TorrentSource::Magnet),
+            _ => url.to_file_path().ok().map(TorrentSource::File),
+        }
+    }
+}
+
+/// 种子信息与选了哪些文件。
+pub(super) struct TorrentChoice {
+    /// 种子的续传数据，新建任务时交给服务
+    resume: Vec<u8>,
+    info: TorrentInfo,
+    /// 与 `info.files` 一一对应：要下
+    wanted: Vec<bool>,
+}
+
+impl TorrentChoice {
+    fn new(resume: Vec<u8>, info: TorrentInfo) -> TorrentChoice {
+        let wanted = vec![true; info.files.len()];
+        TorrentChoice {
+            resume,
+            info,
+            wanted,
+        }
+    }
+
+    /// 选了的文件的序号（[`hs_dlx_app::TorrentFile::index`]）。
+    fn indices(&self) -> Vec<i32> {
+        self.info
+            .files
+            .iter()
+            .zip(&self.wanted)
+            .filter(|(_, wanted)| **wanted)
+            .map(|(file, _)| file.index)
+            .collect()
+    }
+
+    /// 选了几个文件与它们的字节数。
+    fn selected(&self) -> (usize, u64) {
+        self.info
+            .files
+            .iter()
+            .zip(&self.wanted)
+            .filter(|(_, wanted)| **wanted)
+            .fold((0, 0), |(count, bytes), (file, _)| {
+                (count + 1, bytes + file.size)
+            })
+    }
+}
+
+/// 磁力链接或种子文件在取到种子信息之前的标题：磁力链接的 `dn`（显示名），没有时为「磁力链接」；种子文件为去掉
+/// `.torrent` 的文件名。
+fn torrent_title(url: &Url) -> String {
+    match TorrentSource::of(url) {
+        Some(TorrentSource::File(path)) => path.file_stem().map_or_else(
+            || "种子文件".to_owned(),
+            |stem| stem.to_string_lossy().into_owned(),
+        ),
+        _ => url
+            .query_pairs()
+            .find(|(name, _)| name == "dn")
+            .map(|(_, name)| name.into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "磁力链接".to_owned()),
+    }
 }
 
 pub struct NewTask {
@@ -143,6 +226,8 @@ pub struct NewTask {
     dock: Entity<Dock>,
     _route: Task<()>,
     _probe: Task<()>,
+    /// 磁力链接取种子信息时，把连着的节点数转进 [`Probing::Metadata`]
+    _metadata: Task<()>,
     /// 探测中逐帧重画表盘，探测有了结果即停
     _frames: Task<()>,
 }
@@ -183,9 +268,15 @@ impl NewTask {
                 cx.notify();
             });
         });
+        let torrent = TorrentSource::of(&url);
+        let title = if torrent.is_some() {
+            torrent_title(&url)
+        } else {
+            task_title(&url, page_title.as_deref())
+        };
         let mut view = NewTask {
             service,
-            title: task_title(&url, page_title.as_deref()),
+            title,
             page_title,
             url,
             probing: Probing::Running,
@@ -207,13 +298,120 @@ impl NewTask {
             dock,
             _route: route,
             _probe: Task::ready(()),
+            _metadata: Task::ready(()),
             _frames: Task::ready(()),
         };
-        match probe {
-            Some(probe) => view.probed(Probing::Ready(probe)),
-            None => view.probe(headers, true, cx),
+        match (torrent, probe) {
+            (Some(source), _) => view.fetch_torrent(source, cx),
+            (None, Some(probe)) => view.probed(Probing::Ready(probe)),
+            (None, None) => view.probe(headers, true, cx),
         }
         view
+    }
+
+    /// 取种子信息：磁力链接连节点去取，种子文件在后台读（之前的结果作废）。取到即可开始，取不到为失败。
+    fn fetch_torrent(&mut self, source: TorrentSource, cx: &mut Context<Self>) {
+        self.probing = Probing::Metadata(MetadataProgress::default());
+        self.since = Instant::now();
+        self.animate(cx);
+        let failed = |kind, message: String| Probing::Failed(Failure { kind, message });
+        let resume = match source {
+            TorrentSource::Magnet => {
+                let MetadataFetch {
+                    mut progress,
+                    resume,
+                } = match self.service.fetch_metadata(self.url.to_string()) {
+                    Ok(fetch) => fetch,
+                    Err(error) => {
+                        self.probing = failed(FailureKind::Other, error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+                // 取的那一端随句柄释放而丢弃，这里随之结束
+                self._metadata = cx.spawn(async move |this, cx| {
+                    while progress.changed().await.is_ok() {
+                        let now = progress.borrow_and_update().clone();
+                        let shown = this.update(cx, |this, cx| {
+                            if let Probing::Metadata(at) = &mut this.probing {
+                                *at = now;
+                                cx.notify();
+                            }
+                        });
+                        if shown.is_err() {
+                            break;
+                        }
+                    }
+                });
+                cx.background_executor().spawn(async move {
+                    match resume.await {
+                        Ok(Ok(resume)) => TorrentInfo::of(&resume)
+                            .map(|info| (resume, info))
+                            .map_err(|error| failed(FailureKind::Other, error.to_string())),
+                        Ok(Err(error)) => Err(failed(FailureKind::Other, error.to_string())),
+                        Err(join) => Err(failed(
+                            FailureKind::Other,
+                            format!("取种子信息中途出错：{join}"),
+                        )),
+                    }
+                })
+            }
+            TorrentSource::File(path) => cx.background_executor().spawn(async move {
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    failed(
+                        FailureKind::Disk,
+                        format!("读不出种子文件 {}：{error}", path.display()),
+                    )
+                })?;
+                let resume = torrent_from_file(&bytes)
+                    .map_err(|error| failed(FailureKind::Malformed, error.to_string()))?;
+                let info = TorrentInfo::of(&resume)
+                    .map_err(|error| failed(FailureKind::Malformed, error.to_string()))?;
+                Ok((resume, info))
+            }),
+        };
+        self._probe = cx.spawn(async move |this, cx| {
+            let probing = match resume.await {
+                Ok((resume, info)) => Probing::Torrent(Box::new(TorrentChoice::new(resume, info))),
+                Err(failed) => failed,
+            };
+            // 视图在取的期间被关掉时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                let ready = matches!(probing, Probing::Torrent(_));
+                if let Probing::Torrent(choice) = &probing {
+                    this.title = choice.info.name.clone();
+                }
+                this.probing = probing;
+                if ready {
+                    cx.emit(NewTaskEvent::Ready);
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    /// 是磁力链接或种子文件。
+    fn is_torrent(&self) -> bool {
+        TorrentSource::of(&self.url).is_some()
+    }
+
+    /// 勾上或去掉种子里第 `at` 个文件（[`TorrentChoice::info`] 的文件里的位置）。
+    fn toggle_file(&mut self, at: usize, cx: &mut Context<Self>) {
+        if let Probing::Torrent(choice) = &mut self.probing {
+            choice.wanted[at] = !choice.wanted[at];
+            self.error = None;
+            cx.notify();
+        }
+    }
+
+    /// 种子里的文件全选（`all`）或全不选。
+    fn select_all(&mut self, all: bool, cx: &mut Context<Self>) {
+        if let Probing::Torrent(choice) = &mut self.probing {
+            choice.wanted.fill(all);
+            self.error = None;
+            cx.notify();
+        }
     }
 
     /// 带着请求头 `headers` 探测（之前的探测结果作废）；`first` 为打开时的那一次。
@@ -327,8 +525,13 @@ impl NewTask {
         cx.notify();
     }
 
-    /// 带上请求头编辑框里的请求头重新探测；输入框里还没按回车的一条加不进去时不探测（原因显示在输入框下面）。
+    /// 带上请求头编辑框里的请求头重新探测；输入框里还没按回车的一条加不进去时不探测（原因显示在输入框下面）。磁力
+    /// 链接与种子文件没有请求头，重新取种子信息。
     fn reprobe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(source) = TorrentSource::of(&self.url) {
+            self.fetch_torrent(source, cx);
+            return;
+        }
         if let Some(headers) = self
             .headers
             .update(cx, |editor, cx| editor.confirm(window, cx))
@@ -346,7 +549,8 @@ impl NewTask {
             Probing::Running => Phase::Probing,
             Probing::Failed(_) if self.page_check == PageCheck::Opening => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
-            Probing::Ready(_) | Probing::File(_) => Phase::Ready,
+            Probing::Metadata(_) => Phase::Probing,
+            Probing::Ready(_) | Probing::File(_) | Probing::Torrent(_) => Phase::Ready,
         }
     }
 
@@ -465,13 +669,31 @@ impl NewTask {
                 expected: Expected::from(&**info),
                 chunk_size: None,
             },
-            Probing::Running | Probing::Failed(_) => return,
+            Probing::Torrent(choice) => {
+                let wanted = choice.indices();
+                if wanted.is_empty() {
+                    self.error = Some("至少选一个文件".to_owned());
+                    cx.notify();
+                    return;
+                }
+                DraftKind::Torrent {
+                    resume: choice.resume.clone(),
+                    wanted,
+                }
+            }
+            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return,
         };
-        let Some(headers) = self
-            .headers
-            .update(cx, |editor, cx| editor.confirm(window, cx))
-        else {
-            return;
+        // 磁力链接与种子文件没有请求头
+        let headers = if self.is_torrent() {
+            Vec::new()
+        } else {
+            match self
+                .headers
+                .update(cx, |editor, cx| editor.confirm(window, cx))
+            {
+                Some(headers) => headers,
+                None => return,
+            }
         };
         // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随
         let draft = Draft {

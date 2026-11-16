@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter, Subscription, Task};
-use hs_dlx_app::{Event, Events, Finished, Service, Status, TaskId};
+use hs_dlx_app::{Event, Events, Finished, SeedEnd, Service, Status, TaskId};
 use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
 
@@ -75,6 +75,8 @@ pub struct Tasks {
     notices: Vec<Notice>,
     next_notice: u64,
     quit: Quit,
+    /// 撤回过几次退出（见 [`Tasks::stays`]）
+    stays: u64,
     /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
     creating: usize,
     /// 新建期间收到的、列表里还没有的任务的结束事件：新建的结果与任务的事件走两条路，结束可能先到；加进那一行时再处理
@@ -133,7 +135,9 @@ impl Tasks {
                 }
             }),
             Err(reason) => {
-                problems.push(format!("收不了再次打开应用时转交的链接：{reason}"));
+                problems.push(format!(
+                    "之后再打开应用（如在浏览器里点链接）时，链接交不到这个窗口：{reason}"
+                ));
                 Task::ready(())
             }
         };
@@ -165,6 +169,7 @@ impl Tasks {
             notices: Vec::new(),
             next_notice: 0,
             quit: Quit::Staying,
+            stays: 0,
             creating: 0,
             early: Vec::new(),
             free_space: None,
@@ -205,7 +210,7 @@ impl Tasks {
                 }
                 cx.emit(TasksEvent::HandedOver(handoff));
             }
-            Err(reason) => self.add_notice(format!("再次打开应用时转交的链接没收到：{reason}")),
+            Err(reason) => self.add_notice(format!("再次打开应用时带来的链接没收到：{reason}")),
         }
         cx.notify();
     }
@@ -245,6 +250,63 @@ impl Tasks {
                         row.signal(level, text);
                     }
                     row.file_progress = Some(*progress);
+                }
+            }
+            Event::TorrentProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    // 没有片数：剩余时间另按字节算
+                    row.rate.update(Instant::now(), progress.received, 0);
+                    for (level, text) in
+                        crate::signals::between_torrent(row.torrent_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.torrent_progress = Some(*progress);
+                }
+            }
+            Event::SeedingStarted { id } => {
+                if let Some(row) = self.row_mut(id) {
+                    row.task.seeding = true;
+                    // 下载时的进度不再适用
+                    row.torrent_progress = None;
+                    row.signal(Level::Info, "开始做种".to_owned());
+                }
+            }
+            Event::SeedingNotSaved { id, reason } => {
+                if let Some(row) = self.row_mut(id) {
+                    row.signal(Level::Warn, format!("做种的进度这次没存成：{reason}"));
+                }
+            }
+            Event::SeedingEnded { id, end, unsaved } => {
+                let title = self.title(id);
+                if let Some(row) = self.row_mut(id) {
+                    row.task.seeding = false;
+                    let uploaded = row.torrent_progress.as_ref().map(|progress| {
+                        format!(
+                            "已上传 {} · 分享率 {}",
+                            crate::format::bytes(progress.uploaded),
+                            crate::format::ratio(progress.uploaded, progress.wanted)
+                        )
+                    });
+                    let (level, text) = match end {
+                        SeedEnd::Reached => (Level::Info, "做种到了设置里的条件，停下".to_owned()),
+                        SeedEnd::Stopped => (Level::Info, "停止做种".to_owned()),
+                        SeedEnd::Incomplete => (
+                            Level::Warn,
+                            "磁盘上的文件不全（挪走、删了或大小变了），停止做种，不补下".to_owned(),
+                        ),
+                        SeedEnd::Failed(message) => (Level::Error, format!("做种出错：{message}")),
+                    };
+                    let text = match uploaded {
+                        Some(uploaded) => format!("{text} · {uploaded}"),
+                        None => text,
+                    };
+                    row.signal(level, text);
+                }
+                if let Some(error) = unsaved {
+                    self.add_notice(format!(
+                        "「{title}」的做种状态没能存下（{error}），下次打开可能接着做种"
+                    ));
                 }
             }
             Event::Ended {
@@ -485,6 +547,9 @@ fn ended_signal(
                 (Some(r), None) => format!("下载完成 · {}", crate::format::bytes(r.bytes)),
             },
         ),
+        Status::Paused if spec.torrent().is_some() => {
+            (Level::Info, "已暂停，已下的保留".to_owned())
+        }
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),
         Status::Running | Status::DiscardUnfinished => {

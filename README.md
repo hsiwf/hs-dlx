@@ -25,8 +25,9 @@
 </p>
 
 hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不是 Electron，也不是套在网页里的壳。现在支持 HLS（m3u8）
-的点播与直播录制、在网页里找视频流、多连接分段下载文件，都能断点续传；HLS 输出 MP4 或可直接播放的本地 HLS。下载引擎是
-[hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库。接下来会加入磁力、云离线、站点解析与边下边播，见[路线图](#路线图)。
+的点播与直播录制、在网页里找视频流、多连接分段下载文件、磁力链接与种子文件（含做种、诊断与网络检测），都能断点续传；
+HLS 输出 MP4 或可直接播放的本地 HLS。HLS 与文件的下载引擎是 [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库，
+BT 用 libtorrent。接下来会加入云离线、边下边播与站点解析，见[路线图](#路线图)。
 
 <p align="center">
   <img src=".github/screenshots/new-task.jpg" alt="探测出五档清晰度，在同心环上选一档">
@@ -78,10 +79,24 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 - 粘贴的地址是文件时显示大小、类型与能否续传；服务器支持时多个连接分段并行下载、断点续传，限制连接数时自动减少。
 - 第一次请求核对是不是之前看到的那个文件：链接过期、登录失效后换成的错误页不会被当成文件下完。
 
+**磁力与种子**
+
+- 粘贴磁力链接，或点粘贴栏的「种子文件」打开 `.torrent`：取到种子信息后列出文件，勾选要下的再开始。
+- 自动补公共 tracker（[ngosang/trackerslist](https://github.com/ngosang/trackerslist)，经设置里的代理取），DHT 不通时
+  也多一条找节点的路；私有种子不补，补的不存进任务，每次开始时补当时的列表。
+- 连着的节点凑不齐全部内容时标「资源不足」，写明能凑齐多少；tracker 报错时写明原因。
+- 暂停、退出后接着下；上次没正常退出的，继续时先校验已下的文件，不会把没写完的当成下好的。
+- 下完接着做种，默认分享率到 1.0 或做满 24 小时停，可改为不做种或一直做；可限上传速度。
+- 下得慢时一键诊断：监听、路由器端口映射、运营商内网、DHT、tracker、公共 tracker 与种子的人数，逐项写明结论与能做的事。
+- 可让 BT 经 SOCKS5 代理（节点、tracker 与 DHT 都经它）：运营商限制 UDP、DHT 连不上时用；默认直连。很多代理服务禁止
+  BT，开之前先看清它的条款。
+- 网络检测（设置里）：约 10 秒查直连与经 BT 代理的 DHT、UDP 的 tracker、IPv6、端口映射与外部连入，写明是哪里不通、
+  该不该开 BT 代理；只发握手类的包，不带任何种子的信息。
+
 **粘贴什么都行**
 
-- m3u8 地址、网页地址、文件地址；浏览器开发者工具里「复制为 cURL」的整条命令（地址、请求头与 Cookie 一起带上）；
-  迅雷 `thunder://`、QQ 旋风 `qqdl://`、快车 `flashget://` 链接。
+- m3u8 地址、网页地址、文件地址、磁力链接；浏览器开发者工具里「复制为 cURL」的整条命令（地址、请求头与 Cookie 一起
+  带上）；迅雷 `thunder://`、QQ 旋风 `qqdl://`、快车 `flashget://` 链接。
 
 **在网页里找视频流**
 
@@ -108,6 +123,8 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 - 关窗后在托盘里继续下载；任务都停下前退出会先问。
 - 单实例：从别处再打开带链接的 hs-dlx，链接交给已打开的窗口。
 - 顶栏显示保存目录所在盘的可用空间。
+- 自动更新（macOS 与 Windows）：启动时与之后每天查一次新版本，安装包验过发布签名（minisign）才装，装好后退出并打开新
+  版本；Linux 提示到下载页。
 
 **不支持**
 
@@ -119,13 +136,12 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 
 | | 内容 |
 |---|---|
-| 1 | **磁力与种子**：基于 libtorrent；DHT、uTP、协议加密、端口映射、IPv6；判断「能不能下完」、慢时逐项诊断、做种策略 |
+| 1 | **云离线**：用你自己的 PikPak、115、迅雷云盘账号把磁力交给云端下载（命中云端缓存即秒完成），再高速拉回本地并校验 |
 | 2 | **边下边播**：按播放位置优先下载需要的块 |
-| 3 | **云离线**：用你自己的 115、迅雷云盘、PikPak 账号把磁力交给云端下载，再高速拉回本地并校验 |
-| 4 | **站点解析**：接入 yt-dlp 解析视频网站，下载仍由 hs-dlx 自己的引擎完成 |
-| 5 | **DASH**：点播与直播 |
-| 6 | **HTTP-FLV 直播录制**：断线重连、缺口记录 |
-| 7 | **浏览器扩展**、兼容 aria2 的 JSON-RPC 接口 |
+| 3 | **站点解析**：接入 yt-dlp 解析视频网站，下载仍由 hs-dlx 自己的引擎完成 |
+| 4 | **DASH**：点播与直播 |
+| 5 | **HTTP-FLV 直播录制**：断线重连、缺口记录 |
+| 6 | **浏览器扩展**、兼容 aria2 的 JSON-RPC 接口 |
 
 ## 技术栈与结构
 
@@ -133,7 +149,7 @@ hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不�
 |---|---|
 | 界面 | [GPUI](https://gpui.rs/)（经 gpui-kit），GPU 直接绘制 |
 | 嵌入网页 | [wry](https://github.com/tauri-apps/wry)：macOS 用 WKWebView，Windows 用 WebView2，Linux 用 WebKitGTK |
-| 下载引擎 | [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库（Rust、tokio） |
+| 下载引擎 | [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库（Rust、tokio）；BT 为静态链接的 [libtorrent](https://libtorrent.org) |
 | 合并 MP4 | 静态链接的精简 FFmpeg，只做转封装，不需要另装 |
 | 存储 | SQLite（随应用编译） |
 | 打包 | cargo-packager：dmg、NSIS、deb |
@@ -146,13 +162,15 @@ flowchart TD
     relay["crates/relay<br/>网页的本地代理中转"]
     instance["crates/instance<br/>单实例与链接转交"]
     macos["crates/macos<br/>macOS 应用钩子"]
-    core["hs-m3u8-core<br/>HLS 引擎"]
+    core["hs-m3u8-core<br/>HLS 与文件的引擎"]
+    torrent["crates/torrent<br/>libtorrent 的绑定"]
     desktop --> app
     desktop --> webview
     desktop --> relay
     desktop --> instance
     desktop --> macos
     app --> core
+    app --> torrent
 ```
 
 依赖只朝箭头方向：`crates/app` 不认识任何界面框架，各平台 crate 互不依赖、只由界面组合。这些规则由

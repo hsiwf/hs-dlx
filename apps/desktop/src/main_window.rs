@@ -12,10 +12,12 @@ use crate::shell::{Leave, MIN_HEIGHT, MIN_WIDTH, Shell};
 use crate::tasks::{Departure, Quit, Tasks, TasksEvent};
 use crate::tray::Tray;
 use crate::ui::TITLE_HEIGHT;
+use crate::updates::Updates;
 
-/// 任务状态与开着的主窗口（同时最多一个；Shell 已释放即窗口已关）。
+/// 任务状态、更新与开着的主窗口（同时最多一个；Shell 已释放即窗口已关）。
 struct MainWindow {
     tasks: Entity<Tasks>,
+    updates: Entity<Updates>,
     open: Option<(AnyWindowHandle, WeakEntity<Shell>)>,
 }
 
@@ -39,13 +41,22 @@ pub fn options(cx: &App) -> WindowOptions {
     }
 }
 
-/// 接管 `tasks` 到应用退出，并把后打开的实例转交来的交给主窗口；之后才能开主窗口。
-pub fn install(tasks: Entity<Tasks>, cx: &mut App) {
+/// 接管 `tasks` 与 `updates` 到应用退出，并把后打开的实例转交来的交给主窗口；之后才能开主窗口。
+pub fn install(tasks: Entity<Tasks>, updates: Entity<Updates>, cx: &mut App) {
     cx.subscribe(&tasks, |_, event: &TasksEvent, cx| match event {
         TasksEvent::HandedOver(handoff) => hand_over(handoff.clone(), cx),
     })
     .detach();
-    cx.set_global(MainWindow { tasks, open: None });
+    cx.set_global(MainWindow {
+        tasks,
+        updates,
+        open: None,
+    });
+}
+
+/// 更新；还没 [`install`] 时（启动失败）为 None。
+pub fn updates(cx: &App) -> Option<Entity<Updates>> {
+    Some(cx.try_global::<MainWindow>()?.updates.clone())
 }
 
 /// 任务状态；还没 [`install`] 时（启动失败）为 None。
@@ -66,6 +77,7 @@ pub fn show(
     cx: &mut App,
 ) -> Option<gpui_kit::Result<(AnyWindowHandle, Entity<Shell>)>> {
     let tasks = tasks(cx)?;
+    let updates = updates(cx)?;
     cx.activate(true);
     if let Some((handle, shell)) = find(cx) {
         return Some(
@@ -75,7 +87,7 @@ pub fn show(
         );
     }
     let opened = gpui_kit::open_window(options(cx), cx, |window, cx| {
-        cx.new(|cx| Shell::new(tasks, link, window, cx))
+        cx.new(|cx| Shell::new(tasks, updates, link, window, cx))
     });
     if let Ok((handle, shell)) = &opened {
         let view = shell.downgrade();

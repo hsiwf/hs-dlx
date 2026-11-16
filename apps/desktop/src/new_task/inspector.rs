@@ -1,22 +1,33 @@
 //! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
 //! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
-//! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）。
+//! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
+//! 文件读到后）为大小、要下的文件、保存位置与开始。
 
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
-use hs_dlx_app::{Failure, OutputKind};
+use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
+use hs_dlx_app::{Failure, MetadataProgress, OutputKind};
 use hs_m3u8_core::{FileInfo, Probe};
 
-use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, duration_of};
+use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, TorrentChoice, duration_of};
+
+/// 磁力链接取种子信息多久还没有节点时提示去检测网络。
+const NO_PEERS_HINT: std::time::Duration = std::time::Duration::from_secs(60);
 use crate::format;
+use crate::theme;
 use crate::ui::{self, Solid, Step, Tone};
 
 impl NewTask {
     pub(super) fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
-        let host = self.url.host_str().unwrap_or_default().to_owned();
+        let host = crate::links::source(&self.url);
         let title = self.title.clone();
         match &self.probing {
+            Probing::Metadata(progress) => self.metadata_inspector(title, host, progress, cx),
+            Probing::Torrent(choice) => self.torrent_inspector(title, host, choice, cx),
+            Probing::Failed(failure) if self.is_torrent() => {
+                self.torrent_failed_inspector(title, host, failure, cx)
+            }
             // 探测是一次请求，中间没有可报的步骤：表盘写探测了多久，这里只写请求经哪里走
             Probing::Running => ui::inspector(
                 title,
@@ -211,6 +222,169 @@ impl NewTask {
         ui::inspector(title, host, body, foot)
     }
 
+    /// 磁力链接取种子信息时：连着的节点数；种子文件读的时候什么也没有。
+    fn metadata_inspector(
+        &self,
+        title: String,
+        host: String,
+        progress: &MetadataProgress,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut body = Vec::new();
+        if self.url.scheme() == "magnet" {
+            body.push(
+                ui::reads(
+                    vec![("节点".into(), progress.peers.to_string().into())],
+                    None,
+                )
+                .into_any_element(),
+            );
+            body.push(
+                ui::note("没有节点有这个种子时会一直找，可随时取消", false).into_any_element(),
+            );
+            if let Some(error) = &progress.tracker_error {
+                body.push(ui::note(format!("tracker 报错：{error}"), true).into_any_element());
+            }
+            if let Some(error) = &progress.public_trackers_error {
+                body.push(
+                    ui::note(
+                        format!("公共 tracker 列表没取到，隔一阵再取：{error}"),
+                        true,
+                    )
+                    .into_any_element(),
+                );
+            }
+            if let Some(problem) = &progress.proxy_problem {
+                body.push(ui::note(format!("BT 代理：{problem}"), true).into_any_element());
+            }
+            if progress.peers == 0 && self.since.elapsed() >= NO_PEERS_HINT {
+                body.push(
+                    ui::note(
+                        "一直找不到节点时，可到设置里的「网络检测」看是哪里不通",
+                        false,
+                    )
+                    .into_any_element(),
+                );
+            }
+        }
+        ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
+    }
+
+    /// 取不到种子信息、读不出种子文件：错误，能再试的给再试。
+    fn torrent_failed_inspector(
+        &self,
+        title: String,
+        host: String,
+        failure: &Failure,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let body = [ui::note(failure.message.clone(), true).into_any_element()];
+        let mut foot = Vec::new();
+        if failure.kind.retry_helps() {
+            foot.push(
+                ui::primary(
+                    "retry",
+                    "再试一次",
+                    None,
+                    Solid::Amber,
+                    true,
+                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
+                )
+                .into_any_element(),
+            );
+        }
+        foot.push(self.cancel(Tone::Plain, cx));
+        ui::inspector(title, host, body, foot)
+    }
+
+    /// 取到种子信息后：选了的大小与文件数（私有种子写明只经种子里的 tracker 找节点），要下的文件，保存位置，开始。
+    fn torrent_inspector(
+        &self,
+        title: String,
+        host: String,
+        choice: &TorrentChoice,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (count, bytes) = choice.selected();
+        let total: u64 = choice.info.files.iter().map(|file| file.size).sum();
+        let cells: Vec<(SharedString, SharedString)> = vec![
+            (
+                "大小".into(),
+                format!("{} / {}", format::bytes(bytes), format::bytes(total)).into(),
+            ),
+            (
+                "文件".into(),
+                format!("{count} / {} 个", choice.info.files.len()).into(),
+            ),
+        ];
+        let mut body = vec![ui::reads(cells, None).into_any_element()];
+        if choice.info.private {
+            body.push(ui::note("私有种子：只经种子里的 tracker 找节点", false).into_any_element());
+        }
+        let all = count == choice.info.files.len();
+        let toggle_all = ui::chip(
+            "select-all",
+            if all { "全不选" } else { "全选" },
+            false,
+            cx.listener(move |this, _, _, cx| this.select_all(!all, cx)),
+        )
+        .into_any_element();
+        // 简化：文件逐个画出，种子里有上千个文件时改用只画看得见的那些的列表
+        let files = choice
+            .info
+            .files
+            .iter()
+            .zip(&choice.wanted)
+            .enumerate()
+            .map(|(at, (file, wanted))| {
+                file_row(at, &file.path, file.size, *wanted)
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_file(at, cx)))
+                    .into_any_element()
+            });
+        body.push(
+            group(
+                "要下的文件",
+                [
+                    chips_row([toggle_all]),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(files)
+                        .into_any_element(),
+                ],
+            )
+            .into_any_element(),
+        );
+        body.push(self.folder_group(cx).into_any_element());
+        let headline = if self.creating {
+            "正在开始…".to_owned()
+        } else {
+            "开始下载".to_owned()
+        };
+        let mut foot: Vec<AnyElement> = self
+            .error
+            .clone()
+            .map(|error| ui::error_text(error).into_any_element())
+            .into_iter()
+            .collect();
+        foot.push(
+            ui::primary(
+                "start",
+                headline,
+                Some(format!("{count} 个文件 · {}", format::bytes(bytes)).into()),
+                Solid::Glow,
+                !self.creating && count > 0,
+                cx.listener(|this, _, window, cx| this.start(window, cx)),
+            )
+            .into_any_element(),
+        );
+        if !self.creating {
+            foot.push(self.cancel(Tone::Ghost, cx));
+        }
+        ui::inspector(title, host, body, foot)
+    }
+
     /// 「保存到」一组：现在的保存位置与更改。
     fn folder_group(&self, cx: &mut Context<Self>) -> Div {
         group(
@@ -374,6 +548,58 @@ fn output_label(kind: OutputKind) -> &'static str {
         OutputKind::Hls => "本地 HLS",
         OutputKind::Both => "两者",
     }
+}
+
+/// 种子里的一个文件：勾选框、相对路径（过长截断）与大小；点整行勾上或去掉。
+fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Stateful<Div> {
+    let mark = div()
+        .flex_none()
+        .size(px(16.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .border_1()
+        .text_size(px(11.));
+    let mark = if wanted {
+        mark.bg(theme::accent())
+            .border_color(theme::accent())
+            .text_color(theme::ground())
+            .child("✓")
+    } else {
+        mark.border_color(theme::edge())
+    };
+    div()
+        .id(("torrent-file", at))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::raised()))
+        .child(mark)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .text_color(if wanted {
+                    theme::text()
+                } else {
+                    theme::muted()
+                })
+                .child(path.to_owned()),
+        )
+        .child(ui::num(
+            div()
+                .flex_none()
+                .text_size(px(12.))
+                .text_color(theme::muted())
+                .child(format::bytes(size)),
+        ))
 }
 
 /// 带小标题的一组。

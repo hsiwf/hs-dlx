@@ -1,6 +1,8 @@
 """生成随桌面应用的安装包分发的声明（apps/desktop/LICENSES，打包时放进安装包）；`--check` 时只核对是否最新。
 
-声明有 NOTICE.txt、THIRD-PARTY-RUST.txt 与随带的许可证全文的副本（本项目、FFmpeg、字体、gpui-webview）。
+声明有 NOTICE.txt、THIRD-PARTY-RUST.txt 与随带的许可证全文的副本（本项目、FFmpeg、libtorrent、OpenSSL、Boost、字体、
+gpui-webview）。libtorrent、OpenSSL、Boost 的许可证原文取自 third_party/libtorrent/build.sh 下载核对过的源码包，存在
+third_party/libtorrent/licenses/（升级它们时一并换），NOTICE.txt 里的版本取自 build.sh。
 
 THIRD-PARTY-RUST.txt 收录桌面应用（hs-dlx）在各发布平台（deny.toml 的 `[graph] targets`）上依赖的 Rust crate：
 按 `cargo tree` 解析特性后的正常依赖，过程宏与工作区成员不算。各 crate 根目录里的许可证文件原样收录，内容相同的只收
@@ -354,6 +356,23 @@ def ffmpeg_release(script: FfmpegScript) -> tuple[str, str]:
     return version[1], sha256[1]
 
 
+LIBTORRENT_SCRIPT = ROOT / "third_party/libtorrent/build.sh"
+LIBTORRENT_LICENSES = ROOT / "third_party/libtorrent/licenses"
+
+
+def libtorrent_versions() -> dict[str, str]:
+    """BT 引擎静态链接的 libtorrent、OpenSSL 与用到的 Boost 的版本，取自编译它们的构建脚本。"""
+    text = LIBTORRENT_SCRIPT.read_text(encoding="utf-8")
+    versions: dict[str, str] = {}
+    for name in ("LIBTORRENT", "OPENSSL", "BOOST"):
+        found = re.search(rf"^{name}=(\S+)$", text, re.MULTILINE)
+        if found is None:
+            message = f"{LIBTORRENT_SCRIPT} 里找不到 {name}="
+            raise SystemExit(message)
+        versions[name] = found[1]
+    return versions
+
+
 def mpl_crates(crates: list[Crate]) -> list[Crate]:
     """只能按 MPL-2.0 取用的 crate（许可证表达式里有一个子句只有 MPL-2.0）：分发时要告知它们的源码出处。"""
     return [crate for crate in crates if frozenset(["MPL-2.0"]) in Clauses(crate.license).result]
@@ -380,6 +399,7 @@ def ffmpeg_section() -> str:
 def desktop_notice(crates: list[Crate]) -> str:
     """桌面应用的 NOTICE.txt 的内容；`crates` 为它依赖的 crate。"""
     ffmpeg = ffmpeg_section()
+    bt = libtorrent_versions()
     mpl = "".join(
         f"\n   - {crate.label()}：源码见 {crate.repository} 与 https://crates.io/crates/{crate.name}/{crate.version}"
         for crate in mpl_crates(crates)
@@ -400,6 +420,16 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 4. Space Grotesk 字体（© The Space Grotesk Project Authors，https://github.com/floriankarsten/space-grotesk），按 SIL
    Open Font License 1.1 授权，全文见 OFL.txt。
+
+5. libtorrent {bt["LIBTORRENT"]}（https://libtorrent.org，© Arvid Norberg 等），按 BSD 3-Clause 授权；静态链接，源码
+   未作修改。它的许可证与其中收录的别人的代码（puff、ed25519、SHA-1、SHA-256 等）的声明全文见
+   libtorrent-LICENSE.txt。
+
+6. OpenSSL {bt["OPENSSL"]}（https://www.openssl.org），按 Apache License 2.0 授权，全文见 OpenSSL-LICENSE.txt；
+   libtorrent 用它连加密的 tracker 与 web seed、算哈希。静态链接，源码未作修改。
+
+7. Boost {bt["BOOST"]}（https://www.boost.org），按 Boost Software License 1.0 授权，全文见 Boost-LICENSE_1_0.txt；
+   libtorrent 用到它的头文件，未作修改。
 """
 
 
@@ -425,6 +455,9 @@ def main() -> int:
         out / "FFmpeg-LGPL-2.1.txt": read_text(ROOT / "third_party/ffmpeg/LGPL-2.1.txt"),
         out / "OFL.txt": read_text(ROOT / "apps/desktop/assets/fonts/OFL.txt"),
         out / "gpui-webview-LICENSE-APACHE.txt": read_text(ROOT / "crates/webview/LICENSE-APACHE"),
+        out / "libtorrent-LICENSE.txt": read_text(LIBTORRENT_LICENSES / "libtorrent-LICENSE.txt"),
+        out / "OpenSSL-LICENSE.txt": read_text(LIBTORRENT_LICENSES / "OpenSSL-LICENSE.txt"),
+        out / "Boost-LICENSE_1_0.txt": read_text(LIBTORRENT_LICENSES / "Boost-LICENSE_1_0.txt"),
     }
     stale: list[Path] = []
     for path, content in expected.items():

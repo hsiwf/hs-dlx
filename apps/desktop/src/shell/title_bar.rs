@@ -1,4 +1,4 @@
-//! 顶栏：标志与名字，右边是进行中的任务数、总速度与保存目录所在盘的可用空间。
+//! 顶栏：标志与名字，右边是有新版本时的提示、进行中的任务数、总速度与保存目录所在盘的可用空间。
 
 use std::time::Instant;
 
@@ -84,6 +84,18 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(16.))
+                    .children(self.updates.read(cx).pending().map(|version| {
+                        div()
+                            .id("update-pending")
+                            .text_size(px(13.))
+                            .text_color(theme::accent())
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::accent_pale()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(window, cx);
+                            }))
+                            .child(format!("新版本 {version}"))
+                    }))
                     .child(ui::num(
                         div()
                             .flex()

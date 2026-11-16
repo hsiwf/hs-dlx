@@ -2033,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "bindgen",
  "cc",
@@ -3514,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs 7.0.0",
@@ -3540,12 +3540,14 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "hs-dlx-torrent",
  "hs-m3u8-core",
  "icu_normalizer",
+ "minisign-verify",
  "percent-encoding",
  "rusqlite",
  "serde",
@@ -3557,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-instance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs 7.0.0",
  "getrandom 0.4.3",
@@ -3569,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-macos"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "objc2 0.6.5",
  "thiserror 2.0.21",
@@ -3577,7 +3579,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-relay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "percent-encoding",
@@ -3591,7 +3593,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-scene"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "image",
  "pollster 1.0.1",
@@ -3601,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-torrent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -3609,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "hs-dlx-webview"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "block2 0.6.2",
  "gpui-kit",
@@ -3629,7 +3631,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-core"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "aes 0.9.3",
  "cbc 0.2.1",
@@ -3653,7 +3655,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-hls"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "thiserror 2.0.21",
  "url",
@@ -3662,7 +3664,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-remux"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -3672,7 +3674,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-sysproxy"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=c19706d2f3639098471dfbddcf16952ccac415d7#c19706d2f3639098471dfbddcf16952ccac415d7"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=728e874114a9716478b67d4bf3dbb5a8f1dbaaa0#728e874114a9716478b67d4bf3dbb5a8f1dbaaa0"
 dependencies = [
  "system-configuration 0.7.0",
  "windows-registry 0.6.1",
@@ -4787,6 +4789,12 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign-verify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
 
 [[package]]
 name = "miniz_oxide"

@@ -62,7 +62,10 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
    - 核对版本号：`vX.Y.Z` 标签已有对应的公开 Release 时到此为止，不发版；标签在而没有公开的 Release 时失败，要人看。
    - 确认更新日志里有这个版本的一节，再由 `desktop.yml` 在三个平台上打安装包：`.dmg`（Apple 芯片）、`-setup.exe`
      （x64）、`.deb`（amd64）。
-   - 全部成功后建 Release：先建草稿、上传安装包与 `SHA256SUMS`，再公开；公开时 GitHub 在这个提交上打 `vX.Y.Z` 标签。
+   - 全部成功后建 Release：先建草稿，用仓库的 Secret `MINISIGN_SECRET_KEY`（minisign 私钥文件的全文，私钥用
+     `minisign -G -W` 生成、不带口令）给每个安装包
+     签名并用 `apps/desktop/update.pub` 验一遍，再上传安装包、签名（`.minisig`）与 `SHA256SUMS`，最后公开；公开时
+     GitHub 在这个提交上打 `vX.Y.Z` 标签。应用的自动更新按这些签名验安装包，私钥丢了已装的版本就验不了之后的更新。
 5. 任一步失败时没有公开的 Release、也没有标签：
    - 外部原因（网络、GitHub 故障）：在 Actions 里对这次运行点「Re-run failed jobs」，上一次留下的草稿会先删掉。
    - 要改代码或更新日志：在 `dev` 上修好，再提一个 PR 合并。新的推送读到的版本号仍没有标签，照常发版，说明取自
@@ -70,7 +73,8 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
 
 没改版本号的 PR 合并进 `main` 时，标签已在，不发版。
 
-安装包没有签名与公证；签名需要开发者账号，到时在 `desktop.yml` 里加。
+安装包没有 Apple 与 Windows 的代码签名与公证（需要开发者账号，到时在 `desktop.yml` 里加）；防篡改靠上面的 minisign
+签名。
 
 ## 手动打包
 
