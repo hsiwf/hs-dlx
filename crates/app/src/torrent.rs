@@ -594,8 +594,9 @@ pub(crate) struct Bt {
     proxy_reconnect: AtomicBool,
     /// BT 会话在时探出过引导节点被 TUN 代理解析成假地址、经代理问不通：libtorrent 只在启动 DHT 时解析一次，手里的多半
     /// 也是假地址，之后解析到真实地址也要重启才生效。与代理的设置无关，到进程退出都在；持着 `running` 的锁改与读。
-    /// 简化：从探测推断，会话建起之后才开 TUN 的 fake-ip 时（libtorrent 手里是真实地址）也会这样记，多提示一次重启；
-    /// 这种误报成了问题时，改为建会话时照同一个解析器解析一次引导节点来定。
+    /// 简化：从探测推断，两种情况会多提示一次重启：会话建起之后才开 TUN 的 fake-ip（libtorrent 手里是真实地址）；代理
+    /// 就是 TUN 代理自己的 SOCKS 端口而引导节点只排除了一部分（libtorrent 手里的假地址经它本来就通）。这类误报成了问题
+    /// 时，改为建会话时照同一个解析器解析一次引导节点来定，并看回应来自真实地址还是假地址。
     proxy_fake_ip: AtomicBool,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
@@ -863,23 +864,36 @@ impl Bt {
         // 这次探到的代理本身能用（决定要不要让 libtorrent 重连），与记下的分开
         let reachable = check == ProxyCheck::Usable;
         let fake_seen = self.proxy_fake_ip.load(Ordering::Relaxed);
-        // 记着 BT 用着假地址时，这次引导节点一个都没解析出来、判断不了：照旧
-        if reachable && fake_seen && !resolved.real && !resolved.fake {
-            return self.proxy_check.borrow().clone();
-        }
-        // 假地址改好了，BT 还用着旧的：直到重启都算没转发出去。仍是假地址而能用的（代理是 TUN 自己的 SOCKS 端口）照实记
-        let check = if reachable && resolved.real && fake_seen {
+        let recorded = self.proxy_check.borrow().clone();
+        let about_fake_ip = recorded.problem().is_some_and(|why| {
+            why == crate::netcheck::PROXY_FAKE_IP.as_str()
+                || why == crate::netcheck::RESTART_AFTER_FAKE_IP
+        });
+        let check = if reachable && about_fake_ip && !resolved.real && !resolved.fake {
+            // 记着的是假地址的结论，这次引导节点一个都没解析出来、判断不了：照旧
+            recorded.clone()
+        } else if reachable && resolved.real && fake_seen {
+            // 假地址改好了，BT 还用着旧的：直到重启都算没转发出去。仍是假地址而能用的（代理是 TUN 自己的 SOCKS 端口）
+            // 照实记
             ProxyCheck::Silent(crate::netcheck::RESTART_AFTER_FAKE_IP.to_owned())
         } else {
             check
         };
-        let usable = *self.proxy_check.borrow() == ProxyCheck::Usable;
+        // 代理本身能用就照需要重连，不论记下的是什么、存不存疑
+        if reachable && let Some(running) = &*running {
+            let session = &running.engine.session;
+            if self.proxy_reconnect.swap(false, Ordering::Relaxed)
+                || !session.network().proxy_error.is_empty()
+            {
+                session.reconnect_proxy(&libtorrent_proxy(Some(url)));
+            }
+        }
         if doubt
             && matches!(check, ProxyCheck::Silent(_))
-            && usable
+            && recorded == ProxyCheck::Usable
             && !self.proxy_doubted.swap(true, Ordering::Relaxed)
         {
-            return ProxyCheck::Usable;
+            return recorded;
         }
         if running.is_some() && resolved.fake && check.problem().is_some() {
             self.proxy_fake_ip.store(true, Ordering::Relaxed);
@@ -889,14 +903,6 @@ impl Bt {
             self.proxy_reconnect.store(true, Ordering::Relaxed);
         }
         self.proxy_check.send_replace(check.clone());
-        if reachable && let Some(running) = &*running {
-            let session = &running.engine.session;
-            if self.proxy_reconnect.swap(false, Ordering::Relaxed)
-                || !session.network().proxy_error.is_empty()
-            {
-                session.reconnect_proxy(&libtorrent_proxy(Some(url)));
-            }
-        }
         check
     }
 

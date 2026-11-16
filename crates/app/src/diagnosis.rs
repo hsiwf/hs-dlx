@@ -142,6 +142,13 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     if let Some(proxy) = &facts.proxy {
         let address = &proxy.address;
         checks.push(match &proxy.check {
+            ProxyCheck::Silent(why) if why == crate::netcheck::RESTART_AFTER_FAKE_IP => check(
+                CheckItem::Listen,
+                CheckLevel::Bad,
+                format!(
+                    "BT 代理 {address} 是通的，但 BT 还用着之前解析到的 DHT 引导节点的假地址：重启 hs-dlx 后生效"
+                ),
+            ),
             ProxyCheck::Unreachable(why) | ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => check(
                 CheckItem::Listen,
                 CheckLevel::Bad,
