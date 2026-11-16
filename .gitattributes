@@ -1,0 +1,2 @@
+# 更新测试的样本按原样检出：签的是字节，换行被改成 CRLF 就验不过
+crates/app/tests/fixtures/update/** -text
