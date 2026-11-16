@@ -278,6 +278,7 @@ mod ffi {
         fn listen_port(self: &Session) -> u16;
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
         fn set_proxy(self: &Session, proxy: &SocksProxy);
+        fn clear_proxy_error(self: &Session);
         fn network(self: &Session) -> NetworkStatus;
         fn request_stats(self: &Session);
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
@@ -285,6 +286,7 @@ mod ffi {
         fn pop_alerts(self: &Session, wait_ms: u32) -> Result<Vec<Alert>>;
         fn create_torrent(path: &str, options: &CreateOptions) -> Result<Vec<u8>>;
         fn resume_from_torrent_file(torrent: &[u8]) -> Result<Vec<u8>>;
+        fn magnet_id(uri: &str) -> Result<String>;
         fn describe(resume: &[u8]) -> Result<Described>;
         fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>>;
     }
@@ -475,6 +477,11 @@ impl Session {
         self.inner().set_proxy(proxy);
     }
 
+    /// 清掉记着的代理出错（[`NetworkStatus::proxy_error`]）：已确认代理现在能用时（libtorrent 自己重连上不报事件）。
+    pub fn clear_proxy_error(&self) {
+        self.inner().clear_proxy_error();
+    }
+
     /// 网络状况（监听与端口映射随事件更新，DHT 与连入要 [`Session::request_stats`] 之后才新）。
     pub fn network(&self) -> NetworkStatus {
         self.inner().network()
@@ -508,6 +515,11 @@ impl Session {
     pub fn pop_alerts(&self, wait_ms: u32) -> Result<Vec<Alert>, Error> {
         Ok(self.inner().pop_alerts(wait_ms)?)
     }
+}
+
+/// 磁力链接 `uri` 加入会话时会定下的编号（见 [`Session::add_magnet`]）；不是磁力链接时报错。
+pub fn magnet_id(uri: &str) -> Result<TorrentId, Error> {
+    Ok(TorrentId(ffi::magnet_id(uri)?))
 }
 
 /// 种子文件（bencode 写的内容）转成续传数据：什么也没下过，保存目录为空。

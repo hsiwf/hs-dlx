@@ -44,6 +44,10 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// 新建时检查保存目录里的名字最多等多久：网络盘没有响应时不让新建一直挂着。
 const NAMING_TIMEOUT: Duration = Duration::from_secs(10);
+/// 网络检测最多做多久：解析各 3 秒、两轮各等 2 秒、经代理的握手最多 10 秒，并行做完约 10 秒。
+const NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
+/// 设了 BT 代理时多久看一眼它（见 `Shared::probe_torrent_proxy`）。
+const PROXY_RECHECK: Duration = Duration::from_secs(30);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -459,13 +463,20 @@ impl Service {
         })
     }
 
-    /// 检测 BT 用的网络（见 [`crate::NetworkReport`]）：BT 会话还没建时先建（端口映射随之开始），再并行探直连与 IPv6 的
-    /// DHT、UDP 的 tracker（公共 tracker 列表取到了时）、经 BT 代理的 DHT（设了时，探到的结果同时记进 BT 引擎），最后读
-    /// 会话报的端口映射与连入；约 10 秒。BT 会话建不出、开不了 UDP 套接字时报错。返回的句柄在任何执行器上都可等待。
-    pub fn check_network(&self) -> JoinHandle<Result<crate::NetworkReport, Error>> {
+    /// 检测 BT 用的网络（见 [`crate::NetworkReport`]）：并行探直连与 IPv6 的 DHT、UDP 的 tracker（公共 tracker 列表
+    /// 取到了时）、经 BT 代理的 DHT（设了时；探到的结果同时记进 BT 引擎），再读 BT 会话报的监听、端口映射与连入（还没
+    /// 建会话时不建，这几项不测）。设了 BT 代理时也从本机直连测一次。约 10 秒，最多 25 秒，过了报
+    /// [`Error::TimedOut`]；开不了 UDP 套接字时报 [`Error::Io`]。返回的句柄在任何执行器上都可等待，释放它即取消。
+    pub fn check_network(&self) -> AbortOnDropHandle<Result<crate::NetworkReport, Error>> {
         let shared = self.shared.clone();
-        self.runtime()
-            .spawn(async move { shared.check_network().await })
+        AbortOnDropHandle::new(self.runtime().spawn(async move {
+            tokio::time::timeout(NETWORK_CHECK_TIMEOUT, shared.check_network())
+                .await
+                .map_err(|_| Error::TimedOut {
+                    action: "检测网络".to_owned(),
+                    after: NETWORK_CHECK_TIMEOUT,
+                })?
+        }))
     }
 
     /// 让下完的 BT 任务做种（照做种的设置，到了停的条件即停）：记下在做种，加入 BT 会话、校验已下的文件后只上传；文件
@@ -1141,36 +1152,37 @@ impl Shared {
 
     async fn check_network(self: &Arc<Self>) -> Result<crate::NetworkReport, Error> {
         use crate::netcheck::{self, DHT_BOOTSTRAP, Udp};
-        let engine = self.bt_engine()?;
-        engine.request_stats();
         let socket = |error: std::io::Error| Error::Io {
             action: "打开",
             path: "检测网络用的 UDP 套接字".into(),
             cause: error,
         };
-        let (v4, v6, trackers) = (
+        let engine = self.bt.existing();
+        if let Some(engine) = &engine {
+            engine.request_stats();
+        }
+        let (v4, trackers) = (
             Udp::direct(false).await.map_err(socket)?,
-            Udp::direct(true).await.ok(),
             Udp::direct(false).await.map_err(socket)?,
         );
         let direct = async {
-            let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
-            netcheck::dht(&v4, asked, &found).await
+            let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
+            netcheck::dht(&v4, &found, unresolved).await
         };
         let ipv6 = async {
-            let address = netcheck::public_ipv6().await;
-            let dht = match (&address, &v6) {
-                (Some(_), Some(udp)) => {
-                    let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, true).await;
-                    netcheck::dht(udp, asked, &found).await.bootstrap
+            if !netcheck::has_public_ipv6().await {
+                return None;
+            }
+            Some(match Udp::direct(true).await {
+                Ok(udp) => {
+                    let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, true).await;
+                    Ok(netcheck::dht(&udp, &found, unresolved).await.bootstrap)
                 }
-                _ => netcheck::Ratio::default(),
-            };
-            (address, dht)
+                Err(error) => Err(error.to_string()),
+            })
         };
-        // 刚建起 BT 会话时列表还在取：最多等 5 秒
         let udp_trackers = async {
-            match self.bt.public_list(Duration::from_secs(5)).await {
+            match self.bt.public_list(Duration::ZERO).await {
                 Some(list) => Some(netcheck::udp_trackers(&trackers, &list).await),
                 None => None,
             }
@@ -1180,50 +1192,78 @@ impl Shared {
             let url = proxy_url.as_ref()?;
             let address = hs_m3u8_core::bare_url(url);
             Some(match crate::socks::associate(url).await {
-                Ok(relay) => {
-                    self.bt.set_proxy_check(url, ProxyCheck::Usable);
-                    let dht = match Udp::via(relay).await {
-                        Ok(udp) => {
-                            let (asked, found) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
-                            Some(netcheck::dht(&udp, asked, &found).await)
-                        }
-                        Err(_) => None,
-                    };
-                    (address, ProxyCheck::Usable, dht)
-                }
-                Err(why) => {
-                    self.bt
-                        .set_proxy_check(url, ProxyCheck::Unusable(why.clone()));
-                    (address, ProxyCheck::Unusable(why), None)
-                }
+                Ok(relay) => match Udp::via(relay).await {
+                    Ok(udp) => {
+                        let (found, unresolved) = netcheck::bootstrap(&DHT_BOOTSTRAP, false).await;
+                        let dht = netcheck::dht(&udp, &found, unresolved).await;
+                        Ok((url, address, Some(dht), None))
+                    }
+                    Err(error) => Err(socket(error)),
+                },
+                Err(why) => Ok((url, address, None, Some(why))),
             })
         };
-        let (dht, (ipv6, ipv6_dht), trackers, proxy) =
-            tokio::join!(direct, ipv6, udp_trackers, proxied);
-        let (mapped, incoming) = engine.connectivity();
+        let (dht, ipv6, trackers, proxied) = tokio::join!(direct, ipv6, udp_trackers, proxied);
+        let proxy = match proxied.transpose()? {
+            None => None,
+            Some((url, address, through, why)) => {
+                // 记进 BT 引擎：取种子信息的界面与诊断随之更新
+                let check = match (&why, &through) {
+                    (Some(why), _) => ProxyCheck::Unusable(why.clone()),
+                    (None, Some(through)) if netcheck::drops_udp(&dht, through) => {
+                        ProxyCheck::Unusable(netcheck::DROPS_UDP.to_owned())
+                    }
+                    (None, _) => ProxyCheck::Usable,
+                };
+                self.bt.set_proxy_check(url, check.clone());
+                Some(netcheck::Proxied {
+                    address,
+                    // 报告里「没转发出去」另有说明，探测本身算通
+                    check: if why.is_some() {
+                        check
+                    } else {
+                        ProxyCheck::Usable
+                    },
+                    dht: through,
+                })
+            }
+        };
         Ok(netcheck::report(&netcheck::Measured {
             dht,
             trackers,
             ipv6,
-            ipv6_dht,
             proxy,
-            mapped,
-            incoming,
+            session: engine.map(|engine| engine.session_facts()),
         }))
     }
 
-    /// 设了 BT 代理而还没探时探它（见 [`crate::socks::probe`]），结果交给 BT 引擎；之前在探的随之取消。
+    /// 设了 BT 代理而还没探时开始看着它（之前看着的随之取消）：先探一次，之后每 [`PROXY_RECHECK`] 看一眼，探出用不了
+    /// 或 libtorrent 经它的 UDP 报过错时再探；探到能用即清掉 libtorrent 记着的出错。代理改了或服务释放即止。
     fn probe_torrent_proxy(self: &Arc<Self>) {
         let Some(url) = self.bt.begin_proxy_probe() else {
             return;
         };
         let shared = Arc::downgrade(self);
         let probing = self.runtime.spawn(async move {
-            let check = match crate::socks::probe(&url).await {
-                Ok(()) => ProxyCheck::Usable,
-                Err(why) => ProxyCheck::Unusable(why),
-            };
-            if let Some(shared) = shared.upgrade() {
+            let mut ticks = tokio::time::interval(PROXY_RECHECK);
+            loop {
+                ticks.tick().await;
+                let due = match shared.upgrade() {
+                    Some(shared) if shared.bt.proxy_url().as_ref() == Some(&url) => {
+                        shared.bt.proxy_needs_probe()
+                    }
+                    _ => return,
+                };
+                if !due {
+                    continue;
+                }
+                let check = match crate::socks::probe(&url).await {
+                    Ok(()) => ProxyCheck::Usable,
+                    Err(why) => ProxyCheck::Unusable(why),
+                };
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
                 shared.bt.set_proxy_check(&url, check);
             }
         });

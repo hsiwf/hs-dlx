@@ -356,6 +356,8 @@ impl SettingsView {
                 Ok(()) => {
                     self.torrent_proxy = None;
                     self.torrent_proxy_picked = false;
+                    // 检测结果是按旧的设置量的
+                    self.network_report = None;
                 }
                 Err(error) => self.torrent_proxy_error = Some(error.to_string()),
             }
@@ -380,6 +382,8 @@ impl SettingsView {
             Ok(url) => {
                 self.torrent_proxy = Some(url);
                 self.torrent_proxy_error = None;
+                // 检测结果是按旧的设置量的
+                self.network_report = None;
             }
             Err(reason) => self.torrent_proxy_error = Some(reason),
         }
@@ -442,7 +446,7 @@ impl SettingsView {
         }
         row(
             "网络检测",
-            Some("DHT、UDP 的 tracker、IPv6、BT 代理与外部连入通不通；约 10 秒"),
+            Some("约 10 秒；设了 BT 代理时也从本机直连测一次；BT 用过之后才测端口映射与连入"),
             content,
         )
     }
@@ -636,10 +640,10 @@ impl SettingsView {
             }
             UpdateState::Installed(version) => {
                 lines.push(
-                    ui::caption(match (restarting, hs_dlx_app::INSTALLS_ON_EXIT) {
-                        (true, _) => format!("{version} 已装好：退出后打开新版本"),
-                        (false, true) => format!("{version} 已下载并验过：应用退出时装上"),
-                        (false, false) => format!("{version} 已装好，重启后用新版本"),
+                    ui::caption(match (restarting, hs_dlx_app::INSTALLED_BEFORE_RESTART) {
+                        (true, _) => format!("{version}：退出后打开新版本"),
+                        (false, true) => format!("{version} 已装好，重启后用新版本"),
+                        (false, false) => format!("{version} 已下载并验过：点「现在重启」时装上"),
                     })
                     .into_any_element(),
                 );

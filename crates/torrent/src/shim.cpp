@@ -162,6 +162,10 @@ std::string Session::id_of(lt::torrent_handle const& handle) const {
 	return found->second;
 }
 
+rust::String magnet_id(rust::Str uri) {
+	return rust::String(canonical(lt::parse_magnet_uri(string_of(uri)).info_hashes));
+}
+
 rust::String Session::add_magnet(rust::Str uri, rust::Str save_path) const {
 	lt::add_torrent_params params = lt::parse_magnet_uri(string_of(uri));
 	// 不暂停（连节点、取种子信息），但只上传不下载：选好文件后 start 才开始下
@@ -446,6 +450,11 @@ void Session::set_proxy(SocksProxy const& proxy) const {
 	lt::settings_pack pack;
 	set_proxy_of(pack, proxy);
 	m_session.apply_settings(std::move(pack));
+	std::lock_guard<std::mutex> net(m_network_mutex);
+	m_network.proxy_error.clear();
+}
+
+void Session::clear_proxy_error() const {
 	std::lock_guard<std::mutex> net(m_network_mutex);
 	m_network.proxy_error.clear();
 }

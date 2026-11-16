@@ -277,24 +277,52 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    /// 要一次会话的统计（DHT 的节点数、有没有节点连进来），到了之后 [`Engine::connectivity`] 里是新的。
+    /// 要一次会话的统计（DHT 的节点数、有没有节点连进来），到了之后 [`Engine::session_facts`] 里是新的。
     pub(crate) fn request_stats(&self) {
         self.session.request_stats();
     }
 
-    /// 端口映射到的外部端口（UPnP 或 NAT-PMP，都没映射成时为 None）与有没有节点从外面连进来过。
-    pub(crate) fn connectivity(&self) -> (Option<u16>, bool) {
+    /// 监听、端口映射（UPnP 或 NAT-PMP 映射到的外部端口；都没结果时为还没有结果）与有没有节点从外面连进来过。
+    pub(crate) fn session_facts(&self) -> crate::netcheck::Session {
+        use crate::netcheck::Mapping;
         let network = self.session.network();
         let mapped = [network.upnp_port, network.natpmp_port]
             .into_iter()
             .find(|&port| port != 0);
-        (mapped, network.incoming)
+        let errors: Vec<String> = [
+            ("UPnP", &network.upnp_error),
+            ("NAT-PMP", &network.natpmp_error),
+        ]
+        .into_iter()
+        .filter(|(_, error)| !error.is_empty())
+        .map(|(via, error)| format!("{via}：{error}"))
+        .collect();
+        let mapping = match mapped {
+            Some(port) => Mapping::Mapped(port),
+            None if errors.is_empty() => Mapping::Pending,
+            None => Mapping::Failed(errors.join("；")),
+        };
+        let listen_error = (network.listen_port == 0).then(|| {
+            if network.listen_error.is_empty() {
+                "还没监听上".to_owned()
+            } else {
+                network.listen_error.clone()
+            }
+        });
+        crate::netcheck::Session {
+            listen_error,
+            mapping,
+            incoming: network.incoming,
+        }
     }
 
     /// BT 代理的问题：探出用不了的原因，或 libtorrent 经它的 UDP 最近一次出的错；直连或没问题时为 None。
     fn proxy_problem(&self) -> Option<String> {
-        if let ProxyCheck::Unusable(why) = &*self.proxy_check.borrow() {
-            return Some(why.clone());
+        match &*self.proxy_check.borrow() {
+            // 改成直连之后才取出的、经旧代理的出错不算
+            ProxyCheck::Direct => return None,
+            ProxyCheck::Unusable(why) => return Some(why.clone()),
+            ProxyCheck::Unchecked | ProxyCheck::Checking | ProxyCheck::Usable => {}
         }
         let error = self.session.network().proxy_error;
         (!error.is_empty()).then(|| format!("代理出错：{error}"))
@@ -771,11 +799,30 @@ impl Bt {
         }
     }
 
-    /// 记下探 `url` 的结果；代理已改成别的时不记。
+    /// 记下探 `url` 的结果；代理已改成别的时不记。探到能用时清掉 libtorrent 记着的经它的出错（那是之前的，它自己已重连）。
     pub fn set_proxy_check(&self, url: &Url, check: ProxyCheck) {
-        if lock(&self.proxy).as_ref() == Some(url) {
-            self.proxy_check.send_replace(check);
+        let running = lock(&self.running);
+        if lock(&self.proxy).as_ref() != Some(url) {
+            return;
         }
+        if check == ProxyCheck::Usable
+            && let Some(running) = &*running
+        {
+            running.engine.session.clear_proxy_error();
+        }
+        self.proxy_check.send_replace(check);
+    }
+
+    /// 设了代理，而还在探、探出用不了，或 libtorrent 经它的 UDP 报过错：该再探一次。
+    pub fn proxy_needs_probe(&self) -> bool {
+        let errored = lock(&self.running)
+            .as_ref()
+            .is_some_and(|running| !running.engine.session.network().proxy_error.is_empty());
+        errored
+            || matches!(
+                *self.proxy_check.borrow(),
+                ProxyCheck::Checking | ProxyCheck::Unusable(_)
+            )
     }
 
     /// 已建的引擎；还没建会话时为 None。
@@ -810,8 +857,9 @@ fn fingerprint(version: &str) -> String {
     format!("-HD{major}{minor}{patch}0-")
 }
 
-/// 磁力链接 `uri` 取到种子信息，返回它的续传数据；其间把连着的节点数报进 `progress`。不是磁力链接、或这个种子正在
-/// 下载或取种子信息时报 [`Error::Torrent`]。任务被取消（句柄释放）时种子随之从会话里移除。
+/// 磁力链接 `uri` 取到种子信息，返回它的续传数据；其间把连着的节点数报进 `progress`。同一个种子之前的移除还没做完
+/// 时先等它（最多 10 秒）。不是磁力链接、这个种子正在下载或取种子信息、或之前的移除 10 秒内没做完时报
+/// [`Error::Torrent`]。任务被取消（句柄释放）时种子随之从会话里移除。
 pub(crate) async fn fetch_metadata(
     engine: Arc<Engine>,
     uri: String,
@@ -819,10 +867,15 @@ pub(crate) async fn fetch_metadata(
     progress: watch::Sender<MetadataProgress>,
 ) -> Result<Vec<u8>, Error> {
     let save_path = utf8(&probe_dir)?;
+    let not_added =
+        |error: hs_dlx_torrent::Error| Error::Torrent(format!("加不进磁力链接：{error}"));
+    // 同一个磁力链接刚取消或取完、还在移除时，等它移除完再加
+    let pending = hs_dlx_torrent::magnet_id(&uri).map_err(not_added)?;
+    engine.settled(&pending).await?;
     let id = engine
         .session
         .add_magnet(&uri, save_path)
-        .map_err(|error| Error::Torrent(format!("加不进磁力链接：{error}")))?;
+        .map_err(not_added)?;
     let probe = Probe {
         engine: engine.clone(),
         id: id.clone(),

@@ -131,21 +131,21 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
         .map_err(|error| format!("连不上代理 {at}：{error}"))?;
     let io = |error: std::io::Error| format!("代理 {at} 断开了：{error}");
     let login = !proxy.username.is_empty();
-    let method = if login { 2 } else { 0 };
-    stream.write_all(&[5, 1, method]).await.map_err(io)?;
+    // 提供的认证方式同 libtorrent：有用户名时免认证与用户名密码都提供，由代理选
+    let offered: &[u8] = if login { &[5, 2, 0, 2] } else { &[5, 1, 0] };
+    stream.write_all(offered).await.map_err(io)?;
     let mut reply = [0; 2];
     stream.read_exact(&mut reply).await.map_err(io)?;
     if reply[0] != 5 {
         return Err(format!("{at} 不是 SOCKS5 代理"));
     }
-    if reply[1] != method {
-        return Err(if login {
-            format!("代理 {at} 不接受用户名与密码认证")
-        } else {
-            format!("代理 {at} 要认证：在地址里写上用户名与密码")
-        });
+    match reply[1] {
+        0 => {}
+        2 if login => {}
+        _ if login => return Err(format!("代理 {at} 不接受这两种认证方式")),
+        _ => return Err(format!("代理 {at} 要认证：在地址里写上用户名与密码")),
     }
-    if login {
+    if reply[1] == 2 {
         let mut request = vec![1, len(&proxy.username)];
         request.extend_from_slice(proxy.username.as_bytes());
         request.push(len(&proxy.password));
@@ -169,30 +169,48 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
             refusal(head[1])
         ));
     }
-    match head[3] {
+    let relay = match head[3] {
         1 => {
             let mut bound = [0; 6];
             stream.read_exact(&mut bound).await.map_err(io)?;
             let ip = Ipv4Addr::new(bound[0], bound[1], bound[2], bound[3]);
             let port = u16::from_be_bytes([bound[4], bound[5]]);
-            // 回 0.0.0.0 即与代理同一个地址
-            let ip = if ip.is_unspecified() {
-                address.ip()
+            // libtorrent 照原样发往 0.0.0.0：在 macOS 与 Linux 上即本机，只有代理在本机时才到得了它；Windows 上发不出
+            if ip.is_unspecified() {
+                if !address.ip().is_loopback() || cfg!(target_os = "windows") {
+                    return Err(format!(
+                        "代理 {at} 回的 UDP 转发地址是 0.0.0.0：libtorrent 发不到代理那里，DHT、uTP 与 UDP 的 tracker 经不了它"
+                    ));
+                }
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
             } else {
-                ip.into()
-            };
-            Ok(UdpRelay {
-                _control: stream,
-                address: SocketAddr::new(ip, port),
-            })
+                SocketAddr::new(ip.into(), port)
+            }
         }
-        4 => Err(format!(
-            "代理 {at} 转发 UDP 用的是 IPv6 地址，经代理时只能用 IPv4：DHT、uTP 与 UDP 的 tracker 经不了它"
-        )),
-        other => Err(format!(
-            "代理 {at} 回的 UDP 转发地址认不出（地址类型 {other}）"
-        )),
-    }
+        // 域名：libtorrent 不解析它，改发往代理的地址
+        3 => {
+            let mut len = [0; 1];
+            stream.read_exact(&mut len).await.map_err(io)?;
+            let mut rest = vec![0; usize::from(len[0]) + 2];
+            stream.read_exact(&mut rest).await.map_err(io)?;
+            let port = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
+            SocketAddr::new(address.ip(), port)
+        }
+        4 => {
+            return Err(format!(
+                "代理 {at} 转发 UDP 用的是 IPv6 地址，经代理时只能用 IPv4：DHT、uTP 与 UDP 的 tracker 经不了它"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "代理 {at} 回的 UDP 转发地址认不出（地址类型 {other}）"
+            ));
+        }
+    };
+    Ok(UdpRelay {
+        _control: stream,
+        address: relay,
+    })
 }
 
 /// 用户名或密码的长度（已过 [`check`]，不超过 255）。

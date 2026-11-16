@@ -292,22 +292,19 @@ pub fn take_failure(dir: &Path) -> Option<String> {
     })
 }
 
-/// 装好之后要退出才生效的那一步在退出时才装上：Windows 为真（运行中的程序换不了），macOS 为假（.app 已换上）。
-pub const INSTALLS_ON_EXIT: bool = cfg!(target_os = "windows");
+/// 装的时候就已换上新版本，重启即用：macOS 为真（.app 已换上）；Windows 为假（运行中的程序换不了，点了重启
+/// 退出之后才运行安装程序）。
+pub const INSTALLED_BEFORE_RESTART: bool = cfg!(target_os = "macos");
 
 /// 退出之后由它接着做：等本进程退出，macOS 打开换上的新版本，Windows 运行安装程序、装完再打开应用。
 pub struct Restart(Command);
 
 impl Restart {
-    /// 退出已不可撤回时调用：`relaunch` 时起等待的进程，等本进程退出后打开新版本（Windows 先装）；不 `relaunch` 时
-    /// Windows 照样装、装完不打开，macOS 什么也不用做（已换上，下次打开即是新版本）。起了之后本进程不论怎么退出，它都
-    /// 接着做；起不来时报 [`Error::Update`]。
-    pub fn spawn(mut self, relaunch: bool) -> Result<(), Error> {
-        if !relaunch && !INSTALLS_ON_EXIT {
-            return Ok(());
-        }
+    /// 起等待的进程（独立于本进程，本进程退出后照样运行）：等本进程退出后打开新版本（Windows 先装）。只在为重启而退出、
+    /// 且退出已不可撤回时调用（Windows 上不在注销、关机等别的退出里装：安装可能被系统中途结束）；起不来时报
+    /// [`Error::Update`]。
+    pub fn spawn(mut self) -> Result<(), Error> {
         self.0
-            .env("HS_DLX_RELAUNCH", if relaunch { "1" } else { "0" })
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -540,15 +537,14 @@ mod platform {
     /// 不弹控制台窗口、不随本进程的控制台结束（CREATE_NO_WINDOW | DETACHED_PROCESS）。
     const DETACHED: u32 = 0x0800_0000 | 0x0000_0008;
 
-    /// 等本进程退出再装（安装程序见到应用还在运行会直接结束它，等于强退），静默（/S）、不重建快捷方式（/NS）；
-    /// HS_DLX_RELAUNCH 为 1 时装完（或没装上）再打开应用（不用安装程序的 /R：它在自己退出之前打开，新版本启动时清理删不
-    /// 掉还在运行的安装程序）。退出码不是 0（或拿不到）时把它写进结果文件。路径都经环境变量传入，脚本里没有要转义的
-    /// 文字。
+    /// 等本进程退出再装（安装程序见到应用还在运行会直接结束它，等于强退），静默（/S）、不重建快捷方式（/NS）；装完（或
+    /// 没装上）再打开应用（不用安装程序的 /R：它在自己退出之前打开，新版本启动时清理删不掉还在运行的安装程序）。退出码
+    /// 不是 0（或拿不到）时把它写进结果文件。路径都经环境变量传入，脚本里没有要转义的文字。
     const SCRIPT: &str = "Wait-Process -Id $env:HS_DLX_PID -ErrorAction SilentlyContinue; \
         try { $code = (Start-Process -FilePath $env:HS_DLX_SETUP -ArgumentList '/S','/NS' -Wait -PassThru).ExitCode } \
         catch { $code = $_.Exception.Message }; \
         if (-not ($code -is [int] -and $code -eq 0)) { [IO.File]::WriteAllText($env:HS_DLX_FAILED, \"installer: $code\") }; \
-        if ($env:HS_DLX_RELAUNCH -eq '1') { Start-Process -FilePath $env:HS_DLX_EXE }";
+        Start-Process -FilePath $env:HS_DLX_EXE";
 
     pub(super) fn leftovers() -> Vec<PathBuf> {
         Vec::new()

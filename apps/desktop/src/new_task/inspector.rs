@@ -260,7 +260,7 @@ impl NewTask {
             if progress.peers == 0 && self.since.elapsed() >= NO_PEERS_HINT {
                 body.push(
                     ui::note(
-                        "一直找不到节点时，可到设置里「检测网络」看是哪里不通",
+                        "一直找不到节点时，可到设置里的「网络检测」看是哪里不通",
                         false,
                     )
                     .into_any_element(),

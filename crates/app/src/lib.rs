@@ -36,7 +36,7 @@ pub use torrent::{
     TorrentPhase, TorrentProgress, torrent_from_file,
 };
 pub use update::{
-    INSTALLS_ON_EXIT, Package, Release, Restart, UpdateFeed, Version,
+    INSTALLED_BEFORE_RESTART, Package, Release, Restart, UpdateFeed, Version,
     record_failure as record_update_failure, sweep as sweep_update,
     take_failure as take_update_failure,
 };

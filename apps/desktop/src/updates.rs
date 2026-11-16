@@ -65,7 +65,8 @@ pub enum UpdateState {
     },
     /// 下完验过签名，在装
     Installing(Version),
-    /// 装好了：macOS 已换上新版本；Windows 已下载并验过，退出时装（见 [`hs_dlx_app::INSTALLS_ON_EXIT`]）
+    /// 装好了：macOS 已换上新版本；Windows 已下载并验过，点了重启退出时才装（见
+    /// [`hs_dlx_app::INSTALLED_BEFORE_RESTART`]）
     Installed(Version),
     /// 这一步没成：`release` 为查到的新版本（查的时候没成为 None），可再试
     Failed {
@@ -120,10 +121,12 @@ impl Updates {
                 cx.notify();
             }
         });
-        // 退出已不可撤回：装好了的照它接着做，点了重启的另打开新版本
-        let quitting = cx.on_app_quit(|this: &mut Self, _| {
-            if let Some(restart) = this.restart.take()
-                && let Err(error) = restart.spawn(this.restarting.is_some())
+        // 退出已不可撤回、而且是为重启而退出（点了重启之后没有撤回过）：打开新版本（Windows 先装）
+        let quitting = cx.on_app_quit(|this: &mut Self, cx| {
+            let stays = this.tasks.read(cx).stays();
+            if this.restarting == Some(stays)
+                && let Some(restart) = this.restart.take()
+                && let Err(error) = restart.spawn()
             {
                 // 已在退出，界面没了：下次启动时报出来
                 let _unrecorded =

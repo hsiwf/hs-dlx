@@ -49,6 +49,7 @@ public:
 	std::uint16_t listen_port() const;
 	void set_upload_limit(std::int32_t bytes_per_second) const;
 	void set_proxy(SocksProxy const& proxy) const;
+	void clear_proxy_error() const;
 	NetworkStatus network() const;
 	void request_stats() const;
 	rust::Vec<TrackerState> trackers(rust::Str id) const;
@@ -127,6 +128,8 @@ private:
 
 std::unique_ptr<Session> new_session(SessionConfig const& config);
 
+// 磁力链接对应的种子编号（同 add_magnet 定的）；不是磁力链接时抛出。
+rust::String magnet_id(rust::Str uri);
 // 种子文件（bencode 写的）转成续传数据（还没下过的）。
 rust::Vec<std::uint8_t> resume_from_torrent_file(rust::Slice<std::uint8_t const> torrent);
 // 续传数据里的种子信息；没有种子信息时抛出。
