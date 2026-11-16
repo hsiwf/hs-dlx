@@ -590,7 +590,7 @@ pub(crate) struct Bt {
     /// 持着 `running` 的锁改与读
     proxy_doubted: AtomicBool,
     /// libtorrent 可能已放弃连代理、还没让它重连：探出过握手被拒（[`ProxyCheck::Refused`]），或用户在还没探到能用时
-    /// 重新保存了同一个；探到能用时重连并清掉。持着 `running` 的锁改与读
+    /// 重新保存了同一个；之后握手与申请转发成了（能用，或接了转发而 UDP 没回）时重连并清掉。持着 `running` 的锁改与读
     proxy_reconnect: AtomicBool,
     /// BT 会话在时探出过引导节点被 TUN 代理解析成假地址、经代理问不通：libtorrent 只在启动 DHT 时解析一次，手里的多半
     /// 也是假地址，之后解析到真实地址也要重启才生效。与代理的设置无关，到进程退出都在；持着 `running` 的锁改与读。
@@ -776,8 +776,8 @@ impl Bt {
 
     /// 改经的代理（None 为直连；调用方已校验，见 [`crate::socks::check`]）：已建的会话随即照它，之后建的也照它。交给
     /// libtorrent 的设置不变时（重新保存同一个，或写法不同而等价，如 socks5 与 socks5h）只换记着的地址，探到的情况与
-    /// libtorrent 的连接都照旧；只是记着的不是能用时，记下探到能用时让 libtorrent 重连（它在握手被拒后不再自己重试，
-    /// 有的还不报错）。
+    /// libtorrent 的连接都照旧；只是记着的不是能用时，记下下次握手与申请转发成了时让 libtorrent 重连（它在握手被拒后
+    /// 不再自己重试，有的还不报错）。
     pub fn set_proxy(&self, proxy: Option<Url>) {
         let running = lock(&self.running);
         let socks = libtorrent_proxy(proxy.as_ref());
@@ -843,9 +843,8 @@ impl Bt {
 
     /// 记下探 `url` 的结果，不存疑（用户点的网络检测：报告与记下的一致）；代理已改成别的时不记。这次握手与申请转发成了
     /// （能用，或接了转发而 UDP 没回）、而 libtorrent 可能已放弃连代理（见 `proxy_reconnect`）或经它报过错时，让它重连
-    /// 并清掉那条出错：报过错即原来的转发
-    /// 已断，它之后的重试可能在握手时被拒而不再重试、也不报错。重连会断开经代理的 uTP 连接，别的时候不重连。BT 会话
-    /// 在时解析到过 TUN 的假地址而问不通（见 `proxy_fake_ip`），之后这次有引导节点解析到真实地址而能用时，记为没转发
+    /// 并清掉那条出错：报过错即原来的转发已断，它之后的重试可能在握手时被拒而不再重试、也不报错。重连会断开经代理的
+    /// uTP 连接，别的时候不重连。BT 会话在时解析到过 TUN 的假地址而问不通（见 `proxy_fake_ip`），之后这次有引导节点解析到真实地址而能用时，记为没转发
     /// 出去并说明要重启；全是假地址而能用的（代理就是 TUN 代理自己的 SOCKS 端口）照实记。`resolved` 为这次引导节点解析
     /// 得怎样。返回现在记着的（报告照它出）；代理已改成别的时原样返回 `check`。
     pub fn record_proxy_check(

@@ -272,10 +272,23 @@ fn checks_after_connectivity(facts: &Facts, mut checks: Vec<Check>) -> Vec<Check
             CheckLevel::Ok,
             "私有种子不用 DHT".to_owned(),
         ),
+        // 第一项「BT 代理」报了问题（用不了、出过错、还在探）时原因与改法在那里
+        (false, Some(0))
+            if facts.proxy.as_ref().is_some_and(|proxy| {
+                proxy.check != ProxyCheck::Usable || !proxy.error.is_empty()
+            }) =>
+        {
+            check(
+                CheckItem::Dht,
+                CheckLevel::Warn,
+                "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有时原因与改法见第一项「BT 代理」".to_owned(),
+            )
+        }
         (false, Some(0)) if facts.proxy.is_some() => check(
             CheckItem::Dht,
             CheckLevel::Warn,
-            "DHT 里一个节点也没有：刚开始找要等一会儿；一直没有时原因与改法见第一项「BT 代理」".to_owned(),
+            "DHT 里一个节点也没有：刚开始找要等一会儿；代理探着能用而一直没有时，到设置里做一次网络检测，看经代理的 DHT 与引导节点能不能解析"
+                .to_owned(),
         ),
         (false, Some(0)) => check(
             CheckItem::Dht,
