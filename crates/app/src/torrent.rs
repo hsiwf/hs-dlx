@@ -321,7 +321,9 @@ impl Engine {
         match &*self.proxy_check.borrow() {
             // 改成直连之后才取出的、经旧代理的出错不算
             ProxyCheck::Direct => return None,
-            ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => return Some(why.clone()),
+            ProxyCheck::Unreachable(why) | ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => {
+                return Some(why.clone());
+            }
             ProxyCheck::Unchecked | ProxyCheck::Checking | ProxyCheck::Usable => {}
         }
         let error = self.session.network().proxy_error;
@@ -879,7 +881,10 @@ impl Bt {
                 due = true;
                 true
             }
-            ProxyCheck::Checking | ProxyCheck::Refused(_) | ProxyCheck::Silent(_) => {
+            ProxyCheck::Checking
+            | ProxyCheck::Unreachable(_)
+            | ProxyCheck::Refused(_)
+            | ProxyCheck::Silent(_) => {
                 due = true;
                 false
             }

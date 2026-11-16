@@ -142,7 +142,7 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     if let Some(proxy) = &facts.proxy {
         let address = &proxy.address;
         checks.push(match &proxy.check {
-            ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => check(
+            ProxyCheck::Unreachable(why) | ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => check(
                 CheckItem::Listen,
                 CheckLevel::Bad,
                 format!("BT 代理用不了：{why}"),

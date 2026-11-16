@@ -169,21 +169,27 @@ pub(crate) const DROPS_UDP: &str =
 
 /// 经代理问的 DHT 引导节点被 TUN 代理解析成假地址、一个都没回时的说明。libtorrent 解析引导节点同样用本机的 DNS，
 /// 拿到的也是这些假地址。
-pub(crate) const PROXY_FAKE_IP: &str = "DHT 引导节点被系统里的 TUN 代理解析成了假地址（198.18.0.0/15），经这个代理问不到；BT 同样照这些地址问，只能靠之前存下的节点连 DHT，第一次用时连不上。在 TUN 代理里把这几个域名排除出 fake-ip，或把 BT 代理设成 TUN 代理自己的 SOCKS 端口";
+pub(crate) static PROXY_FAKE_IP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let hosts: Vec<&str> = DHT_BOOTSTRAP.iter().map(|(host, _)| *host).collect();
+    format!(
+        "DHT 引导节点被系统里的 TUN 代理解析成了假地址（198.18.0.0/15），经这个代理一个都没回；BT 同样照这些地址问，没有存下的节点时只靠 DHT 的磁力取不到种子信息。BT 代理不是 TUN 代理自己的 SOCKS 端口时，在 TUN 代理里把 {} 排除出 fake-ip，或改用它的 SOCKS 端口；已是时，是它的节点没转发 UDP，换节点或打开 UDP",
+        hosts.join("、")
+    )
+});
 
-/// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为原因）的结论，网络检测与后台看护
-/// 记进 BT 引擎的都照它：只看经代理的，不拿直连的比。握手没成为 [`ProxyCheck::Refused`]；收发出错、引导节点一个都
-/// 没回为 [`ProxyCheck::Silent`]（解析成 TUN 的假地址时说明为 [`PROXY_FAKE_IP`]）。引导节点都解析不出、没问成时握手
-/// 成了即算能用。
-pub(crate) fn judge_proxy(through: &Result<Dht, String>) -> ProxyCheck {
+/// 经 BT 代理问 DHT 引导节点（`through` 为经它量到的，握手或申请转发 UDP 没成时为 [`crate::socks::associate`] 的
+/// 结论）的结论，网络检测与后台看护记进 BT 引擎的都照它：只看经代理的，不拿直连的比。收发出错、引导节点一个都没回为
+/// [`ProxyCheck::Silent`]（解析成 TUN 的假地址时说明为 [`PROXY_FAKE_IP`]）。引导节点都解析不出、没问成时握手成了即
+/// 算能用。
+pub(crate) fn judge_proxy(through: &Result<Dht, ProxyCheck>) -> ProxyCheck {
     match through {
-        Err(why) => ProxyCheck::Refused(why.clone()),
+        Err(check) => check.clone(),
         Ok(Dht {
             failure: Some(why), ..
         }) => ProxyCheck::Silent(why.clone()),
         Ok(through) if through.bootstrap.asked == 0 => ProxyCheck::Usable,
         Ok(through) if through.bootstrap.replied == 0 => ProxyCheck::Silent(if through.tun {
-            PROXY_FAKE_IP.to_owned()
+            PROXY_FAKE_IP.clone()
         } else {
             PROXY_SILENT.to_owned()
         }),
@@ -192,14 +198,14 @@ pub(crate) fn judge_proxy(through: &Result<Dht, String>) -> ProxyCheck {
 }
 
 /// 经 BT 代理 `url` 探 DHT：握手、申请转发 UDP，再经它向引导节点 `hosts` 要节点（`hosts` 为空时只握手）。握手或申请
-/// 没成时内层为原因；开不了本机的 UDP 套接字时为外层的错。
+/// 没成时内层为 [`crate::socks::associate`] 的结论；开不了本机的 UDP 套接字时为外层的错。
 pub(crate) async fn through_proxy(
     url: &Url,
     hosts: &[(&'static str, u16)],
-) -> std::io::Result<Result<Dht, String>> {
+) -> std::io::Result<Result<Dht, ProxyCheck>> {
     let relay = match crate::socks::associate(url).await {
         Ok(relay) => relay,
-        Err(why) => return Ok(Err(why)),
+        Err(check) => return Ok(Err(check)),
     };
     let udp = match Udp::via(relay).await? {
         Ok(udp) => udp,
@@ -222,7 +228,7 @@ pub(crate) const PROXY_SILENT: &str = "经代理问 DHT 引导节点一个都没
 pub(crate) async fn probe_proxy(url: &Url, hosts: &[(&'static str, u16)]) -> ProxyCheck {
     let relay = match crate::socks::associate(url).await {
         Ok(relay) => relay,
-        Err(why) => return ProxyCheck::Refused(why),
+        Err(check) => return check,
     };
     let udp = match Udp::via(relay).await {
         Ok(Ok(udp)) => udp,
@@ -457,8 +463,8 @@ pub(crate) fn report(measured: &Measured) -> NetworkReport {
     });
     let verdict = match &proxied {
         _ if dht.failure.is_some() => "直连的 DHT 没测完：可再测一次".to_owned(),
-        Some((proxy, _)) if proxy.check.problem() == Some(PROXY_FAKE_IP) => {
-            "BT 代理问 DHT 时被系统里的 TUN 代理挡住：见上面「BT 代理」一项".to_owned()
+        Some((proxy, _)) if proxy.check.problem() == Some(PROXY_FAKE_IP.as_str()) => {
+            "经 BT 代理的 DHT 不通，与系统里的 TUN 代理有关：见上面「BT 代理」一项".to_owned()
         }
         None => match direct {
             Health::Healthy => "网络正常：BT 能直接连".to_owned(),
@@ -1035,7 +1041,7 @@ mod tests {
         assert!(report(&both).verdict.contains("可关掉 BT 代理"));
         // 代理用不了、直连正常：不能说「网络正常」
         let mut broken = healthy();
-        broken.proxy = proxied(ProxyCheck::Refused("连不上代理".into()), None);
+        broken.proxy = proxied(ProxyCheck::Unreachable("连不上代理".into()), None);
         let broken = report(&broken);
         assert_eq!(level(&broken, NetItem::Proxy), CheckLevel::Bad);
         assert!(
@@ -1046,7 +1052,7 @@ mod tests {
         // 代理用不了、直连说不准：不说直连大多不通
         let mut unsure = healthy();
         unsure.dht = dht_of(ratio(4, 2), ratio(4, 1));
-        unsure.proxy = proxied(ProxyCheck::Refused("连不上代理".into()), None);
+        unsure.proxy = proxied(ProxyCheck::Unreachable("连不上代理".into()), None);
         let unsure = report(&unsure);
         assert!(!unsure.verdict.contains("大多不通"), "{}", unsure.verdict);
         // 代理接了 UDP 转发却没转发出去
@@ -1125,10 +1131,10 @@ mod tests {
         tun.tun = true;
         assert_eq!(
             judge_proxy(&Ok(tun.clone())),
-            ProxyCheck::Silent(PROXY_FAKE_IP.into())
+            ProxyCheck::Silent(PROXY_FAKE_IP.clone())
         );
         let mut report_of_tun = healthy();
-        report_of_tun.proxy = proxied(ProxyCheck::Silent(PROXY_FAKE_IP.into()), Some(tun));
+        report_of_tun.proxy = proxied(ProxyCheck::Silent(PROXY_FAKE_IP.clone()), Some(tun));
         assert!(text(&report(&report_of_tun), NetItem::Proxy).contains("fake-ip"));
         let mut unsent = silent;
         unsent.failure = Some("发不到代理的 UDP 转发地址".into());
@@ -1137,8 +1143,8 @@ mod tests {
             ProxyCheck::Silent("发不到代理的 UDP 转发地址".into())
         );
         assert_eq!(
-            judge_proxy(&Err("连不上代理".into())),
-            ProxyCheck::Refused("连不上代理".into())
+            judge_proxy(&Err(ProxyCheck::Unreachable("连不上代理".into()))),
+            ProxyCheck::Unreachable("连不上代理".into())
         );
     }
 
@@ -1274,7 +1280,10 @@ mod tests {
         // 回 0.0.0.0 的：libtorrent 收不到经它回来的包
         let unspecified = fake_socks(Ipv4Addr::UNSPECIFIED).await;
         let refused = crate::socks::associate(&unspecified).await.err().unwrap();
-        assert!(refused.contains("0.0.0.0"), "{refused}");
+        assert!(
+            matches!(&refused, ProxyCheck::Refused(why) if why.contains("0.0.0.0")),
+            "{refused:?}"
+        );
     }
 
     /// 后台探 BT 代理只经代理：引导节点经它有回应为能用，一个都不回为用不了，连不上代理写明原因。
@@ -1300,7 +1309,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             probe_proxy(&unreachable, &[("127.0.0.1", answering.port())]).await,
-            ProxyCheck::Refused(why) if why.contains("连不上代理")
+            ProxyCheck::Unreachable(why) if why.contains("连不上代理")
         ));
     }
 }

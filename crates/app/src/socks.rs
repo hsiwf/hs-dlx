@@ -25,7 +25,10 @@ pub(crate) enum ProxyCheck {
     Checking,
     /// 连得上、认证过了、接了 UDP 转发；问得了 DHT 引导节点时经它问通了
     Usable,
-    /// 连不上、握手、认证或申请转发 UDP 没成，为原因。握手被拒后 libtorrent 不再自己重试，恢复后要让它重连
+    /// 解析不出、连不上、超时或连接断开，为原因；libtorrent 遇到这些按退避自己重试
+    Unreachable(String),
+    /// 代理在协议上拒绝了（不是 SOCKS5、认证方式不接受、认证被拒、拒绝转发 UDP、回的转发地址 BT 用不了），为原因；
+    /// libtorrent 遇到这些不再自己重试，恢复后要让它重连
     Refused(String),
     /// 接了 UDP 转发，但经它问 DHT 引导节点一个都没回、或发不到转发地址，为原因；libtorrent 那边的转发照旧
     Silent(String),
@@ -35,7 +38,9 @@ impl ProxyCheck {
     /// 用不了时的原因。
     pub(crate) fn problem(&self) -> Option<&str> {
         match self {
-            ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => Some(why),
+            ProxyCheck::Unreachable(why) | ProxyCheck::Refused(why) | ProxyCheck::Silent(why) => {
+                Some(why)
+            }
             ProxyCheck::Direct
             | ProxyCheck::Unchecked
             | ProxyCheck::Checking
@@ -121,26 +126,32 @@ pub(crate) struct UdpRelay {
 }
 
 /// 照 libtorrent 经代理时的步骤谈 UDP 转发（`url` 已过 [`check`]）：解析主机取 IPv4 地址、连上去、按地址里有没有
-/// 用户名选认证方式、申请转发 UDP，看它回的转发地址 libtorrent 用不用得了；谈好时留着控制连接。用不了时为原因，
-/// [`PROBE_TIMEOUT`] 内没做完也算用不了。
-pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, String> {
+/// 用户名选认证方式、申请转发 UDP，看它回的转发地址 libtorrent 用不用得了；谈好时留着控制连接。用不了时为
+/// [`ProxyCheck::Unreachable`] 或 [`ProxyCheck::Refused`]（带原因），[`PROBE_TIMEOUT`] 内没做完算前者。
+pub(crate) async fn associate(url: &Url) -> Result<UdpRelay, ProxyCheck> {
     let proxy = libtorrent_proxy(Some(url));
     tokio::time::timeout(PROBE_TIMEOUT, handshake(&proxy))
         .await
-        .map_err(|_| format!("代理 {} 10 秒内没回应", hs_m3u8_core::bare_url(url)))?
+        .map_err(|_| {
+            ProxyCheck::Unreachable(format!(
+                "代理 {} 10 秒内没回应",
+                hs_m3u8_core::bare_url(url)
+            ))
+        })?
 }
 
-async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
+async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, ProxyCheck> {
     let at = format!("{}:{}", proxy.host, proxy.port);
+    let refused = |why: String| ProxyCheck::Refused(why);
     let address = tokio::net::lookup_host(&at)
         .await
-        .map_err(|error| format!("解析不出代理 {at}：{error}"))?
+        .map_err(|error| ProxyCheck::Unreachable(format!("解析不出代理 {at}：{error}")))?
         .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| format!("代理 {at} 没有 IPv4 地址"))?;
+        .ok_or_else(|| ProxyCheck::Unreachable(format!("代理 {at} 没有 IPv4 地址")))?;
     let mut stream = TcpStream::connect(address)
         .await
-        .map_err(|error| format!("连不上代理 {at}：{error}"))?;
-    let io = |error: std::io::Error| format!("代理 {at} 断开了：{error}");
+        .map_err(|error| ProxyCheck::Unreachable(format!("连不上代理 {at}：{error}")))?;
+    let io = |error: std::io::Error| ProxyCheck::Unreachable(format!("代理 {at} 断开了：{error}"));
     let login = !proxy.username.is_empty();
     // 提供的认证方式同 libtorrent：有用户名时免认证与用户名密码都提供，由代理选
     let offered: &[u8] = if login { &[5, 2, 0, 2] } else { &[5, 1, 0] };
@@ -148,13 +159,17 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
     let mut reply = [0; 2];
     stream.read_exact(&mut reply).await.map_err(io)?;
     if reply[0] != 5 {
-        return Err(format!("{at} 不是 SOCKS5 代理"));
+        return Err(refused(format!("{at} 不是 SOCKS5 代理")));
     }
     match reply[1] {
         0 => {}
         2 if login => {}
-        _ if login => return Err(format!("代理 {at} 不接受这两种认证方式")),
-        _ => return Err(format!("代理 {at} 要认证：在地址里写上用户名与密码")),
+        _ if login => return Err(refused(format!("代理 {at} 不接受这两种认证方式"))),
+        _ => {
+            return Err(refused(format!(
+                "代理 {at} 要认证：在地址里写上用户名与密码"
+            )));
+        }
     }
     if reply[1] == 2 {
         let mut request = vec![1, len(&proxy.username)];
@@ -164,7 +179,7 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
         stream.write_all(&request).await.map_err(io)?;
         stream.read_exact(&mut reply).await.map_err(io)?;
         if reply[1] != 0 {
-            return Err(format!("代理 {at} 的用户名或密码不对"));
+            return Err(refused(format!("代理 {at} 的用户名或密码不对")));
         }
     }
     // UDP ASSOCIATE，客户端地址不定（0.0.0.0:0），同 libtorrent
@@ -175,10 +190,10 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
     let mut head = [0; 4];
     stream.read_exact(&mut head).await.map_err(io)?;
     if head[1] != 0 {
-        return Err(format!(
+        return Err(refused(format!(
             "代理 {at} 不转发 UDP（{}）：DHT、uTP 与 UDP 的 tracker 经不了它",
             refusal(head[1])
-        ));
+        )));
     }
     let relay = match head[3] {
         1 => {
@@ -188,9 +203,9 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
             let port = u16::from_be_bytes([bound[4], bound[5]]);
             // libtorrent 照原样记下转发地址，只收从它来的包：0.0.0.0 时回包的来源（代理的真实地址）对不上，全被丢掉
             if ip.is_unspecified() {
-                return Err(format!(
-                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它"
-                ));
+                return Err(refused(format!(
+                    "代理 {at} 回的 UDP 转发地址是 0.0.0.0：BT 收不到经它回来的包，DHT、uTP 与 UDP 的 tracker 经不了它。在代理里把 UDP 的绑定地址设成具体的 IP（如 127.0.0.1）"
+                )));
             }
             SocketAddr::new(ip.into(), port)
         }
@@ -204,14 +219,14 @@ async fn handshake(proxy: &SocksProxy) -> Result<UdpRelay, String> {
             SocketAddr::new(address.ip(), port)
         }
         4 => {
-            return Err(format!(
+            return Err(refused(format!(
                 "代理 {at} 转发 UDP 用的是 IPv6 地址，经代理时只能用 IPv4：DHT、uTP 与 UDP 的 tracker 经不了它"
-            ));
+            )));
         }
         other => {
-            return Err(format!(
+            return Err(refused(format!(
                 "代理 {at} 回的 UDP 转发地址认不出（地址类型 {other}）"
-            ));
+            )));
         }
     };
     Ok(UdpRelay {
