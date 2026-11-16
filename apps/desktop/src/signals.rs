@@ -3,8 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hs_dlx_app::pikpak::Phase;
-use hs_dlx_app::{CloudProgress, TorrentPhase, TorrentProgress};
+use hs_dlx_app::{CloudPhase, CloudProgress, TorrentPhase, TorrentProgress};
 use hs_m3u8_core::{
     FetchErrorKind, FetchFailure, FileProgress, HttpErrorKind, Progress, Purpose, Retrying, Stage,
 };
@@ -149,14 +148,12 @@ pub fn between_cloud(before: Option<&CloudProgress>, now: &CloudProgress) -> Vec
             };
             if was != Some(*phase) {
                 let (level, text) = match phase {
-                    Phase::Pending => (Level::Info, "PikPak 收下了，在排队"),
-                    Phase::Running => (Level::Info, "PikPak 在下，下完后取回本机"),
-                    Phase::Paused => (
+                    CloudPhase::Queued => (Level::Info, "PikPak 收下了，在排队"),
+                    CloudPhase::Running => (Level::Info, "PikPak 在下，下完后取回本机"),
+                    CloudPhase::Paused => (
                         Level::Warn,
                         "PikPak 上的离线下载被暂停了（在网页或 App 里），恢复后才接着下",
                     ),
-                    // 完成随后以列出文件报，失败以任务停下报
-                    Phase::Complete | Phase::Failed => return found,
                 };
                 found.push((level, text.to_owned()));
             }

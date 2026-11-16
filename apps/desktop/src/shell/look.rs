@@ -1,8 +1,7 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_dlx_app::pikpak::Phase;
-use hs_dlx_app::{CloudProgress, Failure, Status, TorrentPhase};
+use hs_dlx_app::{CloudPhase, CloudProgress, Failure, Status, TorrentPhase};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -332,13 +331,13 @@ fn running_cloud(row: &Row) -> Look {
         (Some(CloudProgress::Remote { phase, percent: p }), _) => {
             let share = f32::from(*p) / 100.0;
             let (state, color, line) = match phase {
-                Phase::Paused => (
+                CloudPhase::Paused => (
                     "云端暂停",
                     theme::warn(),
                     "在网页或 App 里被暂停了，恢复后才接着下",
                 ),
-                Phase::Pending => ("云端排队", theme::accent_dim(), "PikPak 收下了，在排队"),
-                Phase::Running | Phase::Complete | Phase::Failed => (
+                CloudPhase::Queued => ("云端排队", theme::accent_dim(), "PikPak 收下了，在排队"),
+                CloudPhase::Running => (
                     "云端下载",
                     theme::accent_dim(),
                     "PikPak 在下，下完后取回本机",

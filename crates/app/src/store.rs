@@ -516,7 +516,8 @@ fn add_torrent_proxy(tx: &Transaction<'_>) -> Result<(), Error> {
 /// 第 11 版：
 /// - 重建任务表，加云离线任务（种类 `cloud`，见 [`crate::CloudSpec`]）：网盘（`cloud_provider`）、建任务的账号
 ///   （`cloud_user`）与保存目录（`cloud_folder`）必有；网盘上离线任务的编号（`cloud_job`）提交成了才有；内容的根
-///   （`cloud_root`）与任务目录一起在列出文件时定下，那时一定已提交；没有请求头。失败的种类加 `cloud-login`、
+///   （`cloud_root`）与任务目录一起在列出文件时定下，那时一定已提交；提交发出前记下提交前网盘上已有的同链接任务
+///   （`cloud_before`，JSON 字符串数组），拿到编号即清掉；没有请求头。失败的种类加 `cloud-login`、
 ///   `cloud-quota`、`cloud-failed`、`cloud-api`、`integrity`。其余约束不变。
 /// - 云离线任务的文件（`cloud_file`，见 [`crate::CloudFile`]）：按任务与序号（列出时的次序，从 0 起），路径不重复；
 ///   下完（`done`）的一定已取回到输出位置（`fetched`）。不用外键：迁移在事务里跑，关不了外键检查，之后重建任务表时
@@ -552,6 +553,7 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
             cloud_provider TEXT CHECK (cloud_provider IN ('pikpak')),
             cloud_user TEXT CHECK (cloud_user != ''),
             cloud_job TEXT CHECK (cloud_job != ''),
+            cloud_before TEXT CHECK (cloud_before IS NULL OR cloud_job IS NULL),
             cloud_folder TEXT,
             cloud_root TEXT,
             work_dir TEXT,
@@ -590,7 +592,7 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
             CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_user IS NOT NULL
                                        AND cloud_folder IS NOT NULL)),
             CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_user IS NULL AND cloud_job IS NULL
-                                      AND cloud_folder IS NULL AND cloud_root IS NULL)),
+                                      AND cloud_before IS NULL AND cloud_folder IS NULL AND cloud_root IS NULL)),
             CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)
                                        AND (cloud_root IS NULL OR cloud_job IS NOT NULL)))
         ) STRICT;
@@ -734,7 +736,7 @@ const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, m
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
                        file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding, cloud_provider, \
-                       cloud_job, cloud_folder, cloud_root, cloud_user";
+                       cloud_job, cloud_folder, cloud_root, cloud_user, cloud_before";
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
@@ -817,8 +819,8 @@ pub fn insert(
             )
         }
     };
-    let (provider, user, job, folder, cloud_root) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None),
+    let (provider, user, job, before, folder, cloud_root) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None, None),
         Kind::Cloud(cloud) => {
             if !cloud.folder.is_absolute() {
                 return Err(Error::InvalidInput(format!(
@@ -830,6 +832,7 @@ pub fn insert(
                 Some(provider_code(cloud.provider)),
                 Some(cloud.user.as_str()),
                 cloud.job.as_deref(),
+                cloud.before.as_ref().map(to_json),
                 Some(utf8(&cloud.folder)?),
                 cloud.root.as_deref().map(named_utf8).transpose()?,
             )
@@ -849,9 +852,9 @@ pub fn insert(
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
                            torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root,
-                           cloud_user)
+                           cloud_user, cloud_before)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -881,6 +884,7 @@ pub fn insert(
             folder,
             cloud_root,
             user,
+            before,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -1180,7 +1184,7 @@ pub fn set_cloud_root(
 }
 
 /// 云离线任务的文件，按序号；还没定下根的为空。路径不是相对内容的根、以 `/` 分隔的文件名时（有空段、`.`、`..`、
-/// 反斜杠）报 [`Error::Corrupt`]：本应用写入的都合要求，拼出的路径不会越出内容的根。
+/// 反斜杠、冒号）报 [`Error::Corrupt`]：本应用写入的都合要求，拼出的路径不会越出内容的根。
 pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, Error> {
     let mut statement = tx.prepare(
         "SELECT file_id, path, size, gcid, fetched, done FROM cloud_file WHERE task_id = ?1 ORDER BY seq",
@@ -1197,10 +1201,11 @@ pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, E
     })?;
     rows.map(|row| {
         let (file_id, path, size, gcid, fetched, done) = row?;
+        // 反斜杠与冒号在 Windows 上会换掉路径的根（`C:x`、`\\x`）
         let safe = path.is_empty()
             || path
                 .split('/')
-                .all(|part| !matches!(part, "" | "." | "..") && !part.contains('\\'));
+                .all(|part| !matches!(part, "" | "." | "..") && !part.contains(['\\', ':']));
         if !safe {
             return Err(Error::Corrupt(format!("{id}的文件路径 {path:?}")));
         }
@@ -1216,15 +1221,43 @@ pub fn cloud_files(tx: &Transaction<'_>, id: TaskId) -> Result<Vec<CloudFile>, E
     .collect()
 }
 
-/// 记下云离线任务提交到网盘后网盘给的离线任务编号 `job`（不能为空）；没有这个还没提交过的云离线任务时报
-/// [`Error::NotFound`]。
+/// 记下云离线任务提交到网盘后网盘给的离线任务编号 `job`（不能为空），清掉提交中的标记；没有这个还没提交过的云离线
+/// 任务时报 [`Error::NotFound`]。
 pub fn set_cloud_job(tx: &Transaction<'_>, id: TaskId, job: &str) -> Result<(), Error> {
     if job.is_empty() {
         return Err(Error::InvalidInput("网盘给的离线任务编号是空的".to_owned()));
     }
     if tx.execute(
-        "UPDATE task SET cloud_job = ?2 WHERE id = ?1 AND kind = 'cloud' AND cloud_job IS NULL",
+        "UPDATE task SET cloud_job = ?2, cloud_before = NULL
+         WHERE id = ?1 AND kind = 'cloud' AND cloud_job IS NULL",
         params![id.0, job],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 记下云离线任务正要提交：`before` 为提交前网盘上已有的同一链接的离线任务编号，提交结果不明（发出后断开、退出）时
+/// 下次按它找这之后新建的那个。没有这个还没提交过的云离线任务时报 [`Error::NotFound`]。
+pub fn set_cloud_before(tx: &Transaction<'_>, id: TaskId, before: &[String]) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET cloud_before = ?2 WHERE id = ?1 AND kind = 'cloud' AND cloud_job IS NULL",
+        params![id.0, to_json(&before)],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 网盘上的离线任务不在了（用户在网页或 App 里删了）：清掉记着的编号，继续时重新提交。只用于还没列出文件的；没有
+/// 这样的云离线任务时报 [`Error::NotFound`]。
+pub fn clear_cloud_job(tx: &Transaction<'_>, id: TaskId) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET cloud_job = NULL, cloud_before = NULL
+         WHERE id = ?1 AND kind = 'cloud' AND cloud_root IS NULL",
+        [id.0],
     )? == 0
     {
         return Err(Error::NotFound(id));
@@ -1348,6 +1381,7 @@ struct Row {
     cloud_folder: Option<String>,
     cloud_root: Option<String>,
     cloud_user: Option<String>,
+    cloud_before: Option<String>,
 }
 
 impl Row {
@@ -1389,6 +1423,7 @@ impl Row {
             cloud_folder: row.get(33)?,
             cloud_root: row.get(34)?,
             cloud_user: row.get(35)?,
+            cloud_before: row.get(36)?,
         })
     }
 
@@ -1416,10 +1451,16 @@ impl Row {
                 {
                     return Err(corrupt("云离线的保存目录或内容的根"));
                 }
+                let before = self
+                    .cloud_before
+                    .map(|text| serde_json::from_str::<Vec<String>>(&text))
+                    .transpose()
+                    .map_err(|_| corrupt("提交前已有的离线任务"))?;
                 Some(CloudSpec {
                     provider: parse_provider(&provider).ok_or_else(|| corrupt("网盘"))?,
                     user,
                     job,
+                    before,
                     folder,
                     root,
                 })
@@ -2356,6 +2397,7 @@ mod tests {
                 provider: CloudProvider::PikPak,
                 user: "user-1".into(),
                 job: job.map(str::to_owned),
+                before: None,
                 folder: m(""),
                 root,
             }),
@@ -2389,6 +2431,24 @@ mod tests {
         let files = [cloud_file("VA", "a.bin"), cloud_file("VB", "Sub/b.bin")];
         // 没提交就定不了根
         assert!(set_cloud_root(&tx, id, &m("节目"), &m("节目.hsdl"), &files).is_err());
+        // 提交中的标记读得回；拿到编号即清掉
+        set_cloud_before(&tx, id, &["VOld".to_owned()]).unwrap();
+        let before = get(&tx, id).unwrap().unwrap();
+        assert_eq!(
+            before.spec.cloud().unwrap().before.as_deref(),
+            Some(&["VOld".to_owned()][..])
+        );
+        set_cloud_job(&tx, id, "VGone").unwrap();
+        assert_eq!(
+            get(&tx, id).unwrap().unwrap().spec.cloud().unwrap().before,
+            None
+        );
+        assert!(matches!(
+            set_cloud_before(&tx, id, &[]),
+            Err(Error::NotFound(_))
+        ));
+        // 网盘上的不在了：清掉编号，重新提交
+        clear_cloud_job(&tx, id).unwrap();
         set_cloud_job(&tx, id, "VTask1").unwrap();
         assert!(matches!(
             set_cloud_job(&tx, id, "VTask2"),
@@ -2420,11 +2480,12 @@ mod tests {
                 .unwrap()
                 .contains(&naming::path_key(&text("节目")))
         );
-        // 只能定一次
+        // 只能定一次；定了根之后不再清编号
         assert!(matches!(
             set_cloud_root(&tx, id, &m("别处"), &m("别处.hsdl"), &files),
             Err(Error::NotFound(_))
         ));
+        assert!(matches!(clear_cloud_job(&tx, id), Err(Error::NotFound(_))));
         // 没取回的不能记为下完
         assert!(set_cloud_file_done(&tx, id, 1, true).is_err());
         set_cloud_file_fetched(&tx, id, 1, true).unwrap();
@@ -2492,7 +2553,7 @@ mod tests {
             &[cloud_file("VA", "a/b")],
         )
         .unwrap();
-        for bad in ["../x", "a//b", "/x", "a/..", ".", "a\\b"] {
+        for bad in ["../x", "a//b", "/x", "a/..", ".", "a\\b", "C:x", "a/C:x"] {
             tx.execute("UPDATE cloud_file SET path = ?1", [bad])
                 .unwrap();
             assert!(

@@ -26,7 +26,7 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 mod cloud;
 
-pub use cloud::CloudProgress;
+pub use cloud::{CloudPhase, CloudProgress};
 
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
@@ -441,6 +441,11 @@ impl Service {
         let _timed_out = self
             .runtime()
             .block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tracker.wait()).await });
+        // 在途的换令牌发出后旧的 refresh_token 即作废：等它收下、存好新的（一次接口请求的时限内）
+        let session = lock(&self.shared.pikpak).clone();
+        if let Some(session) = session {
+            self.runtime().block_on(session.settle());
+        }
         let flushed = self.flush();
         let saved = match self.shared.bt.close() {
             Ok(Some(state)) => self
@@ -705,8 +710,17 @@ impl Service {
                     match login.poll(&shared.engine, &http, &endpoints).await? {
                         pikpak::login::Poll::Pending => {}
                         pikpak::login::Poll::Done(account) => {
-                            let session = shared.new_pikpak_session(account.clone());
-                            shared.set_pikpak(Some(&account), Some(session))?;
+                            let current = lock(&shared.pikpak).clone();
+                            match current {
+                                // 同一账号重新登录：在用的登录状态换上新令牌，在跑的任务不受影响
+                                Some(session) if session.user_id() == account.user_id => {
+                                    session.adopt(account).await?;
+                                }
+                                _ => {
+                                    let session = shared.new_pikpak_session(account.clone());
+                                    shared.set_pikpak(Some(&account), Some(session))?;
+                                }
+                            }
                             return Ok(());
                         }
                     }
@@ -1712,6 +1726,7 @@ impl Shared {
             provider,
             user: session.user_id().to_owned(),
             job: None,
+            before: None,
             folder,
             root: None,
         };

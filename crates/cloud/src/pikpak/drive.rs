@@ -45,12 +45,14 @@ pub struct Entry {
     pub folder: bool,
     /// 字节数；文件夹为 0
     pub size: u64,
-    /// 文件的 GCID（见 [`super::gcid`]），40 位小写十六进制；文件夹为 None
+    /// 完整的文件的 GCID（见 [`super::gcid`]），40 位小写十六进制；文件夹与不完整的文件为 None
     pub gcid: Option<String>,
     /// 原文件的直链（带签名、有时效；取链与下载要走同一出口）：只有 [`Client::entry`] 取的文件有
     pub link: Option<Url>,
-    /// 内容完整、不在回收站里：离线下载里失败或还在处理的文件、被移进回收站的文件为 false
-    pub ready: bool,
+    /// 内容完整：离线下载里失败或还在处理的文件为 false；文件夹总是 true
+    pub complete: bool,
+    /// 在回收站里（用户在网页或 App 里删了）
+    pub trashed: bool,
 }
 
 /// 每页列多少项。
@@ -121,7 +123,8 @@ impl Client {
         list.tasks.into_iter().map(Job::of).collect()
     }
 
-    /// 文件夹 `folder` 里的文件与文件夹，按网盘给的次序；不完整的、在回收站里的也列出（[`Entry::ready`] 为 false）。
+    /// 文件夹 `folder` 里的文件与文件夹，按网盘给的次序；不完整的（[`Entry::complete`]）、在回收站里的
+    /// （[`Entry::trashed`]）也列出。
     pub async fn children(&self, folder: &str) -> Result<Vec<Entry>, Error> {
         checked_id(folder)?;
         let mut entries = Vec::new();
@@ -220,7 +223,8 @@ impl Entry {
             "drive#file" => false,
             other => return Err(Error::Unrecognized(format!("文件的种类 {other:?}"))),
         };
-        let gcid = if folder {
+        let complete = folder || file.phase == "PHASE_TYPE_COMPLETE";
+        let gcid = if !complete || folder {
             None
         } else {
             let gcid = file.hash.to_ascii_lowercase();
@@ -239,9 +243,9 @@ impl Entry {
                     .map_err(|error| Error::Unrecognized(format!("{} 的直链：{error}", file.name)))
             })
             .transpose()?;
-        let ready = !file.trashed && (folder || file.phase == "PHASE_TYPE_COMPLETE");
         Ok(Entry {
-            ready,
+            complete,
+            trashed: file.trashed,
             id: checked_id(&file.id)?.to_owned(),
             size: if folder {
                 0

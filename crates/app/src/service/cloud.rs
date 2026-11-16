@@ -32,7 +32,7 @@ const MAX_DEPTH: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudProgress {
     /// 网盘在下：阶段与百分比（0 到 100）
-    Remote { phase: Phase, percent: u8 },
+    Remote { phase: CloudPhase, percent: u8 },
     /// 网盘下完了，在列文件
     Listing,
     /// 在下第 `index` 个文件（从 0 起），共 `count` 个；`done` 为之前的文件已下完的字节数，`total` 为全部文件的，
@@ -53,6 +53,16 @@ pub enum CloudProgress {
         total: u64,
         checked: u64,
     },
+}
+
+/// 网盘上的离线下载还没完成时在哪一步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudPhase {
+    /// 网盘收下了，在排队
+    Queued,
+    Running,
+    /// 在网页或 App 里被暂停了，恢复后才接着下
+    Paused,
 }
 
 /// 开始了的云离线任务。
@@ -85,6 +95,7 @@ pub(super) fn failure(error: &pikpak::Error) -> Failure {
             Reason::Other => FailureKind::CloudFailed,
         },
         pikpak::Error::Unrecognized(_) => FailureKind::CloudApi,
+        // 简化：要人机验证也按登录失效报出、在消息里给出验证页；真遇到时看验证后怎么接着用，再单列一种失败与操作
         pikpak::Error::Verification(_)
         | pikpak::Error::LoginExpired
         | pikpak::Error::LoginDenied
@@ -209,7 +220,9 @@ impl Shared {
             ));
         }
         if spec.job.is_none() {
-            let job = self.submit_cloud(id, &task.spec.url, ctx).await?;
+            let job = self
+                .submit_cloud(id, &task.spec.url, spec.before.take(), ctx)
+                .await?;
             spec.job = Some(job);
         }
         let (root, work_dir, files) = match (&spec.root, &task.work_dir) {
@@ -246,14 +259,12 @@ impl Shared {
             match (exists(&output).await.map_err(Stop::Failed)?, file.fetched) {
                 // 上次取回、装上了输出，还没校验就停了
                 (true, true) => {}
+                // 没记上取回（装上输出后存储写不进、或正好退出）：内容与网盘的相符即认领，不符的不是这个任务的、不删
                 (true, false) => {
-                    return Err(Stop::failed(
-                        FailureKind::OutputTaken,
-                        format!(
-                            "保存位置上已有 {}，不是这个任务取回的：挪走后再继续",
-                            output.display()
-                        ),
-                    ));
+                    self.verify_cloud_file(at, file, &output, ctx.cancel, false)
+                        .await?;
+                    self.write(|tx| store::set_cloud_file_fetched(tx, id, index, true))
+                        .map_err(Stop::store)?;
                 }
                 (false, _) => {
                     let file_dir = work_dir.join(index.to_string());
@@ -264,7 +275,7 @@ impl Shared {
                         .map_err(Stop::store)?;
                 }
             }
-            self.verify_cloud_file(at, file, &output, ctx.cancel)
+            self.verify_cloud_file(at, file, &output, ctx.cancel, true)
                 .await?;
             self.write(|tx| store::set_cloud_file_done(tx, id, index, true))
                 .map_err(Stop::store)?;
@@ -312,15 +323,23 @@ impl Shared {
                 Err(error) => return Err(Stop::cloud(error)),
             };
             let Some(job) = job else {
+                self.write(|tx| store::clear_cloud_job(tx, id))
+                    .map_err(Stop::store)?;
                 return Err(Stop::failed(
                     FailureKind::CloudFailed,
-                    "网盘上的这个离线任务不在了（可能在网页或 App 里删了），只能放弃".to_owned(),
+                    "网盘上的这个离线任务不在了（可能在网页或 App 里删了）：继续即重新提交"
+                        .to_owned(),
                 ));
+            };
+            let phase = match job.phase {
+                Phase::Pending => CloudPhase::Queued,
+                Phase::Running | Phase::Complete | Phase::Failed => CloudPhase::Running,
+                Phase::Paused => CloudPhase::Paused,
             };
             self.cloud_progress(
                 id,
                 CloudProgress::Remote {
-                    phase: job.phase,
+                    phase,
                     percent: job.progress,
                 },
             );
@@ -360,22 +379,24 @@ impl Shared {
         } else {
             found.push((Vec::new(), top.clone()));
         }
+        // 用户在网页或 App 里删进回收站的（多为广告文件）不要
+        found.retain(|(_, entry)| !entry.trashed);
         if found.is_empty() {
             return Err(Stop::failed(
                 FailureKind::CloudFailed,
-                "网盘上下到的文件夹是空的".to_owned(),
+                "网盘上下到的文件夹是空的（或都在回收站里）".to_owned(),
             ));
         }
         let missing: Vec<&str> = found
             .iter()
-            .filter(|(_, entry)| !entry.ready)
+            .filter(|(_, entry)| !entry.complete)
             .map(|(_, entry)| entry.name.as_str())
             .collect();
         if !missing.is_empty() {
             return Err(Stop::failed(
                 FailureKind::CloudFailed,
                 format!(
-                    "网盘上有 {} 个文件不完整或在回收站里：{}",
+                    "网盘上有 {} 个文件没下完整：{}",
                     missing.len(),
                     missing.join("、")
                 ),
@@ -546,13 +567,16 @@ impl Shared {
         }
     }
 
-    /// 按网盘给的 GCID 校验第 `at.index` 个文件 `output`；不符时删掉它、以 [`FailureKind::Integrity`] 失败。
+    /// 按网盘给的 GCID 校验第 `at.index` 个文件 `output`。不符时：`owned`（这个任务取回的）删掉它、记为没取回，以
+    /// [`FailureKind::Integrity`] 失败，删不掉的以磁盘一类的失败报出；不是这个任务取回的不删，以
+    /// [`FailureKind::OutputTaken`] 失败。
     async fn verify_cloud_file(
         self: &Arc<Self>,
         at: Position,
         file: &CloudFile,
         output: &Path,
         cancel: &CancellationToken,
+        owned: bool,
     ) -> Result<(), Stop> {
         let (path, size, cancelled) = (output.to_path_buf(), file.size, cancel.clone());
         let events = self.events.clone();
@@ -578,48 +602,97 @@ impl Shared {
             Ok(gcid) => format!("与网盘给的 GCID 不符（网盘 {}，下到的 {gcid}）", file.gcid),
             Err(read) => format!("有 {read} 字节，网盘上是 {} 字节", file.size),
         };
-        let removed = tokio::fs::remove_file(output).await;
-        let note = match removed {
-            Ok(()) => {
-                self.write(|tx| store::set_cloud_file_fetched(tx, at.id, at.index, false))
-                    .map_err(Stop::store)?;
-                "已删掉，继续时重下这个文件".to_owned()
-            }
-            Err(error) => format!("删不掉（{error}），先手动删掉它再继续"),
-        };
+        if !owned {
+            return Err(Stop::failed(
+                FailureKind::OutputTaken,
+                format!(
+                    "保存位置上已有 {}，{what}，不是这个任务取回的：挪走后再继续",
+                    output.display()
+                ),
+            ));
+        }
+        if let Err(error) = tokio::fs::remove_file(output).await {
+            return Err(Stop::failed(
+                FailureKind::Disk,
+                format!(
+                    "{} {what}，删不掉（{error}）：先手动删掉它再继续",
+                    output.display()
+                ),
+            ));
+        }
+        self.write(|tx| store::set_cloud_file_fetched(tx, at.id, at.index, false))
+            .map_err(Stop::store)?;
         Err(Stop::failed(
             FailureKind::Integrity,
-            format!("{} {what}，{note}", output.display()),
+            format!("{} {what}，已删掉，继续时重下这个文件", output.display()),
         ))
     }
 
-    /// 把磁力链接 `link` 提交给网盘，记下网盘给的离线任务编号并返回。提交前先记下网盘上已有的同一链接的任务：请求
-    /// 可能已生效而没收到结果（发出后断开、没读完响应）时，按链接找这之后新建的那个，找到即用它，不重发。
+    /// 把磁力链接 `link` 提交给网盘，记下网盘给的离线任务编号并返回。发出前先在存储里记下提交前网盘上已有的同一链接
+    /// 的任务（`before`，上次提交结果不明时为那次记下的）：结果不明（发出后断开、没读完响应、网关出错、退出）时，下次
+    /// 按它找之后新建的那个，找到即用它，不重复提交。
     async fn submit_cloud(
         self: &Arc<Self>,
         id: TaskId,
         link: &hs_m3u8_core::Url,
+        before: Option<Vec<String>>,
         ctx: Ctx<'_>,
     ) -> Result<String, Stop> {
         let (client, cancel) = (ctx.client, ctx.cancel);
         let link = link.as_str();
-        let before = until(cancel, client.job_ids_for(link))
-            .await?
-            .map_err(Stop::cloud)?;
-        // 提交发出后不随暂停取消：发出去就要等到结果，记下编号
-        let job = match client.submit(link).await {
-            Ok(job) => job,
-            Err(pikpak::Error::Transport(error)) if super::may_have_taken_effect(&error) => {
-                match client.find_job(link, &before).await.map_err(Stop::cloud)? {
+        let job = match before {
+            // 上次提交结果不明
+            Some(before) => {
+                match until(cancel, client.find_job(link, &before))
+                    .await?
+                    .map_err(Stop::cloud)?
+                {
                     Some(job) => job,
-                    None => return Err(Stop::cloud(pikpak::Error::Transport(error))),
+                    None => self.submit_once(link, &before, ctx).await?,
                 }
             }
-            Err(error) => return Err(Stop::cloud(error)),
+            None => {
+                let before = until(cancel, client.job_ids_for(link))
+                    .await?
+                    .map_err(Stop::cloud)?;
+                self.write(|tx| store::set_cloud_before(tx, id, &before))
+                    .map_err(Stop::store)?;
+                self.submit_once(link, &before, ctx).await?
+            }
         };
         self.write(|tx| store::set_cloud_job(tx, id, &job.id))
             .map_err(Stop::store)?;
         Ok(job.id)
+    }
+
+    /// 提交一次（提交中的标记已记下）；结果不明时在 `before` 之外找新建的那个，找不到照原样报错（标记留着，下次再找）。
+    async fn submit_once(
+        &self,
+        link: &str,
+        before: &[String],
+        ctx: Ctx<'_>,
+    ) -> Result<pikpak::Job, Stop> {
+        let (client, cancel) = (ctx.client, ctx.cancel);
+        let error = match until(cancel, client.submit(link)).await? {
+            Ok(job) => return Ok(job),
+            Err(error) => error,
+        };
+        let unclear = match &error {
+            pikpak::Error::Transport(error) => super::may_have_taken_effect(error),
+            // 网关出错时网盘可能已收下
+            pikpak::Error::Rejected(rejection) => rejection.status >= 500,
+            _ => false,
+        };
+        if !unclear {
+            return Err(Stop::cloud(error));
+        }
+        match until(cancel, client.find_job(link, before))
+            .await?
+            .map_err(Stop::cloud)?
+        {
+            Some(job) => Ok(job),
+            None => Err(Stop::cloud(error)),
+        }
     }
 
     fn cloud_progress(&self, id: TaskId, progress: CloudProgress) {
@@ -737,8 +810,12 @@ impl Stop {
         Stop::Failed(failure(&error))
     }
 
+    /// 核心报的错误；取消（暂停）为 [`Stop::Paused`]。
     fn core(error: hs_m3u8_core::Error) -> Stop {
-        Stop::Failed(Failure::of(&error))
+        match error {
+            hs_m3u8_core::Error::Cancelled => Stop::Paused,
+            error => Stop::Failed(Failure::of(&error)),
+        }
     }
 
     /// 存储读写或取名出错：任务停下，以磁盘一类的失败报出（处理后可再继续）。

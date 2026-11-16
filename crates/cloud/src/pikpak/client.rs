@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hs_m3u8_core::{Body, Call, Engine, HttpOptions, Method, Source, Timeouts, Url};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 
 use super::profile::ANDROID;
 use super::wire;
@@ -43,6 +44,8 @@ pub struct Session {
     state: Arc<Mutex<State>>,
     save: Arc<Save>,
     retired: Arc<AtomicBool>,
+    /// 在途的换令牌（见 [`Client`] 的 refresh）：发出后旧的 refresh_token 即作废，退出前要等它做完、存好新的
+    refreshing: TaskTracker,
 }
 
 impl Session {
@@ -58,7 +61,31 @@ impl Session {
             })),
             save: Arc::new(save),
             retired: Arc::new(AtomicBool::new(false)),
+            refreshing: TaskTracker::new(),
         }
+    }
+
+    /// 等在途的换令牌做完（每次最多一次接口请求的时限）：退出前调，免得旧的 refresh_token 已作废、新的还没存下。
+    pub async fn settle(&self) {
+        self.refreshing.close();
+        self.refreshing.wait().await;
+        self.refreshing.reopen();
+    }
+
+    /// 同一账号重新登录得到的 `account` 换上：在用这个登录状态的请求接着用新令牌，不作废它。先存下再用（同换令牌）；
+    /// 不是这个账号的报 [`Error::Unrecognized`]，存不下报 [`Error::Save`]（换上的照样留在内存里用）。
+    pub async fn adopt(&self, account: Account) -> Result<(), Error> {
+        if account.user_id != self.user_id {
+            return Err(Error::Unrecognized(format!(
+                "登录的是用户 {}，不是这个登录状态的用户 {}",
+                account.user_id, self.user_id
+            )));
+        }
+        let mut state = self.state.lock().await;
+        let saved = (self.save)(&account);
+        state.account = account;
+        state.captcha.clear();
+        saved.map_err(Error::Save)
     }
 
     pub fn user_id(&self) -> &str {
@@ -198,8 +225,8 @@ impl Client {
     }
 
     /// 用 refresh_token 换新令牌，先存下再用；`sent` 为被拒（或到期）的那次用的凭据，别的请求已换过时不再换。换的请求
-    /// 在单独的任务里做、做完为止（最多一次接口请求的时限）：发出后旧的 refresh_token 即作废，调用方中途取消（暂停、
-    /// 退出）时新令牌也要收下存好。
+    /// 在登录状态记着的单独任务里做、做完为止（最多一次接口请求的时限）：发出后旧的 refresh_token 即作废，调用方中途
+    /// 取消（暂停）时新令牌也要收下存好，退出前由 [`Session::settle`] 等它。
     async fn refresh(&self, sent: &Sent) -> Result<(), Error> {
         let (engine, http, endpoints) = (
             self.engine.clone(),
@@ -212,36 +239,38 @@ impl Client {
             self.session.retired.clone(),
         );
         let access = sent.access.clone();
-        tokio::spawn(async move {
-            let mut state = state.lock().await;
-            if state.account.access_token != access {
-                return Ok(());
-            }
-            if retired.load(Ordering::SeqCst) {
-                return Err(Error::LoggedOut);
-            }
-            let body = serde_json::json!({
-                "client_id": ANDROID.client_id,
-                "client_secret": ANDROID.client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": state.account.refresh_token,
-            });
-            let url = endpoints.user("/v1/auth/token")?;
-            let headers = identity_headers(&state.account.device_id);
-            let bytes = send(&engine, &http, Method::Post, url, headers, Some(&body)).await?;
-            let token: wire::Token = decode(&bytes)?;
-            let account = Account::from_token(token, state.account.device_id.clone())?;
-            // 旧的 refresh_token 已作废：存不下也换上新的，这一次照样报错让调用方知道
-            let saved = save(&account);
-            state.account = account;
-            match saved {
-                Ok(()) => Ok(()),
-                Err(_) if retired.load(Ordering::SeqCst) => Err(Error::LoggedOut),
-                Err(reason) => Err(Error::Save(reason)),
-            }
-        })
-        .await
-        .expect("换令牌不会 panic，运行时关闭时本任务也一起丢弃")
+        self.session
+            .refreshing
+            .spawn(async move {
+                let mut state = state.lock().await;
+                if state.account.access_token != access {
+                    return Ok(());
+                }
+                if retired.load(Ordering::SeqCst) {
+                    return Err(Error::LoggedOut);
+                }
+                let body = serde_json::json!({
+                    "client_id": ANDROID.client_id,
+                    "client_secret": ANDROID.client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": state.account.refresh_token,
+                });
+                let url = endpoints.user("/v1/auth/token")?;
+                let headers = identity_headers(&state.account.device_id);
+                let bytes = send(&engine, &http, Method::Post, url, headers, Some(&body)).await?;
+                let token: wire::Token = decode(&bytes)?;
+                let account = Account::from_token(token, state.account.device_id.clone())?;
+                // 旧的 refresh_token 已作废：存不下也换上新的，这一次照样报错让调用方知道
+                let saved = save(&account);
+                state.account = account;
+                match saved {
+                    Ok(()) => Ok(()),
+                    Err(_) if retired.load(Ordering::SeqCst) => Err(Error::LoggedOut),
+                    Err(reason) => Err(Error::Save(reason)),
+                }
+            })
+            .await
+            .expect("换令牌不会 panic，运行时关闭时本任务也一起丢弃")
     }
 
     /// 为动作 `action` 重新申请 captcha token；`sent` 为被拒的那次用的凭据，别的请求已为这个动作换过时不再申请。要人机

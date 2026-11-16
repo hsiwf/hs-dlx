@@ -136,7 +136,7 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         ),
         FailureKind::CloudFailed => (
             "云端".into(),
-            "网盘上的离线下载没成，原因见错误信息；可以改用本地 BT",
+            "网盘那边没成（离线下载失败、文件不全或直链一直下不了），原因见错误信息；可以再试或改用本机 BT",
         ),
         FailureKind::CloudApi => (
             "接口".into(),

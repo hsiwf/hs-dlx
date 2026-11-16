@@ -41,10 +41,12 @@ struct Fake {
     links: HashMap<String, u32>,
     /// 这些文件的直链第一次下载时回 403（过期）
     expire_once: Vec<&'static str>,
-    /// 下载 b.bin 时挂着，直到打开
+    /// 下载 `held` 这个文件时挂着，直到打开
     hold_b: Arc<Gate>,
-    /// 收到下载 b.bin 的请求时通知
+    /// 收到下载 `held` 的请求时通知
     b_requested: Arc<Notify>,
+    /// 挂着的是哪个文件，默认 b.bin
+    held: &'static str,
     /// 提交离线下载的次数
     submits: u32,
     /// 提交时照常建任务，但响应体发到一半断开
@@ -55,8 +57,12 @@ struct Fake {
     user: &'static str,
     /// b.bin 的直链不带 ETag、每次最多给 64 KiB，第一个直链的第二个请求回 403
     b_unverifiable: bool,
-    /// b.bin 在网盘上还没处理完
+    /// b.bin 在网盘上还没处理完（没有 GCID）
     b_incomplete: bool,
+    /// b.bin 在回收站里
+    b_trashed: bool,
+    /// 离线任务列表是空的（任务被删了，或刚提交的还没列出来）
+    jobs_hidden: bool,
 }
 
 #[derive(Default)]
@@ -146,21 +152,34 @@ async fn submit(
 async fn tasks(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     assert!(authorized(&headers));
     let fake = fake.lock().unwrap();
-    let tasks: Vec<Value> = fake.jobs.iter().map(|id| task_body(id)).collect();
+    let tasks: Vec<Value> = if fake.jobs_hidden {
+        Vec::new()
+    } else {
+        fake.jobs.iter().map(|id| task_body(id)).collect()
+    };
     Json(json!({ "tasks": tasks })).into_response()
 }
 
 fn file_json(fake: &Fake, remote: &Remote, base: &str) -> Value {
     let count = fake.links.get(remote.id).copied().unwrap_or(0);
-    let phase = if remote.id == "VB" && fake.b_incomplete {
-        "PHASE_TYPE_RUNNING"
+    let incomplete = remote.id == "VB" && fake.b_incomplete;
+    let (phase, hash) = if incomplete {
+        ("PHASE_TYPE_RUNNING", String::new())
     } else {
-        "PHASE_TYPE_COMPLETE"
+        (
+            "PHASE_TYPE_COMPLETE",
+            remote
+                .gcid
+                .map(str::to_owned)
+                .unwrap_or_else(|| gcid(&remote.body))
+                .to_uppercase(),
+        )
     };
     json!({
         "kind": "drive#file", "id": remote.id, "name": remote.name, "phase": phase,
+        "trashed": remote.id == "VB" && fake.b_trashed,
         "size": remote.body.len().to_string(),
-        "hash": remote.gcid.map(str::to_owned).unwrap_or_else(|| gcid(&remote.body)).to_uppercase(),
+        "hash": hash,
         "web_content_link": format!("{base}dl/{}?n={count}", remote.id),
     })
 }
@@ -231,12 +250,12 @@ async fn download(
             return StatusCode::FORBIDDEN.into_response();
         }
         let remote = fake.files.iter().find(|remote| remote.id == id).unwrap();
-        if id == "VB" {
+        if id == fake.held {
             fake.b_requested.notify_one();
         }
         (
             remote.body.clone(),
-            (id == "VB").then(|| fake.hold_b.clone()),
+            (id == fake.held).then(|| fake.hold_b.clone()),
             unverifiable,
         )
     };
@@ -299,6 +318,9 @@ async fn start(files: Vec<Remote>) -> (Url, Shared) {
         user: "user-1",
         b_unverifiable: false,
         b_incomplete: false,
+        b_trashed: false,
+        jobs_hidden: false,
+        held: "VB",
     }));
     fake.lock().unwrap().hold_b.open();
     let app = axum::Router::new()
@@ -668,4 +690,128 @@ fn resuming_under_another_account_asks_for_the_right_one() {
         }
         other => panic!("应以登录失效停下：{other:?}"),
     }
+}
+
+/// 用户在网页里把 b.bin 删进了回收站：跳过它，只取回 a.bin。
+#[test]
+fn files_in_the_recycle_bin_are_skipped() {
+    let dir = test_dir("trashed");
+    let folder = dir.join("out");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().b_trashed = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(folder.clone()), 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert!(folder.join("Show").join("a.bin").exists());
+    assert!(!folder.join("Show").join("Sub").exists());
+}
+
+/// 网盘上的离线任务不在了：以云端失败停下、清掉编号；继续即重新提交，照常下完。
+#[test]
+fn a_vanished_cloud_job_is_submitted_again_on_resume() {
+    let dir = test_dir("vanished");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    fake.lock().unwrap().jobs_hidden = true;
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    match rt.block_on(ended(&mut events, task.id, |_| {})) {
+        Status::Failed(failure) => assert_eq!(failure.kind, FailureKind::CloudFailed),
+        other => panic!("应以云端失败停下：{other:?}"),
+    }
+    assert_eq!(
+        service.task(task.id).unwrap().spec.cloud().unwrap().job,
+        None
+    );
+    fake.lock().unwrap().jobs_hidden = false;
+    service.resume(task.id).unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert_eq!(fake.lock().unwrap().submits, 2);
+}
+
+/// 提交结果不明、当时也没查到新建的任务：记着提交中，继续时先查到它，不再提交第二次。
+#[test]
+fn an_unclear_submit_is_looked_up_again_before_resubmitting() {
+    let dir = test_dir("unclear");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.break_submit = true;
+        fake.jobs_hidden = true;
+    }
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Failed(_)
+    ));
+    assert!(
+        service
+            .task(task.id)
+            .unwrap()
+            .spec
+            .cloud()
+            .unwrap()
+            .before
+            .is_some()
+    );
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.break_submit = false;
+        fake.jobs_hidden = false;
+    }
+    service.resume(task.id).unwrap();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
+    assert_eq!(fake.lock().unwrap().submits, 1);
+}
+
+/// 同一账号重新登录：在跑的任务换上新令牌接着下（之后取 b.bin 的直链照常），不被打断。
+#[test]
+fn logging_in_again_as_the_same_user_keeps_running_tasks() {
+    let dir = test_dir("relogin");
+    let rt = runtime();
+    let (base, fake) = rt.block_on(start(remotes(None)));
+    let gate = Arc::new(Gate::default());
+    {
+        let mut fake = fake.lock().unwrap();
+        fake.hold_b = gate.clone();
+        fake.held = "VA";
+    }
+    let (service, mut events) = service(&dir, &base);
+    log_in(&rt, &service);
+    let task = rt
+        .block_on(service.create(draft(dir.join("out")), 1))
+        .unwrap()
+        .unwrap();
+    let requested = fake.lock().unwrap().b_requested.clone();
+    rt.block_on(requested.notified());
+    log_in(&rt, &service);
+    gate.open();
+    assert_eq!(
+        rt.block_on(ended(&mut events, task.id, |_| {})),
+        Status::Done
+    );
 }
