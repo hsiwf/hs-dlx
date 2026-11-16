@@ -15,7 +15,7 @@ use std::thread::JoinHandle as ThreadHandle;
 use std::time::Duration;
 
 use hs_dlx_torrent::{
-    AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, State, TorrentId,
+    AddOptions, Alert, AlertKind, Removal, Session, SessionConfig, SocksProxy, State, TorrentId,
 };
 use hs_m3u8_core::Url;
 use tokio::sync::{Notify, mpsc, watch};
@@ -504,6 +504,8 @@ pub(crate) struct Bt {
     closed: AtomicBool,
     /// 上传限速（字节每秒，None 为不限）：建会话时照它，之后改了随即照新的；持着 `running` 的锁改与读
     upload_limit: Mutex<Option<NonZeroU32>>,
+    /// 经的 SOCKS5 代理（None 为直连），同上
+    proxy: Mutex<Option<Url>>,
     /// 磁力链接取种子信息时种子的保存目录：只取信息、不下内容，libtorrent 也可能在里面建空文件，不放进用户的目录
     probe_dir: PathBuf,
     /// 公共 tracker 列表的来源（空时不补）与状况
@@ -526,8 +528,12 @@ pub(crate) struct SessionState {
 }
 
 impl Bt {
-    /// `upload_limit` 为设置里的上传限速。
-    pub fn new(network: TorrentNetwork, upload_limit: Option<NonZeroU32>) -> Bt {
+    /// `upload_limit` 与 `proxy` 为设置里的上传限速与 BT 代理。
+    pub fn new(
+        network: TorrentNetwork,
+        upload_limit: Option<NonZeroU32>,
+        proxy: Option<Url>,
+    ) -> Bt {
         let public_sources = network.public_trackers();
         let public = if public_sources.is_empty() {
             PublicTrackers::Off
@@ -537,6 +543,7 @@ impl Bt {
         Bt {
             network,
             upload_limit: Mutex::new(upload_limit),
+            proxy: Mutex::new(proxy),
             closed: AtomicBool::new(false),
             probe_dir: std::env::temp_dir().join("hs-dlx-magnet"),
             public_sources,
@@ -569,6 +576,7 @@ impl Bt {
     pub fn engine(&self, saved: SessionState) -> Result<Arc<Engine>, Error> {
         let mut running = lock(&self.running);
         let upload_limit = *lock(&self.upload_limit);
+        let proxy = socks_of(lock(&self.proxy).as_ref());
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -592,6 +600,7 @@ impl Bt {
             user_agent: format!("hs-dlx/{version}"),
             peer_fingerprint: fingerprint(version),
             upload_limit: limit_of(upload_limit),
+            proxy,
             state: saved.dht,
         })
         .map_err(|error| Error::Torrent(format!("BT 会话建不出：{error}")))?;
@@ -656,6 +665,21 @@ impl Bt {
         }
     }
 
+    /// 改经的代理（None 为直连；调用方已校验，见 [`check_proxy`]）：已建的会话随即照它，之后建的也照它。
+    pub fn set_proxy(&self, proxy: Option<Url>) {
+        let running = lock(&self.running);
+        let socks = socks_of(proxy.as_ref());
+        *lock(&self.proxy) = proxy;
+        if let Some(running) = &*running {
+            running.engine.session.set_proxy(&socks);
+        }
+    }
+
+    /// 经的代理（去掉凭据的写法）；直连时为 None。
+    pub fn proxy(&self) -> Option<String> {
+        lock(&self.proxy).as_ref().map(hs_m3u8_core::bare_url)
+    }
+
     /// 已建的引擎；还没建会话时为 None。
     pub fn existing(&self) -> Option<Arc<Engine>> {
         lock(&self.running)
@@ -665,6 +689,45 @@ impl Bt {
 
     pub fn probe_dir(&self) -> &Path {
         &self.probe_dir
+    }
+}
+
+/// BT 经的代理（[`crate::Settings::torrent_proxy`]）能不能用：`socks5://` 或 `socks5h://` 开头（两者一样，主机名都交给
+/// 代理解析），有主机与端口，没有路径以外的部分；不能用时为原因。
+pub(crate) fn check_proxy(url: &Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "socks5" | "socks5h") {
+        return Err(
+            "BT 的代理要是 SOCKS5（socks5:// 开头）：HTTP 代理转发不了 DHT 与 UDP".to_owned(),
+        );
+    }
+    if url.host_str().is_none_or(str::is_empty) || url.port().is_none() {
+        return Err("BT 的代理要写明主机与端口，如 socks5://127.0.0.1:1080".to_owned());
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err("BT 的代理地址只写主机与端口（可带用户名与密码）".to_owned());
+    }
+    Ok(())
+}
+
+/// 代理在 libtorrent 里的写法；None 为直连。用户名与密码按地址里的百分号编码解开（不是 UTF-8 的字节换成替换字符）。
+fn socks_of(proxy: Option<&Url>) -> SocksProxy {
+    let decoded = |text: &str| {
+        percent_encoding::percent_decode_str(text)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    match proxy {
+        None => SocksProxy::default(),
+        Some(url) => SocksProxy {
+            host: url
+                .host_str()
+                .expect("存下的代理都过了 check_proxy，有主机")
+                .trim_matches(['[', ']'])
+                .to_owned(),
+            port: url.port().expect("存下的代理都过了 check_proxy，有端口"),
+            username: decoded(url.username()),
+            password: url.password().map(decoded).unwrap_or_default(),
+        },
     }
 }
 
@@ -1316,13 +1379,14 @@ fn sweep(path: &Path) -> Vec<PathBuf> {
 }
 
 /// 诊断在下或做种（`seeding`）的种子 `info_hash`：要一次会话的统计、等它到，再查网络状况、种子的状态与 tracker；上传
-/// 限速为 `upload_limit`。种子不在会话里（刚开始、还没加进去）、统计 [`STEP_TIMEOUT`] 内没到时报 [`Error::Torrent`]；
+/// 限速为 `upload_limit`，经的代理为 `proxy`（去掉凭据的写法，直连为 None）。种子不在会话里（刚开始、还没加进去）、统计 [`STEP_TIMEOUT`] 内没到时报 [`Error::Torrent`]；
 /// 等的期间 BT 会话关闭时报 [`Error::Closed`]。
 pub(crate) async fn diagnose(
     engine: &Engine,
     info_hash: &str,
     seeding: bool,
     upload_limit: Option<NonZeroU32>,
+    proxy: Option<String>,
 ) -> Result<Vec<Check>, Error> {
     let id = TorrentId::parse(info_hash)
         .map_err(|error| Error::Corrupt(format!("种子的编号：{error}")))?;
@@ -1366,6 +1430,7 @@ pub(crate) async fn diagnose(
     let most =
         |of_status: i32, of_trackers: Option<i32>| count(of_status.max(of_trackers.unwrap_or(-1)));
     let facts = Facts {
+        proxy,
         listen_port: network.listen_port,
         listen_error: network.listen_error,
         upnp_port: network.upnp_port,
@@ -1405,6 +1470,34 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxies_must_be_socks5_with_a_port() {
+        let url = |text: &str| Url::parse(text).unwrap();
+        assert!(check_proxy(&url("socks5://127.0.0.1:7897")).is_ok());
+        let socks = socks_of(Some(&url("socks5h://me:p%40ss@[::1]:1080")));
+        assert_eq!(
+            (
+                socks.host.as_str(),
+                socks.port,
+                socks.username.as_str(),
+                socks.password.as_str()
+            ),
+            ("::1", 1080, "me", "p@ss")
+        );
+        assert!(
+            check_proxy(&url("http://127.0.0.1:7897"))
+                .unwrap_err()
+                .contains("SOCKS5")
+        );
+        assert!(
+            check_proxy(&url("socks5://127.0.0.1"))
+                .unwrap_err()
+                .contains("端口")
+        );
+        assert!(check_proxy(&url("socks5://127.0.0.1:1080/x")).is_err());
+        assert_eq!(socks_of(None).host, "");
+    }
 
     #[test]
     fn fingerprints_take_one_digit_per_part() {

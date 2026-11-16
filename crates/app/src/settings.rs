@@ -19,6 +19,9 @@ pub struct Settings {
     pub upload_limit: Option<NonZeroU32>,
     /// 启动时与之后每天查一次有没有新版本
     pub check_updates: bool,
+    /// BT 的节点连接、tracker 与 DHT 经的 SOCKS5 代理（`socks5://` 或 `socks5h://`，带端口，可带用户名与密码）；None
+    /// 为直连。与 `proxy` 无关：那个只管 HTTP 的请求
+    pub torrent_proxy: Option<hs_m3u8_core::Url>,
 }
 
 impl Default for Settings {
@@ -30,6 +33,7 @@ impl Default for Settings {
             seeding: Seeding::default(),
             upload_limit: None,
             check_updates: true,
+            torrent_proxy: None,
         }
     }
 }

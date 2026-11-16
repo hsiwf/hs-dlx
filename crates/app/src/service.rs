@@ -290,7 +290,11 @@ impl Service {
             unsaved: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             events,
-            bt: Bt::new(network, settings.upload_limit),
+            bt: Bt::new(
+                network,
+                settings.upload_limit,
+                settings.torrent_proxy.clone(),
+            ),
             public_fetch: Mutex::new(None),
             proxy_changed: Arc::new(Notify::new()),
             runtime: runtime.handle().clone(),
@@ -446,7 +450,7 @@ impl Service {
             };
             // 在下或做种的已建过会话；关闭之后没有了
             let engine = shared.bt.existing().ok_or(Error::Closed)?;
-            torrent::diagnose(&engine, &spec.info_hash, seeding, limit).await
+            torrent::diagnose(&engine, &spec.info_hash, seeding, limit, shared.bt.proxy()).await
         })
     }
 
@@ -477,6 +481,18 @@ impl Service {
         // 提交了才停（提交失败时做种照旧，与报的错一致），仍在 `store` 锁内：与关闭的先后分明
         by_user.store(true, Ordering::Relaxed);
         cancel.cancel();
+        Ok(())
+    }
+
+    /// 记下 BT 经的 SOCKS5 代理（None 为直连），BT 会话已建时随即照它连。不是 `socks5://` 或 `socks5h://` 开头、没写
+    /// 主机或端口时报 [`Error::InvalidInput`]。
+    pub fn set_torrent_proxy(&self, proxy: Option<Url>) -> Result<(), Error> {
+        if let Some(url) = &proxy {
+            torrent::check_proxy(url).map_err(Error::InvalidInput)?;
+        }
+        self.shared
+            .write(|tx| store::set_torrent_proxy(tx, proxy.as_ref()))?;
+        self.shared.bt.set_proxy(proxy);
         Ok(())
     }
 

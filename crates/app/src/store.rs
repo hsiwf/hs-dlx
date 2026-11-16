@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 9] = [
+const MIGRATIONS: [Migration; 10] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -32,6 +32,7 @@ const MIGRATIONS: [Migration; 9] = [
     rebuild_with_torrents,
     rebuild_with_seeding,
     add_check_updates,
+    add_torrent_proxy,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -499,6 +500,13 @@ fn add_check_updates(tx: &Transaction<'_>) -> Result<(), Error> {
     tx.execute_batch(
         "ALTER TABLE settings ADD COLUMN check_updates INTEGER NOT NULL DEFAULT 1 CHECK (check_updates IN (0, 1));",
     )?;
+    Ok(())
+}
+
+/// 第 10 版：设置加 BT 经的 SOCKS5 代理（见 [`crate::Settings::torrent_proxy`]，`socks5://` 或 `socks5h://` 开头的地址），
+/// NULL 为直连；没设过为直连。
+fn add_torrent_proxy(tx: &Transaction<'_>) -> Result<(), Error> {
+    tx.execute_batch("ALTER TABLE settings ADD COLUMN torrent_proxy TEXT;")?;
     Ok(())
 }
 
@@ -1199,7 +1207,7 @@ fn utf8(path: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::InvalidInput(format!("路径不是 UTF-8：{}", path.display())))
 }
 
-/// 读出设置；保存目录不是绝对路径、代理或主题认不出、做种的数不是正数时报 [`Error::Corrupt`]。
+/// 读出设置；保存目录不是绝对路径、代理（含 BT 的）或主题认不出、做种的数不是正数时报 [`Error::Corrupt`]。
 pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
     type Columns = (
         Option<String>,
@@ -1210,24 +1218,36 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<u32>,
         Option<u32>,
         bool,
+        Option<String>,
     );
-    let (folder, proxy, theme, seed, ratio, minutes, upload, check_updates): Columns = tx.query_row(
-        "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates
-         FROM settings WHERE id = 1",
-        [],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-            ))
-        },
-    )?;
+    let (folder, proxy, theme, seed, ratio, minutes, upload, check_updates, torrent_proxy): Columns =
+        tx.query_row(
+            "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
+                    torrent_proxy
+             FROM settings WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+    let torrent_proxy = torrent_proxy
+        .map(|text| {
+            Url::parse(&text)
+                .ok()
+                .filter(|url| crate::torrent::check_proxy(url).is_ok())
+                .ok_or_else(|| Error::Corrupt(format!("设置里的 BT 代理：{text}")))
+        })
+        .transpose()?;
     let positive = |value: Option<u32>, what: &str| {
         value
             .map(|value| {
@@ -1260,7 +1280,17 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         seeding,
         upload_limit,
         check_updates,
+        torrent_proxy,
     })
+}
+
+/// 记下 BT 经的 SOCKS5 代理（None 为直连）；调用方已校验（见 [`crate::torrent::check_proxy`]）。
+pub fn set_torrent_proxy(tx: &Transaction<'_>, proxy: Option<&Url>) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET torrent_proxy = ?1 WHERE id = 1",
+        params![proxy.map(Url::as_str)],
+    )?;
+    Ok(())
 }
 
 /// 记下要不要自动检查更新。

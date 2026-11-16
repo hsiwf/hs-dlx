@@ -27,6 +27,8 @@ mod ffi {
         peer_fingerprint: String,
         /// 整个会话的上传限速，字节每秒；0 为不限
         upload_limit: i32,
+        /// 节点连接、tracker、DHT 与 uTP 经的 SOCKS5 代理；`host` 为空时直连
+        proxy: SocksProxy,
         /// 上次 [`Session::session_state`] 写出的 DHT 状态（路由表里的节点），启动时载入就不必从头找节点；空时从头找
         state: Vec<u8>,
     }
@@ -159,6 +161,18 @@ mod ffi {
         added: bool,
     }
 
+    /// SOCKS5 代理（RFC 1928）：要转发 UDP（UDP ASSOCIATE），DHT、uTP 与 UDP 的 tracker 才经得了它。经它时不接受
+    /// 外部连入、不映射端口、不做本地发现（libtorrent 只开一个连代理用的接口），主机名交给代理解析。
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct SocksProxy {
+        /// 代理的主机名或 IP；空为不经代理
+        host: String,
+        port: u16,
+        /// 用户名与密码（RFC 1929）；用户名为空时不认证
+        username: String,
+        password: String,
+    }
+
     /// 建种子文件的选择（[`crate::create_torrent`]）。
     struct CreateOptions {
         /// 分块大小，字节；0 为按总大小自动选
@@ -259,6 +273,7 @@ mod ffi {
         fn save_resume_data(self: &Session, id: &str) -> Result<()>;
         fn listen_port(self: &Session) -> u16;
         fn set_upload_limit(self: &Session, bytes_per_second: i32);
+        fn set_proxy(self: &Session, proxy: &SocksProxy);
         fn network(self: &Session) -> NetworkStatus;
         fn request_stats(self: &Session);
         fn trackers(self: &Session, id: &str) -> Result<Vec<TrackerState>>;
@@ -273,7 +288,7 @@ mod ffi {
 
 pub use ffi::{
     AddOptions, Alert, AlertKind, CreateOptions, FileEntry, NetworkStatus, Removal, SessionConfig,
-    Status, TrackerState,
+    SocksProxy, Status, TrackerState,
 };
 
 // SAFETY: libtorrent 的会话把每个操作作为消息交给它自己的网络线程执行（docs/hacking.rst：「manipulates it by sending
@@ -448,6 +463,11 @@ impl Session {
     /// 改整个会话的上传限速，字节每秒；0 为不限。
     pub fn set_upload_limit(&self, bytes_per_second: i32) {
         self.inner().set_upload_limit(bytes_per_second);
+    }
+
+    /// 改经的代理（见 [`SocksProxy`]；`host` 为空时改回直连）：libtorrent 随即重开监听，之后的连接照它，已连着的不断。
+    pub fn set_proxy(&self, proxy: &SocksProxy) {
+        self.inner().set_proxy(proxy);
     }
 
     /// 网络状况（监听与端口映射随事件更新，DHT 与连入要 [`Session::request_stats`] 之后才新）。

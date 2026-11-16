@@ -42,6 +42,8 @@ pub struct Check {
 /// 诊断时查到的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Facts {
+    /// 经的 SOCKS5 代理（去掉凭据的写法）；直连时为 None。经代理时不接受外部连入、不映射端口
+    pub proxy: Option<String>,
     /// 在监听的端口；0 为没在监听
     pub listen_port: u16,
     pub listen_error: String,
@@ -125,6 +127,26 @@ pub(crate) struct Tracker {
 pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
     let check = |item, level, text: String| Check { item, level, text };
     let mut checks = Vec::new();
+    if let Some(proxy) = &facts.proxy {
+        checks.push(check(
+            CheckItem::Listen,
+            CheckLevel::Ok,
+            format!(
+                "经 SOCKS5 代理 {proxy} 连节点、tracker 与 DHT：外面连不进来，只能主动去连别人"
+            ),
+        ));
+        checks.push(check(
+            CheckItem::PortMapping,
+            CheckLevel::Ok,
+            "经代理时不映射端口".to_owned(),
+        ));
+        checks.push(check(
+            CheckItem::Incoming,
+            CheckLevel::Ok,
+            "经代理时不接受外部连入".to_owned(),
+        ));
+        return checks_after_connectivity(facts, checks);
+    }
     checks.push(if facts.listen_port > 0 {
         check(
             CheckItem::Listen,
@@ -201,6 +223,12 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
                 .to_owned(),
         )
     });
+    checks_after_connectivity(facts, checks)
+}
+
+/// 监听、端口映射与连入之后的各项：DHT、tracker、公共 tracker、人数与上传限速，接在 `checks` 后面。
+fn checks_after_connectivity(facts: &Facts, mut checks: Vec<Check>) -> Vec<Check> {
+    let check = |item, level, text: String| Check { item, level, text };
     checks.push(match (facts.private, facts.dht_nodes) {
         (true, _) => check(
             CheckItem::Dht,
@@ -399,6 +427,7 @@ mod tests {
 
     fn healthy() -> Facts {
         Facts {
+            proxy: None,
             listen_port: 51413,
             listen_error: String::new(),
             upnp_port: 51413,
@@ -500,6 +529,19 @@ mod tests {
         assert!(text(&facts, CheckItem::Trackers).contains("其余的还没回应"));
         facts.trackers = vec![tracker(false)];
         assert!(text(&facts, CheckItem::Trackers).contains("还没回应"));
+        // 经代理：不接受连入、不映射端口不算问题
+        let mut facts = healthy();
+        facts.proxy = Some("socks5://127.0.0.1:1080".into());
+        facts.listen_port = 0;
+        facts.upnp_port = 0;
+        facts.incoming = false;
+        assert!(
+            checks(&facts)
+                .iter()
+                .all(|check| check.level == CheckLevel::Ok)
+        );
+        assert!(text(&facts, CheckItem::Listen).contains("socks5://127.0.0.1:1080"));
+        assert_eq!(checks(&facts).len(), checks(&healthy()).len());
         // 公共 tracker：没取到时带上原因；私有种子不补
         let mut facts = healthy();
         facts.public = Public::Failed("connection refused".into());

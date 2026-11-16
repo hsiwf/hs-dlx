@@ -43,6 +43,7 @@ fn local_session() -> Session {
         user_agent: "hs-dlx-test".into(),
         peer_fingerprint: "-HD0000-".into(),
         upload_limit: 0,
+        proxy: Default::default(),
         state: Vec::new(),
     })
     .unwrap()
@@ -308,6 +309,7 @@ fn session_state_round_trips() {
         user_agent: "hs-dlx-test".into(),
         peer_fingerprint: "-HD0000-".into(),
         upload_limit: 0,
+        proxy: Default::default(),
         state,
     };
     Session::new(&config(state)).unwrap();

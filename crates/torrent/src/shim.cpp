@@ -41,6 +41,21 @@ bool names(lt::info_hash_t const& hashes, std::string const& id) {
 		|| (hashes.has_v2() && lt::aux::to_hex(hashes.get(lt::protocol_version::V2)) == id);
 }
 
+// 照 `proxy` 设代理：节点、tracker 都经它，主机名由它解析；`host` 为空时不经代理
+void set_proxy_of(lt::settings_pack& pack, SocksProxy const& proxy) {
+	bool const on = !proxy.host.empty();
+	bool const login = on && !proxy.username.empty();
+	pack.set_int(lt::settings_pack::proxy_type,
+		!on ? lt::settings_pack::none : login ? lt::settings_pack::socks5_pw : lt::settings_pack::socks5);
+	pack.set_str(lt::settings_pack::proxy_hostname, std::string(proxy.host));
+	pack.set_int(lt::settings_pack::proxy_port, proxy.port);
+	pack.set_str(lt::settings_pack::proxy_username, std::string(proxy.username));
+	pack.set_str(lt::settings_pack::proxy_password, std::string(proxy.password));
+	pack.set_bool(lt::settings_pack::proxy_peer_connections, on);
+	pack.set_bool(lt::settings_pack::proxy_tracker_connections, on);
+	pack.set_bool(lt::settings_pack::proxy_hostnames, on);
+}
+
 lt::settings_pack settings_of(SessionConfig const& config) {
 	lt::settings_pack pack;
 	pack.set_str(lt::settings_pack::listen_interfaces, string_of(config.listen_interfaces));
@@ -51,6 +66,7 @@ lt::settings_pack settings_of(SessionConfig const& config) {
 	pack.set_str(lt::settings_pack::user_agent, string_of(config.user_agent));
 	pack.set_str(lt::settings_pack::peer_fingerprint, string_of(config.peer_fingerprint));
 	pack.set_int(lt::settings_pack::upload_rate_limit, config.upload_limit);
+	set_proxy_of(pack, config.proxy);
 	// 协议加密：两个方向都允许，优先加密，对方只会明文时照样连
 	pack.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
 	pack.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
@@ -423,6 +439,12 @@ void Session::drop_added_trackers(std::string const& id, lt::add_torrent_params&
 	}
 	params.trackers = std::move(trackers);
 	params.tracker_tiers = std::move(tiers);
+}
+
+void Session::set_proxy(SocksProxy const& proxy) const {
+	lt::settings_pack pack;
+	set_proxy_of(pack, proxy);
+	m_session.apply_settings(std::move(pack));
 }
 
 void Session::set_upload_limit(std::int32_t bytes_per_second) const {

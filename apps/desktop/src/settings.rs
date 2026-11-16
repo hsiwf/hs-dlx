@@ -1,4 +1,5 @@
-//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种与上传限速、外观、更新、版本与第三方声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
+//! 设置页：新建任务默认保存到哪、请求经哪个代理、BT 下完后的做种、上传限速与 BT 经的代理、外观、更新、版本与第三方
+//! 声明。改了即存进任务存储（见 [`hs_dlx_app::Settings`]），存进了
 //! 界面才换。
 
 use std::num::NonZeroU32;
@@ -28,6 +29,8 @@ const MAX_WIDTH: f32 = 720.;
 const LABEL_WIDTH: f32 = 160.;
 /// 指定代理时输入框里的示例。
 const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
+/// BT 代理的输入框里的示例。
+const TORRENT_PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
 /// 做种的几种选择：名字与设置。「分享率 1.0 或 24 小时」为默认（见 [`Seeding::default`]）
 const SEEDING_CHOICES: [(&str, &str); 3] = [
     ("seed-off", "下完不做种"),
@@ -85,6 +88,13 @@ pub struct SettingsView {
     _system: Task<()>,
     _typed: Subscription,
     _updates: Subscription,
+    /// 存着的 BT 代理（None 为直连）与选中的方式：选了经代理而还没存进地址时为 true
+    torrent_proxy: Option<hs_m3u8_core::Url>,
+    torrent_proxy_picked: bool,
+    torrent_address: Entity<InputState>,
+    /// BT 代理最近一次没存进去的原因
+    torrent_proxy_error: Option<String>,
+    _torrent_typed: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -102,6 +112,23 @@ impl SettingsView {
         let watched = cx.observe(&updates, |_, _, cx| cx.notify());
         let proxy = settings.proxy;
         let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
+        let torrent_address =
+            cx.new(|cx| InputState::new(window, cx).placeholder(TORRENT_PROXY_EXAMPLE));
+        if let Some(url) = &settings.torrent_proxy {
+            torrent_address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
+        }
+        let torrent_typed = cx.subscribe_in(
+            &torrent_address,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { .. } => this.save_torrent_proxy(cx),
+                InputEvent::Change => {
+                    this.torrent_proxy_error = None;
+                    cx.notify();
+                }
+                InputEvent::Focus | InputEvent::Blur => {}
+            },
+        );
         if let Proxy::Url(url) = &proxy {
             address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
         }
@@ -147,6 +174,11 @@ impl SettingsView {
             _system: system,
             _typed: typed,
             _updates: watched,
+            torrent_proxy_picked: settings.torrent_proxy.is_some(),
+            torrent_proxy: settings.torrent_proxy,
+            torrent_address,
+            torrent_proxy_error: None,
+            _torrent_typed: torrent_typed,
         }
     }
 
@@ -303,6 +335,120 @@ impl SettingsView {
                 div().flex().flex_wrap().gap(px(8.)).children(upload),
             ),
         ]
+    }
+
+    /// 改 BT 代理：`via` 为经代理（存输入框里的地址），否则改回直连；存进了才换。
+    fn pick_torrent_proxy(&mut self, via: bool, cx: &mut Context<Self>) {
+        self.torrent_proxy_error = None;
+        if via {
+            self.torrent_proxy_picked = true;
+            if !self.torrent_address.read(cx).value().trim().is_empty() {
+                self.save_torrent_proxy(cx);
+            }
+        } else {
+            match self.tasks.read(cx).service().set_torrent_proxy(None) {
+                Ok(()) => {
+                    self.torrent_proxy = None;
+                    self.torrent_proxy_picked = false;
+                }
+                Err(error) => self.torrent_proxy_error = Some(error.to_string()),
+            }
+        }
+        cx.notify();
+    }
+
+    /// 存输入框里的 BT 代理地址。
+    fn save_torrent_proxy(&mut self, cx: &mut Context<Self>) {
+        let text = self.torrent_address.read(cx).value().trim().to_owned();
+        let saved = hs_m3u8_core::Url::parse(&text)
+            .map_err(|_| format!("不是代理地址，应形如 {TORRENT_PROXY_EXAMPLE}"))
+            .and_then(|url| {
+                self.tasks
+                    .read(cx)
+                    .service()
+                    .set_torrent_proxy(Some(url.clone()))
+                    .map(|()| url)
+                    .map_err(|error| error.to_string())
+            });
+        match saved {
+            Ok(url) => {
+                self.torrent_proxy = Some(url);
+                self.torrent_proxy_error = None;
+            }
+            Err(reason) => self.torrent_proxy_error = Some(reason),
+        }
+        cx.notify();
+    }
+
+    /// BT 代理一行。
+    fn render_torrent_proxy(&self, cx: &mut Context<Self>) -> Div {
+        let picked = self.torrent_proxy_picked;
+        let typed = self.torrent_address.read(cx).value().trim().to_owned();
+        let unsaved = match &self.torrent_proxy {
+            None if picked => Some("保存之前照旧直连".to_owned()),
+            Some(url) if hs_m3u8_core::Url::parse(&typed).ok().as_ref() != Some(url) => Some(
+                format!("改的地址还没保存，照旧经 {}", hs_m3u8_core::bare_url(url)),
+            ),
+            _ => None,
+        };
+        let chips = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.))
+            .child(ui::chip(
+                "torrent-direct",
+                "直连",
+                !picked,
+                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(false, cx)),
+            ))
+            .child(ui::chip(
+                "torrent-socks",
+                "经 SOCKS5 代理",
+                picked,
+                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(true, cx)),
+            ));
+        let input = picked.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            ui::input_frame()
+                                .flex_1()
+                                .px(px(6.))
+                                .child(Input::new(&self.torrent_address).appearance(false)),
+                        )
+                        .child(ui::button(
+                            "save-torrent-proxy",
+                            "保存",
+                            Tone::Glow,
+                            cx.listener(|this, _, _, cx| this.save_torrent_proxy(cx)),
+                        )),
+                )
+                .child(ui::caption(
+                    "要 SOCKS5（HTTP 代理转发不了 DHT），写明端口，可带用户名与密码；代理要允许转发 UDP，DHT 才经得了它",
+                ))
+                .children(unsaved.map(ui::caption))
+        });
+        row(
+            "BT 代理",
+            Some("节点、tracker 与 DHT 经哪里出去；与上面的代理分开设"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(chips)
+                .children(input)
+                .children(self.torrent_proxy_error.clone().map(ui::error_text))
+                .child(ui::caption(
+                    "运营商限制 UDP、DHT 连不上时用；很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来，改了随即生效",
+                )),
+        )
     }
 
     /// 换「自动检查更新」：存进了才选中。
@@ -707,6 +853,11 @@ impl Render for SettingsView {
                             .children(
                                 self.render_seeding(cx)
                                     .map(|row| row.border_b_1().border_color(theme::hairline())),
+                            )
+                            .child(
+                                self.render_torrent_proxy(cx)
+                                    .border_b_1()
+                                    .border_color(theme::hairline()),
                             )
                             .child(
                                 self.render_theme(cx)

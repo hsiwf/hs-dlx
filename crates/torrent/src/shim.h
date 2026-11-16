@@ -26,6 +26,7 @@ struct Described;
 struct NetworkStatus;
 struct TrackerState;
 struct CreateOptions;
+struct SocksProxy;
 enum class Removal : std::uint8_t;
 
 class Session {
@@ -47,6 +48,7 @@ public:
 	void save_resume_data(rust::Str id) const;
 	std::uint16_t listen_port() const;
 	void set_upload_limit(std::int32_t bytes_per_second) const;
+	void set_proxy(SocksProxy const& proxy) const;
 	NetworkStatus network() const;
 	void request_stats() const;
 	rust::Vec<TrackerState> trackers(rust::Str id) const;

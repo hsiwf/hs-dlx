@@ -83,6 +83,7 @@ fn seed_with(
         user_agent: "hs-dlx-test-seeder".into(),
         peer_fingerprint: "-HD0000-".into(),
         upload_limit: 0,
+        proxy: Default::default(),
         state: Vec::new(),
     })
     .unwrap();
@@ -773,4 +774,96 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
     drop(service);
     drop(seeder);
     drop(private_seeder);
+}
+
+/// 测试的 SOCKS5 代理：在回环地址上，只做不认证的 TCP CONNECT（UDP ASSOCIATE 回「不支持」），记下转发到的地址。在自己的
+/// 线程上跑，随测试进程结束。
+struct Socks {
+    port: u16,
+    connected: Arc<Mutex<Vec<std::net::SocketAddr>>>,
+}
+
+impl Socks {
+    fn start() -> Socks {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connected = Arc::new(Mutex::new(Vec::new()));
+        let seen = connected.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(mut client) = client else { continue };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut head = [0; 2];
+                    client.read_exact(&mut head).unwrap();
+                    let mut methods = vec![0; usize::from(head[1])];
+                    client.read_exact(&mut methods).unwrap();
+                    client.write_all(&[5, 0]).unwrap();
+                    let mut request = [0; 4];
+                    client.read_exact(&mut request).unwrap();
+                    let ip = match request[3] {
+                        1 => {
+                            let mut v4 = [0; 4];
+                            client.read_exact(&mut v4).unwrap();
+                            std::net::IpAddr::from(v4)
+                        }
+                        4 => {
+                            let mut v6 = [0; 16];
+                            client.read_exact(&mut v6).unwrap();
+                            std::net::IpAddr::from(v6)
+                        }
+                        atyp => panic!("测试的代理不解析主机名（地址类型 {atyp}）"),
+                    };
+                    let mut port = [0; 2];
+                    client.read_exact(&mut port).unwrap();
+                    let target = std::net::SocketAddr::new(ip, u16::from_be_bytes(port));
+                    if request[1] != 1 {
+                        // 只做 CONNECT
+                        let _closed = client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+                        return;
+                    }
+                    let Ok(upstream) = std::net::TcpStream::connect(target) else {
+                        let _closed = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+                        return;
+                    };
+                    seen.lock().unwrap().push(target);
+                    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                    let (mut up_read, mut client_write) =
+                        (upstream.try_clone().unwrap(), client.try_clone().unwrap());
+                    let (mut up_write, mut client_read) = (upstream, client);
+                    std::thread::spawn(move || std::io::copy(&mut up_read, &mut client_write));
+                    let _done = std::io::copy(&mut client_read, &mut up_write);
+                });
+            }
+        });
+        Socks { port, connected }
+    }
+}
+
+/// BT 经 SOCKS5 代理：磁力链接连做种的一方经代理转发，取到种子信息；HTTP 代理不收。
+#[test]
+fn torrents_connect_through_the_socks_proxy() {
+    let dir = test_dir("socks-proxy");
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
+    let socks = Socks::start();
+    let rt = runtime();
+    let (service, _events) = service(&dir.join("tasks.sqlite"));
+    assert!(matches!(
+        service.set_torrent_proxy(Some(Url::parse("http://127.0.0.1:1").unwrap())),
+        Err(Error::InvalidInput(_))
+    ));
+    let proxy = Url::parse(&format!("socks5://127.0.0.1:{}", socks.port)).unwrap();
+    service.set_torrent_proxy(Some(proxy.clone())).unwrap();
+    assert_eq!(service.settings().unwrap().torrent_proxy, Some(proxy));
+    let resume = fetch(&rt, &service, &magnet(&id, &seeder));
+    assert_eq!(TorrentInfo::of(&resume).unwrap().info_hash, id.as_str());
+    let seeder_at = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, seeder.listen_port()));
+    assert!(
+        socks.connected.lock().unwrap().contains(&seeder_at),
+        "没经代理连做种的一方：{:?}",
+        socks.connected.lock().unwrap()
+    );
+    drop(service);
+    drop(seeder);
 }
