@@ -62,7 +62,8 @@ CI 在 macOS、Windows、Linux 上跑格式、clippy、文档与测试；与平�
    - 核对版本号：`vX.Y.Z` 标签已有对应的公开 Release 时到此为止，不发版；标签在而没有公开的 Release 时失败，要人看。
    - 确认更新日志里有这个版本的一节，再由 `desktop.yml` 在三个平台上打安装包：`.dmg`（Apple 芯片）、`-setup.exe`
      （x64）、`.deb`（amd64）。
-   - 全部成功后建 Release：先建草稿，用仓库的 Secret `MINISIGN_SECRET_KEY`（minisign 私钥文件的全文）给每个安装包
+   - 全部成功后建 Release：先建草稿，用仓库的 Secret `MINISIGN_SECRET_KEY`（minisign 私钥文件的全文，私钥用
+     `minisign -G -W` 生成、不带口令）给每个安装包
      签名并用 `apps/desktop/update.pub` 验一遍，再上传安装包、签名（`.minisig`）与 `SHA256SUMS`，最后公开；公开时
      GitHub 在这个提交上打 `vX.Y.Z` 标签。应用的自动更新按这些签名验安装包，私钥丢了已装的版本就验不了之后的更新。
 5. 任一步失败时没有公开的 Release、也没有标签：

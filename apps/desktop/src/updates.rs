@@ -1,10 +1,11 @@
 //! 应用的更新：设置里开着自动检查时，启动后与之后每天查一次 GitHub 上的最新版本；有新版本时顶栏提示，设置页里下载、
-//! 验签、装上后暂停任务、补写状态再退出，由等着的进程打开新版本（见 [`hs_dlx_app::Restart`]）。窗口关着时照常进行。
+//! 验签、装上，再照常退出（有任务在运行时问）。这次退出不可撤回时起接着更新的进程（见 [`hs_dlx_app::Restart`]），由它
+//! 打开新版本；退出被取消时停在「已装好」，可再点重启。窗口关着时照常进行。
 
 use std::time::Duration;
 
-use gpui_kit::{Context, Entity, Task};
-use hs_dlx_app::{Release, UpdateFeed, Version};
+use gpui_kit::{Context, Entity, Subscription, Task};
+use hs_dlx_app::{Release, Restart, UpdateFeed, Version};
 
 use crate::tasks::{Quit, Tasks};
 
@@ -25,6 +26,7 @@ pub fn feed() -> UpdateFeed {
         return UpdateFeed {
             latest: hs_m3u8_core::Url::parse(&latest).expect("HS_DLX_UPDATE_FEED 要是地址"),
             public_key,
+            dir: download_dir(),
         };
     }
     UpdateFeed {
@@ -37,7 +39,13 @@ pub fn feed() -> UpdateFeed {
             .nth(1)
             .expect("minisign 公钥文件的第二行是公钥")
             .to_owned(),
+        dir: download_dir(),
     }
+}
+
+/// 下载的安装包放在系统的临时目录下。
+fn download_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("hs-dlx-update")
 }
 
 /// 更新进行到哪一步。
@@ -57,13 +65,15 @@ pub enum UpdateState {
     },
     /// 下完验过签名，在装
     Installing(Version),
-    /// 装好了，在等任务停下后退出
-    Restarting(Version),
+    /// 装好了（Windows 为准备好了，退出后装）：退出时打开新版本
+    Installed(Version),
     /// 这一步没成：`release` 为查到的新版本（查的时候没成为 None），可再试
     Failed {
         release: Option<Release>,
         reason: String,
     },
+    /// 换到一半，新旧两份都不在原处：说明里写明各在哪，要手动处理，不再自动更新
+    Stranded(String),
 }
 
 pub struct Updates {
@@ -72,9 +82,14 @@ pub struct Updates {
     state: UpdateState,
     /// 自动检查（设置里的）
     auto: bool,
+    /// 装好后退出时要起的（[`UpdateState::Installed`] 时有）
+    restart: Option<Restart>,
+    /// 这次退出是为了打开新版本（点了重启）：退出不可撤回时起 `restart`；退出被取消即复位
+    restarting: bool,
     /// 在做的那一步（查、下载、装）；释放即取消
     _work: Option<Task<()>>,
     _schedule: Task<()>,
+    _subscriptions: [Subscription; 2],
 }
 
 impl Updates {
@@ -86,8 +101,7 @@ impl Updates {
                 cx.background_executor().timer(wait).await;
                 wait = CHECK_INTERVAL;
                 let alive = this.update(cx, |this, cx| {
-                    // 在下载、在装或已有结果待用户处理时不重查
-                    if this.auto && matches!(this.state, UpdateState::Idle | UpdateState::Latest) {
+                    if this.auto && this.checkable() {
                         this.check(cx);
                     }
                 });
@@ -96,13 +110,34 @@ impl Updates {
                 }
             }
         });
+        // 点了重启而退出被取消（问的时候选了留下、等任务停下时出了要看的事）：之后别的退出不打开新版本
+        let watched = cx.observe(&tasks, |this: &mut Self, tasks, cx| {
+            if this.restarting && tasks.read(cx).quit() == Quit::Staying {
+                this.restarting = false;
+                cx.notify();
+            }
+        });
+        let quitting = cx.on_app_quit(|this: &mut Self, _| {
+            if this.restarting
+                && let Some(restart) = this.restart.take()
+                && let Err(error) = restart.spawn()
+            {
+                // 已在退出，界面没了：下次启动时报出来
+                let _unrecorded =
+                    hs_dlx_app::record_update_failure(&this.feed.dir, &error.to_string());
+            }
+            async {}
+        });
         Updates {
             tasks,
             feed,
             state: UpdateState::Idle,
             auto,
+            restart: None,
+            restarting: false,
             _work: None,
             _schedule: schedule,
+            _subscriptions: [watched, quitting],
         }
     }
 
@@ -114,7 +149,20 @@ impl Updates {
         self.auto
     }
 
-    /// 换「自动检查更新」：存进了才换，没存进时为原因。
+    /// 点了重启、在等退出。
+    pub fn restarting(&self) -> bool {
+        self.restarting
+    }
+
+    /// 可以（重新）查：没查过、已是最新，或上次查没成。
+    fn checkable(&self) -> bool {
+        matches!(
+            self.state,
+            UpdateState::Idle | UpdateState::Latest | UpdateState::Failed { release: None, .. }
+        )
+    }
+
+    /// 换「自动检查更新」：存进了才换，改成自动时随即查一次；没存进时为原因。
     pub fn set_auto(&mut self, auto: bool, cx: &mut Context<Self>) -> Result<(), String> {
         self.tasks
             .read(cx)
@@ -122,6 +170,9 @@ impl Updates {
             .set_check_updates(auto)
             .map_err(|error| error.to_string())?;
         self.auto = auto;
+        if auto && self.checkable() {
+            self.check(cx);
+        }
         cx.notify();
         Ok(())
     }
@@ -135,23 +186,18 @@ impl Updates {
                 release: Some(release),
                 ..
             } => Some(release.version),
-            UpdateState::Installing(version) | UpdateState::Restarting(version) => Some(*version),
+            UpdateState::Installing(version) | UpdateState::Installed(version) => Some(*version),
             UpdateState::Idle
             | UpdateState::Checking
             | UpdateState::Latest
-            | UpdateState::Failed { release: None, .. } => None,
+            | UpdateState::Failed { release: None, .. }
+            | UpdateState::Stranded(_) => None,
         }
     }
 
-    /// 查有没有新版本；在下载、在装时什么也不做。
+    /// 查有没有新版本；不是可以查的时候（见 [`Updates::checkable`]）什么也不做。
     pub fn check(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.state,
-            UpdateState::Checking
-                | UpdateState::Downloading { .. }
-                | UpdateState::Installing(_)
-                | UpdateState::Restarting(_)
-        ) {
+        if !self.checkable() {
             return;
         }
         let handle = match self.tasks.read(cx).service().check_update(&self.feed) {
@@ -190,8 +236,8 @@ impl Updates {
         cx.notify();
     }
 
-    /// 下载新版本的安装包、验签名、装上，再暂停所有任务、补写状态后退出，由等着的进程打开新版本。不是有新版本可装
-    /// （或上次没成可再试）时什么也不做。
+    /// 下载新版本的安装包、验签名、装上，再重启（见 [`Updates::restart_now`]）。不是有新版本可装（或上次没成可再试）时
+    /// 什么也不做。
     pub fn install(&mut self, cx: &mut Context<Self>) {
         let release = match &self.state {
             UpdateState::Available(release)
@@ -264,31 +310,32 @@ impl Updates {
                 return;
             };
             let installed = installing.await;
-            let _closed = this.update(cx, |this, cx| {
-                let restart = match installed {
-                    Ok(Ok(restart)) => restart,
-                    Ok(Err(error)) => return this.fail(Some(release), error.to_string(), cx),
-                    Err(error) => {
-                        return this.fail(
-                            Some(release),
-                            format!("装更新的任务没做完：{error}"),
-                            cx,
-                        );
-                    }
-                };
-                if let Err(error) = restart.spawn() {
-                    return this.fail(Some(release), error.to_string(), cx);
+            let _closed = this.update(cx, |this, cx| match installed {
+                Ok(Ok(restart)) => {
+                    this.state = UpdateState::Installed(version);
+                    this.restart = Some(restart);
+                    this._work = None;
+                    this.restart_now(cx);
                 }
-                this.state = UpdateState::Restarting(version);
-                cx.notify();
-                // 正在问要不要退出或已在退出时照它进行，退出后照样打开新版本
-                this.tasks.update(cx, |tasks, cx| {
-                    if tasks.quit() == Quit::Staying {
-                        tasks.quit_after_stopping(false, cx);
-                    }
-                });
+                Ok(Err(hs_dlx_app::Error::UpdateStranded(reason))) => {
+                    this.state = UpdateState::Stranded(reason);
+                    this._work = None;
+                    cx.notify();
+                }
+                Ok(Err(error)) => this.fail(Some(release), error.to_string(), cx),
+                Err(error) => this.fail(Some(release), format!("装更新的任务没做完：{error}"), cx),
             });
         }));
         cx.notify();
+    }
+
+    /// 装好后重启：照常退出（有任务在运行时问，同退出应用），退出不可撤回时打开新版本。还没装好时什么也不做。
+    pub fn restart_now(&mut self, cx: &mut Context<Self>) {
+        if self.restart.is_none() {
+            return;
+        }
+        self.restarting = true;
+        cx.notify();
+        crate::main_window::quit(cx);
     }
 }

@@ -32,4 +32,7 @@ pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,
     TorrentPhase, TorrentProgress, torrent_from_file,
 };
-pub use update::{Package, Release, Restart, UpdateFeed, Version, sweep as sweep_update};
+pub use update::{
+    Package, Release, Restart, UpdateFeed, Version, record_failure as record_update_failure,
+    sweep as sweep_update, take_failure as take_update_failure,
+};

@@ -345,7 +345,7 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     assert_eq!(checks.len(), 8);
     assert_eq!(level(CheckItem::Listen), CheckLevel::Ok);
     assert_eq!(level(CheckItem::Dht), CheckLevel::Warn);
-    assert_eq!(level(CheckItem::Trackers), CheckLevel::Ok);
+    assert_eq!(level(CheckItem::Trackers), CheckLevel::Warn);
 
     // 根里有用户自己放的文件：删不干净，写明留下了什么，任务留着
     let root = folder.join("album");

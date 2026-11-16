@@ -1,6 +1,7 @@
 //! 应用自己的更新：查 GitHub 上最新的 Release，下载本平台的安装包（经设置里的代理，能续传），用编进应用的 minisign 公钥
-//! 验它的签名，再装上：macOS 把新的 .app 换到旧的位置，Windows 退出后静默运行安装程序；之后由 [`Restart`] 等本进程退出
-//! 再打开新版本。Linux 的 .deb 要 root 才能装，只提示去下载页。
+//! 验它的签名，再装上：macOS 先把新的 .app 换到旧的位置，退出后打开它；Windows 退出后静默运行安装程序，装完（或没装上
+//! 时）重新打开应用。退出之后的事由 [`Restart`] 起的进程做，没做成的写进结果文件，下次启动时由 [`take_failure`] 读出。
+//! Linux 的 .deb 要 root 才能装，只提示去下载页。
 //!
 //! 签名的可信注释为 `hs-dlx <版本> <文件名>`（发版时写入，见 .github/workflows/release.yml），逐字核对：别的版本或别的
 //! 文件的有效签名不能拿来冒充。
@@ -20,13 +21,16 @@ const SIGNATURE_LIMIT: u64 = 4 << 10;
 /// 读安装包验签时每次读多少字节。
 const READ_CHUNK: usize = 1 << 20;
 
-/// 更新从哪里查、用哪个公钥验。
+/// 更新从哪里查、用哪个公钥验、下载到哪。
 #[derive(Debug, Clone)]
 pub struct UpdateFeed {
     /// GitHub REST API 的最新 Release（`https://api.github.com/repos/<所有者>/<仓库>/releases/latest`）
     pub latest: Url,
     /// minisign 公钥（公钥文件的第二行，base64）
     pub public_key: String,
+    /// 下载的安装包与 macOS 挂载磁盘映像的目录，每次启动时清掉（[`sweep`]）；退出后没装上的原因写在它旁边的
+    /// `<目录名>.failed`（[`take_failure`]）
+    pub dir: PathBuf,
 }
 
 /// 版本号 `主.次.修订`。
@@ -69,10 +73,8 @@ impl std::fmt::Display for Version {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: Version,
-    /// Release 的网页
+    /// Release 的网页（更新内容在这里）
     pub page: Url,
-    /// 发布说明（Markdown）
-    pub notes: String,
     /// 本平台的安装包；None 时本平台不能自动装（Linux），到网页下载
     pub package: Option<Package>,
 }
@@ -102,8 +104,6 @@ const PACKAGE_SUFFIX: Option<&str> = if cfg!(all(target_os = "macos", target_arc
 struct GitHubRelease {
     tag_name: String,
     html_url: String,
-    #[serde(default)]
-    body: Option<String>,
     draft: bool,
     prerelease: bool,
     assets: Vec<GitHubAsset>,
@@ -191,7 +191,6 @@ fn release_of(
     Ok(Some(Release {
         version,
         page: url_of(&release.html_url)?,
-        notes: release.body.unwrap_or_default(),
         package,
     }))
 }
@@ -266,16 +265,39 @@ pub(crate) fn verify(
         .map_err(|_| Error::Update(format!("{name} 与签名不符：不是发布的那个文件，没有安装")))
 }
 
-/// 下载的安装包放在哪个目录：系统的临时目录下，每次启动时清掉（见 [`sweep`]）。
-pub(crate) fn download_dir() -> PathBuf {
-    std::env::temp_dir().join("hs-dlx-update")
+/// 退出后没装上的原因写在哪个文件。
+fn failure_file(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".failed");
+    dir.with_file_name(name)
 }
 
-/// 装好之后重新打开应用：等本进程退出，再打开新版本（Windows 为运行安装程序，它装完再打开）。
+/// 记下退出之后没做成的事（下次启动时由 [`take_failure`] 读出）；写不进时为原因。
+pub fn record_failure(dir: &Path, reason: &str) -> Result<(), String> {
+    std::fs::write(failure_file(dir), reason)
+        .map_err(|error| format!("记不下更新没做成的原因（{reason}）：{error}"))
+}
+
+/// 读出并删掉上次退出之后更新没做成的原因；没有时为 None。读不了或删不掉时把这一点也写进原因。
+pub fn take_failure(dir: &Path) -> Option<String> {
+    let file = failure_file(dir);
+    let reason = match std::fs::read(&file) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => format!("读不了 {}：{error}", file.display()),
+    };
+    Some(match std::fs::remove_file(&file) {
+        Ok(()) => reason,
+        Err(error) => format!("{reason}（{} 删不掉：{error}）", file.display()),
+    })
+}
+
+/// 退出之后由它接着做：等本进程退出，macOS 打开换上的新版本，Windows 运行安装程序、装完再打开应用。
 pub struct Restart(Command);
 
 impl Restart {
-    /// 起等待的进程（独立于本进程，本进程退出后照样运行）；起不来时报 [`Error::Update`]。之后本进程正常退出即可。
+    /// 起等待的进程（独立于本进程，本进程退出后照样运行）；起不来时报 [`Error::Update`]。只在退出已不可撤回时调用：
+    /// 起了之后本进程不论怎么退出，它都接着做。
     pub fn spawn(mut self) -> Result<(), Error> {
         self.0
             .stdin(std::process::Stdio::null())
@@ -283,27 +305,31 @@ impl Restart {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map(drop)
-            .map_err(|error| Error::Update(format!("起不来重开应用的进程：{error}")))
+            .map_err(|error| Error::Update(format!("起不来接着更新的进程：{error}")))
     }
 }
 
-/// 装上验过签名的安装包 `package`，返回之后怎么重开。装不上时报 [`Error::Update`]，已装的版本不受影响。在阻塞线程上
-/// 调用。
-pub(crate) fn install(package: &Path) -> Result<Restart, Error> {
-    platform::install(package)
+/// 装上验过签名的安装包 `package`（下载目录为 `dir`），返回退出之后怎么接着做。没装上、已装的版本不受影响时报
+/// [`Error::Update`]；换到一半没换回去时报 [`Error::UpdateStranded`]，说明里写明两份各在哪。在阻塞线程上调用。
+pub(crate) fn install(package: &Path, dir: &Path) -> Result<Restart, Error> {
+    platform::install(package, dir)
 }
 
-/// 启动时清掉上次更新留下的：下载的安装包，与 macOS 上换下来的旧版本。删不掉时为说明。
-pub fn sweep() -> Result<(), String> {
+/// 启动时清掉上次更新留下的：下载目录（macOS 先卸下还挂着的磁盘映像），与 macOS 上暂存的新版本、换下来的旧版本。
+/// 删不掉时为说明。
+pub fn sweep(dir: &Path) -> Result<(), String> {
     let mut left = Vec::new();
+    if let Err(reason) = platform::unmount(dir) {
+        left.push(reason);
+    }
     let mut remove = |path: PathBuf| match std::fs::remove_dir_all(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => left.push(format!("{}（{error}）", path.display())),
     };
-    remove(download_dir());
-    if let Some(old) = platform::replaced() {
-        remove(old);
+    remove(dir.to_path_buf());
+    for leftover in platform::leftovers() {
+        remove(leftover);
     }
     if left.is_empty() {
         Ok(())
@@ -320,9 +346,9 @@ mod platform {
     use super::Restart;
     use crate::Error;
 
-    /// 新版本先拷到旧的旁边的这个名字，验过再换上。
+    /// 新版本先拷到旧的旁边的这个名字，拷完再换上；拷到一半失败时删掉，下次启动时也删。
     const STAGED: &str = ".hs-dlx-update.app";
-    /// 换下来的旧版本，下次启动时删（[`super::sweep`]）。
+    /// 换下来的旧版本，下次启动时删。
     const REPLACED: &str = ".hs-dlx-old.app";
     /// 磁盘映像里的应用。
     const BUNDLE: &str = "hs-dlx.app";
@@ -338,41 +364,69 @@ mod platform {
         (bundle.extension()? == "app").then(|| bundle.to_path_buf())
     }
 
-    pub(super) fn replaced() -> Option<PathBuf> {
-        bundle().map(|bundle| bundle.with_file_name(REPLACED))
+    pub(super) fn leftovers() -> Vec<PathBuf> {
+        bundle().map_or_else(Vec::new, |bundle| {
+            vec![
+                bundle.with_file_name(STAGED),
+                bundle.with_file_name(REPLACED),
+            ]
+        })
+    }
+
+    /// 磁盘映像挂在下载目录的这个子目录。
+    fn mount_point(dir: &Path) -> PathBuf {
+        dir.join("mount")
     }
 
     /// 运行 `program`，失败时报出它的输出。
-    fn run(program: &str, args: &[&std::ffi::OsStr], what: &str) -> Result<(), Error> {
+    fn run(program: &str, args: &[&std::ffi::OsStr], what: &str) -> Result<(), String> {
         let output = Command::new(program)
             .args(args)
             .output()
-            .map_err(|error| update(format!("{what}：起不来 {program}：{error}")))?;
+            .map_err(|error| format!("{what}：起不来 {program}：{error}"))?;
         if output.status.success() {
             return Ok(());
         }
-        Err(update(format!(
+        Err(format!(
             "{what}：{program} 失败（{}）：{}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
-        )))
+        ))
     }
 
-    /// 挂着的磁盘映像，释放时卸下。
+    fn detach(mount: &Path) -> Result<(), String> {
+        run(
+            "hdiutil",
+            &["detach".as_ref(), mount.as_os_str(), "-force".as_ref()],
+            "卸下磁盘映像",
+        )
+    }
+
+    /// 下载目录里还挂着磁盘映像（上次装到一半退出）时卸下；卸不下时为原因。
+    pub(super) fn unmount(dir: &Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mount = mount_point(dir);
+        let (Ok(inner), Ok(outer)) = (std::fs::metadata(&mount), std::fs::metadata(dir)) else {
+            return Ok(());
+        };
+        // 挂着时挂载点与所在目录不在同一个设备上
+        if inner.dev() == outer.dev() {
+            return Ok(());
+        }
+        detach(&mount)
+    }
+
+    /// 挂着的磁盘映像，释放时卸下；卸不下时留到下次启动（[`unmount`]）。
     struct Mounted(PathBuf);
 
     impl Drop for Mounted {
         fn drop(&mut self) {
-            // 卸不下只占着一个挂载点，系统重启即无；不影响更新的结果
-            let _left = run(
-                "hdiutil",
-                &["detach".as_ref(), self.0.as_os_str(), "-force".as_ref()],
-                "卸下磁盘映像",
-            );
+            // 卸不下只占着挂载点：下次启动时清理再卸，那时卸不下会报出来
+            let _later = detach(&self.0);
         }
     }
 
-    pub(super) fn install(package: &Path) -> Result<Restart, Error> {
+    pub(super) fn install(package: &Path, dir: &Path) -> Result<Restart, Error> {
         let bundle =
             bundle().ok_or_else(|| update("不是从 .app 运行的，不能自动更新".to_owned()))?;
         if bundle
@@ -384,7 +438,8 @@ mod platform {
                     .to_owned(),
             ));
         }
-        let mount = super::download_dir().join("mount");
+        let mount = mount_point(dir);
+        unmount(dir).map_err(update)?;
         std::fs::create_dir_all(&mount)
             .map_err(|error| update(format!("建不了 {}：{error}", mount.display())))?;
         run(
@@ -399,7 +454,8 @@ mod platform {
                 package.as_os_str(),
             ],
             "挂载新版本的磁盘映像",
-        )?;
+        )
+        .map_err(update)?;
         let mounted = Mounted(mount);
         let source = mounted.0.join(BUNDLE);
         if !source.is_dir() {
@@ -417,29 +473,39 @@ mod platform {
             }
         }
         // ditto 保留符号链接、扩展属性与代码签名
-        run(
+        if let Err(reason) = run(
             "ditto",
             &[source.as_os_str(), staged.as_os_str()],
             &format!(
                 "把新版本拷到 {}（没有写入权限时先把应用移到自己能改的位置）",
                 staged.display()
             ),
-        )?;
+        ) {
+            return Err(update(match std::fs::remove_dir_all(&staged) {
+                Ok(()) => reason,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => reason,
+                Err(error) => format!(
+                    "{reason}；拷了一半的 {} 也删不掉：{error}",
+                    staged.display()
+                ),
+            }));
+        }
         drop(mounted);
         std::fs::rename(&bundle, &replaced)
             .map_err(|error| update(format!("换不下旧版本 {}：{error}", bundle.display())))?;
         if let Err(error) = std::fs::rename(&staged, &bundle) {
-            // 换回旧的；也换不回时两个都还在，写明在哪
-            return Err(match std::fs::rename(&replaced, &bundle) {
-                Ok(()) => update(format!("换不上新版本：{error}")),
-                Err(back) => update(format!(
-                    "换不上新版本（{error}），旧版本也没换回去（{back}）：旧版本在 {}，新版本在 {}",
+            return match std::fs::rename(&replaced, &bundle) {
+                Ok(()) => Err(update(format!("换不上新版本：{error}"))),
+                Err(back) => Err(Error::UpdateStranded(format!(
+                    "换不上新版本（{error}），旧版本也没换回去（{back}）：旧版本在 {}，新版本在 {}，把其中一个改名为 {} 即可",
                     replaced.display(),
-                    staged.display()
-                )),
-            });
+                    staged.display(),
+                    bundle.display()
+                ))),
+            };
         }
-        // 等本进程退出（caffeinate -w 用 kqueue 等，不轮询）再打开新版本
+        // 退出不可撤回时才起（见 Restart::spawn）：caffeinate -w 用 kqueue 等本进程退出（等的这几秒里系统不会空闲睡眠），
+        // 再打开换上的新版本
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
@@ -463,22 +529,26 @@ mod platform {
     /// 不弹控制台窗口、不随本进程的控制台结束（CREATE_NO_WINDOW | DETACHED_PROCESS）。
     const DETACHED: u32 = 0x0800_0000 | 0x0000_0008;
 
-    pub(super) fn replaced() -> Option<PathBuf> {
-        None
+    /// 等本进程退出再装（安装程序见到应用还在运行会直接结束它，等于强退），静默（/S）、不重建快捷方式（/NS）；装完
+    /// 再打开应用（不用安装程序的 /R：它在自己退出之前打开，新版本启动时清理删不掉还在运行的安装程序）。安装程序没成
+    /// 时把退出码写进结果文件，照样打开（旧的）应用。路径都经环境变量传入，脚本里没有要转义的文字。
+    const SCRIPT: &str = "Wait-Process -Id $env:HS_DLX_PID -ErrorAction SilentlyContinue; \
+        try { $code = (Start-Process -FilePath $env:HS_DLX_SETUP -ArgumentList '/S','/NS' -Wait -PassThru).ExitCode } \
+        catch { $code = $_.Exception.Message }; \
+        if ($code -ne 0) { [IO.File]::WriteAllText($env:HS_DLX_FAILED, \"installer: $code\") }; \
+        Start-Process -FilePath $env:HS_DLX_EXE";
+
+    pub(super) fn leftovers() -> Vec<PathBuf> {
+        Vec::new()
     }
 
-    /// PowerShell 单引号字符串的写法：里面的单引号写两遍。
-    fn quoted(path: &Path) -> String {
-        format!("'{}'", path.display().to_string().replace('\'', "''"))
+    pub(super) fn unmount(_dir: &Path) -> Result<(), String> {
+        Ok(())
     }
 
-    pub(super) fn install(package: &Path) -> Result<Restart, Error> {
-        // 等本进程退出再装：安装程序见到应用还在运行会直接结束它，等于强退。/S 静默、/R 装完打开、/NS 不重建快捷方式
-        let script = format!(
-            "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath {} -ArgumentList '/S','/R','/NS'",
-            std::process::id(),
-            quoted(package)
-        );
+    pub(super) fn install(package: &Path, dir: &Path) -> Result<Restart, Error> {
+        let exe = std::env::current_exe()
+            .map_err(|error| Error::Update(format!("找不到程序所在的位置：{error}")))?;
         let mut command = Command::new("powershell.exe");
         command
             .args([
@@ -487,8 +557,12 @@ mod platform {
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
+                SCRIPT,
             ])
-            .arg(script)
+            .env("HS_DLX_PID", std::process::id().to_string())
+            .env("HS_DLX_SETUP", package)
+            .env("HS_DLX_EXE", exe)
+            .env("HS_DLX_FAILED", super::failure_file(dir))
             .creation_flags(DETACHED);
         Ok(Restart(command))
     }
@@ -501,11 +575,15 @@ mod platform {
     use super::Restart;
     use crate::Error;
 
-    pub(super) fn replaced() -> Option<PathBuf> {
-        None
+    pub(super) fn leftovers() -> Vec<PathBuf> {
+        Vec::new()
     }
 
-    pub(super) fn install(_package: &Path) -> Result<Restart, Error> {
+    pub(super) fn unmount(_dir: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub(super) fn install(_package: &Path, _dir: &Path) -> Result<Restart, Error> {
         Err(Error::Update(
             "这个平台不能自动更新，到下载页下载新版本".to_owned(),
         ))
@@ -546,7 +624,6 @@ mod tests {
         serde_json::json!({
             "tag_name": tag,
             "html_url": "https://example.test/release",
-            "body": "notes",
             "draft": false,
             "prerelease": false,
             "assets": assets,
@@ -591,6 +668,24 @@ mod tests {
         assert_eq!(release_of(&body, same, Some("_aarch64.dmg")).unwrap(), None);
         assert!(release_of(&github("0.3.0", &[]), current, None).is_err());
         assert!(release_of(b"<html>", current, None).is_err());
+    }
+
+    #[test]
+    fn failures_after_exit_are_read_once() {
+        let dir = std::env::temp_dir()
+            .join(format!("hs-dlx-update-failure-{}", std::process::id()))
+            .join("hs-dlx-update");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(take_failure(&dir), None);
+        record_failure(&dir, "installer: 2").unwrap();
+        assert_eq!(take_failure(&dir).as_deref(), Some("installer: 2"));
+        assert_eq!(take_failure(&dir), None);
+        // 下载目录清掉也不影响下次读出
+        record_failure(&dir, "起不来").unwrap();
+        sweep(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(take_failure(&dir).as_deref(), Some("起不来"));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     /// 测试用的密钥对（与发布用的无关）签的 `b"hs-dlx update test\n"`，可信注释为 `hs-dlx 99.0.0 <文件名>`。

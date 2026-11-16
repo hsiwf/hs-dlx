@@ -58,7 +58,6 @@ fn serve(rt: &tokio::runtime::Runtime, tampered: bool) -> Url {
         let latest = serde_json::json!({
             "tag_name": "v99.0.0",
             "html_url": format!("{base}/release"),
-            "body": "新版本",
             "draft": false,
             "prerelease": false,
             "assets": assets,
@@ -83,11 +82,13 @@ fn wait<T: Send + 'static>(
         .unwrap()
 }
 
-fn feed(latest: Url) -> UpdateFeed {
+/// `latest` 上的更新，下载到 `dir`。
+fn feed(latest: Url, dir: &Path) -> UpdateFeed {
     let key = std::fs::read_to_string(Path::new(FIXTURES).join("test.pub")).unwrap();
     UpdateFeed {
         latest,
         public_key: key.lines().nth(1).unwrap().to_owned(),
+        dir: dir.to_path_buf(),
     }
 }
 
@@ -115,12 +116,12 @@ fn updates_are_found_downloaded_and_verified() {
     // 系统代理可能不放过回环地址
     service.set_proxy(&Proxy::Direct).unwrap();
 
-    let good = feed(serve(&rt, false));
+    let downloads = dir.join("downloads");
+    let good = feed(serve(&rt, false), &downloads);
     let release = wait(&rt, service.check_update(&good).unwrap())
         .unwrap()
         .expect("99.0.0 比现在的新");
     assert_eq!(release.version.to_string(), "99.0.0");
-    assert_eq!(release.notes, "新版本");
     let Some(package) = &release.package else {
         assert!(matches!(
             service.download_update(&good, &release),
@@ -134,16 +135,14 @@ fn updates_are_found_downloaded_and_verified() {
     assert_eq!(downloaded.version, release.version);
     assert_eq!(*download.received.borrow(), package.size);
 
-    let bad = feed(serve(&rt, true));
+    let bad = feed(serve(&rt, true), &downloads);
     let release = wait(&rt, service.check_update(&bad).unwrap())
         .unwrap()
         .unwrap();
     let download = service.download_update(&bad, &release).unwrap();
     let error = wait(&rt, download.done).unwrap_err();
     assert!(error.to_string().contains("与签名不符"), "{error}");
-    let left = std::env::temp_dir()
-        .join("hs-dlx-update")
-        .join(&release.package.unwrap().name);
+    let left = downloads.join(release.package.unwrap().name);
     assert!(!left.exists(), "签名不符的文件没删");
     drop(service);
 }

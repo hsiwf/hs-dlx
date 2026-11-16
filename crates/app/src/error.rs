@@ -74,6 +74,9 @@ pub enum Error {
     /// 应用更新没成（查不到、下载不了、签名不符、装不上）：说明里写明哪一步与原因；已装的版本不受影响
     #[error("更新：{0}")]
     Update(String),
+    /// 应用更新换到一半，新旧两份都没在原来的位置：说明里写明各在哪、怎么处理；不能再试
+    #[error("更新没换完：{0}")]
+    UpdateStranded(String),
     /// BT 任务在做种：要先停止做种（[`crate::Service::stop_seeding`]）
     #[error("{0}正在做种，先停止做种")]
     Seeding(TaskId),

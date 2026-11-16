@@ -316,9 +316,13 @@ impl SettingsView {
 
     /// 更新一行：自动检查的开关，与查到的新版本、下载与安装到了哪一步。
     fn render_updates(&self, cx: &mut Context<Self>) -> Div {
-        let (auto, state) = {
+        let (auto, state, restarting) = {
             let updates = self.updates.read(cx);
-            (updates.auto(), updates.state().clone())
+            (
+                updates.auto(),
+                updates.state().clone(),
+                updates.restarting(),
+            )
         };
         let chips = div()
             .flex()
@@ -389,7 +393,7 @@ impl SettingsView {
                     Some(package) => {
                         lines.push(
                             ui::caption(format!(
-                                "下载 {}，验过签名后装上；运行中的任务先暂停，应用重开后在列表里继续",
+                                "下载 {}；装好后退出并打开新版本，运行中的任务会暂停，要在新版本里点继续",
                                 crate::format::bytes(package.size)
                             ))
                             .into_any_element(),
@@ -417,10 +421,33 @@ impl SettingsView {
             UpdateState::Installing(version) => {
                 lines.push(ui::caption(format!("正在装 {version}")).into_any_element());
             }
-            UpdateState::Restarting(version) => lines.push(
-                ui::caption(format!("{version} 已装好：等任务停下后退出并打开新版本"))
+            UpdateState::Installed(version) => {
+                lines.push(
+                    ui::caption(if restarting {
+                        format!("{version} 已装好：退出后打开新版本")
+                    } else {
+                        format!("{version} 已装好，重启后用新版本")
+                    })
                     .into_any_element(),
-            ),
+                );
+                if !restarting {
+                    buttons.push(
+                        ui::button(
+                            "update-restart",
+                            "现在重启",
+                            Tone::Glow,
+                            cx.listener(|this, _, _, cx| {
+                                this.updates
+                                    .update(cx, |updates, cx| updates.restart_now(cx));
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+            }
+            UpdateState::Stranded(reason) => {
+                lines.push(ui::error_text(reason.clone()).into_any_element());
+            }
             UpdateState::Failed { release, reason } => {
                 lines.push(ui::error_text(reason.clone()).into_any_element());
                 match release {
@@ -436,7 +463,7 @@ impl SettingsView {
         }
         row(
             "更新",
-            Some("经上面的代理查 GitHub 上的新版本；安装包验过签名才装"),
+            Some("经上面的代理查 GitHub 上的新版本"),
             div()
                 .flex()
                 .flex_col()

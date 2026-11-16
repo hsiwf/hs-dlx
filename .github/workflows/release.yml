@@ -156,9 +156,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends minisign
           key="$RUNNER_TEMP/minisign.key"
           (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          # 私钥不带口令（minisign -G -W 生成）；minisign 的标准输入另给，免得读走 SHA256SUMS 的行
           while read -r _ file; do
-            minisign -S -s "$key" -m "$file" -c "hs-dlx $VERSION" -t "hs-dlx $VERSION $file"
-            minisign -V -p "$GITHUB_WORKSPACE/apps/desktop/update.pub" -m "$file"
+            minisign -S -s "$key" -m "$file" -c "hs-dlx $VERSION" -t "hs-dlx $VERSION $file" < /dev/null
+            minisign -V -p "$GITHUB_WORKSPACE/apps/desktop/update.pub" -m "$file" < /dev/null
           done < SHA256SUMS
           rm -f "$key"
           ls -la

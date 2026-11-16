@@ -1352,6 +1352,14 @@ pub(crate) async fn diagnose(
         PublicTrackers::Off => Public::Off,
         PublicTrackers::Idle | PublicTrackers::Fetching => Public::Fetching,
         PublicTrackers::Failed(why) => Public::Failed(why.clone()),
+        PublicTrackers::Ready(list)
+            if added.is_empty()
+                && list
+                    .iter()
+                    .all(|url| own.iter().any(|tracker| &tracker.url == url)) =>
+        {
+            Public::Covered
+        }
         PublicTrackers::Ready(_) => Public::Added(added.into_iter().map(fact).collect()),
     };
     let count = |value: i32| u32::try_from(value).ok();

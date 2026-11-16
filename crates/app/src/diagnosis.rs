@@ -79,6 +79,8 @@ pub(crate) enum Public {
     Failed(String),
     /// 列表取到了：给这个种子补上的（还没补时为空）
     Added(Vec<Tracker>),
+    /// 列表取到了，里面的都已在种子自己的 tracker 里，不用补
+    Covered,
 }
 
 /// 一组 tracker 有没有回应。
@@ -229,11 +231,18 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             CheckLevel::Bad,
             "私有种子里没有 tracker：找不到节点".to_owned(),
         ),
-        _ if total == 0 => check(
-            CheckItem::Trackers,
-            CheckLevel::Ok,
-            "种子里没有 tracker，靠 DHT 与公共 tracker 找节点".to_owned(),
-        ),
+        _ if total == 0 => match &facts.public {
+            Public::Added(added) if !added.is_empty() => check(
+                CheckItem::Trackers,
+                CheckLevel::Ok,
+                "种子里没有 tracker，靠 DHT 与补的公共 tracker 找节点".to_owned(),
+            ),
+            _ => check(
+                CheckItem::Trackers,
+                CheckLevel::Warn,
+                "种子里没有 tracker，公共 tracker 也还没补上：只靠 DHT 找节点".to_owned(),
+            ),
+        },
         // 一层里找到一个能用的就不再挨个试同层别的，回应了的往往每层只有一个
         Responses::Working(working) => check(
             CheckItem::Trackers,
@@ -282,6 +291,11 @@ pub(crate) fn checks(facts: &Facts) -> Vec<Check> {
             format!(
                 "公共 tracker 列表没取到（{why}）：隔一阵再取；取到之前只靠种子里的 tracker 与 DHT 找节点，可检查代理设置"
             ),
+        ),
+        Public::Covered => check(
+            CheckItem::PublicTrackers,
+            CheckLevel::Ok,
+            "公共 tracker 都已在种子自己的 tracker 里".to_owned(),
         ),
         Public::Added(added) if added.is_empty() => check(
             CheckItem::PublicTrackers,

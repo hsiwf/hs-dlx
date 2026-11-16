@@ -58,6 +58,8 @@ pub struct UpdateDownload {
 pub struct Downloaded {
     pub version: Version,
     path: PathBuf,
+    /// 下载目录（[`UpdateFeed::dir`]）
+    dir: PathBuf,
 }
 
 /// 交给界面的事件。
@@ -496,7 +498,7 @@ impl Service {
         })))
     }
 
-    /// 下载 `release` 里本平台的安装包（经设置里的代理，放在系统的临时目录，没下完的再下时接着下），先取签名、核对它是
+    /// 下载 `release` 里本平台的安装包（经设置里的代理，放在 `feed.dir`，没下完的再下时接着下），先取签名、核对它是
     /// 这个版本这个文件的，下完验内容。返回已下的字节数与句柄：句柄的结果为验过的安装包，交给
     /// [`Service::install_update`]；释放它即取消。`release` 没有本平台的安装包时报 [`Error::Update`]，读不出设置时直接
     /// 报错；其余失败（取不到、签名不符等）经句柄报 [`Error::Update`]，签名不符的文件删掉。
@@ -510,16 +512,17 @@ impl Service {
             .clone()
             .ok_or_else(|| Error::Update("这个平台不能自动更新，到下载页下载新版本".to_owned()))?;
         let proxy = self.settings()?.proxy;
-        let (engine, key, release) = (
+        let (engine, key, dir, release) = (
             self.shared.engine.clone(),
             feed.public_key.clone(),
+            feed.dir.clone(),
             release.clone(),
         );
         let (progress, received) = watch::channel(0);
         let handle = self.runtime().spawn(async move {
             let (key, signature) =
                 update::signature(&engine, &proxy, &key, &release, &package).await?;
-            let path = update::download_dir().join(&package.name);
+            let path = dir.join(&package.name);
             let mut output = FileOutputOptions::new(path.clone());
             output.overwrite = true;
             let mut source = Source::new(package.url.clone());
@@ -541,6 +544,8 @@ impl Service {
                     }
                 }
             };
+            // 下完与最后一次进度同时到时上面可能先选了下完
+            progress.send_replace(downloaded.bytes);
             let checked = downloaded.path.clone();
             tokio::task::spawn_blocking(move || {
                 let verified = update::verify(&checked, &key, &signature);
@@ -555,6 +560,7 @@ impl Service {
             Ok(Downloaded {
                 version: release.version,
                 path: downloaded.path,
+                dir,
             })
         });
         Ok(UpdateDownload {
@@ -563,11 +569,12 @@ impl Service {
         })
     }
 
-    /// 装上验过签名的安装包（见 [`crate::Restart`]）：返回之后怎么重开，调用方起它之后正常退出应用。装不上时报
-    /// [`Error::Update`]，已装的版本不受影响。返回的句柄在任何执行器上都可等待。
+    /// 装上验过签名的安装包，返回退出之后怎么接着做（见 [`crate::Restart`]：退出已不可撤回时起它）。没装上时报
+    /// [`Error::Update`]（已装的版本不受影响，可再试），换到一半时报 [`Error::UpdateStranded`]。返回的句柄在任何执行器
+    /// 上都可等待。
     pub fn install_update(&self, downloaded: Downloaded) -> JoinHandle<Result<Restart, Error>> {
         self.runtime()
-            .spawn_blocking(move || update::install(&downloaded.path))
+            .spawn_blocking(move || update::install(&downloaded.path, &downloaded.dir))
     }
 
     /// 记下外观主题。

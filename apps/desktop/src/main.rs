@@ -162,7 +162,11 @@ fn main() {
                     });
                     main_window::install(tasks.clone(), updates, cx);
                     let mut problems = Vec::new();
-                    if let Err(left) = hs_dlx_app::sweep_update() {
+                    let downloads = updates::feed().dir;
+                    if let Some(reason) = hs_dlx_app::take_update_failure(&downloads) {
+                        problems.push(format!("上次更新没做成：{reason}"));
+                    }
+                    if let Err(left) = hs_dlx_app::sweep_update(&downloads) {
                         problems.push(left);
                     }
                     #[cfg(target_os = "macos")]
