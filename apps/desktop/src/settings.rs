@@ -9,8 +9,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div, px,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, ScrollHandle,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use hs_dlx_app::{Seeding, Settings};
 use hs_m3u8_core::{Proxy, Url};
@@ -98,6 +98,9 @@ pub struct SettingsView {
     network_check: Option<Task<()>>,
     network_report: Option<Result<hs_dlx_app::NetworkReport, String>>,
     _torrent_typed: Subscription,
+    scroll: ScrollHandle,
+    /// 下一帧把「更新」一行滚到顶上（见 [`SettingsView::reveal_updates`]）
+    reveal_updates: bool,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -185,6 +188,8 @@ impl SettingsView {
             network_check: None,
             network_report: None,
             _torrent_typed: torrent_typed,
+            scroll: ScrollHandle::new(),
+            reveal_updates: false,
         }
     }
 
@@ -522,6 +527,12 @@ impl SettingsView {
                     "很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来；改了之后的连接经它，已连着的不断",
                 )),
         )
+    }
+
+    /// 把「更新」一行滚到顶上：从顶栏的新版本提示进来时用。
+    pub fn reveal_updates(&mut self, cx: &mut Context<Self>) {
+        self.reveal_updates = true;
+        cx.notify();
     }
 
     /// 换「自动检查更新」：存进了才选中。
@@ -885,6 +896,22 @@ impl Render for SettingsView {
                 )
                 .children(self.notices_error.clone().map(ui::error_text)),
         );
+        // 每行是滚动区的直接子元素，按序号滚到某一行
+        let mut rows = vec![folder, self.render_proxy(cx)];
+        rows.extend(self.render_seeding(cx));
+        rows.push(self.render_torrent_proxy(cx));
+        rows.push(self.render_network_check(cx));
+        rows.push(self.render_theme(cx));
+        let updates_row = rows.len();
+        rows.push(self.render_updates(cx));
+        if std::mem::take(&mut self.reveal_updates) {
+            self.scroll.scroll_to_top_of_item(updates_row);
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| row.border_b_1().border_color(theme::hairline()))
+            .chain([about])
+            .map(|row| row.flex_none().w_full().max_w(px(MAX_WIDTH)));
         ui::deck()
             .flex_1()
             .min_w_0()
@@ -903,6 +930,7 @@ impl Render for SettingsView {
             .child(
                 div()
                     .id("settings")
+                    .track_scroll(&self.scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -912,45 +940,7 @@ impl Render for SettingsView {
                     .px(px(24.))
                     .pt(px(8.))
                     .pb(px(24.))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .max_w(px(MAX_WIDTH))
-                            .flex()
-                            .flex_col()
-                            .child(folder.border_b_1().border_color(theme::hairline()))
-                            .child(
-                                self.render_proxy(cx)
-                                    .border_b_1()
-                                    .border_color(theme::hairline()),
-                            )
-                            .children(
-                                self.render_seeding(cx)
-                                    .map(|row| row.border_b_1().border_color(theme::hairline())),
-                            )
-                            .child(
-                                self.render_torrent_proxy(cx)
-                                    .border_b_1()
-                                    .border_color(theme::hairline()),
-                            )
-                            .child(
-                                self.render_network_check(cx)
-                                    .border_b_1()
-                                    .border_color(theme::hairline()),
-                            )
-                            .child(
-                                self.render_theme(cx)
-                                    .border_b_1()
-                                    .border_color(theme::hairline()),
-                            )
-                            .child(
-                                self.render_updates(cx)
-                                    .border_b_1()
-                                    .border_color(theme::hairline()),
-                            )
-                            .child(about),
-                    ),
+                    .children(rows),
             )
     }
 }

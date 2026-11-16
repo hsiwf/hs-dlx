@@ -362,6 +362,14 @@ impl Shell {
         );
     }
 
+    /// 打开设置页并滚到「更新」一行。
+    fn open_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+        if let Page::Settings { view, .. } = &self.page {
+            view.update(cx, |view, cx| view.reveal_updates(cx));
+        }
+    }
+
     /// 换到嗅探页（[`Shell::sniff`] 里的视图）；嗅探页已关时什么也不做（旧帧上的点击）。
     fn show_sniff(&mut self, cx: &mut Context<Self>) {
         if let Some((view, _)) = &self.sniff {
