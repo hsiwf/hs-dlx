@@ -71,6 +71,8 @@ struct Fake {
     sub_trashed: bool,
     /// b.bin 被彻底删了：取它回 404，Sub 里也列不出它
     b_gone: bool,
+    /// 下到的整个文件夹 Show 被彻底删了：取 Show 与 b.bin 都回 404
+    show_gone: bool,
     /// b.bin 的直链每次最多给 64 KiB（带 ETag）
     b_chunked: bool,
     /// 只挂着 `held` 从中间开始的请求（第一个请求照常回，任务目录里已有记录）
@@ -254,6 +256,13 @@ async fn entry(
 ) -> Response {
     assert!(authorized(&headers));
     let mut fake = fake.lock().unwrap();
+    if (id == "VShow" || id == "VB") && fake.show_gone {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "file_not_found", "error_code": 5, "error_description": "" })),
+        )
+            .into_response();
+    }
     if id == "VShow" {
         return Json(json!({ "kind": "drive#folder", "id": "VShow", "name": "Show" }))
             .into_response();
@@ -377,6 +386,7 @@ async fn start(files: Vec<Remote>) -> (Url, Shared) {
         jobs_failed: false,
         sub_trashed: false,
         b_gone: false,
+        show_gone: false,
         b_chunked: false,
         hold_tail: false,
         stable_links: false,
@@ -910,10 +920,15 @@ fn folders_in_the_recycle_bin_are_skipped() {
     assert!(!folder.join("Show").join("Sub").exists());
 }
 
-/// 列出文件之后用户在网盘上删了 b.bin（删进回收站，或彻底删了）：取到它时跳过，其余的照常下完。
+/// 列出文件之后用户在网盘上删了 b.bin（删进回收站、彻底删了，或连整个文件夹一起删了）：取到它时跳过，其余的照常
+/// 下完。
 #[test]
 fn a_file_deleted_after_listing_is_skipped() {
-    for (name, gone) in [("deleted-trashed", false), ("deleted-gone", true)] {
+    for (name, how) in [
+        ("deleted-trashed", "trashed"),
+        ("deleted-gone", "gone"),
+        ("deleted-folder", "folder"),
+    ] {
         let dir = test_dir(name);
         let folder = dir.join("out");
         let rt = runtime();
@@ -934,10 +949,10 @@ fn a_file_deleted_after_listing_is_skipped() {
         rt.block_on(requested.notified());
         {
             let mut fake = fake.lock().unwrap();
-            if gone {
-                fake.b_gone = true;
-            } else {
-                fake.b_trashed = true;
+            match how {
+                "gone" => fake.b_gone = true,
+                "folder" => fake.show_gone = true,
+                _ => fake.b_trashed = true,
             }
         }
         gate.open();

@@ -293,7 +293,7 @@ impl Tasks {
                         row.set_spec(task.spec);
                         let name = row::file_name(&row.task.spec);
                         if name != was {
-                            row.signal(Level::Info, format!("按网盘上的名字保存为 {name}"));
+                            row.signal(Level::Info, format!("保存为 {name}"));
                         }
                     }
                 }

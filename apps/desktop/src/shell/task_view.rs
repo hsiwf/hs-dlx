@@ -16,7 +16,7 @@ use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, FileAmount, Row, main_output, resume_label, saved_as};
+use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
 use crate::{dial, format, motion, ring, theme};
 
@@ -582,6 +582,9 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cells.push(cell("画面", format!("{width}×{height}")));
         }
         cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
+        if let Some(skipped) = cloud_skipped(row) {
+            cells.push(skipped);
+        }
         return cells;
     }
     if row.task.spec.torrent().is_some() {
@@ -736,12 +739,30 @@ fn cloud_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             ]
         }
         (Status::Running, _, _) => Vec::new(),
-        (_, _, Some(amount)) if amount.bytes > 0 => vec![
-            cell("已取回", format::bytes(amount.bytes)),
-            cell("大小", format::bytes(amount.total.unwrap_or(0))),
-        ],
+        (_, _, Some(amount)) if amount.bytes > 0 => {
+            let mut cells = vec![
+                cell("已取回", format::bytes(amount.bytes)),
+                cell("大小", format::bytes(amount.total.unwrap_or(0))),
+            ];
+            cells.extend(cloud_skipped(row));
+            cells
+        }
         _ => Vec::new(),
     }
+}
+
+/// 云离线任务因用户在网盘上删了而跳过的文件数（不算进大小），没有时为 None。
+fn cloud_skipped(row: &Row) -> Option<(SharedString, SharedString)> {
+    let Disk::Cloud(files) = &row.disk else {
+        return None;
+    };
+    let skipped = files.iter().filter(|file| file.skipped).count();
+    (skipped > 0).then(|| {
+        (
+            "跳过".into(),
+            format!("{skipped} 个网盘上删了的文件").into(),
+        )
+    })
 }
 
 /// 输出所在的目录：占着输出路径的东西就在里面；还没定下内容的根的云离线任务为它的保存目录。

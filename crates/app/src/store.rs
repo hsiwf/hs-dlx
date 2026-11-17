@@ -1319,12 +1319,12 @@ pub fn set_cloud_file_done(
     Ok(())
 }
 
-/// 记下云离线任务第 `seq` 个文件跳过（定下根之后用户在网盘上删了它）；没有这个文件时报 [`Error::NotFound`]，已取回
-/// 的记为跳过违反表的约束。
+/// 记下云离线任务第 `seq` 个文件跳过（定下根之后用户在网盘上删了它），一并记为没取回、没下完：调用方已确认输出
+/// 位置上没有它。没有这个文件时报 [`Error::NotFound`]。
 pub fn set_cloud_file_skipped(tx: &Transaction<'_>, id: TaskId, seq: usize) -> Result<(), Error> {
     let seq = i64::try_from(seq).expect("文件数远小于 i64 的上限");
     if tx.execute(
-        "UPDATE cloud_file SET skipped = 1 WHERE task_id = ?1 AND seq = ?2",
+        "UPDATE cloud_file SET skipped = 1, fetched = 0, done = 0 WHERE task_id = ?1 AND seq = ?2",
         params![id.0, seq],
     )? == 0
     {
@@ -2531,11 +2531,10 @@ mod tests {
                 ..files[1].clone()
             }
         );
-        // 取回了的不能记为跳过
-        assert!(set_cloud_file_skipped(&tx, id, 1).is_err());
         set_cloud_file_fetched(&tx, id, 1, false).unwrap();
         assert_eq!(cloud_files(&tx, id).unwrap()[1], files[1]);
-        // 跳过了的不能再记为取回
+        // 记了取回、输出却不在的也能跳过，一并记为没取回；跳过了的不能再记为取回
+        set_cloud_file_fetched(&tx, id, 1, true).unwrap();
         set_cloud_file_skipped(&tx, id, 1).unwrap();
         assert!(set_cloud_file_fetched(&tx, id, 1, true).is_err());
         assert_eq!(

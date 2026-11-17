@@ -305,7 +305,7 @@ impl FileAmount {
         match &row.disk {
             Disk::Cloud(files) if !files.is_empty() => Some(FileAmount {
                 bytes: files.iter().filter(|f| f.done).map(|f| f.size).sum(),
-                total: Some(files.iter().map(|f| f.size).sum()),
+                total: Some(files.iter().filter(|f| !f.skipped).map(|f| f.size).sum()),
             }),
             Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) => None,
             Disk::Unread | Disk::Unreadable(_) => {

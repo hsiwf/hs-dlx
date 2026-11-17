@@ -320,7 +320,7 @@ impl Shared {
         }
         if kept == 0 {
             return Err(Stop::failed(
-                FailureKind::CloudFailed,
+                FailureKind::Unrecoverable,
                 "网盘上下到的文件都被删了，没有可取回的：只能放弃".to_owned(),
             ));
         }
@@ -370,7 +370,7 @@ impl Shared {
                     .map_err(Stop::store)?;
                 return Err(Stop::failed(
                     FailureKind::CloudFailed,
-                    "网盘上的这个离线任务不在了（可能在网页或 App 里删了）：继续即重新提交"
+                    "网盘上的这个离线任务不在了（可能在网页或 App 里删了）：继续即重新提交（再用一次离线次数）"
                         .to_owned(),
                 ));
             };
@@ -401,7 +401,9 @@ impl Shared {
                         .map_err(Stop::store)?;
                     return Err(Stop::failed(
                         FailureKind::CloudFailed,
-                        format!("网盘上的离线下载失败了：{reason}；继续即重新提交"),
+                        format!(
+                            "网盘上的离线下载失败了：{reason}；继续即重新提交（再用一次离线次数）"
+                        ),
                     ));
                 }
                 Phase::Pending | Phase::Running | Phase::Paused => {
@@ -429,7 +431,7 @@ impl Shared {
                 return Err(Stop::failed(
                     FailureKind::CloudFailed,
                     format!(
-                        "网盘上下到的内容不在了，可能在网页或 App 里删了{reason}：继续即重新提交"
+                        "网盘上下到的内容不在了，可能在网页或 App 里删了{reason}：继续即重新提交（再用一次离线次数）"
                     ),
                 ));
             }
@@ -611,7 +613,14 @@ impl Shared {
                 Err(hs_m3u8_core::Error::Cancelled) => return Err(Stop::Paused),
                 Err(error) => error,
             };
-            if !reset && unresumable(&error) {
+            if unresumable(&error) {
+                if reset {
+                    // 同一次里重下后仍核对不上（多为各连接落到了给出不同验证器的节点）：再继续时还会重下
+                    return Err(Stop::failed(
+                        FailureKind::CloudFailed,
+                        format!("{} 的直链重下后仍核对不上：{error}", output.display()),
+                    ));
+                }
                 reset = true;
                 self.reset_file_dir(file_dir, output, cancel).await?;
                 continue;
@@ -811,6 +820,8 @@ impl Shared {
         };
         let top = match until(cancel, client.entry(&top_id)).await? {
             Ok(top) => top,
+            // 下到的内容整个删了
+            Err(error) if maybe_gone(&error) => return Ok(false),
             Err(_) => return Ok(true),
         };
         if top.trashed {
@@ -1008,12 +1019,14 @@ async fn exists(path: &Path) -> Result<bool, Failure> {
     })
 }
 
-/// 网盘拒绝得像是东西不在了（4xx、不是登录、额度、频率一类）：要再查一遍才知道是不是被删了。
+/// 网盘自己（带错误名，不是途中的网关、代理回的）拒绝得像是东西不在了：4xx，不是登录、额度、频率一类。
 fn maybe_gone(error: &pikpak::Error) -> bool {
     matches!(
         error,
         pikpak::Error::Rejected(rejection)
-            if (400..500).contains(&rejection.status) && rejection.reason() == Reason::Other
+            if (400..500).contains(&rejection.status)
+                && !rejection.name.is_empty()
+                && rejection.reason() == Reason::Other
     )
 }
 
