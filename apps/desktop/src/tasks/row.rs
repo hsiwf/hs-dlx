@@ -359,7 +359,7 @@ impl FileAmount {
 }
 
 /// 主要输出（[`TaskSpec::outputs`] 的首项）的文件名；还没定下输出的云离线任务为任务的标题。
-fn file_name(spec: &TaskSpec) -> String {
+pub(super) fn file_name(spec: &TaskSpec) -> String {
     main_output(spec).map_or_else(
         || spec.title.clone(),
         |output| {

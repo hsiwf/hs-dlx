@@ -288,8 +288,13 @@ impl Tasks {
             Event::Renamed { id } => match self.service.task(id) {
                 Ok(task) => {
                     if let Some(row) = self.row_mut(id) {
+                        let was = row::file_name(&row.task.spec);
                         row.task.work_dir = task.work_dir;
                         row.set_spec(task.spec);
+                        let name = row::file_name(&row.task.spec);
+                        if name != was {
+                            row.signal(Level::Info, format!("按网盘上的名字保存为 {name}"));
+                        }
                     }
                 }
                 Err(error) => {
