@@ -16,6 +16,10 @@ pub(super) enum Action {
     Resume,
     /// 打开保存目录：占着输出路径的东西就在里面
     OpenFolder,
+    /// 重新登录网盘（云离线的登录失效了）
+    LogIn,
+    /// 不用网盘了，把磁力链接交给本机的 BT（云离线的种种失败之后）
+    LocalTorrent,
 }
 
 /// 停着的任务的操作。
@@ -37,6 +41,7 @@ pub(super) struct Plan {
 /// - 直播接不上之前录的、来源已没有（404/410）或停滞的，先写出已录的：续录多半不成。
 /// - 再试也一样的不给再跑；改了请求头可能不一样的（[`FailureKind::headers_can_change_outcome`]），保存后接着跑。
 /// - 直播停着时都能写出已录的，选了只写出的也能改回续录；有请求头的停着的任务都能改请求头。
+/// - 云离线登录失效的先重新登录；网盘那边的失败（登录、额度、云端下载、接口变了）都能改用本机 BT。
 pub(super) fn stopped_plan(
     failure: Option<FailureKind>,
     live: bool,
@@ -68,6 +73,9 @@ pub(super) fn stopped_plan(
     if headers_first && offer_headers {
         add(Action::EditHeaders);
     }
+    if failure == Some(FailureKind::CloudLogin) {
+        add(Action::LogIn);
+    }
     if mp4 {
         add(Action::SwitchToHls);
     }
@@ -91,6 +99,17 @@ pub(super) fn stopped_plan(
     }
     if failure == Some(FailureKind::OutputTaken) {
         add(Action::OpenFolder);
+    }
+    if matches!(
+        failure,
+        Some(
+            FailureKind::CloudLogin
+                | FailureKind::CloudQuota
+                | FailureKind::CloudFailed
+                | FailureKind::CloudApi
+        )
+    ) {
+        add(Action::LocalTorrent);
     }
     Plan {
         actions,
@@ -140,6 +159,15 @@ mod tests {
         let torrent = |failure| stopped_plan(failure, false, false, false, false).actions;
         assert_eq!(torrent(None), [Resume]);
         assert_eq!(torrent(Some(FailureKind::Disk)), [Resume]);
+        // 云离线（也没有请求头）：登录失效先登录；网盘那边的失败能改用本机 BT；接口变了不给重试；校验不符只重试
+        let cloud = torrent;
+        assert_eq!(
+            cloud(Some(FailureKind::CloudLogin)),
+            [LogIn, Resume, LocalTorrent]
+        );
+        assert_eq!(cloud(Some(FailureKind::CloudQuota)), [Resume, LocalTorrent]);
+        assert_eq!(cloud(Some(FailureKind::CloudApi)), [LocalTorrent]);
+        assert_eq!(cloud(Some(FailureKind::Integrity)), [Resume]);
     }
 
     #[test]

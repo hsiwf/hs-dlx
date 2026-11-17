@@ -1,7 +1,7 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_dlx_app::{Failure, Status, TorrentPhase};
+use hs_dlx_app::{CloudPhase, CloudProgress, Failure, Status, TorrentPhase};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -37,8 +37,9 @@ enum Stopped<'a> {
 
 pub fn look(row: &Row) -> Look {
     let torrent = row.task.spec.torrent().is_some();
+    let cloud = row.task.spec.cloud().is_some();
     if row.discarding {
-        let line = if torrent {
+        let line = if torrent || cloud {
             "停下并删除已下的文件"
         } else {
             "停下并删除任务目录"
@@ -46,7 +47,7 @@ pub fn look(row: &Row) -> Look {
         return discarding(row, "放弃中", line);
     }
     match &row.task.status {
-        Status::DiscardUnfinished if torrent => discarding(
+        Status::DiscardUnfinished if torrent || cloud => discarding(
             row,
             "放弃没做完",
             "已下的文件没删干净：处理提示里留下的，再放弃一次",
@@ -57,6 +58,7 @@ pub fn look(row: &Row) -> Look {
             "任务目录可能已删了一部分，再放弃一次即可",
         ),
         Status::Running if torrent => running_torrent(row),
+        Status::Running if cloud => running_cloud(row),
         Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
@@ -154,6 +156,9 @@ fn kept(row: &Row, paused: bool) -> Kept {
     if row.task.spec.torrent().is_some() {
         return kept_torrent(row, paused);
     }
+    if row.task.spec.cloud().is_some() {
+        return kept_cloud(row, paused);
+    }
     if row.task.spec.hls().is_none() {
         return kept_file(row, paused);
     }
@@ -238,6 +243,138 @@ fn kept_torrent(row: &Row, paused: bool) -> Kept {
         fraction: fraction.unwrap_or(0.0),
         big: fraction.map_or_else(|| "‖".to_owned(), percent),
         line,
+    }
+}
+
+/// 停着的云离线任务的 [`Kept`]：按存储里记着的已取回、校验过的文件；还没列出文件的，网盘那边还没下完。
+fn kept_cloud(row: &Row, paused: bool) -> Kept {
+    let amount = FileAmount::of(row);
+    let fraction = amount.as_ref().and_then(FileAmount::fraction);
+    let then = if paused {
+        " · 继续时接着取回"
+    } else {
+        ""
+    };
+    let line = match (&amount, &row.disk) {
+        (_, Disk::Unreadable(reason)) => format!("读不出进度：{reason}"),
+        (_, Disk::Cloud(files)) if files.is_empty() => {
+            let then = if paused { " · 继续时接着等" } else { "" };
+            format!("还没取回：PikPak 那边还没下完{then}")
+        }
+        (Some(a), _) if a.bytes > 0 => format!(
+            "已取回 {} / {}{then}",
+            format::bytes(a.bytes),
+            format::bytes(a.total.unwrap_or(0))
+        ),
+        (_, Disk::Unread) => "正在读取进度".to_owned(),
+        _ => "还没有取回内容".to_owned(),
+    };
+    Kept {
+        done: lit(fraction),
+        total: FILE_TICKS,
+        known: fraction.is_some(),
+        fraction: fraction.unwrap_or(0.0),
+        big: fraction.map_or_else(|| "‖".to_owned(), percent),
+        line,
+    }
+}
+
+/// 在跑的云离线任务：网盘在下时按网盘报的百分比，用暗一档的颜色（与之后本机取回的百分比分开）；网盘被暂停时为警告色。
+/// 之后列出文件、按字节取回（多个文件时写第几个）、按 GCID 校验。
+fn running_cloud(row: &Row) -> Look {
+    let look = |state: &str, color: Hsla, fraction: f32, big: String, line: String| Look {
+        state: state.to_owned(),
+        color,
+        ticks: Ticks {
+            color,
+            ..Ticks::of(FILE_TICKS, lit(Some(fraction)), true)
+        },
+        short: percent(fraction),
+        big,
+        line,
+        hint: None,
+        fraction,
+        orb: color,
+    };
+    let preparing = |line: &str| Look {
+        state: "准备中".to_owned(),
+        color: theme::accent(),
+        ticks: Ticks::of(0, 0, true),
+        big: "—".to_owned(),
+        line: line.to_owned(),
+        hint: None,
+        fraction: 0.0,
+        orb: theme::accent(),
+        short: "…".to_owned(),
+    };
+    let which = |index: usize, count: usize| {
+        if count > 1 {
+            format!("第 {} / {count} 个文件 · ", index + 1)
+        } else {
+            String::new()
+        }
+    };
+    let amount = FileAmount::of(row);
+    let fraction = amount
+        .as_ref()
+        .and_then(FileAmount::fraction)
+        .unwrap_or(0.0);
+    let taken = |a: &FileAmount| {
+        format!(
+            "{} / {}",
+            format::bytes(a.bytes),
+            format::bytes(a.total.unwrap_or(0))
+        )
+    };
+    match (row.cloud_progress.as_ref(), amount.as_ref()) {
+        (None, _) => preparing("连接 PikPak"),
+        (Some(CloudProgress::Remote { phase, percent: p }), _) => {
+            let share = f32::from(*p) / 100.0;
+            let (state, color, line) = match phase {
+                CloudPhase::Paused => (
+                    "云端暂停",
+                    theme::warn(),
+                    "在网页或 App 里被暂停了，恢复后才接着下",
+                ),
+                CloudPhase::Queued => ("云端排队", theme::accent_dim(), "PikPak 收下了，在排队"),
+                CloudPhase::Running => (
+                    "云端下载",
+                    theme::accent_dim(),
+                    "PikPak 在下，下完后取回本机",
+                ),
+            };
+            look(state, color, share, percent(share), line.to_owned())
+        }
+        (Some(CloudProgress::Listing), _) => preparing("PikPak 下完了，列出文件"),
+        (Some(CloudProgress::Skipped { output, .. }), _) => {
+            preparing(&format!("网盘上删了 {}，跳过", output.display()))
+        }
+        (
+            Some(CloudProgress::Fetching {
+                index, count, file, ..
+            }),
+            Some(a),
+        ) => {
+            let mut seen = look(
+                "取回中",
+                theme::accent(),
+                fraction,
+                percent(fraction),
+                format!("{}{}", which(*index, *count), taken(a)),
+            );
+            seen.ticks.retrying = !file.retrying.is_empty();
+            seen
+        }
+        (Some(CloudProgress::Verifying { index, count, .. }), Some(a)) => look(
+            "校验中",
+            theme::accent(),
+            fraction,
+            percent(fraction),
+            format!("{}按 GCID 校验 · {}", which(*index, *count), taken(a)),
+        ),
+        (Some(CloudProgress::Fetching { .. } | CloudProgress::Verifying { .. }), None) => {
+            unreachable!("取回与校验的进度总能算出字节数")
+        }
     }
 }
 

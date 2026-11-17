@@ -111,6 +111,7 @@ fn updates_are_found_downloaded_and_verified() {
         TorrentNetwork::Loopback {
             public_trackers: Vec::new(),
         },
+        hs_dlx_app::pikpak::Endpoints::official(),
     )
     .unwrap();
     // 系统代理可能不放过回环地址

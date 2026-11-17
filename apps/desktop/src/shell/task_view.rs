@@ -16,7 +16,7 @@ use super::look::{Look, look};
 use super::plan::{Action, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
-use crate::tasks::{Amount, FileAmount, Row, main_output, resume_label, saved_as};
+use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
 use crate::{dial, format, motion, ring, theme};
 
@@ -327,7 +327,7 @@ impl Shell {
             .editing_headers
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
-        let headers = row.task.spec.torrent().is_none();
+        let headers = row.task.spec.torrent().is_none() && row.task.spec.cloud().is_none();
         stopped_plan(
             failure,
             row.recording(),
@@ -370,15 +370,24 @@ impl Shell {
                     None,
                 ),
                 Action::OpenFolder => ("open-folder", "打开保存目录".to_owned(), None),
+                Action::LogIn => (
+                    "log-in",
+                    "重新登录 PikPak".to_owned(),
+                    Some("在浏览器里确认，之后再继续".into()),
+                ),
+                Action::LocalTorrent => ("local-torrent", "改用本机 BT".to_owned(), None),
             };
             let act = *action;
             let folder = folder_of(&row.task.spec);
+            let link = row.task.spec.url.clone();
             let on_click = cx.listener(move |this, _, window, cx| match act {
                 Action::EditHeaders => this.edit_headers(id, window, cx),
                 Action::WriteRecorded => this.write_recorded(id, cx),
                 Action::SwitchToHls => this.switch_to_hls(id, cx),
                 Action::Resume => this.resume(id, cx),
                 Action::OpenFolder => cx.open_with_system(&folder),
+                Action::LogIn => this.log_in_pikpak(window, cx),
+                Action::LocalTorrent => this.probe_text(link.as_str(), window, cx),
             });
             if index == 0 {
                 let solid = if failed { Solid::Amber } else { Solid::Glow };
@@ -466,9 +475,11 @@ impl Shell {
                 rest: vec![pause(cx), discard(cx)],
             },
             // 没有自己的任务目录（与别的任务共用、迁移时让了出去）：不能继续，放弃会删别人的，只能移除记录。BT 任务本就
-            // 没有任务目录
+            // 没有任务目录，云离线任务列出文件之前也没有
             Status::Paused | Status::Failed(_)
-                if row.task.work_dir.is_none() && row.task.spec.torrent().is_none() =>
+                if row.task.work_dir.is_none()
+                    && row.task.spec.torrent().is_none()
+                    && row.task.spec.cloud().is_none() =>
             {
                 Foot {
                     primary: None,
@@ -571,10 +582,16 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cells.push(cell("画面", format!("{width}×{height}")));
         }
         cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
+        if let Some(skipped) = cloud_skipped(row) {
+            cells.push(skipped);
+        }
         return cells;
     }
     if row.task.spec.torrent().is_some() {
         return torrent_reads(row, now);
+    }
+    if row.task.spec.cloud().is_some() {
+        return cloud_reads(row, now);
     }
     if row.task.spec.hls().is_none() {
         return file_reads(row, now);
@@ -695,12 +712,69 @@ fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     }
 }
 
-/// 输出所在的目录：占着输出路径的东西就在里面。
+/// 云离线任务的 [`reads`]（完成的除外）：取回时为速度、剩余、已取回与文件数，网盘在下时为网盘的进度，停着的为已
+/// 取回与总大小；还没有内容时为空。
+fn cloud_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    use hs_dlx_app::CloudProgress;
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let amount = FileAmount::of(row);
+    match (&row.task.status, &row.cloud_progress, &amount) {
+        (Status::Running, Some(CloudProgress::Remote { percent, .. }), _) => {
+            vec![cell("网盘", format!("{percent}%"))]
+        }
+        (Status::Running, Some(CloudProgress::Fetching { index, count, .. }), Some(amount)) => {
+            let speed = row.rate.bytes_per_second(now);
+            let total = amount.total.unwrap_or(0);
+            let left = if speed > 0.0 {
+                let left = total.saturating_sub(amount.bytes);
+                format::duration(Duration::from_secs_f64(left as f64 / speed))
+            } else {
+                "—".to_owned()
+            };
+            vec![
+                cell("速度", format!("{}/s", format::bytes(speed as u64))),
+                cell("剩余", left),
+                cell("已取回", format::bytes(amount.bytes)),
+                cell("文件", format!("{} / {count}", index + 1)),
+            ]
+        }
+        (Status::Running, _, _) => Vec::new(),
+        (_, _, Some(amount)) if amount.bytes > 0 => {
+            let mut cells = vec![
+                cell("已取回", format::bytes(amount.bytes)),
+                cell("大小", format::bytes(amount.total.unwrap_or(0))),
+            ];
+            cells.extend(cloud_skipped(row));
+            cells
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 云离线任务因用户在网盘上删了而跳过的文件数（不算进大小），没有时为 None。
+fn cloud_skipped(row: &Row) -> Option<(SharedString, SharedString)> {
+    let Disk::Cloud(files) = &row.disk else {
+        return None;
+    };
+    let skipped = files.iter().filter(|file| file.skipped).count();
+    (skipped > 0).then(|| {
+        (
+            "跳过".into(),
+            format!("{skipped} 个网盘上删了的文件").into(),
+        )
+    })
+}
+
+/// 输出所在的目录：占着输出路径的东西就在里面；还没定下内容的根的云离线任务为它的保存目录。
 fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
-    main_output(spec)
-        .parent()
-        .expect("输出是以文件名结尾的绝对路径")
-        .to_path_buf()
+    match (main_output(spec), spec.cloud()) {
+        (Some(output), _) => output
+            .parent()
+            .expect("输出是以文件名结尾的绝对路径")
+            .to_path_buf(),
+        (None, Some(cloud)) => cloud.folder.clone(),
+        (None, None) => unreachable!("只有云离线任务会还没有输出"),
+    }
 }
 
 /// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点。要留意与失败级别的各条整行带同色的淡底与描边，

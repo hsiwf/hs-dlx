@@ -67,12 +67,13 @@ rs_doc: ffmpeg_present libtorrent_present
 rs_test: ffmpeg_present libtorrent_present
 	cargo test --workspace
 
-# 任务存储与生命周期（app）的行覆盖不低于 80%
+# 任务存储与生命周期（app）、网盘的登录与接口（cloud）的行覆盖各不低于 80%
 rs_cov: ffmpeg_present libtorrent_present
 	@cargo llvm-cov --version >/dev/null 2>&1 || { echo "缺少 cargo-llvm-cov，版本见 .github/workflows/check.yml"; exit 1; }
 	# 源码改动后旧的插桩产物会混进统计，先清掉
 	cargo llvm-cov clean --workspace
 	cargo llvm-cov -p hs-dlx-app --fail-under-lines 80 --summary-only
+	cargo llvm-cov -p hs-dlx-cloud --fail-under-lines 80 --summary-only
 
 # FFmpeg 用 hs-m3u8（Cargo.lock 固定的提交）的构建脚本编译，组件与核心库出自同一个提交；源码包与编译的中间文件放在
 # third_party/ffmpeg/build。打印脚本路径的命令：

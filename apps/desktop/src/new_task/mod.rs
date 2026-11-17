@@ -706,6 +706,35 @@ impl NewTask {
         cx.emit(NewTaskEvent::Create(Box::new(draft)));
     }
 
+    /// 把磁力链接交给 PikPak 云离线（整包离线，不分文件），存到选好的保存位置；没登录 PikPak 时写明先去设置里登录。
+    fn start_cloud(&mut self, cx: &mut Context<Self>) {
+        if self.creating {
+            return;
+        }
+        match self.service.pikpak_user() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.error = Some("先在设置里登录 PikPak".to_owned());
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.error = Some(format!("读不出 PikPak 的账号：{error}"));
+                cx.notify();
+                return;
+            }
+        }
+        self.error = None;
+        cx.emit(NewTaskEvent::Create(Box::new(Draft {
+            url: self.url.clone(),
+            headers: Vec::new(),
+            folder: self.folder.clone(),
+            kind: DraftKind::Cloud {
+                provider: hs_dlx_app::CloudProvider::PikPak,
+            },
+        })));
+    }
+
     /// 服务开始新建了。
     pub fn creating(&mut self, cx: &mut Context<Self>) {
         self.creating = true;

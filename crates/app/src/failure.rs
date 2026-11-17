@@ -64,6 +64,16 @@ pub enum FailureKind {
     Unsupported,
     /// 再试也一样的其余失败：任务目录认不出、参数不对、重定向过多、服务器不照范围请求回应、合并时内容不对等
     Unrecoverable,
+    /// 云离线：网盘的登录失效了（令牌被拒、账号退出了或没登录），要重新登录后再继续
+    CloudLogin,
+    /// 云离线：网盘的离线次数、空间或传输额度用尽，等额度恢复或升级会员后再继续
+    CloudQuota,
+    /// 云离线：网盘上的离线下载失败了（没有资源、违规内容等，原因照网盘给的）
+    CloudFailed,
+    /// 云离线：网盘回的内容认不出（接口变了），要升级应用
+    CloudApi,
+    /// 云离线：下完的文件与网盘给的 GCID 不符，已删掉，再继续时重下这个文件
+    Integrity,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
     Other,
 }
@@ -76,6 +86,8 @@ impl FailureKind {
                 FailureKind::of(cause)
             }
             CoreError::Cleanup { failure, .. } => FailureKind::of(failure),
+            // 调接口（网盘）没拿到完整的响应：按原因
+            CoreError::Call { cause, .. } => FailureKind::of(cause),
             CoreError::LiveStalled { cause, .. } => match cause {
                 // 刷新或下载一直被服务器拒绝时按状态码
                 StallReason::RefreshFailed(RefreshReason::Http(failure))
@@ -189,9 +201,10 @@ impl FailureKind {
         }
     }
 
-    /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件）后再试，有没有可能成功；不需要处理什么的暂时性故障
-    /// （408、429、5xx、超时、停滞）同样算。证书、内容不对、来源变了、放不进 MP4、没有可写出的、不支持与其余再试也
-    /// 一样的不算：它们要改请求头、换输出、改为续录，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
+    /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件、重新登录网盘、等网盘额度恢复）后再试，有没有可能
+    /// 成功；不需要处理什么的暂时性故障（408、429、5xx、超时、停滞、云端下载失败、校验不符）同样算。证书、内容不对、
+    /// 来源变了、放不进 MP4、没有可写出的、不支持、网盘接口变了与其余再试也一样的不算：它们要改请求头、换输出、改为
+    /// 续录、升级应用，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
     pub fn retry_helps(self) -> bool {
         match self {
             FailureKind::Status(code) => matches!(code, 408 | 429 | 500..=599),
@@ -199,8 +212,13 @@ impl FailureKind {
             | FailureKind::Disk
             | FailureKind::OutputTaken
             | FailureKind::Stalled
+            | FailureKind::CloudLogin
+            | FailureKind::CloudQuota
+            | FailureKind::CloudFailed
+            | FailureKind::Integrity
             | FailureKind::Other => true,
-            FailureKind::Certificate
+            FailureKind::CloudApi
+            | FailureKind::Certificate
             | FailureKind::SourceChanged
             | FailureKind::NotExpected
             | FailureKind::Malformed
@@ -212,7 +230,8 @@ impl FailureKind {
     }
 
     /// 改了请求头再跑可能有不同结果：失败出在请求上（被拒、错误页、网络、停滞），或还没跑出结果（没有可写出的，接着
-    /// 录制）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占与其余再试也一样的，与请求头无关。
+    /// 录制）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占、云离线的各种与其余再试也一样的，与请求头
+    /// 无关（云离线任务没有请求头）。
     pub fn headers_can_change_outcome(self) -> bool {
         match self {
             FailureKind::Status(_)
@@ -223,6 +242,11 @@ impl FailureKind {
             | FailureKind::NothingToWrite
             | FailureKind::Other => true,
             FailureKind::Certificate
+            | FailureKind::CloudLogin
+            | FailureKind::CloudQuota
+            | FailureKind::CloudFailed
+            | FailureKind::CloudApi
+            | FailureKind::Integrity
             | FailureKind::Disk
             | FailureKind::OutputTaken
             | FailureKind::SourceChanged
@@ -259,6 +283,11 @@ impl FailureKind {
             FailureKind::Stalled => "stalled".into(),
             FailureKind::NothingToWrite => "nothing-to-write".into(),
             FailureKind::Unsupported => "unsupported".into(),
+            FailureKind::CloudLogin => "cloud-login".into(),
+            FailureKind::CloudQuota => "cloud-quota".into(),
+            FailureKind::CloudFailed => "cloud-failed".into(),
+            FailureKind::CloudApi => "cloud-api".into(),
+            FailureKind::Integrity => "integrity".into(),
             FailureKind::Other => "other".into(),
         }
     }
@@ -278,6 +307,11 @@ impl FailureKind {
             "stalled" => FailureKind::Stalled,
             "nothing-to-write" => FailureKind::NothingToWrite,
             "unsupported" => FailureKind::Unsupported,
+            "cloud-login" => FailureKind::CloudLogin,
+            "cloud-quota" => FailureKind::CloudQuota,
+            "cloud-failed" => FailureKind::CloudFailed,
+            "cloud-api" => FailureKind::CloudApi,
+            "integrity" => FailureKind::Integrity,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
         })
@@ -302,6 +336,11 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::Mp4Unsupported,
         FailureKind::Unsupported,
         FailureKind::Unrecoverable,
+        FailureKind::CloudLogin,
+        FailureKind::CloudQuota,
+        FailureKind::CloudFailed,
+        FailureKind::CloudApi,
+        FailureKind::Integrity,
         FailureKind::Other,
     ];
     for kind in &all {
@@ -319,6 +358,11 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::Mp4Unsupported
             | FailureKind::Unsupported
             | FailureKind::Unrecoverable
+            | FailureKind::CloudLogin
+            | FailureKind::CloudQuota
+            | FailureKind::CloudFailed
+            | FailureKind::CloudApi
+            | FailureKind::Integrity
             | FailureKind::Other => {}
         }
     }

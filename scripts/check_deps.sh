@@ -13,6 +13,8 @@ rules=(
   "hs-dlx-relay hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-torrent"
   # BT 引擎只包一层 libtorrent，不知道任务、界面与 HLS
   "hs-dlx-torrent hs-m3u8-core hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-relay"
+  # 云离线只管与网盘的接口（经 core 发请求），不知道任务、存储与界面
+  "hs-dlx-cloud hs-dlx-app gpui-kit gpui-pre wry hs-dlx-webview hs-dlx-instance hs-dlx-macos hs-dlx-relay hs-dlx-torrent rusqlite"
 )
 
 # 每行：<包> <不得直接依赖的包>...：只经由 core 的再导出（core::hls、core::remux）使用

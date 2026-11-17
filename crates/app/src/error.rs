@@ -86,6 +86,12 @@ pub enum Error {
     /// 放弃 BT 任务时下了的文件没删干净（里面有不是这个种子的文件，或删除出错）：任务留在存储里，处理后可再放弃
     #[error("{id}下了的文件没删干净，任务留在列表里：{cause}")]
     ContentLeft { id: TaskId, cause: Box<Error> },
+    /// 用云离线前要先登录网盘
+    #[error("没登录 PikPak")]
+    NotLoggedIn,
+    /// 调网盘的接口失败（提交、登录等不在任务里做的）
+    #[error(transparent)]
+    PikPak(#[from] hs_dlx_cloud::pikpak::Error),
     /// 文件系统或系统资源的操作失败：建存储所在的目录、设权限、给存储加锁、取名时检查路径是否已存在、启动 tokio
     /// 运行时；照原样报出
     #[error("{action} {path} 失败：{cause}")]

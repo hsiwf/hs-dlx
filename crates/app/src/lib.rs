@@ -21,17 +21,20 @@ mod update;
 pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
 pub use failure::{Failure, FailureKind, not_a_playlist};
+/// PikPak 的接口（登录、进度阶段、接口地址等界面要用的类型）。
+pub use hs_dlx_cloud::pikpak;
 pub use naming::{file_name, task_title, title_of};
 pub use netcheck::{NetCheck, NetItem, NetworkReport};
 pub use preference::StoredPreference;
 pub use service::{
-    Downloaded, Event, Events, MetadataFetch, MetadataHandle, Service, UpdateDownload,
+    CloudPhase, CloudProgress, Downloaded, Event, Events, MetadataFetch, MetadataHandle,
+    PikPakLogin, Service, UpdateDownload,
 };
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{
-    Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec, Kind, OutputKind, OutputSpec, Status,
-    Task, TaskId, TaskSpec, TorrentSpec,
+    CloudFile, CloudProvider, CloudSpec, Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec,
+    Kind, OutputKind, OutputSpec, Status, Task, TaskId, TaskSpec, TorrentSpec,
 };
 pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,

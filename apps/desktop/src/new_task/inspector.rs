@@ -1,7 +1,7 @@
 //! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
 //! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
 //! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
-//! 文件读到后）为大小、要下的文件、保存位置与开始。
+//! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。
 
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
@@ -267,7 +267,33 @@ impl NewTask {
                 );
             }
         }
-        ui::inspector(title, host, body, [self.cancel(Tone::Plain, cx)])
+        let mut foot = self.cloud_offer(cx);
+        foot.push(self.cancel(Tone::Plain, cx));
+        ui::inspector(title, host, body, foot)
+    }
+
+    /// 磁力链接改用 PikPak 云离线：新建的没成（多为没登录）时的原因与按钮；不是磁力链接、正在新建时为空。存到的位置
+    /// 同本机下载。
+    fn cloud_offer(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.url.scheme() != "magnet" || self.creating {
+            return Vec::new();
+        }
+        let mut offer: Vec<AnyElement> = self
+            .error
+            .clone()
+            .map(|error| ui::error_text(error).into_any_element())
+            .into_iter()
+            .collect();
+        offer.push(
+            ui::button(
+                "cloud",
+                "改用 PikPak 云离线",
+                Tone::Plain,
+                cx.listener(|this, _, _, cx| this.start_cloud(cx)),
+            )
+            .into_any_element(),
+        );
+        offer
     }
 
     /// 取不到种子信息、读不出种子文件：错误，能再试的给再试。
@@ -279,7 +305,7 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let body = [ui::note(failure.message.clone(), true).into_any_element()];
-        let mut foot = Vec::new();
+        let mut foot = self.cloud_offer(cx);
         if failure.kind.retry_helps() {
             foot.push(
                 ui::primary(
@@ -379,6 +405,17 @@ impl NewTask {
             )
             .into_any_element(),
         );
+        if !self.creating && self.url.scheme() == "magnet" {
+            foot.push(
+                ui::button(
+                    "cloud",
+                    "改用 PikPak 云离线",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.start_cloud(cx)),
+                )
+                .into_any_element(),
+            );
+        }
         if !self.creating {
             foot.push(self.cancel(Tone::Ghost, cx));
         }

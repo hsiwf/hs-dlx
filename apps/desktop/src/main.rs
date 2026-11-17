@@ -139,7 +139,12 @@ fn main() {
                         Err(error) => return Err(Failure::new("启动失败", error.to_string())),
                     };
                     let handoffs = hs_dlx_instance::listen(&path);
-                    let (service, events) = Service::new(store, MAX_REQUESTS, TorrentNetwork::Internet)
+                    let (service, events) = Service::new(
+                        store,
+                        MAX_REQUESTS,
+                        TorrentNetwork::Internet,
+                        hs_dlx_app::pikpak::Endpoints::official(),
+                    )
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
                     let settings = service
                         .settings()

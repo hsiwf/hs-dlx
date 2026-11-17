@@ -92,7 +92,7 @@ impl Shell {
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::accent_pale()))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(window, cx);
+                                this.open_updates(window, cx);
                             }))
                             .child(format!("新版本 {version}"))
                     }))

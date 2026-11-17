@@ -1,0 +1,204 @@
+//! 「下载」一组：新建任务默认保存到哪、请求经哪个代理。
+
+use gpui_kit::component::input::Input;
+use gpui_kit::{Context, Div, ParentElement as _, PathPromptOptions, Styled as _, div, px};
+use hs_m3u8_core::{Proxy, Url};
+
+use super::{Mode, SettingsView, mode_of, row};
+use crate::route::Route;
+use crate::ui::{self, Tone};
+use crate::web_route::WebRoute;
+
+/// 指定代理时输入框里的示例。
+pub(super) const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
+
+impl SettingsView {
+    /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了地址再存。
+    fn pick(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.proxy_error = None;
+        match mode {
+            Mode::System => self.save(Proxy::System, cx),
+            Mode::Direct => self.save(Proxy::Direct, cx),
+            Mode::Custom => self.mode = Mode::Custom,
+        }
+        cx.notify();
+    }
+
+    /// 存输入框里的代理地址。
+    pub(super) fn save_custom(&mut self, cx: &mut Context<Self>) {
+        let text = self.address.read(cx).value().trim().to_owned();
+        match Url::parse(&text) {
+            Ok(url) => self.save(Proxy::Url(url), cx),
+            Err(_) => self.proxy_error = Some(format!("不是代理地址，应形如 {PROXY_EXAMPLE}")),
+        }
+        cx.notify();
+    }
+
+    /// 存 `proxy`：存进了才换成它，没存进时选中的方式回到存着的。
+    fn save(&mut self, proxy: Proxy, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_proxy(&proxy) {
+            Ok(()) => {
+                if let Some(route) = WebRoute::existing(cx) {
+                    route.update(cx, |route, _| route.setting_changed(&proxy));
+                }
+                self.mode = mode_of(&proxy);
+                self.proxy = proxy;
+            }
+            Err(error) => {
+                self.mode = mode_of(&self.proxy);
+                self.proxy_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn change_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("存到这里".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = picked.await;
+            // 选择期间视图被关掉时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Ok(Some(mut paths))) if !paths.is_empty() => {
+                        let folder = paths.swap_remove(0);
+                        this.folder_error = this
+                            .tasks
+                            .update(cx, |tasks, cx| tasks.set_folder(folder, cx))
+                            .err();
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => this.folder_error = Some(format!("打不开目录选择：{error}")),
+                    Err(_) => this.folder_error = Some("目录选择没有返回结果".to_owned()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn render_proxy(&self, cx: &mut Context<Self>) -> Div {
+        // 选了指定代理、还没存进地址，或改了地址还没保存：写明此刻照旧按什么走
+        let typed = self.address.read(cx).value().trim().to_owned();
+        let unsaved = match (self.mode, &self.proxy) {
+            (Mode::Custom, Proxy::System) => Some("保存之前照旧跟随系统".to_owned()),
+            (Mode::Custom, Proxy::Direct) => Some("保存之前照旧直连".to_owned()),
+            // 按解析后的比，写法不同而地址相同（如末尾的斜杠）不算改了
+            (Mode::Custom, Proxy::Url(url)) if Url::parse(&typed).ok().as_ref() != Some(url) => {
+                Some(format!(
+                    "改的地址还没保存，照旧经 {}",
+                    hs_m3u8_core::bare_url(url)
+                ))
+            }
+            _ => None,
+        };
+        let chip = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
+            ui::chip(
+                id,
+                label,
+                self.mode == mode,
+                cx.listener(move |this, _, _, cx| this.pick(mode, cx)),
+            )
+        };
+        let now = |value: String| ui::reads(Vec::new(), Some(("现在".into(), value.into())));
+        let line = match self.mode {
+            Mode::System => self.system.as_ref().map(|route| match route {
+                Route::Proxy(proxy, source) => now(format!("经 {proxy}（{source}）")),
+                Route::Direct(why) => now(format!("直连 · {why}")),
+                Route::Broken(why) => ui::error_text(why.clone()),
+            }),
+            Mode::Direct => Some(now("不经任何代理".to_owned())),
+            Mode::Custom => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                ui::input_frame()
+                                    .flex_1()
+                                    .px(px(6.))
+                                    .child(Input::new(&self.address).appearance(false)),
+                            )
+                            .child(ui::button(
+                                "save-proxy",
+                                "保存",
+                                Tone::Glow,
+                                cx.listener(|this, _, _, cx| this.save_custom(cx)),
+                            )),
+                    )
+                    .child(ui::caption(
+                        "http、https、socks4、socks4a、socks5 或 socks5h 开头，可带用户名与密码",
+                    ))
+                    .children(unsaved.map(ui::caption)),
+            ),
+        };
+        row(
+            "代理",
+            Some("探测、下载与嗅探页的网页经哪里出去；BT 不经它，另在「BT」里设"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .child(chip("proxy-system", "跟随系统", Mode::System, cx))
+                    .child(chip("proxy-direct", "直连", Mode::Direct, cx))
+                    .child(chip("proxy-custom", "指定代理", Mode::Custom, cx)),
+            )
+            .children(line)
+            .children(self.proxy_error.clone().map(ui::error_text))
+            .child(ui::caption(
+                match hs_dlx_webview::custom_proxy_supported() {
+                    Ok(()) if hs_dlx_webview::PROXY_FIXED_FOR_PROCESS => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要重启应用".to_owned(),
+                    Ok(()) => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要把它们都关掉再开".to_owned(),
+                    Err(reason) => format!(
+                        "在下的任务暂停再继续后才换；{reason}，直连或指定代理时嗅探页打不开网页"
+                    ),
+                },
+            )),
+        )
+    }
+
+    /// 「保存到」一行。
+    pub(super) fn render_folder(&self, cx: &mut Context<Self>) -> Div {
+        row(
+            "保存到",
+            Some("新建任务默认存到这里，每个任务可以另选"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            ui::field(crate::format::path(
+                                self.tasks.read(cx).folder(),
+                                self.home.as_deref(),
+                            ))
+                            .flex_1(),
+                        )
+                        .child(ui::button(
+                            "settings-folder",
+                            "更改",
+                            Tone::Plain,
+                            cx.listener(|this, _, _, cx| this.change_folder(cx)),
+                        )),
+                )
+                .children(self.folder_error.clone().map(ui::error_text)),
+        )
+    }
+}

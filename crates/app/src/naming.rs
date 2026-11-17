@@ -71,7 +71,7 @@ pub fn task_title(url: &Url, title: Option<&str>) -> String {
 
 /// 把 `text` 整理成能当文件主名的标题：文件名里不能出现的字符与控制字符换成 `_`，去掉首尾的空白与 `.`，超过 200
 /// 字节时在字符边界截断（给编号与后缀留出文件名上限 255 字节的余量）。可能为空。
-fn clean_title(text: &str) -> String {
+pub(crate) fn clean_title(text: &str) -> String {
     let clean: String = text
         .chars()
         .map(|c| {
@@ -256,6 +256,30 @@ pub fn torrent_root_for(
     fallback: &str,
     taken: &HashSet<String>,
 ) -> Result<(String, PathBuf), Error> {
+    root_for(folder, name, single_file, fallback, taken, false)
+}
+
+/// 在 `folder` 里给云离线内容的根选名字并拼出路径，返回根名与路径：`name` 为网盘上的文件或文件夹名，`fallback` 为
+/// 网盘上离线任务的编号，规则同 [`torrent_root_for`]，另把根的任务目录（[`file_work_dir`]）一起算占用。
+pub fn cloud_root_for(
+    folder: &Path,
+    name: &str,
+    single_file: bool,
+    fallback: &str,
+    taken: &HashSet<String>,
+) -> Result<(String, PathBuf), Error> {
+    root_for(folder, name, single_file, fallback, taken, true)
+}
+
+/// [`torrent_root_for`] 与 [`cloud_root_for`]：`with_work_dir` 时 `<根名>.hsdl` 也算占用。
+fn root_for(
+    folder: &Path,
+    name: &str,
+    single_file: bool,
+    fallback: &str,
+    taken: &HashSet<String>,
+    with_work_dir: bool,
+) -> Result<(String, PathBuf), Error> {
     let cleaned = if single_file {
         clean_file_name(name)
     } else {
@@ -275,10 +299,89 @@ pub fn torrent_root_for(
         Some(extension) => format!("{stem}.{extension}"),
         None => stem.to_owned(),
     };
-    let stem = free_stem(folder, stem, taken, |stem| vec![named(stem)])?;
+    let stem = free_stem(folder, stem, taken, |stem| {
+        let root = named(stem);
+        if with_work_dir {
+            vec![format!("{root}{WORK_DIR_SUFFIX}"), root]
+        } else {
+            vec![root]
+        }
+    })?;
     let root = named(&stem);
     let path = folder.join(&root);
     Ok((root, path))
+}
+
+/// 网盘文件夹里一个文件的位置：从内容的根往下的各级文件夹（名字与网盘上的编号），最后是文件的名字与编号。
+pub struct CloudPlace {
+    pub folders: Vec<(String, String)>,
+    pub file: (String, String),
+}
+
+/// 网盘文件夹里各文件相对内容的根的路径，以 `/` 分隔，与 `places` 一一对应：文件夹名照标题的规则、文件名照
+/// [`file_name`] 的规则整理，什么都不剩时用网盘上的编号；同一文件夹里整理后重名的（不分大小写与 Unicode 写法，
+/// 见 [`path_key`]）按先后在主名后加 ` 2`、` 3`……，网盘上的同一个文件夹总是同一个名字。
+pub fn cloud_paths(places: &[CloudPlace]) -> Vec<String> {
+    use std::collections::HashMap;
+    // 每个本地目录（相对路径）里已用的名字的键，与网盘上的文件夹编号分到的名字
+    let mut used: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut folder_names: HashMap<String, String> = HashMap::new();
+    let mut pick = |parent: &str, cleaned: String, fallback: &str, file: bool| -> String {
+        let cleaned = if cleaned.is_empty() {
+            fallback.to_owned()
+        } else {
+            cleaned
+        };
+        let (stem, extension) = if file {
+            split_extension(&cleaned)
+        } else {
+            (cleaned.as_str(), None)
+        };
+        let names = used.entry(parent.to_owned()).or_default();
+        let mut number = 1;
+        loop {
+            let stem = if number == 1 {
+                stem.to_owned()
+            } else {
+                format!("{stem} {number}")
+            };
+            let name = match extension {
+                Some(extension) => format!("{stem}.{extension}"),
+                None => stem,
+            };
+            if names.insert(path_key(&name)) {
+                return name;
+            }
+            number += 1;
+        }
+    };
+    places
+        .iter()
+        .map(|place| {
+            let mut path = String::new();
+            for (name, id) in &place.folders {
+                let assigned = match folder_names.get(id) {
+                    Some(assigned) => assigned.clone(),
+                    None => {
+                        let assigned = pick(&path, clean_title(name), id, false);
+                        folder_names.insert(id.clone(), assigned.clone());
+                        assigned
+                    }
+                };
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(&assigned);
+            }
+            let (name, id) = &place.file;
+            let file = pick(&path, clean_file_name(name), id, true);
+            if path.is_empty() {
+                file
+            } else {
+                format!("{path}/{file}")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -456,5 +559,38 @@ mod tests {
             ("talk 3".to_owned(), OutputSpec::Hls(dir.join("talk 3")))
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn place(folders: &[(&str, &str)], file: (&str, &str)) -> CloudPlace {
+        CloudPlace {
+            folders: folders
+                .iter()
+                .map(|(name, id)| ((*name).to_owned(), (*id).to_owned()))
+                .collect(),
+            file: (file.0.to_owned(), file.1.to_owned()),
+        }
+    }
+
+    /// 各段照文件名的规则整理；同一目录里整理后重名的（不分大小写）加编号，同一个网盘文件夹总是同一个名字；什么都不剩
+    /// 的用编号。
+    #[test]
+    fn cloud_paths_are_cleaned_and_distinct() {
+        let places = [
+            place(&[], ("a:b.mkv", "V1")),
+            place(&[], ("A_B.mkv", "V2")),
+            place(&[("Sub", "F1")], ("x.srt", "V3")),
+            place(&[("sub", "F2")], ("x.srt", "V4")),
+            place(&[("Sub", "F1"), ("..", "F3")], ("...", "V5")),
+        ];
+        assert_eq!(
+            cloud_paths(&places),
+            [
+                "a_b.mkv",
+                "A_B 2.mkv",
+                "Sub/x.srt",
+                "sub 2/x.srt",
+                "Sub/F3/V5",
+            ]
+        );
     }
 }

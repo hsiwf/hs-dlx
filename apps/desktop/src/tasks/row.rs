@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone as _};
 use hs_dlx_app::{
-    Finished, Kind, OutputSpec, SavedTorrent, Status, Task, TaskSpec, TorrentProgress,
+    CloudFile, CloudProgress, Finished, Kind, OutputSpec, SavedTorrent, Status, Task, TaskSpec,
+    TorrentProgress,
 };
 use hs_m3u8_core::{FileCount, FileProgress, Progress, Saved, Stage};
 
@@ -30,6 +31,8 @@ pub enum Disk {
     Read(Option<Saved>),
     /// BT 任务读到了
     Torrent(SavedTorrent),
+    /// 云离线任务读到了：存储里记着的文件（列出文件之前为空）
+    Cloud(Vec<CloudFile>),
 }
 
 /// 完成任务的输出此刻在不在：完成时与打开应用时在后台查一次，渲染时不碰文件系统。
@@ -48,6 +51,8 @@ pub struct Row {
     pub file_progress: Option<FileProgress>,
     /// BT 任务这次运行最近的进度；继续时清掉
     pub torrent_progress: Option<TorrentProgress>,
+    /// 云离线任务这次运行最近的进度；继续时清掉
+    pub cloud_progress: Option<CloudProgress>,
     /// 任务不在运行时任务目录里已完成的内容；停下时作废重读，运行中留着继续前读到的
     pub disk: Disk,
     /// 读任务目录的代次：每次作废 `disk` 时加一，只收发起时代次相同的结果
@@ -98,6 +103,7 @@ impl Row {
             progress: None,
             file_progress: None,
             torrent_progress: None,
+            cloud_progress: None,
             disk: Disk::Unread,
             reading: 0,
             present: None,
@@ -199,7 +205,7 @@ impl Row {
         }
         match &self.disk {
             Disk::Read(Some(Saved::Hls(saved))) => saved.live,
-            Disk::Read(Some(Saved::File(_))) | Disk::Torrent(_) => false,
+            Disk::Read(Some(Saved::File(_))) | Disk::Torrent(_) | Disk::Cloud(_) => false,
             _ => self.task.spec.hls().is_some_and(|hls| hls.live),
         }
     }
@@ -237,7 +243,7 @@ impl Amount {
                 duration: saved.duration,
             }),
             // 存储里是 HLS 任务、目录里却是文件任务的：服务按种类开始任务，读到时核心已报目录种类不符
-            Disk::Read(Some(Saved::File(_)) | None) | Disk::Torrent(_) => None,
+            Disk::Read(Some(Saved::File(_)) | None) | Disk::Torrent(_) | Disk::Cloud(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.progress.as_ref().map(from_progress),
         }
     }
@@ -252,7 +258,7 @@ impl Amount {
     }
 }
 
-/// 文件与 BT 任务已下的与总字节数（BT 只算选了的文件）。
+/// 文件、BT 与云离线任务已下的与总字节数（BT 只算选了的文件）。
 pub struct FileAmount {
     pub bytes: u64,
     /// 服务器没给出时为 None
@@ -260,13 +266,51 @@ pub struct FileAmount {
 }
 
 impl FileAmount {
-    /// 文件与 BT 任务的：运行中取这次运行的进度；停下的取任务目录里（BT 为续传数据里）读到的，还没读到时取这次运行
-    /// 留下的进度。BT 任务上次没正常停下、已有的块待校验时为 None。HLS 任务为 None（见 [`Amount`]）。
+    /// 文件、BT 与云离线任务的：运行中取这次运行的进度；停下的取任务目录里（BT 为续传数据里，云离线为存储里记着的
+    /// 文件）读到的，还没读到时取这次运行留下的进度。BT 任务上次没正常停下、已有的块待校验时为 None；云离线任务还没
+    /// 列出文件时（网盘还在下）为 None。HLS 任务为 None（见 [`Amount`]）。
     pub fn of(row: &Row) -> Option<FileAmount> {
         match &row.task.spec.kind {
             Kind::Hls(_) => None,
             Kind::File(_) => Self::of_file(row),
             Kind::Torrent(_) => Self::of_torrent(row),
+            Kind::Cloud(_) => Self::of_cloud(row),
+        }
+    }
+
+    fn of_cloud(row: &Row) -> Option<FileAmount> {
+        let from_progress = |p: &CloudProgress| match p {
+            CloudProgress::Fetching {
+                done, total, file, ..
+            } => Some(FileAmount {
+                bytes: done + file.bytes,
+                total: Some(*total),
+            }),
+            CloudProgress::Verifying {
+                done,
+                total,
+                checked,
+                ..
+            } => Some(FileAmount {
+                bytes: done + checked,
+                total: Some(*total),
+            }),
+            CloudProgress::Remote { .. }
+            | CloudProgress::Listing
+            | CloudProgress::Skipped { .. } => None,
+        };
+        if row.task.status == Status::Running {
+            return row.cloud_progress.as_ref().and_then(from_progress);
+        }
+        match &row.disk {
+            Disk::Cloud(files) if !files.is_empty() => Some(FileAmount {
+                bytes: files.iter().filter(|f| f.done).map(|f| f.size).sum(),
+                total: Some(files.iter().filter(|f| !f.skipped).map(|f| f.size).sum()),
+            }),
+            Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) => None,
+            Disk::Unread | Disk::Unreadable(_) => {
+                row.cloud_progress.as_ref().and_then(from_progress)
+            }
         }
     }
 
@@ -283,7 +327,7 @@ impl FileAmount {
                 bytes: saved.bytes,
                 total: saved.total,
             }),
-            Disk::Read(Some(Saved::Hls(_)) | None) | Disk::Torrent(_) => None,
+            Disk::Read(Some(Saved::Hls(_)) | None) | Disk::Torrent(_) | Disk::Cloud(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.file_progress.as_ref().map(from_progress),
         }
     }
@@ -301,7 +345,7 @@ impl FileAmount {
                 bytes: saved.info.done,
                 total: Some(saved.info.wanted()),
             }),
-            Disk::Read(_) => None,
+            Disk::Read(_) | Disk::Cloud(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.torrent_progress.as_ref().map(from_progress),
         }
     }
@@ -314,24 +358,26 @@ impl FileAmount {
     }
 }
 
-/// 主要输出（[`TaskSpec::outputs`] 的首项）的文件名。
-fn file_name(spec: &TaskSpec) -> String {
-    main_output(spec)
-        .file_name()
-        .expect("存储读回任务时已校验输出路径以文件名结尾")
-        .to_string_lossy()
-        .into_owned()
+/// 主要输出（[`TaskSpec::outputs`] 的首项）的文件名；还没定下输出的云离线任务为任务的标题。
+pub(super) fn file_name(spec: &TaskSpec) -> String {
+    main_output(spec).map_or_else(
+        || spec.title.clone(),
+        |output| {
+            output
+                .file_name()
+                .expect("存储读回任务时已校验输出路径以文件名结尾")
+                .to_string_lossy()
+                .into_owned()
+        },
+    )
 }
 
-/// 主要输出（[`TaskSpec::outputs`] 的首项）。
-pub fn main_output(spec: &TaskSpec) -> &Path {
-    spec.outputs()
-        .first()
-        .copied()
-        .expect("每种任务都至少有一个输出")
+/// 主要输出（[`TaskSpec::outputs`] 的首项）；还没定下内容的根的云离线任务没有。
+pub fn main_output(spec: &TaskSpec) -> Option<&Path> {
+    spec.outputs().first().copied()
 }
 
-/// 存成了什么：HLS 为输出的种类，文件任务为「文件」，BT 任务为「BT」。
+/// 存成了什么：HLS 为输出的种类，文件任务为「文件」，BT 任务为「BT」，云离线任务为「PikPak 云离线」。
 pub fn saved_as(spec: &TaskSpec) -> &'static str {
     match &spec.kind {
         Kind::Hls(hls) => match hls.output {
@@ -341,6 +387,7 @@ pub fn saved_as(spec: &TaskSpec) -> &'static str {
         },
         Kind::File(_) => "文件",
         Kind::Torrent(_) => "BT",
+        Kind::Cloud(_) => "PikPak 云离线",
     }
 }
 

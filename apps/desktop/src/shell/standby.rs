@@ -152,7 +152,7 @@ impl Shell {
                 .child(kind(
                     magnet_icon(),
                     "磁力链接与种子文件",
-                    "取到种子信息后选要下的文件",
+                    "取到种子信息后选要下的文件；磁力链接也能交给 PikPak 云离线",
                 ))
                 .into_any_element(),
         );

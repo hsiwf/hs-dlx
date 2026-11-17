@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hs_dlx_app::{TorrentPhase, TorrentProgress};
+use hs_dlx_app::{CloudPhase, CloudProgress, TorrentPhase, TorrentProgress};
 use hs_m3u8_core::{
     FetchErrorKind, FetchFailure, FileProgress, HttpErrorKind, Progress, Purpose, Retrying, Stage,
 };
@@ -136,6 +136,77 @@ pub fn between_file(before: Option<&FileProgress>, now: &FileProgress) -> Vec<(L
     found
 }
 
+/// 云离线任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事：网盘排队、在下、被暂停、
+/// 下完；开始下第几个文件（同一个文件里的照 [`between_file`]）；开始校验。
+pub fn between_cloud(before: Option<&CloudProgress>, now: &CloudProgress) -> Vec<(Level, String)> {
+    let mut found = Vec::new();
+    match now {
+        CloudProgress::Remote { phase, .. } => {
+            let was = match before {
+                Some(CloudProgress::Remote { phase, .. }) => Some(*phase),
+                _ => None,
+            };
+            if was != Some(*phase) {
+                let (level, text) = match phase {
+                    CloudPhase::Queued => (Level::Info, "PikPak 收下了，在排队"),
+                    CloudPhase::Running => (Level::Info, "PikPak 在下，下完后取回本机"),
+                    CloudPhase::Paused => (
+                        Level::Warn,
+                        "PikPak 上的离线下载被暂停了（在网页或 App 里），恢复后才接着下",
+                    ),
+                };
+                found.push((level, text.to_owned()));
+            }
+        }
+        CloudProgress::Listing => {
+            if before != Some(now) {
+                found.push((Level::Info, "PikPak 下完了，列出文件".to_owned()));
+            }
+        }
+        CloudProgress::Fetching {
+            index, count, file, ..
+        } => {
+            let same = match before {
+                Some(CloudProgress::Fetching {
+                    index: at,
+                    file: was,
+                    ..
+                }) if at == index => Some(was.as_ref()),
+                _ => None,
+            };
+            if same.is_none() && *count > 1 {
+                found.push((
+                    Level::Info,
+                    format!("取回第 {} / {count} 个文件", index + 1),
+                ));
+            }
+            found.extend(between_file(same, file));
+        }
+        CloudProgress::Skipped { output, .. } => {
+            found.push((
+                Level::Warn,
+                format!(
+                    "{} 在网盘上被删了（或删进了回收站），跳过它",
+                    output.display()
+                ),
+            ));
+        }
+        CloudProgress::Verifying { index, count, .. } => {
+            let again =
+                matches!(before, Some(CloudProgress::Verifying { index: at, .. }) if at == index);
+            if !again {
+                let which = if *count > 1 {
+                    format!("第 {} 个文件", index + 1)
+                } else {
+                    "文件".to_owned()
+                };
+                found.push((Level::Info, format!("按网盘给的 GCID 校验{which}")));
+            }
+        }
+    }
+    found
+}
+
 /// BT 任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事：开始与校验完磁盘上已有的
 /// 文件；资源不足（[`TorrentProgress::scarce`]）与又凑得齐了；tracker 报了新的错。
 pub fn between_torrent(
@@ -225,6 +296,7 @@ fn purpose(purpose: Purpose) -> &'static str {
         Purpose::Init => "init 段",
         Purpose::Segment => "分片",
         Purpose::File => "文件的一段",
+        Purpose::Call => "接口",
     }
 }
 

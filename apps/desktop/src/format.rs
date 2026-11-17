@@ -129,6 +129,23 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         }
         FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
         FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见错误信息"),
+        FailureKind::CloudLogin => ("登录".into(), "PikPak 的登录失效了：在设置里重新登录后继续"),
+        FailureKind::CloudQuota => (
+            "额度".into(),
+            "PikPak 的离线次数、空间或流量用完了：额度恢复或升级会员后继续",
+        ),
+        FailureKind::CloudFailed => (
+            "云端".into(),
+            "网盘那边没成（离线下载失败、文件不全或直链一直下不了），原因见错误信息；可以再试或改用本机 BT",
+        ),
+        FailureKind::CloudApi => (
+            "接口".into(),
+            "PikPak 回的内容认不出，多为接口变了：升级应用后再试",
+        ),
+        FailureKind::Integrity => (
+            "校验".into(),
+            "下完的文件与网盘上的不符，已删掉：继续时重下",
+        ),
         FailureKind::Other => ("!".into(), "原因见错误信息"),
     }
 }

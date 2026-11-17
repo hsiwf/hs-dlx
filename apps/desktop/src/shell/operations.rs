@@ -46,6 +46,12 @@ impl Shell {
         self.tasks.update(cx, |tasks, cx| tasks.discard(id, cx));
     }
 
+    /// 重新登录 PikPak：打开设置页的「网盘」一组（登录的进展在那里），在系统浏览器里打开确认页。
+    pub(super) fn log_in_pikpak(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_at(crate::settings::Section::Cloud, window, cx);
+        self.tasks.update(cx, |tasks, cx| tasks.login_pikpak(cx));
+    }
+
     /// 打开停着的任务 `id` 的请求头编辑框，填上它现在的请求头。
     pub(super) fn edit_headers(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(spec) = self.tasks.read(cx).row(id).map(|row| row.task.spec.clone()) else {
